@@ -187,7 +187,7 @@ fn serve(config: Config) -> Result<(), String> {
                 Arc::clone(pipeline.stats()),
                 scheduler.policy(),
                 scheduler.control(),
-            );
+            )?;
             web::spawn(status_page, Arc::new(web));
         }
 

@@ -237,7 +237,8 @@ async fn site(config: Config) -> Site {
         Arc::clone(dns.pipeline.stats()),
         Arc::clone(&policy),
         Arc::clone(&control),
-    );
+    )
+    .unwrap();
     web::spawn(listeners, Arc::new(web_state));
 
     Site {

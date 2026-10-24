@@ -806,6 +806,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "regex",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
