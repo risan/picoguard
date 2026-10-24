@@ -151,7 +151,7 @@ fn serve(config: Config) -> Result<(), String> {
         .build()
         .map_err(|error| format!("cannot start the runtime: {error}"))?;
 
-    runtime.block_on(async {
+    run_to_shutdown(runtime, async {
         let worker = CompileWorker::spawn()
             .map_err(|error| format!("cannot start the compile worker: {error}"))?;
         let store = if config.state.persist_lists {
@@ -199,8 +199,26 @@ fn serve(config: Config) -> Result<(), String> {
             log::warn!("the snapshot writer did not finish in time");
         }
 
-        Ok(())
+        Ok(deadline)
     })
+}
+
+/// Runs `work` to completion; it returns the moment by which the process must be gone.
+/// Dropping the runtime would wait for every blocking task, however long (a list on a hung
+/// disk), so it is stopped with what is left of that allowance and the stuck threads are
+/// left behind.
+fn run_to_shutdown(
+    runtime: tokio::runtime::Runtime,
+    work: impl std::future::Future<Output = Result<Instant, String>>,
+) -> Result<(), String> {
+    let outcome = runtime.block_on(work);
+    let deadline = match &outcome {
+        Ok(deadline) => *deadline,
+        Err(_) => Instant::now() + SHUTDOWN_WAIT,
+    };
+    runtime.shutdown_timeout(deadline.saturating_duration_since(Instant::now()));
+
+    outcome.map(|_| ())
 }
 
 /// SIGTERM (the service manager) and SIGINT (Ctrl-C).
@@ -230,6 +248,8 @@ impl StopSignals {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Command, String> {
@@ -303,5 +323,31 @@ mod tests {
             parse(&["--config"]),
             Err("--config needs a file argument".to_string())
         );
+    }
+
+    #[test]
+    fn a_blocking_task_that_never_returns_does_not_hold_the_runtime_past_the_deadline() {
+        let (done, finished) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let outcome = run_to_shutdown(runtime, async {
+                // Like a local list that is a pipe nobody writes to.
+                let (keep_open, never_sent) = mpsc::channel::<()>();
+                std::mem::forget(keep_open);
+                tokio::task::spawn_blocking(move || never_sent.recv());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                Ok(Instant::now() + Duration::from_millis(300))
+            });
+            let _ = done.send(outcome);
+        });
+
+        let outcome = finished.recv_timeout(Duration::from_secs(5));
+
+        assert_eq!(outcome, Ok(Ok(())));
     }
 }
