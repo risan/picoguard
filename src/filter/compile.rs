@@ -1,7 +1,6 @@
 //! The compile worker: one plain thread that parses and compiles list text, loads snapshot
 //! files and drops big values, so none of that runs on the DNS thread (plan D13, D20).
 
-use std::any::Any;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +9,7 @@ use std::sync::mpsc as std_mpsc;
 use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::Xxh3;
 
-use super::engine::{CompiledList, ListBuilder};
+use super::engine::{CompiledList, Engine, ListBuilder};
 use super::parse::{ListFormat, ParseSummary, Parser, Rule};
 use super::snapshot::{self, Snapshot, SnapshotError};
 use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
@@ -71,7 +70,7 @@ enum Job {
         max_rules: u32,
         reply: oneshot::Sender<Result<Snapshot, SnapshotError>>,
     },
-    Discard(Box<dyn Any + Send>),
+    Run(Box<dyn FnOnce() + Send>),
 }
 
 pub struct CompileWorker {
@@ -120,7 +119,35 @@ impl CompileWorker {
     /// Drops `garbage` on the worker: an old engine or a replaced list has arrays of
     /// megabytes, and freeing them must not stall the DNS thread.
     pub fn discard<T: Send + 'static>(&self, garbage: T) {
-        let _ = self.jobs.send(Job::Discard(Box::new(garbage)));
+        let _ = self.jobs.send(Job::Run(Box::new(move || drop(garbage))));
+    }
+
+    /// Runs `work` on the worker and returns its result.
+    pub async fn run<T, F>(&self, work: F) -> Result<T, CompileError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (reply, result) = oneshot::channel();
+        let job = Job::Run(Box::new(move || {
+            let _ = reply.send(work());
+        }));
+        self.jobs
+            .send(job)
+            .map_err(|_| CompileError::WorkerStopped)?;
+
+        result.await.map_err(|_| CompileError::WorkerStopped)
+    }
+
+    /// Builds the next engine on the worker: its slow-rule scan and `$badfilter` indexes
+    /// (plan D7) must not run on the DNS thread. `main` holds the lists and the user rules,
+    /// `allow` the allowlists.
+    pub async fn assemble(
+        &self,
+        main: Vec<Arc<CompiledList>>,
+        allow: Vec<Arc<CompiledList>>,
+    ) -> Result<Engine, CompileError> {
+        self.run(move || Engine::new(main, allow)).await
     }
 }
 
@@ -143,8 +170,8 @@ fn run(queue: std_mpsc::Receiver<Job>) {
                 let _ = reply.send(snapshot::load(&path, max_rules));
             }
 
-            Job::Discard(garbage) => {
-                drop(garbage);
+            Job::Run(work) => {
+                work();
             }
         }
     }
@@ -331,6 +358,69 @@ mod tests {
                 .0
                 .send((thread.id(), thread.name().map(str::to_string)));
         }
+    }
+
+    #[tokio::test]
+    async fn work_runs_on_the_worker_thread_and_its_result_comes_back() {
+        let worker = CompileWorker::spawn().unwrap();
+
+        let (thread, name) = worker
+            .run(|| {
+                let thread = std::thread::current();
+                (thread.id(), thread.name().map(str::to_string))
+            })
+            .await
+            .unwrap();
+
+        assert_ne!(thread, std::thread::current().id());
+        assert_eq!(name.as_deref(), Some("picoguard-compile"));
+    }
+
+    #[tokio::test]
+    async fn an_assembled_engine_decides_like_one_built_in_place() {
+        let worker = CompileWorker::spawn().unwrap();
+        let blocklist = compile_in_pieces(
+            &worker,
+            options(ListFormat::Auto),
+            b"||ads.example^\n||both.example^\n||bad.example^\n||bad.example^$badfilter\n",
+            64,
+        )
+        .await
+        .unwrap();
+        let user_rules =
+            compile_in_pieces(&worker, options(ListFormat::Auto), b"||mine.example^\n", 64)
+                .await
+                .unwrap();
+        let allowlist =
+            compile_in_pieces(&worker, options(ListFormat::Auto), b"||both.example^\n", 64)
+                .await
+                .unwrap();
+        let main = vec![Arc::clone(&blocklist.list), Arc::clone(&user_rules.list)];
+        let allow = vec![Arc::clone(&allowlist.list)];
+        let in_place = Engine::new(main.clone(), allow.clone());
+
+        let assembled = worker.assemble(main, allow).await.unwrap();
+
+        for name in ["ads.example", "mine.example", "both.example", "bad.example"] {
+            assert_eq!(
+                assembled.check(name, TYPE_A, false),
+                in_place.check(name, TYPE_A, false),
+                "{name}"
+            );
+        }
+
+        assert!(matches!(
+            assembled.check("mine.example", TYPE_A, false),
+            Decision::Block { .. }
+        ));
+        assert_eq!(
+            assembled.check("both.example", TYPE_A, false),
+            Decision::Pass
+        );
+        assert_eq!(
+            assembled.check("bad.example", TYPE_A, false),
+            Decision::Pass
+        );
     }
 
     #[test]
