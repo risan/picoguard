@@ -30,13 +30,28 @@ pub fn init(level: LogLevel) {
     let _ = log::set_logger(&LOGGER);
 }
 
+#[rustfmt::skip]
 fn level_filter(level: LogLevel) -> LevelFilter {
     match level {
-        LogLevel::Error => LevelFilter::Error,
-        LogLevel::Warn => LevelFilter::Warn,
-        LogLevel::Info => LevelFilter::Info,
-        LogLevel::Debug => LevelFilter::Debug,
-        LogLevel::Trace => LevelFilter::Trace,
+        LogLevel::Error => {
+            LevelFilter::Error
+        }
+
+        LogLevel::Warn => {
+            LevelFilter::Warn
+        }
+
+        LogLevel::Info => {
+            LevelFilter::Info
+        }
+
+        LogLevel::Debug => {
+            LevelFilter::Debug
+        }
+
+        LogLevel::Trace => {
+            LevelFilter::Trace
+        }
     }
 }
 

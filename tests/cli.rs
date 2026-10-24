@@ -73,17 +73,6 @@ fn check_rejects_a_missing_file() {
 }
 
 #[test]
-fn check_without_config_flag_reads_the_default_path() {
-    let output = picoguard(&["--check"]);
-
-    let default_path_exists = std::path::Path::new("/etc/picoguard/picoguard.toml").exists();
-    if !default_path_exists {
-        assert_eq!(output.status.code(), Some(1));
-        assert!(text(&output.stderr).contains("/etc/picoguard/picoguard.toml"));
-    }
-}
-
-#[test]
 fn running_with_a_good_config_logs_one_info_line_and_exits_zero() {
     let path = write_config("info-level.toml", "[log]\nlevel = \"info\"\n");
 

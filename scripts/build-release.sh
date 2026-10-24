@@ -10,11 +10,12 @@ targets=(
 )
 armv7_target=armv7-unknown-linux-musleabihf
 armv7_size_limit=$((4 * 1024 * 1024))
+target_dir="$PWD/target"
 
 for target in "${targets[@]}"; do
-    cargo zigbuild --release --target "$target"
+    cargo zigbuild --release --target "$target" --target-dir "$target_dir"
     mkdir -p "dist/bin/$target"
-    cp "target/$target/release/picoguard" "dist/bin/$target/picoguard"
+    cp "$target_dir/$target/release/picoguard" "dist/bin/$target/picoguard"
     echo "$target: $(stat -c %s "dist/bin/$target/picoguard") bytes"
 done
 

@@ -1,5 +1,5 @@
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -26,8 +26,14 @@ impl fmt::Display for ConfigError {
             ConfigError::Read { path, source } => {
                 write!(formatter, "cannot read {}: {source}", path.display())
             }
-            ConfigError::Parse(source) => write!(formatter, "{source}"),
-            ConfigError::Invalid(message) => write!(formatter, "{message}"),
+
+            ConfigError::Parse(source) => {
+                write!(formatter, "{source}")
+            }
+
+            ConfigError::Invalid(message) => {
+                write!(formatter, "{message}")
+            }
         }
     }
 }
@@ -123,6 +129,10 @@ pub struct ServerConfig {
     pub bind: IpAddr,
     pub port: u16,
     pub udp_size: u16,
+}
+
+fn default_bind() -> Vec<IpAddr> {
+    vec![Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()]
 }
 
 impl Default for ServerConfig {
@@ -269,22 +279,49 @@ impl ListConfig {
             (Some(_), Some(_)) => {
                 return invalid(format!("{field}: set either url or path, not both"));
             }
-            (None, None) => return invalid(format!("{field}: set url or path")),
+
+            (None, None) => {
+                return invalid(format!("{field}: set url or path"));
+            }
+
             (Some(url), None) => {
-                if !LIST_URL_SCHEMES
+                let Some(rest) = LIST_URL_SCHEMES
                     .iter()
-                    .any(|scheme| url.starts_with(scheme))
-                {
+                    .find_map(|scheme| url.strip_prefix(scheme))
+                else {
                     return invalid(format!("{field}.url must start with http:// or https://"));
+                };
+
+                if !has_host(rest) {
+                    return invalid(format!("{field}.url has no host"));
                 }
             }
-            (None, Some(_)) => {}
+
+            (None, Some(path)) => {
+                if path.as_os_str().is_empty() {
+                    return invalid(format!("{field}.path must not be empty"));
+                }
+            }
         }
 
         positive(&format!("{field}.refresh_hours"), self.refresh_hours)?;
         positive(&format!("{field}.max_rules"), self.max_rules)?;
         positive(&format!("{field}.max_body_bytes"), self.max_body_bytes)
     }
+}
+
+fn has_host(url_after_scheme: &str) -> bool {
+    let authority = url_after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host_and_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host_and_port.split(':').next().unwrap_or_default(),
+    };
+
+    !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
 fn validate_lists(section: &str, lists: &[ListConfig]) -> Result<(), ConfigError> {
@@ -410,7 +447,7 @@ impl LimitsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct WebConfig {
     pub enabled: bool,
-    pub bind: IpAddr,
+    pub bind: Vec<IpAddr>,
     pub port: u16,
     pub hostnames: Vec<String>,
     pub user: Option<String>,
@@ -422,7 +459,7 @@ impl Default for WebConfig {
     fn default() -> Self {
         WebConfig {
             enabled: true,
-            bind: Ipv4Addr::UNSPECIFIED.into(),
+            bind: default_bind(),
             port: 8080,
             hostnames: Vec::new(),
             user: None,
@@ -435,8 +472,14 @@ impl Default for WebConfig {
 impl WebConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         match (&self.user, &self.password) {
-            (Some(_), None) => return invalid("web.password must be set when web.user is set"),
-            (None, Some(_)) => return invalid("web.user must be set when web.password is set"),
+            (Some(_), None) => {
+                return invalid("web.password must be set when web.user is set");
+            }
+
+            (None, Some(_)) => {
+                return invalid("web.user must be set when web.password is set");
+            }
+
             (Some(user), Some(password)) => {
                 if user.is_empty() || user.contains(':') {
                     return invalid("web.user must not be empty or contain ':'");
@@ -446,6 +489,7 @@ impl WebConfig {
                     return invalid("web.password must not be empty");
                 }
             }
+
             (None, None) => {}
         }
 
@@ -661,7 +705,7 @@ mod tests {
 
             [web]
             enabled = false
-            bind = "192.168.1.2"
+            bind = ["192.168.1.2"]
             port = 80
             hostnames = ["picoguard.lan"]
             user = "admin"
@@ -891,6 +935,24 @@ mod tests {
                 "web.query_log_entries must be > 0",
             ),
             ("[state]\ndir = \"\"", "state.dir must not be empty"),
+            ("[[lists]]\npath = \"\"", "lists[0].path must not be empty"),
+            ("[[lists]]\nurl = \"https://\"", "lists[0].url has no host"),
+            (
+                "[[lists]]\nurl = \"http:///list.txt\"",
+                "lists[0].url has no host",
+            ),
+            (
+                "[[lists]]\nurl = \"https://user@:8080/x\"",
+                "lists[0].url has no host",
+            ),
+            (
+                "[[allowlists]]\npath = \"\"",
+                "allowlists[0].path must not be empty",
+            ),
+            (
+                "[[allowlists]]\nurl = \"https://\"",
+                "allowlists[0].url has no host",
+            ),
         ];
 
         for (text, expected) in cases {
@@ -901,6 +963,38 @@ mod tests {
                 "config {text:?}: expected {expected:?}, got {message:?}"
             );
         }
+    }
+
+    #[test]
+    fn urls_with_a_host_are_accepted() {
+        for url in [
+            "https://example.com/list.txt",
+            "http://192.168.1.2:8080/l",
+            "https://user:pw@example.com/l",
+            "https://[2001:db8::1]:443/l",
+            "https://example.com",
+        ] {
+            let text = format!("[[lists]]\nurl = \"{url}\"");
+
+            Config::parse(&text).unwrap();
+        }
+    }
+
+    #[test]
+    fn web_bind_defaults_to_both_families() {
+        assert_eq!(
+            Config::default().web.bind,
+            ["0.0.0.0".parse::<IpAddr>().unwrap(), "::".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn web_bind_accepts_ipv4_only_and_ipv6_only() {
+        let ipv4 = Config::parse("[web]\nbind = [\"127.0.0.1\"]").unwrap();
+        let ipv6 = Config::parse("[web]\nbind = [\"::1\"]").unwrap();
+
+        assert_eq!(ipv4.web.bind, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(ipv6.web.bind, ["::1".parse::<IpAddr>().unwrap()]);
     }
 
     #[test]
