@@ -64,16 +64,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
     Ok(Command::Run { config_path })
 }
 
-#[rustfmt::skip]
 fn main() -> ExitCode {
     match parse_args(std::env::args().skip(1)) {
-        Ok(Command::Run { config_path }) => {
-            run(&config_path)
-        }
+        Ok(Command::Run { config_path }) => run(&config_path),
 
-        Ok(Command::Check { config_path }) => {
-            check(&config_path)
-        }
+        Ok(Command::Check { config_path }) => check(&config_path),
 
         Ok(Command::Version) => {
             println!("picoguard {}", env!("CARGO_PKG_VERSION"));
@@ -111,12 +106,9 @@ fn check(config_path: &Path) -> ExitCode {
     }
 }
 
-#[rustfmt::skip]
 fn run(config_path: &Path) -> ExitCode {
     let config = match Config::load(config_path) {
-        Ok(config) => {
-            config
-        }
+        Ok(config) => config,
 
         Err(error) => {
             eprintln!("{error}");

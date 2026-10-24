@@ -158,7 +158,6 @@ enum Transport {
 }
 
 impl Transport {
-    #[rustfmt::skip]
     async fn query(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
         match self {
             Transport::Udp(upstream) => {
@@ -171,9 +170,7 @@ impl Transport {
                 Ok(reply)
             }
 
-            Transport::Tcp(upstream) => {
-                upstream.query(request, deadline).await
-            }
+            Transport::Tcp(upstream) => upstream.query(request, deadline).await,
         }
     }
 }
