@@ -535,10 +535,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_connection_makes_the_remote_resolve_again() {
-        let free_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        // Bound but not listening: connections are refused, and the port stays ours until
+        // `listen`, so no other test can take it in between.
+        let reserved = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        reserved
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let free_port = reserved.local_addr().unwrap().as_socket().unwrap().port();
 
         let dns = fake_dns(vec![Ipv4Addr::LOCALHOST], Vec::new()).await;
         let target = parse_tls(
@@ -550,7 +558,9 @@ mod tests {
 
         let refused = target.remote.connect_with(later(), accept).await;
         assert!(matches!(refused, Err(UpstreamError::Io(_))));
-        let listener = TcpListener::bind(("127.0.0.1", free_port)).await.unwrap();
+        reserved.listen(16).unwrap();
+        reserved.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(reserved.into()).unwrap();
         let connected = target.remote.connect_with(later(), accept).await;
 
         assert!(connected.is_ok());

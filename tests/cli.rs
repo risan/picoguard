@@ -1,7 +1,9 @@
+mod common;
+
 use std::net::UdpSocket;
-use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::process::{Command, Output};
+
+use common::process::{start, write_config};
 
 fn picoguard(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_picoguard"))
@@ -12,13 +14,6 @@ fn picoguard(args: &[&str]) -> Output {
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
-}
-
-fn write_config(name: &str, content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("picoguard-cli-{}-{name}", std::process::id()));
-    std::fs::write(&path, content).unwrap();
-
-    path
 }
 
 fn example_config() -> String {
@@ -77,52 +72,17 @@ fn check_rejects_a_missing_file() {
 /// Runs the server on a free port until it answers, then stops it and
 /// returns what it wrote to stderr.
 fn run_until_ready(name: &str, log_level: &str) -> (u16, String) {
-    let port = {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket.local_addr().unwrap().port()
-    };
-    let config = format!(
-        "lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
-         [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
-         [log]\nlevel = \"{log_level}\"\n"
-    );
-    let path = write_config(name, &config);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_picoguard"))
-        .args(["-c", path.to_str().unwrap()])
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("picoguard binary should start");
+    let mut server = start(name, |port| {
+        format!(
+            "lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+             [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
+             [log]\nlevel = \"{log_level}\"\n"
+        )
+    });
+    server.child.kill().unwrap();
+    let output = server.child.wait_with_output().unwrap();
 
-    let ready = wait_for_refused_version_bind(port);
-    child.kill().unwrap();
-    let output = child.wait_with_output().unwrap();
-
-    assert!(ready, "the server never answered");
-
-    (port, text(&output.stderr))
-}
-
-/// `version.bind` is refused without any upstream, which makes it a probe.
-fn wait_for_refused_version_bind(port: u16) -> bool {
-    let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-    query.extend_from_slice(b"\x07version\x04bind\x00");
-    query.extend_from_slice(&[0, 16, 0, 3]);
-    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-
-    for _ in 0..50 {
-        socket.send_to(&query, ("127.0.0.1", port)).unwrap();
-        let mut reply = [0u8; 512];
-        if let Ok((length, _)) = socket.recv_from(&mut reply)
-            && length >= 12
-        {
-            return reply[3] & 0x0F == 5;
-        }
-    }
-
-    false
+    (server.port, text(&output.stderr))
 }
 
 #[test]
@@ -162,23 +122,11 @@ fn running_with_a_host_name_upstream_and_no_bootstrap_exits_one() {
 
 #[test]
 fn running_with_the_default_encrypted_upstreams_starts() {
-    let port = {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket.local_addr().unwrap().port()
-    };
-    let config = format!("lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n");
-    let path = write_config("default-upstreams.toml", &config);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_picoguard"))
-        .args(["-c", path.to_str().unwrap()])
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("picoguard binary should start");
-
-    let ready = wait_for_refused_version_bind(port);
-    child.kill().unwrap();
-    let output = child.wait_with_output().unwrap();
-
-    assert!(ready, "the server never answered");
+    let mut server = start("default-upstreams.toml", |port| {
+        format!("lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n")
+    });
+    server.child.kill().unwrap();
+    let output = server.child.wait_with_output().unwrap();
 
     assert!(text(&output.stderr).is_empty(), "{}", text(&output.stderr));
 }

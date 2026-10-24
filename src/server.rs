@@ -458,9 +458,21 @@ mod tests {
             return;
         }
 
-        let port = free_port();
+        // A port that was free a moment ago can be taken by a test running beside this one
+        // (UDP or TCP): draw again.
+        let mut attempts = Vec::new();
+        let listeners = loop {
+            let result = Listeners::bind(&server_config(&["0.0.0.0", "::"], free_port()));
+            match result {
+                Ok(listeners) => break listeners,
 
-        let listeners = Listeners::bind(&server_config(&["0.0.0.0", "::"], port)).unwrap();
+                Err(error) if attempts.len() < 20 => {
+                    attempts.push(error);
+                }
+
+                Err(error) => panic!("{error}; earlier: {attempts:?}"),
+            }
+        };
 
         assert_eq!(listeners.udp_addresses().len(), 2);
         assert_eq!(listeners.tcp_addresses().len(), 2);

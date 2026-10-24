@@ -205,6 +205,9 @@ struct Upstream {
     /// Caps the requests in flight to this server.
     limiter: Semaphore,
     health: Mutex<Health>,
+    /// How long the first failure of a run keeps the server out of the pick; it doubles for
+    /// each failure after that. A field so that a test can make it longer than the test.
+    first_backoff: Duration,
 }
 
 impl Upstream {
@@ -219,6 +222,7 @@ impl Upstream {
                 retry_at: None,
                 outage: Outage::default(),
             }),
+            first_backoff: FIRST_BACKOFF,
         }
     }
 
@@ -303,7 +307,8 @@ impl Upstream {
         }
 
         health.failures += 1;
-        let backoff = FIRST_BACKOFF
+        let backoff = self
+            .first_backoff
             .saturating_mul(1 << (health.failures - 1).min(6))
             .min(MAX_BACKOFF);
         health.retry_at = Some(Instant::now() + backoff);
@@ -750,7 +755,11 @@ mod tests {
     async fn a_failed_server_is_skipped_while_it_backs_off() {
         let dead = dead_udp().await;
         let good = good_udp().await;
-        let upstreams = upstreams(vec![udp_url(&dead), udp_url(&good)], 1000);
+        let mut upstreams = upstreams(vec![udp_url(&dead), udp_url(&good)], 1000);
+        // The backoff lasts longer than the test, however slow the machine is.
+        for server in &mut upstreams.servers {
+            server.first_backoff = MAX_BACKOFF;
+        }
 
         for _ in 0..12 {
             upstreams
