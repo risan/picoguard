@@ -596,6 +596,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_server_without_h2_gets_no_http_bytes() {
+        let pki = TestPki::new();
+        let (received, bytes_seen) = tokio::sync::mpsc::unbounded_channel();
+        let server = TlsServer::start(
+            pki.server_config(&[], rustls::crypto::ring::default_provider()),
+            move |mut stream| {
+                let received = received.clone();
+
+                async move {
+                    let mut buffer = Vec::new();
+                    let _ = stream.read_to_end(&mut buffer).await;
+                    let _ = received.send(buffer.len());
+                }
+            },
+        )
+        .await;
+        let mut bytes_seen = bytes_seen;
+
+        let result = upstream(&pki, &server)
+            .query(&query_for("example.com."), deadline())
+            .await;
+
+        assert!(matches!(result, Err(UpstreamError::Io(_))), "{result:?}");
+        assert_eq!(bytes_seen.recv().await, Some(0));
+    }
+
+    #[tokio::test]
     async fn the_h2_window_and_header_settings_are_sent_to_the_server() {
         let pki = TestPki::new();
         let (found, seen) = tokio::sync::oneshot::channel();

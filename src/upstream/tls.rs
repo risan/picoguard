@@ -211,7 +211,17 @@ impl TlsDialer {
             return Err(UpstreamError::Timeout);
         };
 
-        Ok(handshake?)
+        let stream = handshake?;
+        let negotiated = stream.get_ref().1.alpn_protocol();
+        if self.alpn == Alpn::H2 && negotiated != Some(self.alpn.protocol()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the server did not negotiate HTTP/2 (ALPN h2)",
+            )
+            .into());
+        }
+
+        Ok(stream)
     }
 
     #[cfg(test)]
@@ -383,6 +393,31 @@ mod tests {
 
         assert_eq!(h2.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
         assert_eq!(dot.get_ref().1.alpn_protocol(), Some(&b"dot"[..]));
+    }
+
+    #[tokio::test]
+    async fn an_h2_dialer_rejects_a_server_that_negotiates_no_protocol() {
+        let pki = TestPki::new();
+        let server = idle_server(&pki, &[], ring::default_provider()).await;
+
+        let result = dialer(&pki, true, Alpn::H2, &server)
+            .connect(deadline())
+            .await;
+
+        assert!(matches!(result, Err(UpstreamError::Io(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_dot_dialer_accepts_a_server_that_negotiates_no_protocol() {
+        let pki = TestPki::new();
+        let server = idle_server(&pki, &[], ring::default_provider()).await;
+
+        let stream = dialer(&pki, true, Alpn::Dot, &server)
+            .connect(deadline())
+            .await
+            .unwrap();
+
+        assert_eq!(stream.get_ref().1.alpn_protocol(), None);
     }
 
     #[tokio::test]
