@@ -108,6 +108,7 @@ impl DohUpstream {
         let Some(id) = reply.get_mut(0..2) else {
             return Err(UpstreamError::BadReply);
         };
+
         id.copy_from_slice(&request[0..2]);
 
         if !is_answer_to(request, &reply) {
@@ -204,6 +205,7 @@ impl DohUpstream {
         let Ok(_serialize_connects) = timeout_at(deadline, self.connect_lock.lock()).await else {
             return Err(UpstreamError::Timeout);
         };
+
         if let Some(connection) = self.open_connection() {
             return Ok(connection);
         }
@@ -256,6 +258,7 @@ impl DohUpstream {
         else {
             return Err(UpstreamError::Timeout);
         };
+
         let (sender, connection) = handshake.map_err(from_hyper)?;
 
         tokio::spawn(async move {
@@ -377,6 +380,7 @@ mod tests {
                 upstream.query(&query_for("example.com."), deadline()).await
             }));
         }
+
         for task in tasks {
             task.await.unwrap().unwrap();
         }
@@ -697,12 +701,14 @@ mod tests {
                 waiting.push(task);
             }
         }
+
         assert_eq!(refused, 5);
 
         until(|| stalled.lock().unwrap().len() == 8).await;
         for release in stalled.lock().unwrap().drain(..) {
             release.send_rest();
         }
+
         let mut held = Vec::new();
         for task in waiting {
             let (reply, charge) = task.await.unwrap().unwrap();
@@ -710,6 +716,7 @@ mod tests {
             assert_eq!(charge.bytes(), 30_000);
             held.push(charge);
         }
+
         assert_eq!(budget.used(), 90_000, "the charges went to the callers");
 
         drop(held);

@@ -122,6 +122,7 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
     let Ok(name_end) = wire::skip_name(request, wire::HEADER_LEN) else {
         return false;
     };
+
     let question_end = name_end + 4;
 
     let (Some(asked), Some(echoed)) = (
@@ -130,6 +131,7 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
     ) else {
         return false;
     };
+
     let name_len = name_end - wire::HEADER_LEN;
 
     asked[..name_len].eq_ignore_ascii_case(&echoed[..name_len])
@@ -182,6 +184,7 @@ impl Transport {
                 return upstream.query_charged(request, budget, deadline).await;
             }
         };
+
         let charge = budget
             .try_charge(reply.len())
             .ok_or(UpstreamError::BudgetExhausted)?;
@@ -252,6 +255,7 @@ impl Upstream {
         let Ok(acquired) = timeout_at(deadline, self.limiter.acquire()).await else {
             return Err(UpstreamError::Timeout);
         };
+
         let _permit = acquired.map_err(|_| UpstreamError::Closed)?;
 
         let Ok(result) =
@@ -559,6 +563,7 @@ mod tests {
                 let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
                     break;
                 };
+
                 counter.fetch_add(1, Ordering::SeqCst);
                 let replies = behavior(&buffer[..length]);
                 let socket = Arc::clone(&socket);
@@ -748,6 +753,7 @@ mod tests {
                 break (listener, udp);
             }
         };
+
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buffer = [0u8; 2048];
@@ -775,6 +781,7 @@ mod tests {
             let Ok((mut connection, _)) = listener.accept().await else {
                 break;
             };
+
             accepted.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let mut served = 0;
@@ -851,6 +858,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             listener.local_addr().unwrap()
         };
+
         let upstreams = upstreams(vec![format!("tcp://{free_port}")], 300);
 
         let result = upstreams.query(&mut query_for("example.com.")).await;
@@ -896,6 +904,7 @@ mod tests {
                 upstreams.query(&mut query_for("example.com.")).await
             }));
         }
+
         for task in tasks {
             task.await.unwrap().unwrap();
         }
@@ -970,6 +979,7 @@ mod tests {
         for _ in 0..20 {
             server.record_failure(&UpstreamError::Timeout);
         }
+
         let capped = server.health.lock().unwrap().retry_at.unwrap();
 
         assert!(second > first + Duration::from_millis(500));
@@ -1179,6 +1189,7 @@ mod tests {
             reply[13..20].make_ascii_lowercase();
             reply
         };
+
         let other_name = answer(&query_for("other.com."), ANSWER_MARKER, false);
 
         assert!(is_answer_to(&query, &good));
@@ -1270,10 +1281,12 @@ mod tests {
                 let Transport::Tcp(tcp) = &upstreams.servers[0].transport else {
                     unreachable!();
                 };
+
                 let _held = tcp.connect_lock.lock().await;
                 tokio::time::sleep(Duration::from_millis(300)).await;
             })
         };
+
         tokio::task::yield_now().await;
         let started = Instant::now();
 
@@ -1289,6 +1302,7 @@ mod tests {
                     .await
             })
         };
+
         let patient = {
             let upstreams = Arc::clone(&upstreams);
             tokio::spawn(async move {

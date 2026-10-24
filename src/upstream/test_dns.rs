@@ -86,6 +86,7 @@ pub async fn fake_dns(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>) -> FakeDns {
                 reply.extend_from_slice(&(data.len() as u16).to_be_bytes());
                 reply.extend_from_slice(&data);
             }
+
             let _ = socket.send_to(&reply, peer).await;
         }
     });

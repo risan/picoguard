@@ -95,6 +95,7 @@ async fn lookup(
     let Ok(reply) = udp::exchange(server, &mut query, BOOTSTRAP_REPLY_MAX, deadline).await else {
         return Vec::new();
     };
+
     let Ok(records) = Records::new(&reply) else {
         return Vec::new();
     };
@@ -161,6 +162,7 @@ impl Remote {
 
                 now + deadline.saturating_duration_since(now) / 2
             };
+
             let connecting = async {
                 let stream = TcpStream::connect((*ip, self.port)).await?;
                 stream.set_nodelay(true)?;
@@ -233,6 +235,7 @@ pub fn parse_https(
         Some(slash) => (&rest[..slash], &rest[slash..]),
         None => (rest, ""),
     };
+
     let path = if path.is_empty() || path == "/" {
         DEFAULT_DOH_PATH
     } else {
@@ -462,6 +465,7 @@ mod tests {
             assert!(https.contains("SPEC"), "{rest}: {https}");
             assert!(tls.contains("SPEC"), "{rest}: {tls}");
         }
+
         let name = parse_tls("SPEC", "1.1.1.1#bad name", &some_bootstrap())
             .err()
             .unwrap();
@@ -535,6 +539,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             listener.local_addr().unwrap().port()
         };
+
         let dns = fake_dns(vec![Ipv4Addr::LOCALHOST], Vec::new()).await;
         let target = parse_tls(
             "u",
