@@ -1,0 +1,205 @@
+# Full-flow golden case. tools/agh-flow runs AdGuard Home v0.107.79 with these lists, the
+# user rules and the allowlist, and an upstream that answers from [upstream]; the replies
+# it gives for [queries] are recorded in flow.expected.
+#
+# [upstream] syntax (the subset picoguard's end-to-end test understands):
+#   Q name TYPE                       starts the scripted answer for that question
+#   RCODE NXDOMAIN                    optional response code (default NOERROR)
+#   owner. ttl IN TYPE rdata          answer record; TYPE is A, AAAA, CNAME, TXT or HTTPS;
+#                                     HTTPS rdata is "1 . [ipv4hint=a,b] [ipv6hint=c,d]"
+# A question AdGuard Home forwards that is not scripted is a fixture bug.
+[main]
+! full-flow list
+||cloak-target.tracker.example^
+||1.2.3.4^
+||2001:db8::bad^
+|66.66.66.66^
+/^203\.0\.113\.(1[0-9])$/
+||cdn.example^$denyallow=ok.cdn.example
+||203.0.113.99^$denyallow=ok.cdn.example
+0.0.0.0 hosty.example
+1.2.3.4 hosty-ip.example
+::1 hosty6.example
+1.1.1.1 6.6.6.6
+2001:db8::1 2001:db8::6
+||req-blocked.example^
+||req-allowed.example^
+||req-wild-*.example^
+||dt-block.example^$dnstype=AAAA
+||important-target.example^$important
+@@||allowed-target.example^
+||allowed-target.example^
+||at.example^
+||it.example^$important
+||ut.example^
+[user]
+@@||ut.example^
+@@||it.example^
+[allow]
+||at.example^
+||req-allowed.example^
+[upstream]
+Q req-allowed.example A
+req-allowed.example. 300 IN A 8.8.8.8
+Q dt-block.example A
+dt-block.example. 300 IN A 8.8.8.8
+Q cloaked.example A
+cloaked.example. 300 IN CNAME cloak-target.tracker.example.
+cloak-target.tracker.example. 300 IN A 9.9.9.9
+Q cloaked.example AAAA
+cloaked.example. 300 IN CNAME cloak-target.tracker.example.
+cloak-target.tracker.example. 300 IN AAAA 2620:fe::fe
+Q cloaked.example HTTPS
+cloaked.example. 300 IN CNAME cloak-target.tracker.example.
+cloak-target.tracker.example. 300 IN HTTPS 1 . ipv4hint=9.9.9.9
+Q cloaked.example TXT
+cloaked.example. 300 IN CNAME cloak-target.tracker.example.
+cloak-target.tracker.example. 300 IN TXT "hello"
+Q cloaked.example MX
+cloaked.example. 300 IN CNAME cloak-target.tracker.example.
+Q mixedcase.example A
+mixedcase.example. 300 IN CNAME CLOAK-Target.Tracker.Example.
+Cloak-Target.Tracker.Example. 300 IN A 9.9.9.9
+Q ipans.example A
+ipans.example. 300 IN A 1.2.3.4
+Q ipans6.example AAAA
+ipans6.example. 300 IN AAAA 2001:db8::bad
+Q multi.example A
+multi.example. 300 IN A 8.8.8.8
+multi.example. 300 IN A 1.2.3.4
+Q ipans-ok.example A
+ipans-ok.example. 300 IN A 8.8.8.8
+Q ipans-ok.example AAAA
+ipans-ok.example. 300 IN AAAA 2606:4700::1111
+Q regex-ip.example A
+regex-ip.example. 300 IN A 203.0.113.15
+Q regex-ip-ok.example A
+regex-ip-ok.example. 300 IN A 203.0.113.50
+Q anchored-ip.example A
+anchored-ip.example. 300 IN A 66.66.66.66
+Q anchored-ip-ok.example A
+anchored-ip-ok.example. 300 IN A 166.66.66.66
+Q hostip.example A
+hostip.example. 300 IN A 6.6.6.6
+Q hostip6.example AAAA
+hostip6.example. 300 IN AAAA 2001:db8::6
+Q viahost.example A
+viahost.example. 300 IN CNAME hosty.example.
+hosty.example. 300 IN A 5.5.5.5
+Q viahost.example HTTPS
+viahost.example. 300 IN CNAME hosty.example.
+Q viahost-ip.example A
+viahost-ip.example. 300 IN CNAME hosty-ip.example.
+hosty-ip.example. 300 IN A 5.5.5.5
+Q viahost-ip.example AAAA
+viahost-ip.example. 300 IN CNAME hosty-ip.example.
+hosty-ip.example. 300 IN AAAA 2606:4700::1111
+Q viahost6.example AAAA
+viahost6.example. 300 IN CNAME hosty6.example.
+hosty6.example. 300 IN AAAA 2606:4700::1111
+Q viahost6.example A
+viahost6.example. 300 IN CNAME hosty6.example.
+hosty6.example. 300 IN A 5.5.5.5
+Q hint.example HTTPS
+hint.example. 300 IN HTTPS 1 . ipv4hint=8.8.8.8,1.2.3.4
+Q hint6.example HTTPS
+hint6.example. 300 IN HTTPS 1 . ipv6hint=2606:4700::1111,2001:db8::bad
+Q hint-ok.example HTTPS
+hint-ok.example. 300 IN HTTPS 1 . ipv4hint=8.8.4.4 ipv6hint=2606:4700::1111
+Q hint-host.example HTTPS
+hint-host.example. 300 IN HTTPS 1 . ipv4hint=6.6.6.6
+Q hint-regex.example HTTPS
+hint-regex.example. 300 IN HTTPS 1 . ipv4hint=203.0.113.12
+Q denyall-bad.example A
+denyall-bad.example. 300 IN CNAME bad.cdn.example.
+bad.cdn.example. 300 IN A 8.8.8.8
+Q denyall-ok.example A
+denyall-ok.example. 300 IN CNAME ok.cdn.example.
+ok.cdn.example. 300 IN A 8.8.8.8
+Q denyall-ip.example A
+denyall-ip.example. 300 IN A 203.0.113.99
+Q userallow.example A
+userallow.example. 300 IN CNAME ut.example.
+ut.example. 300 IN A 8.8.8.8
+Q impblock.example A
+impblock.example. 300 IN CNAME it.example.
+it.example. 300 IN A 8.8.8.8
+Q allowlisted.example A
+allowlisted.example. 300 IN CNAME at.example.
+at.example. 300 IN A 8.8.8.8
+Q allowed.example A
+allowed.example. 300 IN CNAME allowed-target.example.
+allowed-target.example. 300 IN A 8.8.8.8
+Q importantt.example A
+importantt.example. 300 IN CNAME important-target.example.
+important-target.example. 300 IN A 8.8.8.8
+Q pass.example TXT
+pass.example. 60 IN TXT "hello world"
+Q nx.example A
+RCODE NXDOMAIN
+Q nodata.example A
+Q chain.example A
+chain.example. 300 IN CNAME mid.example.
+mid.example. 200 IN CNAME cloak-target.tracker.example.
+cloak-target.tracker.example. 100 IN A 9.9.9.9
+[queries]
+req-blocked.example A
+req-blocked.example AAAA
+req-blocked.example HTTPS
+req-blocked.example TXT
+req-blocked.example MX
+req-blocked.example NS
+req-blocked.example ANY
+REQ-Blocked.Example A
+req-wild-x.example A
+req-allowed.example A
+dt-block.example A
+dt-block.example AAAA
+hosty.example A
+hosty.example AAAA
+hosty.example HTTPS
+hosty.example TXT
+hosty-ip.example A
+hosty-ip.example AAAA
+hosty6.example A
+hosty6.example AAAA
+cloaked.example A
+cloaked.example AAAA
+cloaked.example HTTPS
+cloaked.example TXT
+cloaked.example MX
+mixedcase.example A
+ipans.example A
+ipans6.example AAAA
+multi.example A
+ipans-ok.example A
+ipans-ok.example AAAA
+regex-ip.example A
+regex-ip-ok.example A
+anchored-ip.example A
+anchored-ip-ok.example A
+hostip.example A
+hostip6.example AAAA
+viahost.example A
+viahost.example HTTPS
+viahost-ip.example A
+viahost-ip.example AAAA
+viahost6.example AAAA
+viahost6.example A
+hint.example HTTPS
+hint6.example HTTPS
+hint-ok.example HTTPS
+hint-host.example HTTPS
+hint-regex.example HTTPS
+denyall-bad.example A
+denyall-ok.example A
+denyall-ip.example A
+userallow.example A
+impblock.example A
+allowlisted.example A
+allowed.example A
+importantt.example A
+pass.example TXT
+nx.example A
+nodata.example A
+chain.example A

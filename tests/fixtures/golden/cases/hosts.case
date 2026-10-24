@@ -1,0 +1,448 @@
+# Host rules: hosts lines and bare domains, IPs in answers, the other address family,
+# comment handling quirks, case, duplicates across lists.
+[main]
+0.0.0.0 h-null.example
+127.0.0.1 h-loop.example
+1.2.3.4 h-v4.example
+2001:db8::1 h-v6.example
+::1 h-v6loop.example
+:: h-v6null.example
+0.0.0.0 h-multi1.example h-multi2.example	h-multi3.example
+0.0.0.0   h-spaces.example
+0.0.0.0 h-comment.example # trailing comment
+0.0.0.0 h-comment-nospace.example#comment
+0.0.0.0 h-comment-nospace2.example# comment
+1.1.1.1 h-dual.example
+2606:4700::1111 h-dual.example
+9.9.9.9 h-dual-v4b.example
+0.0.0.0 H-Upper.Example
+bare-host.example
+Bare-Upper.Example
+single-label
+a.b
+xn--bcher-kva.example
+::ffff:1.2.3.4 h-mapped.example
+fe80::1%eth0 h-zone.example
+0.0.0.0 localhost
+127.0.0.1 localhost.localdomain
+999.1.1.1 h-bad-ip.example
+0.0.0.0 *.h-star.example
+0.0.0.0 h-tab.example
+	0.0.0.0	h-leading-tab.example
+h-dup.example
+bare-comment.example # comment
+bare-comment2.example#comment
+bare-two tokens.example
+under_score.example
+0.0.0.0 under_score2.example
+0.0.0.0 h-also-network.example
+||h-also-network.example^$dnstype=MX
+0.0.0.0 h-allowed.example
+@@||h-allowed.example^
+1.2.3.4 h-v4-and-v6.example
+2001:db8::2 h-v4-and-v6.example
+1.2.3.5 h-v4-and-v6.example
+[main]
+5.5.5.5 h-dual.example
+0.0.0.0 h-dup.example
+1.2.3.4 h-dup.example
+1.2.3.4 h-v4.example
+[queries]
+h-null.example A
+h-null.example AAAA
+h-null.example HTTPS
+h-null.example TXT
+h-null.example CNAME A
+h-null.example CNAME AAAA
+h-null.example CNAME HTTPS
+h-null.example A HTTPS
+h-null.example AAAA A
+h-loop.example A
+h-loop.example AAAA
+h-loop.example HTTPS
+h-loop.example TXT
+h-loop.example CNAME A
+h-loop.example CNAME AAAA
+h-loop.example CNAME HTTPS
+h-loop.example A HTTPS
+h-loop.example AAAA A
+h-v4.example A
+h-v4.example AAAA
+h-v4.example HTTPS
+h-v4.example TXT
+h-v4.example CNAME A
+h-v4.example CNAME AAAA
+h-v4.example CNAME HTTPS
+h-v4.example A HTTPS
+h-v4.example AAAA A
+h-v6.example A
+h-v6.example AAAA
+h-v6.example HTTPS
+h-v6.example TXT
+h-v6.example CNAME A
+h-v6.example CNAME AAAA
+h-v6.example CNAME HTTPS
+h-v6.example A HTTPS
+h-v6.example AAAA A
+h-v6loop.example A
+h-v6loop.example AAAA
+h-v6loop.example HTTPS
+h-v6loop.example TXT
+h-v6loop.example CNAME A
+h-v6loop.example CNAME AAAA
+h-v6loop.example CNAME HTTPS
+h-v6loop.example A HTTPS
+h-v6loop.example AAAA A
+h-v6null.example A
+h-v6null.example AAAA
+h-v6null.example HTTPS
+h-v6null.example TXT
+h-v6null.example CNAME A
+h-v6null.example CNAME AAAA
+h-v6null.example CNAME HTTPS
+h-v6null.example A HTTPS
+h-v6null.example AAAA A
+h-multi1.example A
+h-multi1.example AAAA
+h-multi1.example HTTPS
+h-multi1.example TXT
+h-multi1.example CNAME A
+h-multi1.example CNAME AAAA
+h-multi1.example CNAME HTTPS
+h-multi1.example A HTTPS
+h-multi1.example AAAA A
+h-multi2.example A
+h-multi2.example AAAA
+h-multi2.example HTTPS
+h-multi2.example TXT
+h-multi2.example CNAME A
+h-multi2.example CNAME AAAA
+h-multi2.example CNAME HTTPS
+h-multi2.example A HTTPS
+h-multi2.example AAAA A
+h-multi3.example A
+h-multi3.example AAAA
+h-multi3.example HTTPS
+h-multi3.example TXT
+h-multi3.example CNAME A
+h-multi3.example CNAME AAAA
+h-multi3.example CNAME HTTPS
+h-multi3.example A HTTPS
+h-multi3.example AAAA A
+h-spaces.example A
+h-spaces.example AAAA
+h-spaces.example HTTPS
+h-spaces.example TXT
+h-spaces.example CNAME A
+h-spaces.example CNAME AAAA
+h-spaces.example CNAME HTTPS
+h-spaces.example A HTTPS
+h-spaces.example AAAA A
+h-comment.example A
+h-comment.example AAAA
+h-comment.example HTTPS
+h-comment.example TXT
+h-comment.example CNAME A
+h-comment.example CNAME AAAA
+h-comment.example CNAME HTTPS
+h-comment.example A HTTPS
+h-comment.example AAAA A
+h-comment-nospace.example A
+h-comment-nospace.example AAAA
+h-comment-nospace.example HTTPS
+h-comment-nospace.example TXT
+h-comment-nospace.example CNAME A
+h-comment-nospace.example CNAME AAAA
+h-comment-nospace.example CNAME HTTPS
+h-comment-nospace.example A HTTPS
+h-comment-nospace.example AAAA A
+h-comment-nospace.exampl A
+h-comment-nospace.exampl AAAA
+h-comment-nospace.exampl HTTPS
+h-comment-nospace.exampl TXT
+h-comment-nospace.exampl CNAME A
+h-comment-nospace.exampl CNAME AAAA
+h-comment-nospace.exampl CNAME HTTPS
+h-comment-nospace.exampl A HTTPS
+h-comment-nospace.exampl AAAA A
+h-comment-nospace2.example A
+h-comment-nospace2.example AAAA
+h-comment-nospace2.example HTTPS
+h-comment-nospace2.example TXT
+h-comment-nospace2.example CNAME A
+h-comment-nospace2.example CNAME AAAA
+h-comment-nospace2.example CNAME HTTPS
+h-comment-nospace2.example A HTTPS
+h-comment-nospace2.example AAAA A
+h-comment-nospace2.exampl A
+h-comment-nospace2.exampl AAAA
+h-comment-nospace2.exampl HTTPS
+h-comment-nospace2.exampl TXT
+h-comment-nospace2.exampl CNAME A
+h-comment-nospace2.exampl CNAME AAAA
+h-comment-nospace2.exampl CNAME HTTPS
+h-comment-nospace2.exampl A HTTPS
+h-comment-nospace2.exampl AAAA A
+h-dual.example A
+h-dual.example AAAA
+h-dual.example HTTPS
+h-dual.example TXT
+h-dual.example CNAME A
+h-dual.example CNAME AAAA
+h-dual.example CNAME HTTPS
+h-dual.example A HTTPS
+h-dual.example AAAA A
+h-dual-v4b.example A
+h-dual-v4b.example AAAA
+h-dual-v4b.example HTTPS
+h-dual-v4b.example TXT
+h-dual-v4b.example CNAME A
+h-dual-v4b.example CNAME AAAA
+h-dual-v4b.example CNAME HTTPS
+h-dual-v4b.example A HTTPS
+h-dual-v4b.example AAAA A
+h-upper.example A
+h-upper.example AAAA
+h-upper.example HTTPS
+h-upper.example TXT
+h-upper.example CNAME A
+h-upper.example CNAME AAAA
+h-upper.example CNAME HTTPS
+h-upper.example A HTTPS
+h-upper.example AAAA A
+H-Upper.Example A
+H-Upper.Example AAAA
+H-Upper.Example HTTPS
+H-Upper.Example TXT
+H-Upper.Example CNAME A
+H-Upper.Example CNAME AAAA
+H-Upper.Example CNAME HTTPS
+H-Upper.Example A HTTPS
+H-Upper.Example AAAA A
+bare-host.example A
+bare-host.example AAAA
+bare-host.example HTTPS
+bare-host.example TXT
+bare-host.example CNAME A
+bare-host.example CNAME AAAA
+bare-host.example CNAME HTTPS
+bare-host.example A HTTPS
+bare-host.example AAAA A
+bare-upper.example A
+bare-upper.example AAAA
+bare-upper.example HTTPS
+bare-upper.example TXT
+bare-upper.example CNAME A
+bare-upper.example CNAME AAAA
+bare-upper.example CNAME HTTPS
+bare-upper.example A HTTPS
+bare-upper.example AAAA A
+single-label A
+single-label AAAA
+single-label HTTPS
+single-label TXT
+single-label CNAME A
+single-label CNAME AAAA
+single-label CNAME HTTPS
+single-label A HTTPS
+single-label AAAA A
+a.b A
+a.b AAAA
+a.b HTTPS
+a.b TXT
+a.b CNAME A
+a.b CNAME AAAA
+a.b CNAME HTTPS
+a.b A HTTPS
+a.b AAAA A
+xn--bcher-kva.example A
+xn--bcher-kva.example AAAA
+xn--bcher-kva.example HTTPS
+xn--bcher-kva.example TXT
+xn--bcher-kva.example CNAME A
+xn--bcher-kva.example CNAME AAAA
+xn--bcher-kva.example CNAME HTTPS
+xn--bcher-kva.example A HTTPS
+xn--bcher-kva.example AAAA A
+h-mapped.example A
+h-mapped.example AAAA
+h-mapped.example HTTPS
+h-mapped.example TXT
+h-mapped.example CNAME A
+h-mapped.example CNAME AAAA
+h-mapped.example CNAME HTTPS
+h-mapped.example A HTTPS
+h-mapped.example AAAA A
+h-zone.example A
+h-zone.example AAAA
+h-zone.example HTTPS
+h-zone.example TXT
+h-zone.example CNAME A
+h-zone.example CNAME AAAA
+h-zone.example CNAME HTTPS
+h-zone.example A HTTPS
+h-zone.example AAAA A
+localhost A
+localhost AAAA
+localhost HTTPS
+localhost TXT
+localhost CNAME A
+localhost CNAME AAAA
+localhost CNAME HTTPS
+localhost A HTTPS
+localhost AAAA A
+localhost.localdomain A
+localhost.localdomain AAAA
+localhost.localdomain HTTPS
+localhost.localdomain TXT
+localhost.localdomain CNAME A
+localhost.localdomain CNAME AAAA
+localhost.localdomain CNAME HTTPS
+localhost.localdomain A HTTPS
+localhost.localdomain AAAA A
+h-bad-ip.example A
+h-bad-ip.example AAAA
+h-bad-ip.example HTTPS
+h-bad-ip.example TXT
+h-bad-ip.example CNAME A
+h-bad-ip.example CNAME AAAA
+h-bad-ip.example CNAME HTTPS
+h-bad-ip.example A HTTPS
+h-bad-ip.example AAAA A
+*.h-star.example A
+*.h-star.example AAAA
+*.h-star.example HTTPS
+*.h-star.example TXT
+*.h-star.example CNAME A
+*.h-star.example CNAME AAAA
+*.h-star.example CNAME HTTPS
+*.h-star.example A HTTPS
+*.h-star.example AAAA A
+x.h-star.example A
+x.h-star.example AAAA
+x.h-star.example HTTPS
+x.h-star.example TXT
+x.h-star.example CNAME A
+x.h-star.example CNAME AAAA
+x.h-star.example CNAME HTTPS
+x.h-star.example A HTTPS
+x.h-star.example AAAA A
+h-tab.example A
+h-tab.example AAAA
+h-tab.example HTTPS
+h-tab.example TXT
+h-tab.example CNAME A
+h-tab.example CNAME AAAA
+h-tab.example CNAME HTTPS
+h-tab.example A HTTPS
+h-tab.example AAAA A
+h-leading-tab.example A
+h-leading-tab.example AAAA
+h-leading-tab.example HTTPS
+h-leading-tab.example TXT
+h-leading-tab.example CNAME A
+h-leading-tab.example CNAME AAAA
+h-leading-tab.example CNAME HTTPS
+h-leading-tab.example A HTTPS
+h-leading-tab.example AAAA A
+h-dup.example A
+h-dup.example AAAA
+h-dup.example HTTPS
+h-dup.example TXT
+h-dup.example CNAME A
+h-dup.example CNAME AAAA
+h-dup.example CNAME HTTPS
+h-dup.example A HTTPS
+h-dup.example AAAA A
+bare-comment.example A
+bare-comment.example AAAA
+bare-comment.example HTTPS
+bare-comment.example TXT
+bare-comment.example CNAME A
+bare-comment.example CNAME AAAA
+bare-comment.example CNAME HTTPS
+bare-comment.example A HTTPS
+bare-comment.example AAAA A
+bare-comment.exampl A
+bare-comment.exampl AAAA
+bare-comment.exampl HTTPS
+bare-comment.exampl TXT
+bare-comment.exampl CNAME A
+bare-comment.exampl CNAME AAAA
+bare-comment.exampl CNAME HTTPS
+bare-comment.exampl A HTTPS
+bare-comment.exampl AAAA A
+bare-comment2.example A
+bare-comment2.example AAAA
+bare-comment2.example HTTPS
+bare-comment2.example TXT
+bare-comment2.example CNAME A
+bare-comment2.example CNAME AAAA
+bare-comment2.example CNAME HTTPS
+bare-comment2.example A HTTPS
+bare-comment2.example AAAA A
+bare-comment2.exampl A
+bare-comment2.exampl AAAA
+bare-comment2.exampl HTTPS
+bare-comment2.exampl TXT
+bare-comment2.exampl CNAME A
+bare-comment2.exampl CNAME AAAA
+bare-comment2.exampl CNAME HTTPS
+bare-comment2.exampl A HTTPS
+bare-comment2.exampl AAAA A
+under_score.example A
+under_score.example AAAA
+under_score.example HTTPS
+under_score.example TXT
+under_score.example CNAME A
+under_score.example CNAME AAAA
+under_score.example CNAME HTTPS
+under_score.example A HTTPS
+under_score.example AAAA A
+under_score2.example A
+under_score2.example AAAA
+under_score2.example HTTPS
+under_score2.example TXT
+under_score2.example CNAME A
+under_score2.example CNAME AAAA
+under_score2.example CNAME HTTPS
+under_score2.example A HTTPS
+under_score2.example AAAA A
+h-also-network.example A
+h-also-network.example AAAA
+h-also-network.example HTTPS
+h-also-network.example TXT
+h-also-network.example CNAME A
+h-also-network.example CNAME AAAA
+h-also-network.example CNAME HTTPS
+h-also-network.example A HTTPS
+h-also-network.example AAAA A
+h-allowed.example A
+h-allowed.example AAAA
+h-allowed.example HTTPS
+h-allowed.example TXT
+h-allowed.example CNAME A
+h-allowed.example CNAME AAAA
+h-allowed.example CNAME HTTPS
+h-allowed.example A HTTPS
+h-allowed.example AAAA A
+h-v4-and-v6.example A
+h-v4-and-v6.example AAAA
+h-v4-and-v6.example HTTPS
+h-v4-and-v6.example TXT
+h-v4-and-v6.example CNAME A
+h-v4-and-v6.example CNAME AAAA
+h-v4-and-v6.example CNAME HTTPS
+h-v4-and-v6.example A HTTPS
+h-v4-and-v6.example AAAA A
+sub.h-v4.example A
+sub.h-v4.example AAAA
+sub.h-v4.example HTTPS
+sub.h-v4.example TXT
+sub.h-v4.example CNAME A
+sub.h-v4.example CNAME AAAA
+sub.h-v4.example CNAME HTTPS
+sub.h-v4.example A HTTPS
+sub.h-v4.example AAAA A
+h-also-network.example MX
+h-v4.example MX

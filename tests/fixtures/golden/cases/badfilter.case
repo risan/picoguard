@@ -1,0 +1,63 @@
+# $badfilter: disables a rule with the same pattern and options, across lists and the
+# user rules, case-sensitive identity, conditional badfilters. Overlapping badfilters
+# (two badfilters matching one input) are the documented deviation (plan D7).
+[main]
+||bf-plain.example^
+@@||bf-allow.example^
+||bf-allow.example^
+||bf-imp.example^$important
+||bf-dt.example^
+||bf-dt2.example^$dnstype=A
+||bf-dt3.example^
+||bf-case.example^
+||bf-both-spell.example^
+||BF-both-spell.example^
+||bf-mod.example^$important
+||bf-mod2.example^
+0.0.0.0 bf-host.example
+||bf-deny.example^$denyallow=sub.bf-deny.example
+||bf-user.example^
+||bf-self.example^$badfilter
+||bf-nobadfilter.example^
+||bf-pattern.example
+[main]
+||bf-plain.example^$badfilter
+@@||bf-allow.example^$badfilter
+||bf-imp.example^$important,badfilter
+||bf-dt.example^$badfilter,dnstype=A
+||bf-dt2.example^$badfilter
+||bf-dt3.example^$badfilter,dnstype=~A
+||bf-case.example^$badfilter
+||bf-both-spell.example^$badfilter
+||bf-mod.example^$badfilter
+||bf-mod2.example^$badfilter,important
+bf-host.example$badfilter
+||bf-deny.example^$badfilter
+||bf-unknown.example^$badfilter
+||bf-pattern.example^$badfilter
+[user]
+||bf-user.example^$badfilter
+[queries]
+bf-plain.example A
+sub.bf-plain.example A
+bf-allow.example A
+bf-imp.example A
+bf-dt.example A
+bf-dt.example AAAA
+bf-dt2.example A
+bf-dt2.example AAAA
+bf-dt3.example A
+bf-dt3.example AAAA
+bf-case.example A
+bf-both-spell.example A
+bf-mod.example A
+bf-mod2.example A
+bf-host.example A
+bf-deny.example A
+sub.bf-deny.example A
+x.bf-deny.example A
+bf-user.example A
+bf-self.example A
+bf-nobadfilter.example A
+bf-unknown.example A
+bf-pattern.example A

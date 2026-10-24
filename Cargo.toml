@@ -22,3 +22,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+flate2 = "1.1.10"

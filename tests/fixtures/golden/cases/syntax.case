@@ -1,0 +1,124 @@
+# Rule syntax: anchors, separators, wildcards, substring rules, line classes.
+# Sections: [main] (one per list, in order), [user], [allow], [queries]
+# Query lines: input checktype [querytype]
+[main]
+! comment
+# comment
+#
+[Adblock Plus 2.0]
+example.com##.cosmetic
+example.com#@#.cosmetic
+example.com#?#div:has(a)
+example.com#$#body { x: y }
+example.com#%#//scriptlet('x')
+example.com$$script[data-x]
+||sub-anchored.example^
+|exact-anchored.example^
+plain-substring.example
+.dot-prefix.example^
+||partial-label.
+||no-sep.example
+||wild*card.example^
+||*.star-first.example^
+*.leading-star.example
+||ends-pipe.example^|
+@@||allowed.sub-anchored.example^
+example.org/*
+||path.example/ads^
+|http://url-exact.example^
+://scheme-less.example^
+/^regex-host[0-9]+\.example$/
+||a^
+||ab^
+||ab-c^
+*
+||
+|
+^
+@@
+||mid|pipe.example^
+||trailing-dot.example.^
+||under_score.example^
+||dash-ed.example^
+||UPPER.example^
+bare-domain-rule.example
+[queries]
+sub-anchored.example A
+www.sub-anchored.example A
+a.b.sub-anchored.example AAAA
+xsub-anchored.example A
+sub-anchored.example.org A
+sub-anchored.examples A
+allowed.sub-anchored.example A
+x.allowed.sub-anchored.example A
+exact-anchored.example A
+www.exact-anchored.example A
+xexact-anchored.example A
+plain-substring.example A
+www.plain-substring.example A
+xplain-substring.example A
+plain-substring.example.org A
+dot-prefix.example A
+www.dot-prefix.example A
+x.dot-prefix.example A
+xdot-prefix.example A
+partial-label.com A
+partial-label.co.uk A
+www.partial-label.net A
+partial-labelx.com A
+xpartial-label.com A
+no-sep.example A
+no-sep.example.org A
+no-sep.examples A
+wildxcard.example A
+wild-anything-card.example A
+wildcard.example A
+sub.wildcard.example A
+sub.wild-card.example A
+wildcard.examples A
+sub.star-first.example A
+a.b.star-first.example A
+star-first.example A
+xstar-first.example A
+x.leading-star.example A
+leading-star.example A
+leading-star.example.org A
+ends-pipe.example A
+x.ends-pipe.example A
+ends-pipe.example.org A
+org A
+example.org A
+www.example.org A
+sub.example.org A
+example.org.evil A
+path.example A
+url-exact.example A
+www.url-exact.example A
+scheme-less.example A
+www.scheme-less.example A
+regex-host1.example A
+regex-host22.example A
+regex-host.example A
+xregex-host1.example A
+regex-host1.example.org A
+a A
+ab A
+a.b A
+x.a A
+ab-c A
+b.ab-c A
+cab-c A
+anything.test A
+mid|pipe.example A
+mid.pipe.example A
+trailing-dot.example A
+under_score.example A
+sub.under_score.example A
+dash-ed.example A
+upper.example A
+x.upper.example A
+UPPER.example A
+Sub-Anchored.Example A
+bare-domain-rule.example A
+www.bare-domain-rule.example A
+cosmetic A

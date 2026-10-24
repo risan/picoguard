@@ -1,0 +1,30 @@
+# $badfilter identity is case-sensitive (urlfilter compares patterns as written), while
+# matching is case-insensitive.
+[main]
+||BF-A.example^
+||BF-B.example^
+||bf-c.example^
+||BF-c.example^
+||bf-d.example^
+||bf-e.example^
+||BF-F.example^
+||ADS.example^
+||ads.example^
+[main]
+||bf-a.example^$badfilter
+||BF-B.example^$badfilter
+||bf-c.example^$badfilter
+||BF-D.example^$badfilter
+||bf-e.example^$badfilter
+||BF-F.example^$badfilter
+||ads.example^$badfilter
+[queries]
+bf-a.example A
+BF-A.example A
+bf-b.example A
+bf-c.example A
+bf-d.example A
+bf-e.example A
+bf-f.example A
+ads.example A
+ADS.example A

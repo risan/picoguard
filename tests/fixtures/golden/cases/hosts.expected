@@ -1,0 +1,398 @@
+h-null.example A block 0.0.0.0
+h-null.example AAAA block ::
+h-null.example HTTPS block empty
+h-null.example TXT block nodata
+h-null.example CNAME A block 0.0.0.0
+h-null.example CNAME AAAA block ::
+h-null.example CNAME HTTPS block empty
+h-null.example A HTTPS block empty
+h-null.example AAAA A block 0.0.0.0
+h-loop.example A block 127.0.0.1
+h-loop.example AAAA block ::
+h-loop.example HTTPS block empty
+h-loop.example TXT block nodata
+h-loop.example CNAME A block 0.0.0.0
+h-loop.example CNAME AAAA block ::
+h-loop.example CNAME HTTPS block empty
+h-loop.example A HTTPS block empty
+h-loop.example AAAA A block 0.0.0.0
+h-v4.example A block 1.2.3.4
+h-v4.example AAAA block ::
+h-v4.example HTTPS block empty
+h-v4.example TXT block nodata
+h-v4.example CNAME A block 0.0.0.0
+h-v4.example CNAME AAAA block ::
+h-v4.example CNAME HTTPS block empty
+h-v4.example A HTTPS block empty
+h-v4.example AAAA A block 0.0.0.0
+h-v6.example A block 0.0.0.0
+h-v6.example AAAA block 2001:db8::1
+h-v6.example HTTPS block empty
+h-v6.example TXT block nodata
+h-v6.example CNAME A block 0.0.0.0
+h-v6.example CNAME AAAA block ::
+h-v6.example CNAME HTTPS block empty
+h-v6.example A HTTPS block empty
+h-v6.example AAAA A block empty
+h-v6loop.example A block 0.0.0.0
+h-v6loop.example AAAA block ::1
+h-v6loop.example HTTPS block empty
+h-v6loop.example TXT block nodata
+h-v6loop.example CNAME A block 0.0.0.0
+h-v6loop.example CNAME AAAA block ::
+h-v6loop.example CNAME HTTPS block empty
+h-v6loop.example A HTTPS block empty
+h-v6loop.example AAAA A block empty
+h-v6null.example A block 0.0.0.0
+h-v6null.example AAAA block ::
+h-v6null.example HTTPS block empty
+h-v6null.example TXT block nodata
+h-v6null.example CNAME A block 0.0.0.0
+h-v6null.example CNAME AAAA block ::
+h-v6null.example CNAME HTTPS block empty
+h-v6null.example A HTTPS block empty
+h-v6null.example AAAA A block empty
+h-multi1.example A block 0.0.0.0
+h-multi1.example AAAA block ::
+h-multi1.example HTTPS block empty
+h-multi1.example TXT block nodata
+h-multi1.example CNAME A block 0.0.0.0
+h-multi1.example CNAME AAAA block ::
+h-multi1.example CNAME HTTPS block empty
+h-multi1.example A HTTPS block empty
+h-multi1.example AAAA A block 0.0.0.0
+h-multi2.example A block 0.0.0.0
+h-multi2.example AAAA block ::
+h-multi2.example HTTPS block empty
+h-multi2.example TXT block nodata
+h-multi2.example CNAME A block 0.0.0.0
+h-multi2.example CNAME AAAA block ::
+h-multi2.example CNAME HTTPS block empty
+h-multi2.example A HTTPS block empty
+h-multi2.example AAAA A block 0.0.0.0
+h-multi3.example A block 0.0.0.0
+h-multi3.example AAAA block ::
+h-multi3.example HTTPS block empty
+h-multi3.example TXT block nodata
+h-multi3.example CNAME A block 0.0.0.0
+h-multi3.example CNAME AAAA block ::
+h-multi3.example CNAME HTTPS block empty
+h-multi3.example A HTTPS block empty
+h-multi3.example AAAA A block 0.0.0.0
+h-spaces.example A block 0.0.0.0
+h-spaces.example AAAA block ::
+h-spaces.example HTTPS block empty
+h-spaces.example TXT block nodata
+h-spaces.example CNAME A block 0.0.0.0
+h-spaces.example CNAME AAAA block ::
+h-spaces.example CNAME HTTPS block empty
+h-spaces.example A HTTPS block empty
+h-spaces.example AAAA A block 0.0.0.0
+h-comment.example A block 0.0.0.0
+h-comment.example AAAA block ::
+h-comment.example HTTPS block empty
+h-comment.example TXT block nodata
+h-comment.example CNAME A block 0.0.0.0
+h-comment.example CNAME AAAA block ::
+h-comment.example CNAME HTTPS block empty
+h-comment.example A HTTPS block empty
+h-comment.example AAAA A block 0.0.0.0
+h-comment-nospace.example A pass -
+h-comment-nospace.example AAAA pass -
+h-comment-nospace.example HTTPS pass -
+h-comment-nospace.example TXT pass -
+h-comment-nospace.example CNAME A pass -
+h-comment-nospace.example CNAME AAAA pass -
+h-comment-nospace.example CNAME HTTPS pass -
+h-comment-nospace.example A HTTPS pass -
+h-comment-nospace.example AAAA A pass -
+h-comment-nospace.exampl A block 0.0.0.0
+h-comment-nospace.exampl AAAA block ::
+h-comment-nospace.exampl HTTPS block empty
+h-comment-nospace.exampl TXT block nodata
+h-comment-nospace.exampl CNAME A block 0.0.0.0
+h-comment-nospace.exampl CNAME AAAA block ::
+h-comment-nospace.exampl CNAME HTTPS block empty
+h-comment-nospace.exampl A HTTPS block empty
+h-comment-nospace.exampl AAAA A block 0.0.0.0
+h-comment-nospace2.example A pass -
+h-comment-nospace2.example AAAA pass -
+h-comment-nospace2.example HTTPS pass -
+h-comment-nospace2.example TXT pass -
+h-comment-nospace2.example CNAME A pass -
+h-comment-nospace2.example CNAME AAAA pass -
+h-comment-nospace2.example CNAME HTTPS pass -
+h-comment-nospace2.example A HTTPS pass -
+h-comment-nospace2.example AAAA A pass -
+h-comment-nospace2.exampl A block 0.0.0.0
+h-comment-nospace2.exampl AAAA block ::
+h-comment-nospace2.exampl HTTPS block empty
+h-comment-nospace2.exampl TXT block nodata
+h-comment-nospace2.exampl CNAME A block 0.0.0.0
+h-comment-nospace2.exampl CNAME AAAA block ::
+h-comment-nospace2.exampl CNAME HTTPS block empty
+h-comment-nospace2.exampl A HTTPS block empty
+h-comment-nospace2.exampl AAAA A block 0.0.0.0
+h-dual.example A block 1.1.1.1,5.5.5.5
+h-dual.example AAAA block 2606:4700::1111
+h-dual.example HTTPS block empty
+h-dual.example TXT block nodata
+h-dual.example CNAME A block 0.0.0.0
+h-dual.example CNAME AAAA block ::
+h-dual.example CNAME HTTPS block empty
+h-dual.example A HTTPS block empty
+h-dual.example AAAA A block empty
+h-dual-v4b.example A block 9.9.9.9
+h-dual-v4b.example AAAA block ::
+h-dual-v4b.example HTTPS block empty
+h-dual-v4b.example TXT block nodata
+h-dual-v4b.example CNAME A block 0.0.0.0
+h-dual-v4b.example CNAME AAAA block ::
+h-dual-v4b.example CNAME HTTPS block empty
+h-dual-v4b.example A HTTPS block empty
+h-dual-v4b.example AAAA A block 0.0.0.0
+h-upper.example A pass -
+h-upper.example AAAA pass -
+h-upper.example HTTPS pass -
+h-upper.example TXT pass -
+h-upper.example CNAME A pass -
+h-upper.example CNAME AAAA pass -
+h-upper.example CNAME HTTPS pass -
+h-upper.example A HTTPS pass -
+h-upper.example AAAA A pass -
+H-Upper.Example A pass -
+H-Upper.Example AAAA pass -
+H-Upper.Example HTTPS pass -
+H-Upper.Example TXT pass -
+H-Upper.Example CNAME A pass -
+H-Upper.Example CNAME AAAA pass -
+H-Upper.Example CNAME HTTPS pass -
+H-Upper.Example A HTTPS pass -
+H-Upper.Example AAAA A pass -
+bare-host.example A block 0.0.0.0
+bare-host.example AAAA block ::
+bare-host.example HTTPS block empty
+bare-host.example TXT block nodata
+bare-host.example CNAME A block 0.0.0.0
+bare-host.example CNAME AAAA block ::
+bare-host.example CNAME HTTPS block empty
+bare-host.example A HTTPS block empty
+bare-host.example AAAA A block 0.0.0.0
+bare-upper.example A pass -
+bare-upper.example AAAA pass -
+bare-upper.example HTTPS pass -
+bare-upper.example TXT pass -
+bare-upper.example CNAME A pass -
+bare-upper.example CNAME AAAA pass -
+bare-upper.example CNAME HTTPS pass -
+bare-upper.example A HTTPS pass -
+bare-upper.example AAAA A pass -
+single-label A block 0.0.0.0
+single-label AAAA block ::
+single-label HTTPS block empty
+single-label TXT block nodata
+single-label CNAME A block 0.0.0.0
+single-label CNAME AAAA block ::
+single-label CNAME HTTPS block empty
+single-label A HTTPS block empty
+single-label AAAA A block 0.0.0.0
+a.b A block 0.0.0.0
+a.b AAAA block ::
+a.b HTTPS block empty
+a.b TXT block nodata
+a.b CNAME A block 0.0.0.0
+a.b CNAME AAAA block ::
+a.b CNAME HTTPS block empty
+a.b A HTTPS block empty
+a.b AAAA A block 0.0.0.0
+xn--bcher-kva.example A block 0.0.0.0
+xn--bcher-kva.example AAAA block ::
+xn--bcher-kva.example HTTPS block empty
+xn--bcher-kva.example TXT block nodata
+xn--bcher-kva.example CNAME A block 0.0.0.0
+xn--bcher-kva.example CNAME AAAA block ::
+xn--bcher-kva.example CNAME HTTPS block empty
+xn--bcher-kva.example A HTTPS block empty
+xn--bcher-kva.example AAAA A block 0.0.0.0
+h-mapped.example A block 0.0.0.0
+h-mapped.example AAAA block ::ffff:1.2.3.4
+h-mapped.example HTTPS block empty
+h-mapped.example TXT block nodata
+h-mapped.example CNAME A block 0.0.0.0
+h-mapped.example CNAME AAAA block ::
+h-mapped.example CNAME HTTPS block empty
+h-mapped.example A HTTPS block empty
+h-mapped.example AAAA A block empty
+h-zone.example A block 0.0.0.0
+h-zone.example AAAA block fe80::1
+h-zone.example HTTPS block empty
+h-zone.example TXT block nodata
+h-zone.example CNAME A block 0.0.0.0
+h-zone.example CNAME AAAA block ::
+h-zone.example CNAME HTTPS block empty
+h-zone.example A HTTPS block empty
+h-zone.example AAAA A block empty
+localhost A block 0.0.0.0
+localhost AAAA block ::
+localhost HTTPS block empty
+localhost TXT block nodata
+localhost CNAME A block 0.0.0.0
+localhost CNAME AAAA block ::
+localhost CNAME HTTPS block empty
+localhost A HTTPS block empty
+localhost AAAA A block 0.0.0.0
+localhost.localdomain A block 127.0.0.1
+localhost.localdomain AAAA block ::
+localhost.localdomain HTTPS block empty
+localhost.localdomain TXT block nodata
+localhost.localdomain CNAME A block 0.0.0.0
+localhost.localdomain CNAME AAAA block ::
+localhost.localdomain CNAME HTTPS block empty
+localhost.localdomain A HTTPS block empty
+localhost.localdomain AAAA A block 0.0.0.0
+h-bad-ip.example A pass -
+h-bad-ip.example AAAA pass -
+h-bad-ip.example HTTPS pass -
+h-bad-ip.example TXT pass -
+h-bad-ip.example CNAME A pass -
+h-bad-ip.example CNAME AAAA pass -
+h-bad-ip.example CNAME HTTPS pass -
+h-bad-ip.example A HTTPS pass -
+h-bad-ip.example AAAA A pass -
+*.h-star.example A block 0.0.0.0
+*.h-star.example AAAA block ::
+*.h-star.example HTTPS block empty
+*.h-star.example TXT block nodata
+*.h-star.example CNAME A block 0.0.0.0
+*.h-star.example CNAME AAAA block ::
+*.h-star.example CNAME HTTPS block empty
+*.h-star.example A HTTPS block empty
+*.h-star.example AAAA A block 0.0.0.0
+x.h-star.example A pass -
+x.h-star.example AAAA pass -
+x.h-star.example HTTPS pass -
+x.h-star.example TXT pass -
+x.h-star.example CNAME A pass -
+x.h-star.example CNAME AAAA pass -
+x.h-star.example CNAME HTTPS pass -
+x.h-star.example A HTTPS pass -
+x.h-star.example AAAA A pass -
+h-tab.example A block 0.0.0.0
+h-tab.example AAAA block ::
+h-tab.example HTTPS block empty
+h-tab.example TXT block nodata
+h-tab.example CNAME A block 0.0.0.0
+h-tab.example CNAME AAAA block ::
+h-tab.example CNAME HTTPS block empty
+h-tab.example A HTTPS block empty
+h-tab.example AAAA A block 0.0.0.0
+h-leading-tab.example A block 0.0.0.0
+h-leading-tab.example AAAA block ::
+h-leading-tab.example HTTPS block empty
+h-leading-tab.example TXT block nodata
+h-leading-tab.example CNAME A block 0.0.0.0
+h-leading-tab.example CNAME AAAA block ::
+h-leading-tab.example CNAME HTTPS block empty
+h-leading-tab.example A HTTPS block empty
+h-leading-tab.example AAAA A block 0.0.0.0
+h-dup.example A block 0.0.0.0,1.2.3.4
+h-dup.example AAAA block ::
+h-dup.example HTTPS block empty
+h-dup.example TXT block nodata
+h-dup.example CNAME A block 0.0.0.0
+h-dup.example CNAME AAAA block ::
+h-dup.example CNAME HTTPS block empty
+h-dup.example A HTTPS block empty
+h-dup.example AAAA A block 0.0.0.0
+bare-comment.example A block 0.0.0.0
+bare-comment.example AAAA block ::
+bare-comment.example HTTPS block empty
+bare-comment.example TXT block nodata
+bare-comment.example CNAME A block 0.0.0.0
+bare-comment.example CNAME AAAA block ::
+bare-comment.example CNAME HTTPS block empty
+bare-comment.example A HTTPS block empty
+bare-comment.example AAAA A block 0.0.0.0
+bare-comment.exampl A pass -
+bare-comment.exampl AAAA pass -
+bare-comment.exampl HTTPS pass -
+bare-comment.exampl TXT pass -
+bare-comment.exampl CNAME A pass -
+bare-comment.exampl CNAME AAAA pass -
+bare-comment.exampl CNAME HTTPS pass -
+bare-comment.exampl A HTTPS pass -
+bare-comment.exampl AAAA A pass -
+bare-comment2.example A pass -
+bare-comment2.example AAAA pass -
+bare-comment2.example HTTPS pass -
+bare-comment2.example TXT pass -
+bare-comment2.example CNAME A pass -
+bare-comment2.example CNAME AAAA pass -
+bare-comment2.example CNAME HTTPS pass -
+bare-comment2.example A HTTPS pass -
+bare-comment2.example AAAA A pass -
+bare-comment2.exampl A block 0.0.0.0
+bare-comment2.exampl AAAA block ::
+bare-comment2.exampl HTTPS block empty
+bare-comment2.exampl TXT block nodata
+bare-comment2.exampl CNAME A block 0.0.0.0
+bare-comment2.exampl CNAME AAAA block ::
+bare-comment2.exampl CNAME HTTPS block empty
+bare-comment2.exampl A HTTPS block empty
+bare-comment2.exampl AAAA A block 0.0.0.0
+under_score.example A block 0.0.0.0
+under_score.example AAAA block ::
+under_score.example HTTPS block empty
+under_score.example TXT block nodata
+under_score.example CNAME A block 0.0.0.0
+under_score.example CNAME AAAA block ::
+under_score.example CNAME HTTPS block empty
+under_score.example A HTTPS block empty
+under_score.example AAAA A block 0.0.0.0
+under_score2.example A block 0.0.0.0
+under_score2.example AAAA block ::
+under_score2.example HTTPS block empty
+under_score2.example TXT block nodata
+under_score2.example CNAME A block 0.0.0.0
+under_score2.example CNAME AAAA block ::
+under_score2.example CNAME HTTPS block empty
+under_score2.example A HTTPS block empty
+under_score2.example AAAA A block 0.0.0.0
+h-also-network.example A block 0.0.0.0
+h-also-network.example AAAA block ::
+h-also-network.example HTTPS block empty
+h-also-network.example TXT block nodata
+h-also-network.example CNAME A block 0.0.0.0
+h-also-network.example CNAME AAAA block ::
+h-also-network.example CNAME HTTPS block empty
+h-also-network.example A HTTPS block empty
+h-also-network.example AAAA A block 0.0.0.0
+h-allowed.example A pass -
+h-allowed.example AAAA pass -
+h-allowed.example HTTPS pass -
+h-allowed.example TXT pass -
+h-allowed.example CNAME A pass -
+h-allowed.example CNAME AAAA pass -
+h-allowed.example CNAME HTTPS pass -
+h-allowed.example A HTTPS pass -
+h-allowed.example AAAA A pass -
+h-v4-and-v6.example A block 1.2.3.4,1.2.3.5
+h-v4-and-v6.example AAAA block 2001:db8::2
+h-v4-and-v6.example HTTPS block empty
+h-v4-and-v6.example TXT block nodata
+h-v4-and-v6.example CNAME A block 0.0.0.0
+h-v4-and-v6.example CNAME AAAA block ::
+h-v4-and-v6.example CNAME HTTPS block empty
+h-v4-and-v6.example A HTTPS block empty
+h-v4-and-v6.example AAAA A block empty
+sub.h-v4.example A pass -
+sub.h-v4.example AAAA pass -
+sub.h-v4.example HTTPS pass -
+sub.h-v4.example TXT pass -
+sub.h-v4.example CNAME A pass -
+sub.h-v4.example CNAME AAAA pass -
+sub.h-v4.example CNAME HTTPS pass -
+sub.h-v4.example A HTTPS pass -
+sub.h-v4.example AAAA A pass -
+h-also-network.example MX block nodata
+h-v4.example MX block nodata

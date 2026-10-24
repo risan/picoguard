@@ -1,0 +1,195 @@
+# Modifiers: important, dnstype, denyallow, content types, third-party, domain, match-case,
+# unsupported (client, ctag, dnsrewrite, respgeo) and unknown modifiers.
+[main]
+||imp.example^$important
+||dt-a.example^$dnstype=A
+||dt-multi.example^$dnstype=A|AAAA
+||dt-not-a.example^$dnstype=~A
+||dt-not-multi.example^$dnstype=~A|~AAAA
+||dt-mixed.example^$dnstype=A|~AAAA
+||dt-lower.example^$dnstype=a
+||dt-txt.example^$dnstype=TXT
+||dt-https.example^$dnstype=HTTPS
+||dt-cname.example^$dnstype=CNAME
+||dt-bad.example^$dnstype=NOTATYPE
+||dt-empty.example^$dnstype=
+||dt-none.example^$dnstype=NONE
+||dt-any.example^$dnstype=ANY
+||dt-imp.example^$dnstype=A,important
+@@||dt-allow.example^$dnstype=AAAA
+||dt-allow.example^
+||deny.example^$denyallow=ok.deny.example|fine.deny.example
+||deny-one.example^$denyallow=deny-one.example
+||deny-sub.example^$denyallow=sub.deny-sub.example
+||deny-upper.example^$denyallow=Deny-Upper.example
+||deny-both.example^$denyallow=a.example,dnstype=A
+||deny-empty.example^$denyallow=
+||deny-neg.example^$denyallow=~a.example
+||ct-script.example^$script
+||ct-nscript.example^$~script
+||ct-doc.example^$document
+||ct-image.example^$image
+||ct-nimage.example^$~image,~script
+||ct-both.example^$script,~image
+||ct-sub.example^$subdocument
+||ct-xhr.example^$xmlhttprequest
+||ct-other.example^$other
+@@||ct-allow-script.example^$script
+||ct-allow-script.example^
+@@||ct-allow-nscript.example^$~script
+||ct-allow-nscript.example^
+||tp.example^$third-party
+||ntp.example^$~third-party
+||fp.example^$first-party
+||nfp.example^$~first-party
+||dom.example^$domain=a.example
+||ndom.example^$domain=~a.example
+||mc.example^$match-case
+||nmc.example^$~match-case
+||MC-upper.example^$match-case
+||client.example^$client=127.0.0.1
+||nclient.example^$client=~192.168.0.1
+||ctag.example^$ctag=device_phone
+||nctag.example^$ctag=~device_phone
+||rewrite.example^$dnsrewrite=1.2.3.4
+||rewrite-cname.example^$dnsrewrite=other.example
+||rewrite-bad.example^$dnsrewrite=NOTAKEYWORD
+@@||rewrite-allow.example^$dnsrewrite
+||respgeo.example^$respgeo=us
+||unknown.example^$nosuchmodifier
+||unknown2.example^$important,nosuchmodifier
+||popup.example^$popup
+||empty.example^$empty
+||mp4.example^$mp4
+||redirect.example^$redirect=noopjs
+||cookie.example^$cookie
+||csp.example^$csp=script-src 'none'
+||replace.example^$replace=/a/b/
+||stealth.example^$stealth
+@@||stealth.example^$stealth
+||elemhide.example^$elemhide
+@@||elemhide2.example^$elemhide
+||elemhide2.example^
+@@||urlblock.example^$urlblock
+||urlblock.example^
+@@||doc-allow.example^$document
+||doc-allow.example^
+||empty-opts.example^$
+||comma-opts.example^$,important
+||dup.example^$important,important
+||esc-comma.example^$denyallow=a.example\,b.example
+||esc-dollar\$sign.example^
+||dollar.example^$important$
+||ext.example^$extension
+@@||ext.example^$extension
+[queries]
+imp.example A
+dt-a.example A
+dt-a.example AAAA
+dt-a.example TXT
+dt-multi.example A
+dt-multi.example AAAA
+dt-multi.example HTTPS
+dt-not-a.example A
+dt-not-a.example AAAA
+dt-not-a.example TXT
+dt-not-multi.example A
+dt-not-multi.example AAAA
+dt-not-multi.example MX
+dt-mixed.example A
+dt-mixed.example AAAA
+dt-mixed.example MX
+dt-lower.example A
+dt-lower.example AAAA
+dt-txt.example TXT
+dt-txt.example A
+dt-https.example HTTPS
+dt-https.example A
+dt-cname.example CNAME
+dt-cname.example A
+dt-bad.example A
+dt-empty.example A
+dt-none.example A
+dt-any.example A
+dt-any.example ANY
+dt-imp.example A
+dt-imp.example AAAA
+dt-allow.example A
+dt-allow.example AAAA
+deny.example A
+sub.deny.example A
+ok.deny.example A
+sub.ok.deny.example A
+fine.deny.example A
+x.deny.example A
+deny.example AAAA
+deny-one.example A
+sub.deny-one.example A
+deny-sub.example A
+sub.deny-sub.example A
+x.sub.deny-sub.example A
+deny-upper.example A
+deny-both.example A
+deny-both.example AAAA
+deny-empty.example A
+deny-neg.example A
+never-blocked.example A
+never-blocked.example AAAA
+never-blocked2.example A
+x.never-blocked.example A
+other.example A
+other.example AAAA
+1.2.3.4 A
+1.2.3.4 AAAA
+2001:db8::1 AAAA
+ct-script.example A
+ct-nscript.example A
+ct-doc.example A
+ct-image.example A
+ct-nimage.example A
+ct-both.example A
+ct-sub.example A
+ct-xhr.example A
+ct-other.example A
+ct-allow-script.example A
+ct-allow-nscript.example A
+tp.example A
+ntp.example A
+fp.example A
+nfp.example A
+dom.example A
+ndom.example A
+mc.example A
+nmc.example A
+MC-upper.example A
+mc-upper.example A
+client.example A
+nclient.example A
+ctag.example A
+nctag.example A
+rewrite.example A
+rewrite-cname.example A
+rewrite-bad.example A
+rewrite-allow.example A
+respgeo.example A
+unknown.example A
+unknown2.example A
+popup.example A
+empty.example A
+mp4.example A
+redirect.example A
+cookie.example A
+csp.example A
+replace.example A
+stealth.example A
+elemhide.example A
+elemhide2.example A
+urlblock.example A
+doc-allow.example A
+empty-opts.example A
+comma-opts.example A
+dup.example A
+esc-comma.example A
+esc-dollar$sign.example A
+dollar.example A
+ext.example A

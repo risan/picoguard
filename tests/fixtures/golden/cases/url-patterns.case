@@ -1,0 +1,76 @@
+# Patterns urlfilter evaluates against the synthetic URL "http://<host>" instead of the host,
+# and patterns with path or query parts that can never match a bare host.
+[main]
+||url-a.example/ads.
+/ads/foo.
+|http://url-b.example
+http://url-c.example^
+https://url-d.example^
+||url-e.example^/
+||url-f.example/
+||url-g.example/*
+url-h.example/path
+//url-i.example
+ws://url-j.example^
+||url-k.example:8080^
+||url-l.example?q=1
+||url-m.example^*
+|url-n.example|
+url-o.example|
+|url-p
+||http://url-q.example^
+|/url-r.example^
+.url-s.example
+url-t.example.
+.
+-
+_
+||url-u-
+url-v.example^|
+http
+ttp://url-w.example
+//url-x.example^
+[queries]
+url-a.example A
+sub.url-a.example A
+url-b.example A
+url-c.example A
+sub.url-c.example A
+url-d.example A
+url-e.example A
+sub.url-e.example A
+url-f.example A
+url-g.example A
+sub.url-g.example A
+url-h.example A
+url-i.example A
+url-j.example A
+url-k.example A
+url-l.example A
+url-m.example A
+sub.url-m.example A
+url-n.example A
+xurl-n.example A
+url-o.example A
+sub.url-o.example A
+url-o.example.org A
+url-p A
+url-pq A
+xurl-p A
+url-q.example A
+url-r.example A
+url-s.example A
+sub.url-s.example A
+xurl-s.example A
+url-t.example A
+url-u-1.example A
+sub.url-u-1.example A
+url-v.example A
+sub.url-v.example A
+url-v.example.org A
+http A
+xhttp A
+http.example A
+url-w.example A
+url-x.example A
+sub.url-x.example A

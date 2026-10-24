@@ -1,0 +1,137 @@
+# Regex rules and the Go (RE2) regex syntax: classes, Unicode properties, \Q..\E, flags,
+# POSIX classes, escapes, literal braces, patterns Go rejects.
+[main]
+/^ad[sx]?[0-9]+\./
+/tracker-\d{2,3}\.example$/
+/\bword\b/
+/^[^.]+\.nonword\.example$/
+/(?i)UPPER-CI\.example/
+/UPPER-CS\.example/
+/(?s)dot.all\.example/
+/(?m)^multi\.example$/
+/(?U)lazy.+\.example/
+/^\Qquoted.[literal]\E\.example$/
+/\pL+\.latin-class\.example/
+/^\p{Latin}+\.script\.example$/
+/\p{Greek}\.greek\.example/
+/^[[:alpha:]]+\.posix\.example$/
+/^[[:^digit:]]+\.notdigit\.example$/
+/^\x61bc\.hex\.example$/
+/^q\.(a|b|c)\.alt\.example$/
+/^opt(ional)?\.example$/
+/^rep{2}\.example$/
+/^brace{\.example$/
+/^lit\{x\}\.example$/
+/^under\_score\.example$/
+/\.z$/
+/^a{,3}\.example$/
+/^\d+\.digits\.example$/
+/^[\w-]+\.word-class\.example$/
+/^[\d]+\.d-in-class\.example$/
+/^[^\D]+\.negd\.example$/
+/^\s\.space\.example$/
+/^(?:non-capture)\.example$/
+/^(?P<name>named)\.example$/
+/^(?<name2>named2)\.example$/
+/^\Aanchor-a\.example\z/
+/(?=lookahead)\.example/
+/(?<=lookbehind)\.example/
+/^(a+)+$\.backref\.example/
+/\1/
+/[/
+/(unclosed/
+/^\y\.badescape\.example$/
+/x*+/
+/^\<angle\>\.example$/
+/^ünï\.example$/
+/\x{4e2d}/
+@@/^allowed-regex[0-9]\.example$/
+/^allowed-regex[0-9]\.example$/
+/^imp-regex\.example$/$important
+/^dt-regex\.example$/$dnstype=A
+//
+/.*/$dnstype=TXT
+/^$/
+/ab/$important,dnstype=MX
+/^anchored-dollar\.example$/$dnstype=A
+[queries]
+ad1.example A
+ads22.example A
+adx3.example A
+adxx3.example A
+xad1.example A
+tracker-12.example A
+tracker-123.example A
+tracker-1.example A
+tracker-12.example.org A
+word.test A
+sword.test A
+a.word.b A
+a-word-b.test A
+a_word_b.test A
+x.nonword.example A
+x.y.nonword.example A
+upper-ci.example A
+UPPER-CI.example A
+upper-cs.example A
+UPPER-CS.example A
+dotxall.example A
+multi.example A
+lazyabc.example A
+quoted.[literal].example A
+quotedx[literal].example A
+abc.latin-class.example A
+ab1.latin-class.example A
+abc.script.example A
+abc1.script.example A
+a.greek.example A
+α.greek.example A
+abc.posix.example A
+ab1.posix.example A
+abc.notdigit.example A
+123.notdigit.example A
+abc.hex.example A
+q.a.alt.example A
+q.d.alt.example A
+opt.example A
+optional.example A
+repp.example A
+rep.example A
+brace{.example A
+lit{x}.example A
+under_score.example A
+under-score.example A
+foo.z A
+foo.zz A
+a.example A
+aaa.example A
+aaaa.example A
+{,3}.example A
+123.digits.example A
+abc.digits.example A
+ab-1.word-class.example A
+123.d-in-class.example A
+123.negd.example A
+abc.negd.example A
+non-capture.example A
+named.example A
+named2.example A
+anchor-a.example A
+lookahead.example A
+lookbehind.example A
+aaa.backref.example A
+badescape.example A
+angle.example A
+<angle>.example A
+ünï.example A
+xn--n-0fa.example A
+中 A
+allowed-regex1.example A
+imp-regex.example A
+dt-regex.example A
+dt-regex.example AAAA
+anything.example TXT
+anything.example A
+ab.example MX
+ab.example A
+anchored-dollar.example A
