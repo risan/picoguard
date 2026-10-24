@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128};
 
-use super::compile::{COMPILER_VERSION, CompileOptions, Compiled};
+use super::compile::{COMPILER_VERSION, CompileOptions, Compiled, SlowRuleBudget};
 use super::engine::{CompiledList, FAST_KINDS, HostGroup, SlowRule};
 use super::parse::{Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
 use crate::lists::Validators;
@@ -463,6 +463,7 @@ struct Decoder<R: Read> {
     remaining: u64,
     /// Rules the list may still hold under its cap.
     rules_left: u64,
+    slow_budget: SlowRuleBudget,
 }
 
 impl<R: Read> Decoder<R> {
@@ -612,12 +613,16 @@ impl<R: Read> Decoder<R> {
             ctag_key: self.text(MAX_LINE_BYTES, "tag key")?,
         };
 
+        self.slow_budget
+            .charge(&rule)
+            .map_err(|_| SnapshotError::TooLarge("slow rule memory"))?;
+
         SlowRule::compile(rule).map_err(|()| SnapshotError::Corrupt("a rule does not compile"))
     }
 }
 
-/// Reads and checks a snapshot file. `max_rules` is the rule cap of the list.
-pub fn load(path: &Path, max_rules: u32) -> Result<Snapshot, SnapshotError> {
+/// Reads and checks a snapshot file against the caps of the list's options.
+pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotError> {
     let file = File::open(path)?;
     let length = file.metadata()?.len();
     if length < PREAMBLE_BYTES + CHECKSUM_BYTES {
@@ -640,7 +645,8 @@ pub fn load(path: &Path, max_rules: u32) -> Result<Snapshot, SnapshotError> {
         input,
         hasher: Xxh3::new(),
         remaining: length - PREAMBLE_BYTES - CHECKSUM_BYTES,
-        rules_left: u64::from(max_rules),
+        rules_left: u64::from(options.max_rules),
+        slow_budget: SlowRuleBudget::new(options.slow_rule_budget),
     };
     let stored_fingerprint = decoder.u128()?;
     let content_hash = decoder.u128()?;
@@ -934,7 +940,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::filter::compile::CompileWorker;
+    use crate::filter::compile::{CompileWorker, slow_rule_cost};
     use crate::filter::engine::{Decision, Engine, TYPE_A, TYPE_AAAA};
     use crate::lists::Piece;
     use crate::test_dir::TestDir;
@@ -965,9 +971,18 @@ ads.*.tracker
 ";
 
     fn options(format: ListFormat) -> CompileOptions {
+        CompileOptions::new(format, 5000)
+    }
+
+    /// The options of `snapshot_of` with the default format, for loading.
+    fn caps() -> CompileOptions {
+        options(ListFormat::Auto)
+    }
+
+    fn capped(max_rules: u32) -> CompileOptions {
         CompileOptions {
-            format,
-            max_rules: 5000,
+            max_rules,
+            ..caps()
         }
     }
 
@@ -1051,7 +1066,7 @@ ads.*.tracker
         store.flush().await;
 
         let path = store.path_for(SOURCE).unwrap();
-        let loaded = load(&path, 5000).unwrap();
+        let loaded = load(&path, &caps()).unwrap();
         assert_eq!(loaded.meta, snapshot.meta);
         assert_eq!(loaded.counters, snapshot.counters);
         assert_same_list(&loaded.list, &snapshot.list);
@@ -1075,7 +1090,7 @@ ads.*.tracker
         let snapshot = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
         store.save(clone_of(&snapshot)).await;
         store.flush().await;
-        let loaded = load(&store.path_for(SOURCE).unwrap(), 5000).unwrap();
+        let loaded = load(&store.path_for(SOURCE).unwrap(), &caps()).unwrap();
 
         let compiled = Engine::new(vec![Arc::clone(&snapshot.list)], Vec::new());
         let reloaded = Engine::new(vec![loaded.list], Vec::new());
@@ -1161,7 +1176,7 @@ ads.*.tracker
 
         assert!(store.bytes_written() > first);
         let path = store.path_for(SOURCE).unwrap();
-        let loaded = load(&path, 5000).unwrap();
+        let loaded = load(&path, &caps()).unwrap();
         assert_eq!(loaded.list.rule_count(), 2);
         assert_eq!(
             files_in(&lists_dir(&state)),
@@ -1188,7 +1203,7 @@ ads.*.tracker
         store.flush().await;
 
         assert!(store.bytes_written() > written);
-        let loaded = load(&store.path_for(SOURCE).unwrap(), 5000).unwrap();
+        let loaded = load(&store.path_for(SOURCE).unwrap(), &caps()).unwrap();
         assert_eq!(loaded.meta.effective_format, ListFormat::Domains);
         assert_eq!(loaded.meta.configured_format, ListFormat::Domains);
     }
@@ -1210,7 +1225,7 @@ ads.*.tracker
         let worker = CompileWorker::spawn().unwrap();
         let store = SnapshotStore::open(state.path()).unwrap();
         let path = store.path_for(SOURCE).unwrap();
-        let old = worker.load(path.clone(), 5000).await.unwrap();
+        let old = worker.load(path.clone(), caps()).await.unwrap();
         assert!(old.fits(SOURCE, &options(ListFormat::Auto)));
         assert!(!old.fits(SOURCE, &options(ListFormat::Domains)));
         assert_eq!(store.bytes_written(), 0);
@@ -1221,7 +1236,7 @@ ads.*.tracker
         store.flush().await;
 
         assert!(store.bytes_written() > 0);
-        let loaded = load(&path, 5000).unwrap();
+        let loaded = load(&path, &caps()).unwrap();
         assert_eq!(loaded.meta.effective_format, ListFormat::Domains);
     }
 
@@ -1232,11 +1247,7 @@ ads.*.tracker
 
         assert!(snapshot.fits(SOURCE, &options(ListFormat::Auto)));
         assert!(!snapshot.fits("https://other.example/list.txt", &options(ListFormat::Auto)));
-        let capped = CompileOptions {
-            max_rules: 10,
-            ..options(ListFormat::Auto)
-        };
-        assert!(!snapshot.fits(SOURCE, &capped));
+        assert!(!snapshot.fits(SOURCE, &capped(10)));
     }
 
     #[tokio::test]
@@ -1277,7 +1288,9 @@ ads.*.tracker
     }
 
     fn rejected(path: &Path) -> SnapshotError {
-        load(path, 5000).err().expect("the file should be refused")
+        load(path, &caps())
+            .err()
+            .expect("the file should be refused")
     }
 
     #[tokio::test]
@@ -1314,7 +1327,7 @@ ads.*.tracker
         assert!(matches!(rejected(&path), SnapshotError::BadChecksum));
 
         fs::write(&path, &good).unwrap();
-        assert!(load(&path, 5000).is_ok());
+        assert!(load(&path, &caps()).is_ok());
     }
 
     #[tokio::test]
@@ -1382,9 +1395,9 @@ ads.*.tracker
 
         // The caps come from the config: a list now capped below its size is refused.
         fs::write(&path, &good).unwrap();
-        assert!(load(&path, 1).is_ok());
+        assert!(load(&path, &capped(1)).is_ok());
         assert!(matches!(
-            load(&path, 0).err(),
+            load(&path, &capped(0)).err(),
             Some(SnapshotError::TooLarge(_))
         ));
     }
@@ -1407,6 +1420,32 @@ ads.*.tracker
     }
 
     #[tokio::test]
+    async fn the_slow_rule_budget_of_the_compiler_applies_to_a_snapshot_load() {
+        let state = TestDir::new("snap");
+        let text: String = (0..20).map(|i| format!("a{i}*b\n")).collect();
+        let (path, _) = saved_bytes(&state, &text).await;
+        let loaded = load(&path, &caps()).unwrap();
+        let total: usize = loaded
+            .list
+            .slow
+            .iter()
+            .map(|slow| slow_rule_cost(&slow.rule))
+            .sum();
+        let budget = |slow_rule_budget| CompileOptions {
+            slow_rule_budget,
+            ..caps()
+        };
+
+        assert_eq!(loaded.list.slow_rule_count(), 20);
+        assert!(load(&path, &budget(total)).is_ok());
+        let error = load(&path, &budget(total - 1))
+            .err()
+            .expect("over the budget");
+
+        assert!(matches!(error, SnapshotError::TooLarge(_)), "{error:?}");
+    }
+
+    #[tokio::test]
     async fn a_damaged_file_is_replaced_by_the_same_snapshot() {
         let worker = CompileWorker::spawn().unwrap();
         let state = TestDir::new("snap");
@@ -1426,7 +1465,7 @@ ads.*.tracker
         store.flush().await;
 
         assert!(store.bytes_written() > before);
-        assert!(load(&path, 5000).is_ok());
+        assert!(load(&path, &caps()).is_ok());
     }
 
     #[tokio::test]
@@ -1449,7 +1488,7 @@ ads.*.tracker
             .await;
         store.flush().await;
         assert!(store.bytes_written() > 0);
-        assert!(load(&store.path_for(SOURCE).unwrap(), 5000).is_ok());
+        assert!(load(&store.path_for(SOURCE).unwrap(), &caps()).is_ok());
     }
 
     #[test]

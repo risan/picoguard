@@ -733,9 +733,20 @@ where
     Fut: Future<Output = Result<(), FetchError>>,
 {
     let compilation = worker.start(options);
-    produce(compilation.pieces.clone())
-        .await
-        .map_err(RefreshError::Fetch)?;
+    let produced = produce(compilation.pieces.clone()).await;
+    match produced {
+        Ok(()) => {}
+
+        // The worker gave up on its own (over budget): its error says why.
+        Err(FetchError::SinkClosed) => {
+            return match compilation.result().await {
+                Err(error) => Err(RefreshError::Compile(error)),
+                Ok(_) => Err(RefreshError::Fetch(FetchError::SinkClosed)),
+            };
+        }
+
+        Err(error) => return Err(RefreshError::Fetch(error)),
+    }
 
     compilation.result().await.map_err(RefreshError::Compile)
 }
@@ -1907,10 +1918,7 @@ mod tests {
     }
 
     fn compile_options() -> CompileOptions {
-        CompileOptions {
-            format: crate::filter::parse::ListFormat::Auto,
-            max_rules: 1000,
-        }
+        CompileOptions::new(crate::filter::parse::ListFormat::Auto, 1000)
     }
 
     fn blocks(compiled: &Compiled, name: &str) -> bool {
@@ -2020,6 +2028,68 @@ mod tests {
             panic!("the second download should work");
         };
         assert!(blocks(&updated.compiled, "a.example"));
+    }
+
+    #[tokio::test]
+    async fn a_list_over_the_slow_rule_budget_fails_the_refresh_and_the_worker_goes_on() {
+        let worker = CompileWorker::spawn().unwrap();
+        let heavy: String = (0..100_000).map(|n| format!("a{n}*b\n")).collect();
+        let heavy = heavy.into_bytes();
+        let server = Server::start(move |index, _, mut stream| {
+            let heavy = heavy.clone();
+            async move {
+                if index == 0 {
+                    respond(&mut stream, "200 OK", &[], &heavy).await;
+                } else {
+                    respond(&mut stream, "200 OK", &[], b"||a.example^\n").await;
+                }
+            }
+        })
+        .await;
+        let options = CompileOptions {
+            max_rules: 1_000_000,
+            ..compile_options()
+        };
+        let downloader = local();
+        let url = server.url("/");
+        let (previous, limits) = (Validators::default(), Limits::default());
+        let refresh = || downloader.refresh(&worker, &url, &previous, &limits, options);
+
+        let heavy = refresh().await;
+        let light = refresh().await;
+
+        assert!(
+            matches!(heavy, Err(RefreshError::Compile(CompileError::OverBudget))),
+            "{:?}",
+            heavy.err()
+        );
+        let Ok(Refresh::Updated(updated)) = light else {
+            panic!("the next download should work");
+        };
+        assert!(blocks(&updated.compiled, "a.example"));
+    }
+
+    #[tokio::test]
+    async fn a_local_file_over_the_slow_rule_budget_fails_the_refresh() {
+        let worker = CompileWorker::spawn().unwrap();
+        let dir = TestDir::new("lists-budget");
+        let path = dir.path().join("heavy.txt");
+        let heavy: String = (0..100_000)
+            .map(|n| format!("/track{n}[0-9]+/\n"))
+            .collect();
+        std::fs::write(&path, heavy).unwrap();
+        let options = CompileOptions {
+            max_rules: 1_000_000,
+            ..compile_options()
+        };
+
+        let result = refresh_file(&worker, path, 1 << 30, options).await;
+
+        assert!(
+            matches!(result, Err(RefreshError::Compile(CompileError::OverBudget))),
+            "{:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]

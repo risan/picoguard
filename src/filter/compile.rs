@@ -1,16 +1,18 @@
 //! The compile worker: one plain thread that parses and compiles list text, loads snapshot
 //! files and drops big values, so none of that runs on the DNS thread (plan D13, D20).
 
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 
 use tokio::sync::{mpsc, oneshot};
-use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
 use super::engine::{CompiledList, Engine, ListBuilder};
-use super::parse::{ListFormat, ParseSummary, Parser, Rule};
+use super::parse::{ListFormat, NetworkRule, ParseSummary, Parser, Rule};
 use super::snapshot::{self, Snapshot, SnapshotError};
 use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 
@@ -18,11 +20,72 @@ use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 /// compiler are then ignored and the lists compile again (plan D14).
 pub const COMPILER_VERSION: u32 = 1;
 
-/// The per-list settings that change the compiled result.
+/// Default memory budget of the slow rules of one list. Plan section 5 leaves about 8 MB
+/// between the steady total (20 MB) and the refresh peak (28 MB). The real lists are far
+/// below it: the AdGuard DNS filter, with 878 slow rules and 22 regexes, is estimated at 1 MB.
+pub const DEFAULT_SLOW_RULE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// The per-list settings that change the compiled result (the first two) or limit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompileOptions {
     pub format: ListFormat,
     pub max_rules: u32,
+    /// Bytes the slow rules and regexes of the list may cost, as `SlowRuleBudget` estimates.
+    /// A list over it fails to compile or to load; it never changes what a list means, so
+    /// it is not part of the fingerprint.
+    pub slow_rule_budget: usize,
+}
+
+impl CompileOptions {
+    pub fn new(format: ListFormat, max_rules: u32) -> CompileOptions {
+        CompileOptions {
+            format,
+            max_rules,
+            slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
+        }
+    }
+}
+
+/// Estimated bytes of a compiled slow rule: measured at 430 to 800 bytes for glob rules and
+/// 3 to 20 KiB for regexes (a Unicode class such as `\p{L}` is the expensive one).
+const SLOW_RULE_BYTES: usize = 512;
+const TEXT_BYTE_COST: usize = 4;
+const REGEX_BYTES: usize = 24 * 1024;
+
+/// Counts the estimated memory of the slow rules of one list against a budget. Parsing and
+/// snapshot loading charge the same way, so a list that compiles also loads.
+pub(super) struct SlowRuleBudget {
+    left: usize,
+}
+
+pub(super) struct OverBudget;
+
+impl SlowRuleBudget {
+    pub(super) fn new(total: usize) -> SlowRuleBudget {
+        SlowRuleBudget { left: total }
+    }
+
+    pub(super) fn charge(&mut self, rule: &NetworkRule) -> Result<(), OverBudget> {
+        let cost = slow_rule_cost(rule);
+        self.left = self.left.checked_sub(cost).ok_or(OverBudget)?;
+
+        Ok(())
+    }
+}
+
+pub(super) fn slow_rule_cost(rule: &NetworkRule) -> usize {
+    let text = rule.pattern.len()
+        + rule.client_key.len()
+        + rule.ctag_key.len()
+        + rule
+            .denyallow
+            .iter()
+            .map(|name| name.len() + 24)
+            .sum::<usize>()
+        + 2 * (rule.dns_permitted.len() + rule.dns_restricted.len());
+    let regex = if rule.is_regex() { REGEX_BYTES } else { 0 };
+
+    SLOW_RULE_BYTES + TEXT_BYTE_COST * text + regex
 }
 
 pub struct Compiled {
@@ -40,6 +103,8 @@ pub enum CompileError {
     /// The sender was dropped before `Piece::End`: the text is incomplete.
     Aborted,
     WorkerStopped,
+    /// The slow rules of the list cost more than `CompileOptions::slow_rule_budget`.
+    OverBudget,
 }
 
 /// A compile job that is waiting for text. Send the pieces, then `Piece::End`, then await
@@ -67,7 +132,7 @@ enum Job {
     },
     Load {
         path: PathBuf,
-        max_rules: u32,
+        options: CompileOptions,
         reply: oneshot::Sender<Result<Snapshot, SnapshotError>>,
     },
     Run(Box<dyn FnOnce() + Send>),
@@ -101,11 +166,15 @@ impl CompileWorker {
     }
 
     /// Reads a snapshot file on the worker.
-    pub async fn load(&self, path: PathBuf, max_rules: u32) -> Result<Snapshot, SnapshotError> {
+    pub async fn load(
+        &self,
+        path: PathBuf,
+        options: CompileOptions,
+    ) -> Result<Snapshot, SnapshotError> {
         let (reply, result) = oneshot::channel();
         let _ = self.jobs.send(Job::Load {
             path,
-            max_rules,
+            options,
             reply,
         });
 
@@ -164,10 +233,10 @@ fn run(queue: std_mpsc::Receiver<Job>) {
 
             Job::Load {
                 path,
-                max_rules,
+                options,
                 reply,
             } => {
-                let _ = reply.send(snapshot::load(&path, max_rules));
+                let _ = reply.send(snapshot::load(&path, &options));
             }
 
             Job::Run(work) => {
@@ -184,13 +253,38 @@ fn compile(
     let mut builder = ListBuilder::new();
     let mut parser = Parser::new(options.format, options.max_rules as usize);
     let mut hasher = Xxh3::new();
-    let mut sink = |rule: Rule<'_>| builder.add(rule);
+    let mut budget = SlowRuleBudget::new(options.slow_rule_budget);
+    let mut seen_slow_rules = HashSet::new();
+    let over_budget = Cell::new(false);
+    let mut sink = |rule: Rule<'_>| {
+        if over_budget.get() {
+            return;
+        }
+
+        if let Rule::Slow(slow) = &rule {
+            // The debug text holds every field, so equal text means an identical rule.
+            if !seen_slow_rules.insert(xxh3_128(format!("{slow:?}").as_bytes())) {
+                return;
+            }
+
+            if budget.charge(slow).is_err() {
+                over_budget.set(true);
+
+                return;
+            }
+        }
+
+        builder.add(rule);
+    };
 
     loop {
         match pieces.blocking_recv() {
             Some(Piece::Data(bytes)) => {
                 hasher.update(&bytes);
                 parser.push(&bytes, &mut sink);
+                if over_budget.get() {
+                    return Err(CompileError::OverBudget);
+                }
             }
 
             Some(Piece::End) => break,
@@ -200,6 +294,10 @@ fn compile(
     }
 
     let summary = parser.finish(&mut sink);
+    if over_budget.get() {
+        return Err(CompileError::OverBudget);
+    }
+
     let content_hash = hasher.digest128();
 
     Ok(Compiled {
@@ -231,6 +329,7 @@ mod tests {
         CompileOptions {
             format,
             max_rules: 1000,
+            slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
         }
     }
 
@@ -241,15 +340,19 @@ mod tests {
         piece_size: usize,
     ) -> Result<Compiled, CompileError> {
         let compilation = worker.start(options);
+        // The worker stops listening once the job has failed.
         for piece in text.chunks(piece_size) {
-            compilation
+            if compilation
                 .pieces
                 .send(Piece::Data(piece.to_vec()))
                 .await
-                .unwrap();
+                .is_err()
+            {
+                break;
+            }
         }
 
-        compilation.pieces.send(Piece::End).await.unwrap();
+        let _ = compilation.pieces.send(Piece::End).await;
 
         compilation.result().await
     }
@@ -358,6 +461,110 @@ mod tests {
                 .0
                 .send((thread.id(), thread.name().map(str::to_string)));
         }
+    }
+
+    fn slow_rule_cost_of(line: &str) -> usize {
+        let mut cost = None;
+        let mut parser = Parser::new(ListFormat::Adblock, 10);
+        let mut sink = |rule: Rule<'_>| {
+            if let Rule::Slow(slow) = rule {
+                cost = Some(slow_rule_cost(&slow));
+            }
+        };
+        parser.push(line.as_bytes(), &mut sink);
+        parser.finish(&mut sink);
+
+        cost.expect("the line is a slow rule")
+    }
+
+    fn with_budget(slow_rule_budget: usize) -> CompileOptions {
+        CompileOptions {
+            slow_rule_budget,
+            ..options(ListFormat::Adblock)
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_rules_are_charged_against_the_budget_to_the_byte() {
+        let worker = CompileWorker::spawn().unwrap();
+        let cost = slow_rule_cost_of("a1*b\n");
+        let lines = |count: usize| -> String { (0..count).map(|i| format!("a{i}*b\n")).collect() };
+
+        let fits = compile_in_pieces(&worker, with_budget(3 * cost), lines(3).as_bytes(), 64).await;
+        let over = compile_in_pieces(&worker, with_budget(3 * cost), lines(4).as_bytes(), 64).await;
+
+        assert_eq!(fits.unwrap().list.slow_rule_count(), 3);
+        assert_eq!(over.err(), Some(CompileError::OverBudget));
+    }
+
+    #[tokio::test]
+    async fn millions_of_identical_slow_rules_cost_one_rule() {
+        const COPIES: usize = 1_000_000;
+        let worker = CompileWorker::spawn().unwrap();
+        let text = "a*b\n".repeat(COPIES);
+        let uncapped = CompileOptions {
+            max_rules: COPIES as u32,
+            ..options(ListFormat::Adblock)
+        };
+
+        let compiled = compile_in_pieces(&worker, uncapped, text.as_bytes(), 64 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(compiled.list.slow_rule_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn many_different_slow_rules_fail_the_job_within_the_default_budget() {
+        let worker = CompileWorker::spawn().unwrap();
+        let text: String = (0..200_000).map(|i| format!("a{i}*b\n")).collect();
+        let uncapped = CompileOptions {
+            max_rules: 200_000,
+            ..options(ListFormat::Adblock)
+        };
+
+        let result = compile_in_pieces(&worker, uncapped, text.as_bytes(), 64 * 1024).await;
+
+        assert_eq!(result.err(), Some(CompileError::OverBudget));
+        let next = compile_in_pieces(&worker, options(ListFormat::Auto), LIST.as_bytes(), 100)
+            .await
+            .unwrap();
+        assert!(blocked(&next.list, "ads.example"));
+    }
+
+    #[tokio::test]
+    async fn many_regexes_fail_the_job_within_the_default_budget() {
+        let worker = CompileWorker::spawn().unwrap();
+        let text: String = (0..2000).map(|i| format!("/track{i}[0-9]+/\n")).collect();
+
+        let result = compile_in_pieces(
+            &worker,
+            options(ListFormat::Adblock),
+            text.as_bytes(),
+            64 * 1024,
+        )
+        .await;
+
+        assert_eq!(result.err(), Some(CompileError::OverBudget));
+    }
+
+    #[tokio::test]
+    async fn a_list_with_a_few_hundred_slow_rules_fits_the_default_budget() {
+        let worker = CompileWorker::spawn().unwrap();
+        let globs: String = (0..800).map(|i| format!("||ads{i}.*.example^\n")).collect();
+        let regexes: String = (0..20).map(|i| format!("/track{i}[0-9]+/\n")).collect();
+        let text = format!("{globs}{regexes}");
+
+        let compiled = compile_in_pieces(
+            &worker,
+            options(ListFormat::Adblock),
+            text.as_bytes(),
+            64 * 1024,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(compiled.list.slow_rule_count(), 820);
     }
 
     #[tokio::test]
