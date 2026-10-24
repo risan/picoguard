@@ -75,11 +75,12 @@ impl SlowRuleBudget {
 
 pub(super) fn slow_rule_cost(rule: &NetworkRule) -> usize {
     let text = rule.pattern.len()
-        + rule.client_key.len()
-        + rule.ctag_key.len()
+        + 24 * rule.restricted_clients.nets.len()
         + rule
             .denyallow
             .iter()
+            .chain(&rule.restricted_clients.names)
+            .chain(&rule.restricted_ctags)
             .map(|name| name.len() + 24)
             .sum::<usize>()
         + 2 * (rule.dns_permitted.len() + rule.dns_restricted.len());
