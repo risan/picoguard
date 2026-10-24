@@ -30,7 +30,7 @@ const SUB_ALLOW: usize = 2;
 const EXACT_ALLOW: usize = 3;
 const STRICT_BLOCK: usize = 4;
 const STRICT_ALLOW: usize = 5;
-const FAST_KINDS: usize = 6;
+pub(super) const FAST_KINDS: usize = 6;
 
 fn kind_index(kind: FastKind) -> usize {
     match kind {
@@ -49,25 +49,38 @@ fn hash(name: &str) -> u64 {
 
 // ---- Compiled lists ----
 
-struct HostGroup {
-    ip: IpAddr,
-    names: Vec<u64>,
+pub(super) struct HostGroup {
+    pub(super) ip: IpAddr,
+    pub(super) names: Vec<u64>,
 }
 
-struct SlowRule {
-    rule: NetworkRule,
+pub(super) struct SlowRule {
+    pub(super) rule: NetworkRule,
     matcher: Matcher,
     /// Hash of what `$badfilter` compares, so another list's badfilter can find the rule.
-    identity: u64,
+    pub(super) identity: u64,
+}
+
+impl SlowRule {
+    /// Fails when the pattern is a regular expression the `regex` crate rejects.
+    pub(super) fn compile(rule: NetworkRule) -> Result<SlowRule, ()> {
+        let matcher = Matcher::compile(&rule.pattern).map_err(|_| ())?;
+
+        Ok(SlowRule {
+            identity: identity_hash(&rule),
+            matcher,
+            rule,
+        })
+    }
 }
 
 /// The rules of one list, ready for lookups. Shared between engines through an `Arc`
 /// (plan D6): a refresh of another list does not rebuild it.
 pub struct CompiledList {
-    fast: [Vec<u64>; FAST_KINDS],
-    hosts: Vec<HostGroup>,
-    slow: Vec<SlowRule>,
-    regex_failed: u64,
+    pub(super) fast: [Vec<u64>; FAST_KINDS],
+    pub(super) hosts: Vec<HostGroup>,
+    pub(super) slow: Vec<SlowRule>,
+    pub(super) regex_failed: u64,
 }
 
 impl CompiledList {
@@ -143,13 +156,9 @@ impl ListBuilder {
                 self.hosts[group].names.push(hash(name));
             }
             Rule::Fast { kind, name } => self.fast[kind_index(kind)].push(hash(name)),
-            Rule::Slow(rule) => match Matcher::compile(&rule.pattern) {
-                Ok(matcher) => self.slow.push(SlowRule {
-                    identity: identity_hash(&rule),
-                    matcher,
-                    rule,
-                }),
-                Err(_) => self.regex_failed += 1,
+            Rule::Slow(rule) => match SlowRule::compile(rule) {
+                Ok(slow) => self.slow.push(slow),
+                Err(()) => self.regex_failed += 1,
             },
         }
     }

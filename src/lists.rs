@@ -32,6 +32,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
+use crate::filter::compile::{CompileError, CompileOptions, CompileWorker, Compiled};
 use crate::upstream::tls::{Alpn, Tls, lacks_shared_cipher};
 
 pub const MAX_PIECE_BYTES: usize = 64 * 1024;
@@ -628,6 +629,106 @@ impl Download {
 
 async fn send(sink: &PieceSender, piece: Piece) -> Result<(), FetchError> {
     sink.send(piece).await.map_err(|_| FetchError::SinkClosed)
+}
+
+/// What a refresh found.
+pub enum Refresh {
+    NotModified,
+    Updated(Box<Updated>),
+}
+
+pub struct Updated {
+    pub compiled: Compiled,
+    /// What the server said about this copy; keep it with the snapshot.
+    pub validators: Validators,
+}
+
+#[derive(Debug)]
+pub enum RefreshError {
+    Fetch(FetchError),
+    Compile(CompileError),
+}
+
+impl fmt::Display for RefreshError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RefreshError::Fetch(error) => {
+                write!(formatter, "{error}")
+            }
+
+            RefreshError::Compile(error) => {
+                write!(formatter, "compile failed: {error:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
+impl Downloader {
+    /// Downloads the list at `url` into a compile job on the worker. Answers
+    /// `NotModified` without compiling when the server says so.
+    pub async fn refresh(
+        &self,
+        worker: &CompileWorker,
+        url: &str,
+        previous: &Validators,
+        limits: &Limits,
+        options: CompileOptions,
+    ) -> Result<Refresh, RefreshError> {
+        let Fetch::Modified(download) = self
+            .fetch(url, previous, limits)
+            .await
+            .map_err(RefreshError::Fetch)?
+        else {
+            return Ok(Refresh::NotModified);
+        };
+
+        let validators = download.validators.clone();
+        let compiled = compile_with(
+            worker,
+            options,
+            |sink| async move { download.pump(&sink).await },
+        )
+        .await?;
+
+        Ok(Refresh::Updated(Box::new(Updated {
+            compiled,
+            validators,
+        })))
+    }
+}
+
+/// Starts a compile job and lets `produce` feed it. A failed `produce` drops its sender
+/// without `End`, so the worker discards the partial text.
+async fn compile_with<F, Fut>(
+    worker: &CompileWorker,
+    options: CompileOptions,
+    produce: F,
+) -> Result<Compiled, RefreshError>
+where
+    F: FnOnce(PieceSender) -> Fut,
+    Fut: Future<Output = Result<(), FetchError>>,
+{
+    let compilation = worker.start(options);
+    produce(compilation.pieces.clone())
+        .await
+        .map_err(RefreshError::Fetch)?;
+
+    compilation.result().await.map_err(RefreshError::Compile)
+}
+
+/// Reads the list in a local file into a compile job on the worker.
+pub async fn refresh_file(
+    worker: &CompileWorker,
+    path: PathBuf,
+    max_bytes: u64,
+    options: CompileOptions,
+) -> Result<Compiled, RefreshError> {
+    compile_with(worker, options, |sink| async move {
+        read_file(path, max_bytes, &sink).await
+    })
+    .await
 }
 
 /// Sends a local file as pieces followed by `End`. The reading runs on a blocking thread.
@@ -1683,5 +1784,142 @@ mod tests {
             }
         }
         assert_eq!(ended, 1);
+    }
+
+    fn compile_options() -> CompileOptions {
+        CompileOptions {
+            format: crate::filter::parse::ListFormat::Auto,
+            max_rules: 1000,
+        }
+    }
+
+    fn blocks(compiled: &Compiled, name: &str) -> bool {
+        use crate::filter::engine::{Decision, Engine, TYPE_A};
+
+        let engine = Engine::new(vec![Arc::clone(&compiled.list)], Vec::new());
+
+        matches!(engine.check(name, TYPE_A, false), Decision::Block { .. })
+    }
+
+    #[tokio::test]
+    async fn a_refresh_downloads_into_the_compile_worker() {
+        let worker = CompileWorker::spawn().unwrap();
+        let mut list = String::new();
+        for n in 0..20_000 {
+            list.push_str(&format!("||host{n}.example^\n"));
+        }
+        let body = list.clone().into_bytes();
+        let server = Server::start(move |_, _, mut stream| {
+            let body = body.clone();
+            async move {
+                respond(&mut stream, "200 OK", &[("ETag", "\"v7\"")], &body).await;
+            }
+        })
+        .await;
+        let options = CompileOptions {
+            max_rules: 100_000,
+            ..compile_options()
+        };
+
+        let refresh = local()
+            .refresh(
+                &worker,
+                &server.url("/list"),
+                &Validators::default(),
+                &Limits::default(),
+                options,
+            )
+            .await
+            .unwrap();
+
+        let Refresh::Updated(updated) = refresh else {
+            panic!("expected a new list");
+        };
+        assert_eq!(updated.validators.etag.as_deref(), Some("\"v7\""));
+        assert_eq!(updated.compiled.list.rule_count(), 20_000);
+        assert_eq!(
+            updated.compiled.content_hash,
+            xxhash_rust::xxh3::xxh3_128(list.as_bytes())
+        );
+        assert!(blocks(&updated.compiled, "sub.host19999.example"));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_is_not_modified_compiles_nothing() {
+        let worker = CompileWorker::spawn().unwrap();
+        let server = Server::start(|_, _, mut stream| async move {
+            respond(&mut stream, "304 Not Modified", &[], b"").await;
+        })
+        .await;
+        let previous = Validators {
+            etag: Some("\"v7\"".to_string()),
+            last_modified: None,
+        };
+
+        let refresh = local()
+            .refresh(
+                &worker,
+                &server.url("/"),
+                &previous,
+                &Limits::default(),
+                compile_options(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(refresh, Refresh::NotModified));
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_gives_no_list_and_the_worker_goes_on() {
+        let worker = CompileWorker::spawn().unwrap();
+        let server = Server::start(|index, _, mut stream| async move {
+            if index == 0 {
+                let head = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n||a.example^\n";
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            } else {
+                respond(&mut stream, "200 OK", &[], b"||a.example^\n").await;
+            }
+        })
+        .await;
+        let downloader = local();
+        let url = server.url("/");
+        let (previous, limits) = (Validators::default(), Limits::default());
+        let refresh = || downloader.refresh(&worker, &url, &previous, &limits, compile_options());
+
+        let truncated = refresh().await;
+        let complete = refresh().await;
+
+        assert!(
+            matches!(truncated, Err(RefreshError::Fetch(FetchError::Http(_)))),
+            "{:?}",
+            truncated.err()
+        );
+        let Ok(Refresh::Updated(updated)) = complete else {
+            panic!("the second download should work");
+        };
+        assert!(blocks(&updated.compiled, "a.example"));
+    }
+
+    #[tokio::test]
+    async fn a_file_refresh_compiles_the_file() {
+        let worker = CompileWorker::spawn().unwrap();
+        let dir = TestDir::new("lists-refresh");
+        let path = dir.path().join("mine.txt");
+        std::fs::write(&path, "0.0.0.0 mine.example\n||other.example^\n").unwrap();
+
+        let compiled = refresh_file(&worker, path.clone(), 1 << 20, compile_options())
+            .await
+            .unwrap();
+
+        assert!(blocks(&compiled, "mine.example"));
+        assert!(blocks(&compiled, "www.other.example"));
+        let too_big = refresh_file(&worker, path, 10, compile_options()).await;
+        assert!(
+            matches!(too_big, Err(RefreshError::Fetch(FetchError::BodyTooLarge))),
+            "{:?}",
+            too_big.err()
+        );
     }
 }
