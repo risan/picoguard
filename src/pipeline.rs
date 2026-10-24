@@ -177,12 +177,14 @@ impl Pipeline {
         let Ok(query) = Query::parse(request) else {
             return false;
         };
+
         let compact = build::compact_query(&query);
         *request = compact;
 
         let Ok(query) = Query::parse(request) else {
             return false;
         };
+
         let reply = Reply::new(&query, self.udp_size, protocol);
         let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
             return self.overloaded(&reply, protocol, out);
@@ -211,6 +213,7 @@ impl Pipeline {
         let Ok(query) = Query::parse(request) else {
             return false;
         };
+
         Reply::new(&query, self.udp_size, protocol).error(rcode::SERVFAIL, out);
 
         true
@@ -445,6 +448,7 @@ fn reverse_address(name: &Name) -> Option<IpAddr> {
             let [character] = nibble_label else {
                 return None;
             };
+
             let nibble = (*character as char).to_digit(16)? as u8;
             let position = 31 - index;
             octets[position / 2] |= nibble << (4 * (1 - position % 2));

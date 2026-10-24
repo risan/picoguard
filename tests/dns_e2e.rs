@@ -173,6 +173,7 @@ async fn fake_upstream(
             let Ok(query) = Message::from_vec(&buffer[..length]) else {
                 continue;
             };
+
             let replies = handler(&query);
             let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             highest.fetch_max(now, Ordering::SeqCst);
@@ -182,6 +183,7 @@ async fn fake_upstream(
                     tokio::time::sleep(delay).await;
                     let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
                 }
+
                 in_flight.fetch_sub(1, Ordering::SeqCst);
             });
         }
@@ -336,6 +338,7 @@ async fn the_answer_keeps_the_clients_letter_case_from_the_upstream_and_from_the
     for reply in [fresh, cached] {
         assert_eq!(reply.queries[0].name().to_ascii(), "MiXeD.Example.COM.");
     }
+
     assert_eq!(upstream.count(), 1);
     assert_eq!(
         upstream.last_query().queries[0].name().to_ascii(),
@@ -458,10 +461,12 @@ async fn a_big_answer_is_truncated_over_udp_and_complete_over_tcp() {
         assert!(truncated.metadata.truncation);
         assert!(truncated.answers.is_empty());
     }
+
     for complete in [&tcp_plain, &tcp_edns] {
         assert!(!complete.metadata.truncation);
         assert_eq!(complete.answers.len(), 1);
     }
+
     assert_eq!(upstream.count(), 1, "the TCP retry is a cache hit");
 }
 
@@ -579,6 +584,7 @@ async fn identical_queries_in_flight_share_one_upstream_query() {
         assert_eq!(reply.metadata.id, id as u16);
         assert_eq!(first_a(&reply), ANSWER);
     }
+
     assert_eq!(upstream.count(), 1);
 }
 
@@ -597,6 +603,7 @@ async fn queries_with_different_rd_are_not_coalesced() {
             udp_ask(&server, &ask).await
         }));
     }
+
     for client in clients {
         assert!(client.await.unwrap().is_some());
     }
@@ -842,6 +849,7 @@ async fn too_many_queries_in_flight_are_dropped_over_udp() {
             udp_ask(&server, &ask).await
         }));
     }
+
     let mut answered = 0;
     for client in clients {
         answered += usize::from(client.await.unwrap().is_some());
@@ -869,6 +877,7 @@ async fn too_many_waiting_clients_are_dropped_over_udp_even_when_coalesced() {
             .await
         }));
     }
+
     let mut answered = 0;
     for client in clients {
         answered += usize::from(client.await.unwrap().is_some());
@@ -1002,6 +1011,7 @@ async fn pipelined_tcp_queries_are_limited_per_connection() {
     for _ in 0..6 {
         ids.push(read_framed(&mut stream).await.unwrap().metadata.id);
     }
+
     ids.sort_unstable();
 
     assert_eq!(ids, [0, 1, 2, 3, 4, 5]);

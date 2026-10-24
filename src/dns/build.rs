@@ -226,6 +226,7 @@ impl<'q, 'a> Reply<'q, 'a> {
             rdata.push(label.len() as u8);
             rdata.extend_from_slice(label);
         }
+
         rdata.push(0);
 
         rdata.push(SOA_RNAME_LABEL.len() as u8);
@@ -444,6 +445,7 @@ mod tests {
         let RData::A(address) = &message.answers[0].data else {
             panic!("expected an A record");
         };
+
         assert_eq!(address.0, std::net::Ipv4Addr::UNSPECIFIED);
     }
 
@@ -454,6 +456,7 @@ mod tests {
         let RData::AAAA(address) = &message.answers[0].data else {
             panic!("expected an AAAA record");
         };
+
         assert_eq!(address.0, std::net::Ipv6Addr::UNSPECIFIED);
         assert_eq!(message.answers[0].ttl, 10);
     }
@@ -481,6 +484,7 @@ mod tests {
             let RData::SOA(data) = &soa.data else {
                 panic!("expected a SOA record");
             };
+
             assert_eq!(
                 data.mname.to_ascii(),
                 "fake-for-negative-caching.adguard.com."
@@ -501,6 +505,7 @@ mod tests {
         let RData::SOA(data) = &message.authorities[0].data else {
             panic!("expected a SOA record");
         };
+
         assert_eq!(data.rname.to_ascii(), "hostmaster.");
     }
 
@@ -863,6 +868,7 @@ mod tests {
         if with_opt {
             push_opt_record(&mut bytes, 4096, false, 0);
         }
+
         assert_eq!(bytes.len(), total);
 
         bytes
@@ -922,6 +928,7 @@ mod tests {
             if expects_opt {
                 assert_eq!(message.edns.unwrap().max_payload(), SERVER_UDP_SIZE);
             }
+
             assert_eq!(message.answers[0].ttl, 290);
             let additionals: Vec<(String, u32)> = message
                 .additionals
@@ -939,6 +946,7 @@ mod tests {
             let RData::CNAME(target) = &message.additionals[2].data else {
                 panic!("expected a CNAME");
             };
+
             assert_eq!(target.0.to_ascii(), "alt.ns.example.com.");
         }
     }

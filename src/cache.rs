@@ -239,6 +239,7 @@ impl Cache {
             let Some((_, evicted)) = self.entries.pop_lru() else {
                 break;
             };
+
             self.bytes -= evicted.cost();
         }
 
@@ -709,6 +710,7 @@ mod tests {
         for fixture in &fixtures[..3] {
             insert(&mut cache, fixture, &fixture.positive(60), start);
         }
+
         assert!(age_of_hit(&mut cache, &fixtures[0], start).is_some());
 
         insert(&mut cache, &fixtures[3], &fixtures[3].positive(60), start);

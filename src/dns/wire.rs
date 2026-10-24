@@ -190,6 +190,7 @@ impl Name {
         for (target, byte) in self.bytes[start + 1..].iter_mut().zip(label) {
             *target = byte.to_ascii_lowercase();
         }
+
         self.len += 1 + label.len() as u8;
 
         Ok(())
@@ -509,6 +510,7 @@ fn read_query_edns(msg: &[u8], start: usize, count: u16) -> Result<Option<Edns>,
                 dnssec_ok: ttl & EDNS_DO != 0,
             });
         }
+
         position = end;
     }
 
@@ -835,6 +837,7 @@ impl ResponseInfo {
             let Ok(ttl) = read_u32(msg, at) else {
                 continue;
             };
+
             let capped = ttl.min(soa.minimum);
 
             msg[at..at + 4].copy_from_slice(&capped.to_be_bytes());
@@ -881,6 +884,7 @@ fn is_negative(msg: &[u8], header: &Header) -> Result<bool, WireError> {
 
             break;
         };
+
         current = target;
     }
 
@@ -1267,6 +1271,7 @@ mod tests {
             long_question.push(50);
             long_question.extend_from_slice(&[b'a'; 50]);
         }
+
         long_question.push(0);
         let mut owner = vec![60];
         owner.extend_from_slice(&[b'b'; 60]);
@@ -1289,6 +1294,7 @@ mod tests {
             chain.extend_from_slice(&pointer_to(previous));
             previous = this;
         }
+
         let owner = pointer_to(HEADER_LEN);
         let last_hop = pointer_to(previous);
 
@@ -1345,12 +1351,14 @@ mod tests {
             long_name.push(60);
             long_name.extend_from_slice(&[b'a'; 60]);
         }
+
         long_name.push(0);
         let mut longest_valid = Vec::new();
         for _ in 0..3 {
             longest_valid.push(63);
             longest_valid.extend_from_slice(&[b'a'; 63]);
         }
+
         longest_valid.push(61);
         longest_valid.extend_from_slice(&[b'a'; 61]);
         longest_valid.push(0);
@@ -1678,6 +1686,7 @@ mod tests {
                 "prefix of {length} bytes parsed"
             );
         }
+
         assert!(ResponseInfo::parse(&bytes).is_ok());
     }
 
@@ -1742,6 +1751,7 @@ mod tests {
         let OracleRData::CNAME(target) = &oracle.additionals[2].data else {
             panic!("expected a CNAME");
         };
+
         assert_eq!(target.0.to_ascii(), "alt.ns.example.com.");
         let info = ResponseInfo::parse(&bytes).unwrap();
         assert_eq!(info.opt_start, None);
@@ -1823,6 +1833,7 @@ mod tests {
                     let _ = record.data(&bytes);
                 }
             }
+
             let _ = ResponseInfo::parse(&bytes);
         }
 
