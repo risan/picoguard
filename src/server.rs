@@ -99,7 +99,7 @@ fn bind_udp(address: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::from_std(socket.into())
 }
 
-fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
+pub(crate) fn bind_tcp(address: SocketAddr) -> io::Result<TcpListener> {
     let socket = Socket::new(
         Domain::for_address(address),
         Type::STREAM,

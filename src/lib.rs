@@ -11,6 +11,7 @@ pub mod scheduler;
 pub mod server;
 pub mod stats;
 pub mod upstream;
+pub mod web;
 
 #[cfg(test)]
 mod test_dir;

@@ -11,6 +11,7 @@ use picoguard::pipeline::Pipeline;
 use picoguard::scheduler::{Scheduler, Timing};
 use picoguard::server::{self, Listeners};
 use picoguard::upstream::tls::Tls;
+use picoguard::web::{self, Web, WebListeners};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -165,10 +166,29 @@ fn serve(config: Config) -> Result<(), String> {
             Scheduler::boot(&config, worker, Arc::clone(&store), Timing::default()).await?;
         let pipeline = Pipeline::new(&config, scheduler.policy())?;
         let listeners = Listeners::bind(&config.server)?;
+        let status_page = if config.web.enabled {
+            Some(WebListeners::bind(&config.web)?)
+        } else {
+            None
+        };
         let mut stop_signals = StopSignals::install()?;
 
         for address in listeners.udp_addresses() {
             log::info!("listening on {address} (udp and tcp)");
+        }
+
+        if let Some(status_page) = status_page {
+            for address in status_page.addresses() {
+                log::info!("status page on http://{address}/");
+            }
+
+            let web = Web::new(
+                &config,
+                Arc::clone(pipeline.stats()),
+                scheduler.policy(),
+                scheduler.control(),
+            );
+            web::spawn(status_page, Arc::new(web));
         }
 
         let downloader = Downloader::new(

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Serialize;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -64,7 +65,8 @@ enum Work {
     Save,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     Blocklist,
     Allowlist,
@@ -86,6 +88,7 @@ pub struct ListStatus {
 }
 
 /// The scheduler seen from outside: what the lists look like, and a way to ask for a refresh.
+#[derive(Default)]
 pub struct ListControl {
     statuses: Mutex<Vec<ListStatus>>,
     refresh_requested: Notify,
@@ -176,10 +179,7 @@ impl Scheduler {
 
         let mut scheduler = Scheduler {
             policy: Arc::new(Policy::new()),
-            control: Arc::new(ListControl {
-                statuses: Mutex::new(Vec::new()),
-                refresh_requested: Notify::new(),
-            }),
+            control: Arc::new(ListControl::default()),
             worker,
             store,
             timing,
