@@ -1,16 +1,64 @@
 # picoguard
 
-A DNS ad and malware blocker written in Rust, built to run on a 256 MB ARM board
-(Orange Pi Zero class) with very little memory, CPU and SD-card wear.
+picoguard is a DNS ad and malware blocker written in Rust. It runs on a cheap 256 MB ARM board
+(Orange Pi Zero class) and uses very little memory, CPU and SD-card wear. It forwards queries to
+encrypted upstreams (DoH, DoT), blocks names with the popular blocklist formats, and keeps its
+query log and statistics in memory only.
 
-It forwards to encrypted upstreams (DoH, DoT), reads the popular blocklist
-formats (adblock/AdGuard DNS syntax, hosts, plain domains, wildcard domains,
-dnsmasq, RPZ) and keeps its query log and statistics in memory only.
+## Why
+
+A home DNS blocker should fit on a 256 MB board where every MB counts, and should not wear out an
+SD card. picoguard was built to use less than half the memory and CPU of numa, another blocker
+that we tried first, while reading every popular blocklist format correctly. On the same lists (about 450k
+domains), the same 10,000-entry cache and the same replay of 52,137 real queries (x86_64
+container, 2026-10-25):
+
+| | picoguard | numa v0.25.0 |
+|---|---|---|
+| Steady RSS | 16.2 MB | 45.3 MB |
+| Peak RSS | 16.3 MB | 58.5 MB |
+| CPU seconds, cold replay | 8.4 s | 66.1 s |
+
+AdGuard Home was not measured in this run. It is the reference for blocking decisions, not for
+memory. A plain domain rule costs picoguard about 8 bytes. Details, method and open measurements:
+[docs/benchmarks.md](docs/benchmarks.md).
+
+## Features
+
+- DNS on UDP and TCP port 53 for all record types. Blocking applies to every type of a blocked
+  name, and to CNAME targets and answer addresses (catches CNAME cloaking).
+- Encrypted upstreams: DoH and DoT, several servers with load balancing and failover, bootstrapped
+  from fixed IPs, connections kept open. On CPUs without hardware AES it prefers ChaCha20-Poly1305.
+- Six blocklist formats, detected per list: adblock/AdGuard DNS syntax, hosts, plain domains,
+  wildcard domains, dnsmasq and RPZ. Same block and allow decisions as AdGuard Home v0.107.79.
+- Lists download on a schedule with ETag / If-Modified-Since. A failed download keeps the last
+  good list. A new list takes effect without a restart.
+- A small status page: totals, top blocked domains, top clients, recent queries, list status, and
+  a pause button. Optional basic auth, LAN only by default.
+- Almost no disk writes: no query log, no stats file. The only routine write is the last-good
+  copy of a list, only when it changed, and it can be turned off.
+- Static binaries for ARMv7, ARM64 and x86_64 Linux, and a systemd unit.
+- One TOML file for all settings.
+
+Not included: DHCP (your router does that), serving DoH/DoT to your devices, per-client rules,
+DNS rewriting, DNSSEC validation.
+
+## Documentation
+
+- [docs/install.md](docs/install.md): install on a used TV box, an Orange Pi Zero, or a Proxmox
+  LXC / x86_64 Linux, point your router at it, and make the SD card last.
+- [docs/configuration.md](docs/configuration.md): every config key, list formats, and lists for
+  256 MB, 512 MB and 1 GB boards.
+- [docs/benchmarks.md](docs/benchmarks.md): measurements against numa, method, open measurements.
+- [bench/README.md](bench/README.md): rerun the benchmark.
+- [dist/picoguard.toml](dist/picoguard.toml) and [dist/picoguard.service](dist/picoguard.service):
+  example config and systemd unit.
+- [tools/README.md](tools/README.md): the AdGuard Home oracle tools behind the compatibility tests.
 
 ## Status
 
-In development. Nothing is usable yet: the config file loads and validates
-(`picoguard --check`), the DNS server is not built.
+Pre-release. Version 0.1.0 is coming. Measured so far on x86_64 only. ARM board numbers are still
+open.
 
 ## Known differences from AdGuard Home
 
