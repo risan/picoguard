@@ -751,6 +751,9 @@ pub struct ResponseInfo {
     /// NXDOMAIN, or NOERROR where the name at the end of the answer's CNAME
     /// chain (the queried name when there is no chain) has no data.
     pub is_negative: bool,
+    /// The upper 8 bits of the 12-bit RCODE, from the OPT record (0 without
+    /// one).
+    pub extended_rcode: u8,
     soas: Vec<AuthoritySoa>,
 }
 
@@ -774,6 +777,7 @@ impl ResponseInfo {
             min_ttl: None,
             negative_ttl: None,
             is_negative: false,
+            extended_rcode: 0,
             soas: Vec::new(),
         };
 
@@ -790,6 +794,7 @@ impl ResponseInfo {
                 }
 
                 info.opt_start = Some(offset(record.start)?);
+                info.extended_rcode = (record.ttl >> 24) as u8;
 
                 continue;
             }

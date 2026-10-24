@@ -6,6 +6,9 @@ use super::wire::{
 
 const CLASSIC_UDP_LIMIT: u16 = 512;
 const OPT_RECORD_LEN: usize = 11;
+/// Owner (1 byte), type and class (4): the TTL field starts here, and its
+/// first byte is the extended RCODE.
+const OPT_EXTENDED_RCODE_AT: usize = 5;
 const EDNS_DO: u32 = 0x8000;
 const NAME_POINTER_TO_QUESTION: [u8; 2] = [0xC0, HEADER_LEN as u8];
 
@@ -72,7 +75,7 @@ impl<'q, 'a> Reply<'q, 'a> {
     /// An empty reply with only the question and the given rcode.
     pub fn error(&self, rcode: u8, out: &mut Vec<u8>) {
         self.begin(rcode, out);
-        self.end(out);
+        self.end(out, 0);
     }
 
     /// AdGuard "default" blocking: A is 0.0.0.0, AAAA is ::, HTTPS is empty,
@@ -96,7 +99,7 @@ impl<'q, 'a> Reply<'q, 'a> {
             }
         }
 
-        self.end(out);
+        self.end(out, 0);
     }
 
     /// Answers an A or AAAA question with the addresses of that family.
@@ -117,7 +120,7 @@ impl<'q, 'a> Reply<'q, 'a> {
             }
         }
 
-        self.end(out);
+        self.end(out, 0);
     }
 
     /// Rebuilds a stored upstream reply for this client: its ID, RD and CD, our
@@ -125,6 +128,19 @@ impl<'q, 'a> Reply<'q, 'a> {
     pub fn from_upstream(&self, parts: ReplyParts<'_>, ttl_rule: TtlRule, out: &mut Vec<u8>) {
         let question_end = HEADER_LEN + self.query.question_bytes().len();
         if parts.bytes.len() < question_end {
+            self.error(rcode::SERVFAIL, out);
+
+            return;
+        }
+
+        // The upper 8 bits of the RCODE live in the OPT record's TTL field. Only
+        // a client that sent an OPT can be given them.
+        let extended_rcode = parts
+            .opt_start
+            .and_then(|start| parts.bytes.get(usize::from(start) + OPT_EXTENDED_RCODE_AT))
+            .copied()
+            .unwrap_or(0);
+        if extended_rcode != 0 && self.query.edns.is_none() {
             self.error(rcode::SERVFAIL, out);
 
             return;
@@ -152,7 +168,7 @@ impl<'q, 'a> Reply<'q, 'a> {
             return;
         }
 
-        self.end(out);
+        self.end(out, extended_rcode);
 
         // Our OPT record can be larger than the one it replaces.
         if out.len() > MAX_MESSAGE_LEN {
@@ -233,8 +249,8 @@ impl<'q, 'a> Reply<'q, 'a> {
     }
 
     /// Truncates for UDP when needed, then appends our OPT record if the client
-    /// sent one. TCP replies are never truncated.
-    fn end(&self, out: &mut Vec<u8>) {
+    /// sent one, carrying `extended_rcode`. TCP replies are never truncated.
+    fn end(&self, out: &mut Vec<u8>, extended_rcode: u8) {
         let opt_len = if self.query.edns.is_some() {
             OPT_RECORD_LEN
         } else {
@@ -249,7 +265,8 @@ impl<'q, 'a> Reply<'q, 'a> {
         }
 
         if self.query.edns.is_some() {
-            self.push_opt(out);
+            push_opt_record(out, self.udp_size, self.query.dnssec_ok(), extended_rcode);
+            add_to_count(out, ADDITIONAL_COUNT);
         }
     }
 
@@ -260,11 +277,6 @@ impl<'q, 'a> Reply<'q, 'a> {
             .map_or(CLASSIC_UDP_LIMIT, |edns| edns.udp_size);
 
         usize::from(advertised.max(CLASSIC_UDP_LIMIT))
-    }
-
-    fn push_opt(&self, out: &mut Vec<u8>) {
-        push_opt_record(out, self.udp_size, self.query.dnssec_ok(), 0);
-        add_to_count(out, ADDITIONAL_COUNT);
     }
 }
 
@@ -894,6 +906,57 @@ mod tests {
             };
             assert_eq!(target.0.to_ascii(), "alt.ns.example.com.");
         }
+    }
+
+    fn reply_with_extended_rcode(extended_rcode: u8) -> Vec<u8> {
+        let client = QuerySpec::new("example.com.", RecordType::A);
+        let mut upstream = ResponseSpec {
+            edns: Some(4096),
+            ..ResponseSpec::default()
+        }
+        .bytes(&client);
+        let opt_start = upstream.len() - OPT_RECORD_LEN;
+        upstream[opt_start + 5] = extended_rcode;
+
+        upstream
+    }
+
+    #[test]
+    fn the_extended_rcode_of_the_upstream_goes_into_our_opt() {
+        let upstream = reply_with_extended_rcode(1);
+        let mut client = QuerySpec::new("example.com.", RecordType::A);
+        client.edns = Some((1232, true));
+
+        let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
+
+        let message = parse(&out);
+        assert_eq!(u16::from(message.metadata.response_code), 16, "BADVERS");
+        let edns = message.edns.unwrap();
+        assert_eq!(edns.max_payload(), SERVER_UDP_SIZE);
+        assert!(edns.flags().dnssec_ok);
+    }
+
+    #[test]
+    fn a_client_without_edns_cannot_get_an_extended_rcode_and_gets_servfail() {
+        let upstream = reply_with_extended_rcode(1);
+        let client = QuerySpec::new("example.com.", RecordType::A);
+
+        let out = from_upstream(&client, &upstream, Protocol::Tcp, no_aging());
+
+        let message = parse(&out);
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+        assert!(message.edns.is_none());
+    }
+
+    #[test]
+    fn no_extended_rcode_stays_a_plain_header_rcode() {
+        let upstream = reply_with_extended_rcode(0);
+        let mut client = QuerySpec::new("example.com.", RecordType::A);
+        client.edns = Some((1232, false));
+
+        let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
+
+        assert_eq!(parse(&out).metadata.response_code, ResponseCode::NoError);
     }
 
     #[test]

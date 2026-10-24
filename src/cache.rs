@@ -279,7 +279,7 @@ impl Cache {
     /// SOA; other replies live as long as their smallest TTL.
     fn lifetime_of(&self, info: &ResponseInfo) -> Option<u32> {
         let header = &info.header;
-        if !header.is_response() || header.flags & flags::TC != 0 {
+        if !header.is_response() || header.flags & flags::TC != 0 || info.extended_rcode != 0 {
             return None;
         }
 
@@ -566,6 +566,22 @@ mod tests {
 
             assert_eq!(lifetime_in_secs(&mut cache, &fixture, start), Some(120));
         }
+    }
+
+    #[test]
+    fn a_reply_with_an_extended_rcode_is_not_cached() {
+        let mut cache = Cache::new(&config());
+        let fixture = Fixture::new("example.com.");
+        let mut reply = ResponseSpec {
+            authorities: vec![soa("example.com.", 900, 45)],
+            edns: Some(1232),
+            ..ResponseSpec::default()
+        }
+        .bytes(&fixture.spec);
+        let opt_start = reply.len() - 11;
+        reply[opt_start + 5] = 1;
+
+        assert!(!insert(&mut cache, &fixture, &reply, Instant::now()));
     }
 
     #[test]

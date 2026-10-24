@@ -377,6 +377,35 @@ async fn a_cached_negative_reply_shows_the_effective_soa_ttl_and_ages_it() {
 }
 
 #[tokio::test]
+async fn an_extended_rcode_reaches_an_edns_client_and_becomes_servfail_for_a_plain_one() {
+    let upstream = fake_upstream(|query| {
+        let mut reply = answer_a(query, 60);
+        reply.answers.clear();
+        reply.metadata.response_code = ResponseCode::BADVERS;
+        reply.set_edns(Edns::new());
+
+        vec![(Duration::ZERO, reply)]
+    })
+    .await;
+    let server = start(config_for(&upstream)).await;
+
+    let with_edns = udp_ask(
+        &server,
+        &Ask::new("old.example.", RecordType::A).with_edns(1232),
+    )
+    .await
+    .unwrap();
+    let without_edns = udp_ask(&server, &Ask::new("old.example.", RecordType::A))
+        .await
+        .unwrap();
+
+    assert_eq!(u16::from(with_edns.metadata.response_code), 16, "BADVERS");
+    assert_eq!(without_edns.metadata.response_code, ResponseCode::ServFail);
+    assert!(without_edns.edns.is_none());
+    assert_eq!(upstream.count(), 2, "an extended rcode is not cached");
+}
+
+#[tokio::test]
 async fn an_upstream_that_never_answers_gives_servfail() {
     let upstream = silent_upstream().await;
     let mut config = config_for(&upstream);
