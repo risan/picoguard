@@ -101,9 +101,11 @@ impl RpzReader {
                 .next()
                 .is_some_and(|d| d.eq_ignore_ascii_case("$ORIGIN"))
             {
+                // `$ORIGIN .` is the root: an absolute owner has nothing to lose.
                 self.origin = words
                     .next()
-                    .map(|origin| origin.trim_end_matches('.').to_ascii_lowercase());
+                    .map(|origin| origin.trim_end_matches('.').to_ascii_lowercase())
+                    .filter(|origin| !origin.is_empty());
             }
 
             out(Record::Directive);
@@ -449,6 +451,29 @@ mod tests {
                 Record::Other,
             ]
         );
+    }
+
+    #[test]
+    fn the_root_origin_removes_nothing_from_absolute_owners() {
+        let text = "$ORIGIN .\nabs.example. CNAME .\n*.wild.example. CNAME .\nrel.example CNAME .\nok.example. CNAME rpz-passthru.\n";
+        let records = read(text);
+        assert_eq!(
+            records,
+            [
+                Record::Directive,
+                policy("abs.example", false, false),
+                policy("wild.example", true, false),
+                policy("rel.example", false, false),
+                policy("ok.example", false, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_root_origin_replaces_an_earlier_zone_origin() {
+        let records = read("$ORIGIN rpz.test.\n$ORIGIN .\nabs.example. CNAME .\n");
+
+        assert_eq!(records[2], policy("abs.example", false, false));
     }
 
     #[test]

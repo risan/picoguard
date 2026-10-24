@@ -57,6 +57,9 @@ impl PolicyView {
             };
 
             let decision = match data {
+                // AdGuard Home checks an empty host name for a root target, which matches
+                // nothing.
+                RData::Cname(target) if target.is_root() => Decision::Pass,
                 RData::Cname(target) => self.engine.check(&target.to_string(), TYPE_CNAME, false),
                 RData::A(address) => self.check_address(IpAddr::V4(address), TYPE_A),
                 RData::Aaaa(address) => self.check_address(IpAddr::V6(address), TYPE_AAAA),
@@ -313,6 +316,18 @@ mod tests {
             check(vec![a("8.8.8.8"), a("203.0.113.7")]),
             Decision::Block { .. }
         ));
+    }
+
+    #[test]
+    fn a_root_cname_target_is_not_checked_as_a_name() {
+        let policy = Policy::with_engine(engine("/^\\.$/\n/./\n"));
+        let view = policy.view(Instant::now());
+        let root_target = vec![test_util::cname("q.example.", 60, ".")];
+
+        assert_eq!(
+            response_decision(&view, RecordType::A, root_target),
+            Decision::Pass
+        );
     }
 
     #[test]

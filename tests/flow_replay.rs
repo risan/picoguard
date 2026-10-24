@@ -288,5 +288,5 @@ async fn picoguard_replies_like_adguard_home_to_every_flow_query() {
         mismatches.len(),
         mismatches.join("\n")
     );
-    assert_eq!(matched, 60);
+    assert_eq!(matched, 63);
 }

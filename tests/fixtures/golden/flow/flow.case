@@ -15,6 +15,8 @@
 ||2001:db8::bad^
 |66.66.66.66^
 /^203\.0\.113\.(1[0-9])$/
+/^\.$/
+/^$/
 ||cdn.example^$denyallow=ok.cdn.example
 ||203.0.113.99^$denyallow=ok.cdn.example
 0.0.0.0 hosty.example
@@ -142,6 +144,13 @@ Q chain.example A
 chain.example. 300 IN CNAME mid.example.
 mid.example. 200 IN CNAME cloak-target.tracker.example.
 cloak-target.tracker.example. 100 IN A 9.9.9.9
+Q rootcname.example A
+rootcname.example. 300 IN CNAME .
+Q rootcname.example AAAA
+rootcname.example. 300 IN CNAME .
+Q rootchain.example A
+rootchain.example. 300 IN CNAME mid-root.example.
+mid-root.example. 300 IN CNAME .
 [queries]
 req-blocked.example A
 req-blocked.example AAAA
@@ -203,3 +212,6 @@ pass.example TXT
 nx.example A
 nodata.example A
 chain.example A
+rootcname.example A
+rootcname.example AAAA
+rootchain.example A
