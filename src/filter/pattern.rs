@@ -191,7 +191,10 @@ impl Glob {
                 '^' => tokens.push(Token::Separator),
                 _ => {
                     let mut lower = c.to_lowercase();
-                    let literal = lower.next().filter(|_| lower.len() == 0).unwrap_or(c);
+                    let literal = match (lower.next(), lower.next()) {
+                        (Some(single), None) => single,
+                        _ => c,
+                    };
                     let bytes = literal.encode_utf8(&mut buffer).as_bytes();
                     match tokens.last_mut() {
                         Some(Token::Literal(run)) => run.extend_from_slice(bytes),
@@ -212,8 +215,15 @@ impl Glob {
     }
 
     fn is_match(&self, subject: &[u8]) -> bool {
+        // A failed (token, position) pair fails from every start, so one memo serves all.
+        let mut failed = if self.has_any {
+            vec![false; self.tokens.len() * (subject.len() + 1)]
+        } else {
+            Vec::new()
+        };
+
         match self.start {
-            Start::Anchored => self.match_at(subject, 0),
+            Start::Anchored => self.match_from(subject, 0, 0, &mut failed),
             Start::UrlHost => {
                 const SCHEME: &[u8] = b"http://";
                 if !subject
@@ -224,7 +234,7 @@ impl Glob {
                 }
 
                 // `([a-z0-9-_.]+\.)?` may skip leading labels made of name characters.
-                if self.match_at(subject, SCHEME.len()) {
+                if self.match_from(subject, 0, SCHEME.len(), &mut failed) {
                     return true;
                 }
 
@@ -233,7 +243,10 @@ impl Glob {
                         break;
                     }
 
-                    if byte == b'.' && at > SCHEME.len() && self.match_at(subject, at + 1) {
+                    if byte == b'.'
+                        && at > SCHEME.len()
+                        && self.match_from(subject, 0, at + 1, &mut failed)
+                    {
                         return true;
                     }
                 }
@@ -242,18 +255,8 @@ impl Glob {
             }
             Start::Anywhere => (0..=subject.len())
                 .filter(|&at| is_boundary(subject, at))
-                .any(|at| self.match_at(subject, at)),
+                .any(|at| self.match_from(subject, 0, at, &mut failed)),
         }
-    }
-
-    fn match_at(&self, subject: &[u8], at: usize) -> bool {
-        let mut failed = if self.has_any {
-            vec![false; self.tokens.len() * (subject.len() + 1)]
-        } else {
-            Vec::new()
-        };
-
-        self.match_from(subject, 0, at, &mut failed)
     }
 
     fn match_from(&self, subject: &[u8], token: usize, at: usize, failed: &mut [bool]) -> bool {

@@ -534,6 +534,7 @@ fn is_plain_name(name: &str) -> bool {
 pub fn detect_format(head: &[u8]) -> ListFormat {
     let head = &head[..head.len().min(DETECTION_BYTES)];
     let text = String::from_utf8_lossy(head);
+    let text = text.trim_start_matches('\u{feff}');
     let mut first_content = None;
     let mut rule_lines = 0;
     let mut wildcard_lines = 0;
@@ -662,7 +663,7 @@ fn is_adblock_header(line: &str) -> bool {
 }
 
 /// `||d^`, `|d^`, `@@||d^` and `@@|d^` with a plain lowercase `d` and no modifiers.
-fn fast_rule(line: &str) -> Option<(FastKind, &str)> {
+pub(crate) fn fast_rule(line: &str) -> Option<(FastKind, &str)> {
     let (allow, rest) = match line.strip_prefix("@@") {
         Some(rest) => (true, rest),
         None => (false, line),
@@ -1159,7 +1160,7 @@ fn split_pattern_and_options(text: &str) -> (String, String) {
     (text.to_string(), String::new())
 }
 
-fn dns_type_code(name: &str) -> Option<u16> {
+pub fn dns_type_code(name: &str) -> Option<u16> {
     if name.eq_ignore_ascii_case("none") || name.eq_ignore_ascii_case("reserved") {
         return None;
     }
