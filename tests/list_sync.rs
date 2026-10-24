@@ -400,6 +400,43 @@ async fn every_kind_of_failure_keeps_the_last_good_list() {
 }
 
 #[tokio::test]
+async fn a_hosts_list_with_too_many_answer_ips_keeps_the_last_good_list() {
+    capture_warnings();
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    let hosts_with_ips = |count: u32| -> String {
+        (0..count)
+            .map(|index| {
+                let [a, b, c, d] = (0x0A00_0000 + index).to_be_bytes();
+
+                format!("{a}.{b}.{c}.{d} ads{index}.example\n")
+            })
+            .collect()
+    };
+    server.serve("/hosts.txt", &hosts_with_ips(1024), Some("\"h1\""));
+    let config = config_of(
+        &dir,
+        vec![url_list("hosts-groups", server.url("/hosts.txt"))],
+    );
+    let (mut scheduler, _) = boot(&config).await;
+    scheduler.refresh(0, &downloader()).await;
+    let policy = scheduler.policy();
+    let in_force = Arc::clone(scheduler.list(0).unwrap());
+    let generation_before = generation(&policy);
+    assert!(blocked(&policy, "ads5.example."));
+
+    server.serve("/hosts.txt", &hosts_with_ips(1025), Some("\"h2\""));
+    scheduler.refresh(0, &downloader()).await;
+    scheduler.refresh(0, &downloader()).await;
+
+    assert!(Arc::ptr_eq(&in_force, scheduler.list(0).unwrap()));
+    assert!(blocked(&policy, "ads5.example."));
+    assert!(!blocked(&policy, "ads1024.example."));
+    assert_eq!(generation(&policy), generation_before);
+    assert_eq!(warnings_about("hosts-groups"), 1, "one warning per streak");
+}
+
+#[tokio::test]
 async fn a_success_ends_a_failure_streak_and_the_next_failure_warns_again() {
     capture_warnings();
     let dir = StateDir::new();

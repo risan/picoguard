@@ -21,6 +21,7 @@
 //! Strings are a u32 length and UTF-8 text. Every length is checked against the limits of
 //! plan D12 before anything is allocated.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::IpAddr;
@@ -33,11 +34,11 @@ use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128};
 
 use super::compile::{COMPILER_VERSION, CompileOptions, Compiled, SlowRuleBudget};
-use super::engine::{CompiledList, FAST_KINDS, HostGroup, SlowRule};
+use super::engine::{CompiledList, FAST_KINDS, HostRules, SlowRule};
 use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
 use crate::lists::Validators;
 
-pub const FILE_VERSION: u32 = 2;
+pub const FILE_VERSION: u32 = 3;
 
 const MAGIC: [u8; 8] = *b"PICOSNAP";
 const PREAMBLE_BYTES: u64 = 12;
@@ -435,11 +436,12 @@ fn encode<W: Write>(snapshot: &Snapshot, mut out: W) -> io::Result<()> {
         encoder.u64s(array)?;
     }
 
-    encoder.u32(list.hosts.len() as u32)?;
-    for group in &list.hosts {
-        encoder.text(&group.ip.to_string())?;
-        encoder.u64s(&group.names)?;
+    encoder.u32(list.hosts.ips.len() as u32)?;
+    for ip in &list.hosts.ips {
+        encoder.text(&ip.to_string())?;
     }
+
+    encoder.u64s(&list.hosts.entries)?;
 
     encoder.u32(list.slow.len() as u32)?;
     for slow in &list.slow {
@@ -457,7 +459,7 @@ fn encode<W: Write>(snapshot: &Snapshot, mut out: W) -> io::Result<()> {
 
 /// The least bytes one host group and one slow rule take in the file: a length field that
 /// promises more of them than the file holds is refused before anything is reserved.
-const MIN_HOST_GROUP_BYTES: u64 = 4 + 2 + 8;
+const MIN_HOST_GROUP_BYTES: u64 = 4 + 2;
 const MIN_SLOW_RULE_BYTES: u64 = 1 + 4 + 6 * 4;
 
 /// Decodes the body of a file whose checksum already matched, so damage by accident is
@@ -731,20 +733,29 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         *array = decoder.u64s("plain rule array")?;
     }
 
-    // Host groups are not rules: the names in them are charged, the groups are bounded by
-    // their own count. Neither vector is reserved up front, so a count the file cannot back
-    // costs nothing.
+    // Host groups are not rules: the names mapped to them are charged, the groups are bounded
+    // by their own cap and memory charge. The vector is not reserved up front, so a count the
+    // file cannot back costs nothing.
     let group_count = decoder.count_within_file(MIN_HOST_GROUP_BYTES, "host groups")?;
-    let mut hosts = Vec::new();
+    let mut host_ips = Vec::new();
     for _ in 0..group_count {
+        decoder
+            .slow_budget
+            .charge_host_group()
+            .map_err(|_| SnapshotError::TooLarge("host groups"))?;
         let ip: IpAddr = decoder
             .text(64, "host address")?
             .parse()
             .map_err(|_| SnapshotError::Corrupt("host address"))?;
-        hosts.push(HostGroup {
-            ip,
-            names: decoder.u64s("host name array")?,
-        });
+        host_ips.push(ip);
+    }
+
+    let hosts = HostRules {
+        ips: host_ips,
+        entries: decoder.u64s("host name array")?,
+    };
+    if !hosts.groups_exist() {
+        return Err(SnapshotError::Corrupt("host name without a group"));
     }
 
     let slow_count = decoder.count_within_file(MIN_SLOW_RULE_BYTES, "slow rules")?;
@@ -753,7 +764,6 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         slow.push(decoder.rule()?);
     }
 
-    hosts.shrink_to_fit();
     slow.shrink_to_fit();
 
     if decoder.remaining != 0 {
@@ -993,6 +1003,8 @@ impl SnapshotStore {
 }
 
 fn write_loop(mut jobs: mpsc::Receiver<WriteJob>, files: &dyn Files, written: &AtomicU64) {
+    let mut unsynced = BTreeSet::new();
+
     while let Some(job) = jobs.blocking_recv() {
         match job {
             WriteJob::Write {
@@ -1000,9 +1012,10 @@ fn write_loop(mut jobs: mpsc::Receiver<WriteJob>, files: &dyn Files, written: &A
                 snapshot,
                 done,
             } => {
-                let result = write_if_changed(files, written, &path, &snapshot).map_err(|error| {
-                    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-                });
+                let result = write_if_changed(files, written, &path, &snapshot, &mut unsynced)
+                    .map_err(|error| {
+                        io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+                    });
                 drop(snapshot);
 
                 let _ = done.send(result);
@@ -1022,9 +1035,13 @@ fn parent_of(path: &Path) -> &Path {
     }
 }
 
-/// Creates `directory` and the missing directories above it, outermost first, and returns
-/// those this call created.
-fn create_missing_directories(files: &dyn Files, directory: &Path) -> io::Result<Vec<PathBuf>> {
+/// Creates `directory` and the missing directories above it, outermost first. The parent of
+/// each one created is added to `unsynced` at once, so a failure further down forgets none.
+fn create_missing_directories(
+    files: &dyn Files,
+    directory: &Path,
+    unsynced: &mut BTreeSet<PathBuf>,
+) -> io::Result<()> {
     let mut missing = Vec::new();
     let mut current = directory;
     while !current.is_dir() {
@@ -1037,11 +1054,10 @@ fn create_missing_directories(files: &dyn Files, directory: &Path) -> io::Result
         current = parent;
     }
 
-    let mut created = Vec::new();
     for path in missing.into_iter().rev() {
         match files.create_dir(path) {
             Ok(()) => {
-                created.push(path.to_path_buf());
+                unsynced.insert(parent_of(path).to_path_buf());
             }
 
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
@@ -1050,27 +1066,49 @@ fn create_missing_directories(files: &dyn Files, directory: &Path) -> io::Result
         }
     }
 
-    Ok(created)
+    Ok(())
 }
 
-/// Writes the snapshot unless the file already holds it. Bytes are counted into `written` as
-/// they reach the file, whether or not the write succeeds.
+/// Syncs the directories whose entries are not known to be durable yet. One that fails stays
+/// in `unsynced` for the next call, so a retry finishes the work even when the file is
+/// already in place.
+fn sync_owed_directories(files: &dyn Files, unsynced: &mut BTreeSet<PathBuf>) -> io::Result<()> {
+    // Parents sort before their children.
+    while let Some(directory) = unsynced.first().cloned() {
+        match files.sync_dir(&directory) {
+            Ok(()) => {}
+
+            // Removed since: there is nothing left to make durable.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+
+            Err(error) => return Err(error),
+        }
+
+        unsynced.remove(&directory);
+    }
+
+    Ok(())
+}
+
+/// Writes the snapshot unless the file already holds it, then syncs the directories whose
+/// entries it created (a new directory is only durable once its parent is synced, and a new
+/// file once its directory is; without that the snapshot could vanish after a power loss).
+/// Bytes are counted into `written` as they reach the file, whether or not the write
+/// succeeds.
 fn write_if_changed(
     files: &dyn Files,
     written: &AtomicU64,
     path: &Path,
     snapshot: &Snapshot,
+    unsynced: &mut BTreeSet<PathBuf>,
 ) -> io::Result<()> {
     if holds_fingerprint(path, snapshot.meta.fingerprint) {
-        return Ok(());
+        return sync_owed_directories(files, unsynced);
     }
 
     let directory = parent_of(path);
-    // A new directory is only durable once its parent is synced; without that the first
-    // snapshot could vanish with the directory after a power loss.
-    for created in create_missing_directories(files, directory)? {
-        files.sync_dir(parent_of(&created))?;
-    }
+    create_missing_directories(files, directory, unsynced)?;
+    sync_owed_directories(files, unsynced)?;
 
     let temporary = path.with_extension("pgs.tmp");
     let result = write_synced(files, written, &temporary, snapshot)
@@ -1081,7 +1119,9 @@ fn write_if_changed(
         return Err(error);
     }
 
-    files.sync_dir(directory)
+    unsynced.insert(directory.to_path_buf());
+
+    sync_owed_directories(files, unsynced)
 }
 
 fn write_synced(
@@ -1106,7 +1146,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::filter::compile::{CompileWorker, slow_rule_cost};
+    use crate::filter::compile::{CompileWorker, HOST_GROUP_BYTES, slow_rule_cost};
+    use crate::filter::engine::MAX_HOST_GROUPS;
     use crate::filter::engine::{Decision, Engine, TYPE_A, TYPE_AAAA};
     use crate::lists::Piece;
     use crate::test_dir::TestDir;
@@ -1204,10 +1245,8 @@ ads.*.tracker
 
     fn assert_same_list(a: &CompiledList, b: &CompiledList) {
         assert_eq!(a.fast, b.fast);
-        assert_eq!(a.hosts.len(), b.hosts.len());
-        for (x, y) in a.hosts.iter().zip(&b.hosts) {
-            assert_eq!((x.ip, &x.names), (y.ip, &y.names));
-        }
+        assert_eq!(a.hosts.ips, b.hosts.ips);
+        assert_eq!(a.hosts.entries, b.hosts.entries);
 
         assert_eq!(a.slow.len(), b.slow.len());
         for (x, y) in a.slow.iter().zip(&b.slow) {
@@ -1226,7 +1265,7 @@ ads.*.tracker
         let snapshot = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
         assert!(snapshot.list.slow_rule_count() > 5);
         assert_eq!(snapshot.list.regex_failed(), 1);
-        assert_eq!(snapshot.list.hosts.len(), 3);
+        assert_eq!(snapshot.list.hosts.ips.len(), 3);
 
         store.save(clone_of(&snapshot)).await.unwrap();
         store.flush().await;
@@ -1635,11 +1674,13 @@ ads.*.tracker
         reloads_at_its_exact_rule_cap(mixed, ListFormat::Adblock, 6).await;
     }
 
-    /// A file whose body ends with the two counts of a list without host or slow rules.
+    /// A file whose body ends with the counts of a list without host or slow rules: the
+    /// number of host groups, the length of the host entries (8 bytes) and the number of slow
+    /// rules.
     fn with_counts(good: &[u8], groups: u32, slow: u32, fix: bool) -> Vec<u8> {
         let mut bytes = good.to_vec();
         let end = bytes.len() - CHECKSUM_BYTES as usize;
-        bytes[end - 8..end - 4].copy_from_slice(&groups.to_le_bytes());
+        bytes[end - 16..end - 12].copy_from_slice(&groups.to_le_bytes());
         bytes[end - 4..end].copy_from_slice(&slow.to_le_bytes());
         if fix {
             fix_checksum(&mut bytes);
@@ -1659,8 +1700,10 @@ ads.*.tracker
             fs::write(&path, with_counts(&good, groups, slow, true)).unwrap();
             let error = load(&path, &generous).err().expect("refused");
 
+            // A group count that fits the bytes left is read as far as it goes: the data that
+            // follows is not an address.
             assert!(
-                matches!(error, SnapshotError::Truncated),
+                matches!(error, SnapshotError::Truncated | SnapshotError::Corrupt(_)),
                 "{groups}/{slow}: {error:?}"
             );
         }
@@ -1717,6 +1760,64 @@ ads.*.tracker
         let error = load(&path, &budget(total - 1))
             .err()
             .expect("over the budget");
+
+        assert!(matches!(error, SnapshotError::TooLarge(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn host_groups_are_charged_to_the_budget_when_a_snapshot_loads() {
+        let state = TestDir::new("snap");
+        let text: String = (0..10)
+            .map(|i| format!("10.0.0.{i} a{i}.example\n"))
+            .collect();
+        let (path, _) = saved_bytes(&state, &text).await;
+        let budget = |slow_rule_budget| CompileOptions {
+            slow_rule_budget,
+            ..caps()
+        };
+
+        assert!(load(&path, &budget(10 * HOST_GROUP_BYTES)).is_ok());
+        let error = load(&path, &budget(10 * HOST_GROUP_BYTES - 1))
+            .err()
+            .expect("over the budget");
+
+        assert!(matches!(error, SnapshotError::TooLarge(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_with_more_host_groups_than_the_cap_is_refused() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let store = SnapshotStore::open(state.path()).unwrap();
+        let mut snapshot = snapshot_of(&worker, "||a.example^\n", ListFormat::Auto).await;
+        let group_ip = |index: u32| IpAddr::from((0x0A00_0000 + index).to_be_bytes());
+        let list_with_groups = |count: u32| {
+            Arc::new(CompiledList {
+                fast: Default::default(),
+                hosts: HostRules {
+                    ips: (0..count).map(group_ip).collect(),
+                    entries: Vec::new(),
+                },
+                slow: Vec::new(),
+                regex_failed: 0,
+            })
+        };
+        let unlimited = CompileOptions {
+            slow_rule_budget: usize::MAX / 2,
+            ..caps()
+        };
+
+        snapshot.list = list_with_groups(MAX_HOST_GROUPS as u32);
+        store.save(clone_of(&snapshot)).await.unwrap();
+        store.flush().await;
+        let path = store.path_for(SOURCE).unwrap();
+        assert!(load(&path, &unlimited).is_ok());
+
+        snapshot.meta.fingerprint += 1;
+        snapshot.list = list_with_groups(MAX_HOST_GROUPS as u32 + 1);
+        store.save(clone_of(&snapshot)).await.unwrap();
+        store.flush().await;
+        let error = load(&path, &unlimited).err().expect("over the cap");
 
         assert!(matches!(error, SnapshotError::TooLarge(_)), "{error:?}");
     }
@@ -2129,36 +2230,98 @@ ads.*.tracker
     }
 
     #[tokio::test]
-    async fn a_failed_directory_sync_keeps_the_file_and_the_retry_writes_nothing_more() {
+    async fn the_sync_of_a_new_directory_that_failed_is_retried_before_anything_is_written() {
+        let worker = CompileWorker::spawn().unwrap();
         let state = TestDir::new("snap");
-        let size = size_of_a_good_file(MIXED).await;
-        let faults = Faults {
+        let files = TestFiles::new();
+        let base = state.path().join("deep");
+        let store = SnapshotStore::open_with(&base, files.clone()).unwrap();
+        files.set_faults(Faults {
             fail_dir_sync: true,
             ..Faults::default()
-        };
+        });
 
-        let (store, files, left) = save_with_faults(&state, MIXED, faults).await;
+        // The directories are created, the sync of their parents fails, nothing is written.
+        for _ in 0..2 {
+            store
+                .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+                .await
+                .unwrap_err();
+        }
 
-        // The new directory's parent could not be synced, so nothing was written.
         assert_eq!(store.bytes_written(), 0);
-        assert!(left.is_empty());
-
-        // The directory exists now. The file sync of the final directory fails: the file is
-        // in place and counted once.
-        let worker = CompileWorker::spawn().unwrap();
-        store
-            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
-            .await
-            .unwrap_err();
-        assert_eq!(store.bytes_written(), size);
-        assert_eq!(files_in(&lists_dir(&state)).len(), 1);
+        assert!(files_in(&base.join("lists")).is_empty());
+        files.calls();
 
         files.set_faults(Faults::default());
         store
             .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
             .await
             .unwrap();
-        assert_eq!(store.bytes_written(), size);
+
+        // The directories exist, but the syncs that were owed are made before the file.
+        assert_eq!(
+            files.calls(),
+            [
+                Call::SyncDir(state.path().to_path_buf()),
+                Call::SyncDir(base.clone()),
+                Call::Rename,
+                Call::SyncDir(base.join("lists")),
+            ]
+        );
+        assert!(store.bytes_written() > 0);
+    }
+
+    #[tokio::test]
+    async fn a_directory_sync_after_the_rename_is_retried_without_writing_the_file_again() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let files = TestFiles::new();
+        let store = SnapshotStore::open_with(state.path(), files.clone()).unwrap();
+        store
+            .save(snapshot_of(&worker, "||a.example^\n", ListFormat::Auto).await)
+            .await
+            .unwrap();
+        let size_before = store.bytes_written();
+        files.calls();
+        files.set_faults(Faults {
+            fail_dir_sync: true,
+            ..Faults::default()
+        });
+
+        store
+            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+            .await
+            .unwrap_err();
+        let size_after_the_failure = store.bytes_written();
+        assert!(size_after_the_failure > size_before);
+        let path = store.path_for(SOURCE).unwrap();
+        assert!(load(&path, &caps()).is_ok(), "the file is in place");
+        files.calls();
+
+        // The same text again: the file already holds it, but the directory is not synced.
+        store
+            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+            .await
+            .unwrap_err();
+        assert_eq!(files.calls(), [Call::SyncDir(lists_dir(&state))]);
+
+        files.set_faults(Faults::default());
+        store
+            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+            .await
+            .unwrap();
+
+        assert_eq!(files.calls(), [Call::SyncDir(lists_dir(&state))]);
+        assert_eq!(store.bytes_written(), size_after_the_failure);
+
+        // Nothing is owed any more: the same text again touches no directory.
+        store
+            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+            .await
+            .unwrap();
+
+        assert_eq!(files.calls(), []);
     }
 
     #[test]

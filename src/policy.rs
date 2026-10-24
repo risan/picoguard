@@ -95,6 +95,9 @@ fn go_ip_text(address: IpAddr) -> String {
     }
 }
 
+/// Where "now" comes from when the policy is evaluated, so a test can move time by hand.
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 struct State {
     generation: u64,
     paused_until: Option<Instant>,
@@ -103,6 +106,7 @@ struct State {
 
 pub struct Policy {
     state: Mutex<State>,
+    clock: Clock,
 }
 
 impl Default for Policy {
@@ -118,13 +122,23 @@ impl Policy {
     }
 
     pub fn with_engine(engine: Arc<Engine>) -> Policy {
+        Policy::with_clock(engine, Arc::new(Instant::now))
+    }
+
+    pub fn with_clock(engine: Arc<Engine>, clock: Clock) -> Policy {
         Policy {
+            clock,
             state: Mutex::new(State {
                 generation: 0,
                 paused_until: None,
                 engine,
             }),
         }
+    }
+
+    /// The moment the policy is evaluated at.
+    pub fn now(&self) -> Instant {
+        (self.clock)()
     }
 
     /// Pausing is judged against the deadline, so it ends without an event.

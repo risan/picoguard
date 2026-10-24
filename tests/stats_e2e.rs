@@ -173,7 +173,7 @@ async fn a_queued_stream_reply_is_counted_when_it_is_written_and_only_once() {
     assert_eq!(snapshot_of(&server).counters.total, 0);
 
     let mut out = Vec::new();
-    assert!(pipeline.finish(&prepared, &mut out));
+    assert!(pipeline.finish(&prepared, &mut out).await);
 
     let counters = snapshot_of(&server).counters;
     assert_eq!((counters.total, counters.upstream), (1, 1));

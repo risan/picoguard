@@ -54,9 +54,46 @@ fn hash(name: &str) -> u64 {
 
 // ---- Compiled lists ----
 
-pub(super) struct HostGroup {
-    pub(super) ip: IpAddr,
-    pub(super) names: Vec<u64>,
+/// The low bits of a host entry hold the group (the answer IP) its name maps to; the rest is
+/// the hash of the name. One sorted array per list therefore finds a name whatever the number
+/// of groups, at 8 bytes per name and group.
+const HOST_GROUP_BITS: u32 = 10;
+const HOST_GROUP_MASK: u64 = (1 << HOST_GROUP_BITS) - 1;
+
+/// The most distinct answer IPs the host rules of one list may have.
+pub(super) const MAX_HOST_GROUPS: usize = 1 << HOST_GROUP_BITS;
+
+/// The host rules of one list.
+#[derive(Default)]
+pub(super) struct HostRules {
+    /// The answer IP of each group, in the order the groups first appeared in the list.
+    pub(super) ips: Vec<IpAddr>,
+    /// Sorted, distinct: the hash of a name with its group in the low bits.
+    pub(super) entries: Vec<u64>,
+}
+
+impl HostRules {
+    fn entry(name_hash: u64, group: usize) -> u64 {
+        (name_hash & !HOST_GROUP_MASK) | group as u64
+    }
+
+    /// True when every entry names a group that exists.
+    pub(super) fn groups_exist(&self) -> bool {
+        self.entries
+            .iter()
+            .all(|entry| ((entry & HOST_GROUP_MASK) as usize) < self.ips.len())
+    }
+
+    /// The answer IPs `name_hash` maps to, in the order the groups appeared.
+    fn ips_of(&self, name_hash: u64) -> impl Iterator<Item = &IpAddr> {
+        let first = name_hash & !HOST_GROUP_MASK;
+        let start = lower_bound(&self.entries, first);
+
+        self.entries[start..]
+            .iter()
+            .take_while(move |entry| *entry & !HOST_GROUP_MASK == first)
+            .map(|entry| &self.ips[(*entry & HOST_GROUP_MASK) as usize])
+    }
 }
 
 pub(super) struct SlowRule {
@@ -83,7 +120,7 @@ impl SlowRule {
 /// (plan D6): a refresh of another list does not rebuild it.
 pub struct CompiledList {
     pub(super) fast: [Vec<u64>; FAST_KINDS],
-    pub(super) hosts: Vec<HostGroup>,
+    pub(super) hosts: HostRules,
     pub(super) slow: Vec<SlowRule>,
     pub(super) regex_failed: u64,
 }
@@ -126,13 +163,7 @@ impl CompiledList {
 
     /// Distinct rules: plain rules, host names and slow rules.
     pub fn rule_count(&self) -> usize {
-        self.fast.iter().map(Vec::len).sum::<usize>()
-            + self
-                .hosts
-                .iter()
-                .map(|group| group.names.len())
-                .sum::<usize>()
-            + self.slow.len()
+        self.fast.iter().map(Vec::len).sum::<usize>() + self.hosts.entries.len() + self.slow.len()
     }
 
     pub fn slow_rule_count(&self) -> usize {
@@ -148,7 +179,7 @@ impl CompiledList {
 /// Collects the rules of one list. Hashes go straight into arrays; `finish` sorts them.
 pub struct ListBuilder {
     fast: [Vec<u64>; FAST_KINDS],
-    hosts: Vec<HostGroup>,
+    hosts: HostRules,
     host_index: HashMap<IpAddr, usize>,
     slow: Vec<SlowRule>,
     regex_failed: u64,
@@ -164,25 +195,36 @@ impl ListBuilder {
     pub fn new() -> ListBuilder {
         ListBuilder {
             fast: Default::default(),
-            hosts: Vec::new(),
+            hosts: HostRules::default(),
             host_index: HashMap::new(),
             slow: Vec::new(),
             regex_failed: 0,
         }
     }
 
+    /// True when the host rules already have a group for `ip`.
+    pub(super) fn has_host_group(&self, ip: IpAddr) -> bool {
+        self.host_index.contains_key(&ip)
+    }
+
+    /// Adds a rule. A host rule that would start a group past `MAX_HOST_GROUPS` is left out;
+    /// the compile worker refuses such a list before it gets here.
     pub fn add(&mut self, rule: Rule<'_>) {
         match rule {
             Rule::Host { ip, name } => {
-                let group = *self.host_index.entry(ip).or_insert_with(|| {
-                    self.hosts.push(HostGroup {
-                        ip,
-                        names: Vec::new(),
-                    });
+                let group = match self.host_index.get(&ip) {
+                    Some(group) => *group,
 
-                    self.hosts.len() - 1
-                });
-                self.hosts[group].names.push(hash(name));
+                    None if self.hosts.ips.len() < MAX_HOST_GROUPS => {
+                        self.hosts.ips.push(ip);
+                        self.host_index.insert(ip, self.hosts.ips.len() - 1);
+
+                        self.hosts.ips.len() - 1
+                    }
+
+                    None => return,
+                };
+                self.hosts.entries.push(HostRules::entry(hash(name), group));
             }
             Rule::Fast { kind, name } => self.fast[kind_index(kind)].push(hash(name)),
             Rule::Slow(rule) => match SlowRule::compile(rule) {
@@ -198,15 +240,12 @@ impl ListBuilder {
             sort_dedup(hashes);
         }
 
-        for group in self.hosts.iter_mut() {
-            sort_dedup(&mut group.names);
-        }
-
+        sort_dedup(&mut self.hosts.entries);
         if format == ListFormat::Rpz {
             self.merge_rpz_pairs();
         }
 
-        self.hosts.shrink_to_fit();
+        self.hosts.ips.shrink_to_fit();
         self.slow.shrink_to_fit();
 
         CompiledList {
@@ -273,6 +312,41 @@ fn contains_hash(sorted: &[u64], needle: u64) -> bool {
     }
 
     sorted[low..high].binary_search(&needle).is_ok()
+}
+
+/// Index of the first element of `sorted` that is not below `needle`. Found like
+/// `contains_hash` does, by estimating the position first.
+fn lower_bound(sorted: &[u64], needle: u64) -> usize {
+    const ROUNDS: usize = 6;
+
+    const LINEAR_TAIL: usize = 8;
+
+    // Everything before `low` is below `needle`; everything from `high` on is not.
+    let (mut low, mut high) = (0, sorted.len());
+    for _ in 0..ROUNDS {
+        if high - low <= LINEAR_TAIL {
+            break;
+        }
+
+        let (first, last) = (sorted[low], sorted[high - 1]);
+        if needle <= first {
+            return low;
+        }
+
+        if needle > last {
+            return high;
+        }
+
+        let share = (needle - first) as f64 / (last - first) as f64;
+        let at = low + (share * (high - low - 1) as f64) as usize;
+        if sorted[at] < needle {
+            low = at + 1;
+        } else {
+            high = at;
+        }
+    }
+
+    low + sorted[low..high].partition_point(|value| *value < needle)
 }
 
 fn sort_dedup(hashes: &mut Vec<u64>) {
@@ -802,13 +876,9 @@ impl RuleSet {
         let mut matched = false;
         let mut ips = Vec::new();
 
-        for group in self.lists.iter().flat_map(|list| &list.hosts) {
-            if !contains_hash(&group.names, name) {
-                continue;
-            }
-
+        for ip in self.lists.iter().flat_map(|list| list.hosts.ips_of(name)) {
             matched = true;
-            if !wanted(&group.ip) {
+            if !wanted(ip) {
                 if !matches!(record_type, TYPE_A | TYPE_AAAA) {
                     break;
                 }
@@ -816,8 +886,8 @@ impl RuleSet {
                 continue;
             }
 
-            if !ips.contains(&group.ip) {
-                ips.push(group.ip);
+            if !ips.contains(ip) {
+                ips.push(*ip);
             }
 
             if ips.len() > MAX_HOST_IPS {
@@ -955,10 +1025,10 @@ mod tests {
 
     #[test]
     fn a_name_with_more_addresses_than_the_cap_is_cut_one_past_it() {
-        let many_v4: String = (0..1000)
+        let many_v4: String = (0..600)
             .map(|index| format!("10.0.{}.{} big.example\n", index / 256, index % 256))
             .collect();
-        let many_v6: String = (0..1000)
+        let many_v6: String = (0..400)
             .map(|index| format!("2001:db8::{index:x} big.example\n"))
             .collect();
         let engine = adblock(&format!("{many_v4}{many_v6}1.1.1.1 few.example\n"));
@@ -1003,6 +1073,71 @@ mod tests {
                 ips: ips(&["1.2.3.4"])
             }
         );
+    }
+
+    /// A hosts list with `groups` distinct IPv4 answer IPs and 3000 names; the first name
+    /// maps to the first IP only.
+    fn hosts_list_with_groups(groups: usize) -> Engine {
+        let text: String = (0..3000)
+            .map(|index| {
+                let group = index % groups;
+
+                format!(
+                    "10.{}.{}.{} name{index}.example\n",
+                    group / 65_536,
+                    group / 256 % 256,
+                    group % 256
+                )
+            })
+            .collect();
+
+        adblock(&text)
+    }
+
+    /// The time `lookups` queries take, the best of a few rounds.
+    fn time_of(
+        engine: &Engine,
+        lookups: usize,
+        record_type: u16,
+        name: impl Fn(usize) -> String,
+    ) -> std::time::Duration {
+        (0..5)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                for index in 0..lookups {
+                    std::hint::black_box(engine.check(&name(index), record_type, false));
+                }
+
+                started.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_lookup_costs_the_same_with_one_host_group_or_the_most_groups() {
+        const LOOKUPS: usize = 20_000;
+        let one_group = hosts_list_with_groups(1);
+        let most_groups = hosts_list_with_groups(1024);
+        let unrelated = |index| format!("other{index}.example");
+        let listed_for_ipv4_only = |index| format!("name{}.example", index % 3000);
+
+        for (what, record_type, name) in [
+            (
+                "unrelated names",
+                TYPE_A,
+                &unrelated as &dyn Fn(usize) -> String,
+            ),
+            ("opposite family", TYPE_AAAA, &listed_for_ipv4_only),
+        ] {
+            let baseline = time_of(&one_group, LOOKUPS, record_type, name);
+            let with_groups = time_of(&most_groups, LOOKUPS, record_type, name);
+
+            assert!(
+                with_groups < baseline * 4,
+                "{what}: {with_groups:?} with 1024 groups against {baseline:?} with one"
+            );
+        }
     }
 
     #[test]
