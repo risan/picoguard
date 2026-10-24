@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use picoguard::dns::wire::Name;
 use picoguard::stats::{Event, QueryResult, Stats, StatsSettings};
 
 struct CountingAllocator;
@@ -38,13 +39,13 @@ const NAMES: usize = 10;
 const LOG_ENTRIES: usize = 100;
 
 /// Every name has the same length, so a ring slot warmed with one name holds any other.
-fn names_for(queries: usize) -> Vec<String> {
+fn names_for(queries: usize) -> Vec<Name> {
     (0..queries)
-        .map(|number| format!("name{:02}.example", number % NAMES))
+        .map(|number| Name::from_text(&format!("name{:02}.example", number % NAMES)).unwrap())
         .collect()
 }
 
-fn record_all(stats: &Stats, names: &[String]) {
+fn record_all(stats: &Stats, names: &[Name]) {
     for (number, name) in names.iter().enumerate() {
         let result = if (number / NAMES).is_multiple_of(2) {
             QueryResult::BlockedRequest

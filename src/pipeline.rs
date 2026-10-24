@@ -9,7 +9,6 @@
 //! 7. cache insert and the client reply.
 
 use std::collections::HashMap;
-use std::fmt::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,8 +38,6 @@ const PRIVATE_NETWORKS: [&str; 7] = [
 ];
 const IPV4_REVERSE_LABELS: usize = 6;
 const IPV6_REVERSE_LABELS: usize = 34;
-/// Longest name text the statistics see; a name with many escapes is cut.
-const STATS_NAME_BYTES: usize = 256;
 
 /// What the steps that need no waiting settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,40 +69,6 @@ impl Asker {
             client,
             started: Instant::now(),
         }
-    }
-}
-
-/// A name as text in a fixed buffer, so recording a query allocates nothing.
-struct NameText {
-    bytes: [u8; STATS_NAME_BYTES],
-    len: usize,
-}
-
-impl NameText {
-    fn of(name: &Name) -> NameText {
-        let mut text = NameText {
-            bytes: [0; STATS_NAME_BYTES],
-            len: 0,
-        };
-        let _ = write!(text, "{name}");
-
-        text
-    }
-
-    fn as_str(&self) -> &str {
-        // The text of a name is ASCII, so a cut never splits a character.
-        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or_default()
-    }
-}
-
-impl fmt::Write for NameText {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        let room = STATS_NAME_BYTES - self.len;
-        let kept = text.len().min(room);
-        self.bytes[self.len..self.len + kept].copy_from_slice(&text.as_bytes()[..kept]);
-        self.len += kept;
-
-        Ok(())
     }
 }
 
@@ -612,11 +575,9 @@ impl Pipeline {
     }
 
     fn record(&self, asker: &Asker, query: &Query<'_>, result: QueryResult, server: Option<u8>) {
-        let name = NameText::of(&query.question.name);
-
         self.stats.record(&Event {
             client: asker.client,
-            qname: name.as_str(),
+            qname: &query.question.name,
             qtype: query.question.qtype,
             result,
             upstream: server,
@@ -1055,23 +1016,6 @@ mod tests {
 
     fn address_of(text: &str) -> Option<IpAddr> {
         reverse_address(&Name::from_text(text).unwrap())
-    }
-
-    #[test]
-    fn a_name_text_for_the_statistics_is_cut_when_escapes_make_it_long() {
-        let short = NameText::of(&Name::from_text("Www.Example.COM.").unwrap());
-        let mut wire = Vec::new();
-        for _ in 0..3 {
-            wire.push(60);
-            wire.extend_from_slice(&[0xff; 60]);
-        }
-        wire.push(0);
-        let (name, _) = crate::dns::wire::read_name(&wire, 0).unwrap();
-        let long = NameText::of(&name);
-
-        assert_eq!(short.as_str(), "www.example.com");
-        assert_eq!(long.as_str().len(), STATS_NAME_BYTES);
-        assert!(long.as_str().starts_with("\\255\\255"));
     }
 
     #[test]

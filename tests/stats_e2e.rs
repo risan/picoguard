@@ -224,3 +224,49 @@ async fn a_reply_that_cannot_be_rebuilt_for_the_client_is_counted_as_an_error() 
     assert_eq!((counters.total, counters.errors), (1, 1));
     assert_eq!(counters.upstream, 0);
 }
+
+/// An ANY query (refused locally, so no upstream is needed) for a name of three labels whose
+/// bytes print as `\255`: the text is 720 characters long. Names for different `last` bytes
+/// share their first 716.
+fn long_text_query(last: u8) -> Vec<u8> {
+    let mut query = vec![0x33, 0x33, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label_length in [60, 60, 60] {
+        query.push(label_length);
+        query.extend(std::iter::repeat_n(0xff, usize::from(label_length)));
+    }
+    *query.last_mut().unwrap() = last;
+    query.extend_from_slice(&[0, 0, 255, 0, 1]);
+
+    query
+}
+
+#[tokio::test]
+async fn names_that_differ_only_beyond_the_displayed_text_are_counted_apart() {
+    let upstream = scripted_upstream().await;
+    let server = start(&config_for(&upstream), engine_of(&[], &[])).await;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    for last in [1, 2, 1, 2] {
+        socket
+            .send_to(&long_text_query(last), server.udp)
+            .await
+            .unwrap();
+        socket.recv_from(&mut [0u8; 512]).await.unwrap();
+    }
+
+    let snapshot = snapshot_of(&server);
+    let counts: Vec<u64> = snapshot
+        .top_queried
+        .iter()
+        .map(|entry| entry.count)
+        .collect();
+    assert_eq!(counts, [2, 2], "one entry per name");
+    for entry in &snapshot.top_queried {
+        assert!(
+            entry.key.ends_with('\u{2026}'),
+            "the cut is marked: {}",
+            entry.key
+        );
+        assert!(entry.key.len() < 300);
+    }
+}
