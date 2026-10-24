@@ -71,6 +71,7 @@ fn outcome(engine: &Engine, query: &Query) -> Outcome {
             let answer = match blocked_answer(type_code(&query.query_type), &ips) {
                 BlockedAnswer::NoData => "nodata".to_string(),
                 BlockedAnswer::Empty => "empty".to_string(),
+                BlockedAnswer::TooMany => "toomany".to_string(),
                 BlockedAnswer::Ips(ips) => ips
                     .iter()
                     .map(IpAddr::to_string)

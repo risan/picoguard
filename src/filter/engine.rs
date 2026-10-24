@@ -312,12 +312,18 @@ fn fast_key(rule: &NetworkRule) -> Option<(usize, u64)> {
 
 // ---- Decisions ----
 
+/// The most answer IPs one name gets from host rules. A hostile list can map one name to
+/// hundreds of thousands of addresses; nothing past this is collected or copied.
+pub const MAX_HOST_IPS: usize = 256;
+
 /// What the engine decides for one input and record type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Pass,
     /// Blocked. `ips` are the answer IPs of host rules of the checked address family, in
-    /// list order without duplicates; empty for network rules and other host rules.
+    /// list order without duplicates; empty for network rules and other host rules. At most
+    /// `MAX_HOST_IPS + 1` of them: the extra one marks a list that had more (see
+    /// [`BlockedAnswer::TooMany`]).
     Block {
         ips: Vec<IpAddr>,
     },
@@ -331,6 +337,8 @@ pub enum BlockedAnswer {
     Empty,
     /// NOERROR with the fake SOA.
     NoData,
+    /// The host rules gave more than `MAX_HOST_IPS` addresses; no complete answer is built.
+    TooMany,
 }
 
 /// `query_type` is the type of the original question, `ips` the IPs of a [`Decision::Block`].
@@ -344,15 +352,14 @@ pub fn blocked_answer(query_type: u16, ips: &[IpAddr]) -> BlockedAnswer {
         TYPE_AAAA => Some(IpAddr::from([0u16; 8])),
         _ => None,
     };
-    let ips: Vec<IpAddr> = if ips.is_empty() {
-        null_ip.into_iter().collect()
-    } else {
-        ips.to_vec()
-    };
+    if ips.len() > MAX_HOST_IPS {
+        return BlockedAnswer::TooMany;
+    }
 
-    let answer: Vec<IpAddr> = match query_type {
-        TYPE_A if ips.iter().all(IpAddr::is_ipv4) => ips,
-        TYPE_AAAA => ips.into_iter().filter(IpAddr::is_ipv6).collect(),
+    let answer: Vec<IpAddr> = match (query_type, null_ip) {
+        (_, Some(null_ip)) if ips.is_empty() => vec![null_ip],
+        (TYPE_A, _) if ips.iter().all(IpAddr::is_ipv4) => ips.to_vec(),
+        (TYPE_AAAA, _) => ips.iter().filter(|ip| ip.is_ipv6()).copied().collect(),
         _ => Vec::new(),
     };
 
@@ -782,31 +789,43 @@ impl RuleSet {
         best.get()
     }
 
-    /// The answer IPs of the host rules that match `host`, or `None` without a match.
+    /// The answer IPs of the host rules that match `host`, or `None` without a match. Only
+    /// addresses of the family asked for are collected, and collecting stops one past
+    /// `MAX_HOST_IPS`.
     fn host_rules(&self, host: &str, record_type: u16) -> Option<Vec<IpAddr>> {
         let name = hash(host);
+        let wanted = |ip: &IpAddr| match record_type {
+            TYPE_A => ip.is_ipv4(),
+            TYPE_AAAA => ip.is_ipv6(),
+            _ => false,
+        };
         let mut matched = false;
-        let mut v4 = Vec::new();
-        let mut v6 = Vec::new();
-        for list in &self.lists {
-            for group in &list.hosts {
-                if !contains_hash(&group.names, name) {
-                    continue;
+        let mut ips = Vec::new();
+
+        for group in self.lists.iter().flat_map(|list| &list.hosts) {
+            if !contains_hash(&group.names, name) {
+                continue;
+            }
+
+            matched = true;
+            if !wanted(&group.ip) {
+                if !matches!(record_type, TYPE_A | TYPE_AAAA) {
+                    break;
                 }
 
-                matched = true;
-                let ips = if group.ip.is_ipv4() { &mut v4 } else { &mut v6 };
-                if !ips.contains(&group.ip) {
-                    ips.push(group.ip);
-                }
+                continue;
+            }
+
+            if !ips.contains(&group.ip) {
+                ips.push(group.ip);
+            }
+
+            if ips.len() > MAX_HOST_IPS {
+                break;
             }
         }
 
-        matched.then(|| match record_type {
-            TYPE_A => v4,
-            TYPE_AAAA => v6,
-            _ => Vec::new(),
-        })
+        matched.then_some(ips)
     }
 }
 
@@ -932,6 +951,74 @@ mod tests {
             blocked_answer(TYPE_AAAA, &mapped),
             BlockedAnswer::Ips(mapped)
         );
+    }
+
+    #[test]
+    fn a_name_with_more_addresses_than_the_cap_is_cut_one_past_it() {
+        let many_v4: String = (0..1000)
+            .map(|index| format!("10.0.{}.{} big.example\n", index / 256, index % 256))
+            .collect();
+        let many_v6: String = (0..1000)
+            .map(|index| format!("2001:db8::{index:x} big.example\n"))
+            .collect();
+        let engine = adblock(&format!("{many_v4}{many_v6}1.1.1.1 few.example\n"));
+
+        let Decision::Block { ips: v4 } = engine.check("big.example", TYPE_A, false) else {
+            panic!("blocked");
+        };
+        let Decision::Block { ips: v6 } = engine.check("big.example", TYPE_AAAA, false) else {
+            panic!("blocked");
+        };
+
+        assert_eq!(v4.len(), MAX_HOST_IPS + 1);
+        assert!(v4.iter().all(IpAddr::is_ipv4));
+        assert_eq!(v6.len(), MAX_HOST_IPS + 1);
+        assert!(v6.iter().all(IpAddr::is_ipv6));
+        assert_eq!(
+            engine.check("big.example", TYPE_HTTPS, false),
+            Decision::Block { ips: Vec::new() }
+        );
+        assert_eq!(
+            engine.check("few.example", TYPE_A, false),
+            Decision::Block {
+                ips: ips(&["1.1.1.1"])
+            }
+        );
+    }
+
+    #[test]
+    fn the_same_address_in_several_lists_counts_once() {
+        let compile = |text: &str| Arc::new(CompiledList::from_text(ListFormat::Adblock, text).0);
+        let engine = Engine::new(
+            vec![
+                compile("1.2.3.4 a.example\n"),
+                compile("1.2.3.4 a.example\n"),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            engine.check("a.example", TYPE_A, false),
+            Decision::Block {
+                ips: ips(&["1.2.3.4"])
+            }
+        );
+    }
+
+    #[test]
+    fn blocked_answer_gives_up_past_the_cap_instead_of_copying() {
+        let at_cap: Vec<IpAddr> = (0..MAX_HOST_IPS as u32)
+            .map(|index| IpAddr::from(index.to_be_bytes()))
+            .collect();
+        let mut past_cap = at_cap.clone();
+        past_cap.push(IpAddr::from([9, 9, 9, 9]));
+
+        assert_eq!(
+            blocked_answer(TYPE_A, &at_cap),
+            BlockedAnswer::Ips(at_cap.clone())
+        );
+        assert_eq!(blocked_answer(TYPE_A, &past_cap), BlockedAnswer::TooMany);
+        assert_eq!(blocked_answer(TYPE_AAAA, &past_cap), BlockedAnswer::TooMany);
     }
 
     #[test]

@@ -127,20 +127,15 @@ impl<'q, 'a> Reply<'q, 'a> {
         };
         let total_len = HEADER_LEN + self.query.question_bytes().len() + answers_len + opt_len;
 
-        if self.protocol == Protocol::Tcp && total_len > MAX_MESSAGE_LEN {
-            self.error(rcode::SERVFAIL, out);
+        if total_len > MAX_MESSAGE_LEN
+            || self.protocol == Protocol::Udp && total_len > self.udp_limit()
+        {
+            self.too_big(out);
 
             return;
         }
 
         self.begin(rcode::NOERROR, out);
-
-        if self.protocol == Protocol::Udp && total_len > self.udp_limit() {
-            out[2..4].copy_from_slice(&(self.client_flags() | flags::TC).to_be_bytes());
-            self.end(out, 0);
-
-            return;
-        }
 
         for address in addresses.iter().filter(in_family) {
             match address {
@@ -154,6 +149,20 @@ impl<'q, 'a> Reply<'q, 'a> {
             }
         }
 
+        self.end(out, 0);
+    }
+
+    /// The reply for an answer that cannot be given whole: an empty reply with TC over UDP
+    /// (the client retries over TCP), SERVFAIL over TCP.
+    pub fn too_big(&self, out: &mut Vec<u8>) {
+        if self.protocol == Protocol::Tcp {
+            self.error(rcode::SERVFAIL, out);
+
+            return;
+        }
+
+        self.begin(rcode::NOERROR, out);
+        out[2..4].copy_from_slice(&(self.client_flags() | flags::TC).to_be_bytes());
         self.end(out, 0);
     }
 

@@ -10,9 +10,12 @@ use common::harness::{
     FakeUpstream, Running, a_record, answering_upstream, ask, config_for, engine_of, fake_upstream,
     name, reply_to, start,
 };
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, Query as DnsQuery};
 use hickory_proto::rr::{RData, Record, RecordType};
+use picoguard::dns::build::Protocol;
 use picoguard::filter::engine::Engine;
+use picoguard::pipeline::Pipeline;
+use picoguard::policy::Policy;
 
 const BLOCKED_TTL: u32 = 10;
 
@@ -352,4 +355,60 @@ async fn the_answer_address_of_a_reply_is_checked_with_the_go_text_form() {
     let reply = ask(&server, "mapped.example.", RecordType::AAAA).await;
 
     assert_eq!(answer_addresses(&reply), ["::"]);
+}
+
+/// One name mapped to 200,000 different addresses used to cost a quadratic duplicate scan on
+/// every query. Now the collection stops one past the cap and the reply is TC (UDP) or
+/// SERVFAIL (TCP).
+#[tokio::test]
+async fn a_name_with_200_000_host_addresses_is_answered_fast_with_tc_or_servfail() {
+    const ADDRESSES: u32 = 200_000;
+    let hosts: String = (0..ADDRESSES)
+        .map(|index| {
+            let [a, b, c, d] = (0x0A00_0000 + index).to_be_bytes();
+
+            format!("{a}.{b}.{c}.{d} big.example\n")
+        })
+        .collect();
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let engine = engine_of(&[&hosts, "||plain.example^\n"], &[]);
+    let config = config_for(&upstream);
+    let server = start(&config, Arc::clone(&engine)).await;
+    let started = Instant::now();
+
+    let mut udp_replies = Vec::new();
+    for _ in 0..20 {
+        udp_replies.push(ask(&server, "big.example.", RecordType::A).await);
+    }
+
+    for reply in &udp_replies {
+        assert!(reply.metadata.truncation);
+        assert!(reply.answers.is_empty());
+    }
+
+    let pipeline = Pipeline::new(&config, Arc::new(Policy::with_engine(engine))).unwrap();
+    let mut query = Message::query();
+    query.add_query(DnsQuery::query(name("big.example."), RecordType::A));
+    let query = query.to_vec().unwrap();
+    let mut out = Vec::new();
+    for _ in 0..20 {
+        assert!(
+            pipeline
+                .answer(query.clone(), Protocol::Tcp, &mut out)
+                .await
+        );
+        let reply = Message::from_vec(&out).unwrap();
+        assert_eq!(u16::from(reply.metadata.response_code), 2, "SERVFAIL");
+    }
+
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        upstream.count(),
+        0,
+        "a blocked name never reaches the upstream"
+    );
 }

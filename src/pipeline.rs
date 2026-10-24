@@ -473,6 +473,7 @@ impl Pipeline {
             BlockedAnswer::Ips(addresses) => reply.addresses(&addresses, self.blocked_ttl, out),
             BlockedAnswer::Empty => reply.error(rcode::NOERROR, out),
             BlockedAnswer::NoData => reply.blocked(self.blocked_ttl, out),
+            BlockedAnswer::TooMany => reply.too_big(out),
         }
     }
 
@@ -851,7 +852,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_blocked_decision_with_many_ips_is_recomputed_instead_of_held_in_the_cache() {
-        let host_rules: String = (0..300)
+        let host_rules: String = (0..200)
             .map(|index| format!("10.0.{}.{} 9.9.9.9\n", index / 256, index % 256))
             .collect();
         let mut config = Config::default();
@@ -879,12 +880,12 @@ mod tests {
         let mut out = Vec::new();
 
         pipeline.deliver(&query, &reply, &delivery, &mut out);
-        assert_eq!(parse(&out).answers.len(), 300);
+        assert_eq!(parse(&out).answers.len(), 200);
         assert_eq!(pipeline.cache.lock().unwrap().bytes(), bytes_without_memo);
 
         let quick = pipeline.answer_quickly(&request, Protocol::Tcp, &mut out);
         assert_eq!(quick, Quick::Replied);
-        assert_eq!(parse(&out).answers.len(), 300);
+        assert_eq!(parse(&out).answers.len(), 200);
         assert_eq!(pipeline.cache.lock().unwrap().bytes(), bytes_without_memo);
     }
 }
