@@ -77,7 +77,7 @@ pub struct ClientSet {
 }
 
 impl ClientSet {
-    fn new(entries: &[String]) -> ClientSet {
+    pub fn new(entries: &[String]) -> ClientSet {
         let mut set = ClientSet::default();
         for entry in entries {
             match parse_client_net(entry) {
@@ -96,6 +96,13 @@ impl ClientSet {
 
     pub fn is_empty(&self) -> bool {
         self.nets.is_empty() && self.names.is_empty()
+    }
+
+    /// The entries in text form; `ClientSet::new` turns them back into the same set.
+    pub fn entries(&self) -> Vec<String> {
+        let nets = self.nets.iter().map(|(ip, bits)| format!("{ip}/{bits}"));
+
+        nets.chain(self.names.iter().cloned()).collect()
     }
 }
 
