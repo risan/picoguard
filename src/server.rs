@@ -15,7 +15,7 @@ use tokio::time::timeout;
 use crate::budget::{Budget, Charge};
 use crate::config::{Cidr, Config, ServerConfig, is_allowed};
 use crate::dns::build::Protocol;
-use crate::pipeline::{Pipeline, Quick};
+use crate::pipeline::{Pipeline, Prepared, Quick};
 
 const UDP_RECEIVE_BUFFER: usize = 4096;
 const TCP_BACKLOG: i32 = 128;
@@ -204,12 +204,12 @@ fn send_now(socket: &UdpSocket, reply: &[u8], peer: SocketAddr) -> bool {
 async fn answer_udp(
     pipeline: Arc<Pipeline>,
     socket: Arc<UdpSocket>,
-    mut request: Vec<u8>,
+    request: Vec<u8>,
     peer: SocketAddr,
 ) {
     let mut out = Vec::new();
 
-    if pipeline.answer(&mut request, Protocol::Udp, &mut out).await {
+    if pipeline.answer(request, Protocol::Udp, &mut out).await {
         send_now(&socket, &out, peer);
     }
 }
@@ -246,11 +246,12 @@ async fn serve_tcp(
     }
 }
 
-/// A framed reply waiting for the writer. It holds its share of the byte
-/// budgets and its pipelining slot until it has been written.
+/// A reply waiting for the writer. It is decided only when the writer gets to it (D20), so
+/// a policy change or the end of a pause while it waits behind a slow client counts. It holds
+/// its share of the connection's byte budget and its pipelining slot until it has been written.
 struct QueuedReply {
-    frame: Vec<u8>,
-    _charges: Option<(Charge, Charge)>,
+    prepared: Prepared,
+    _charge: Option<Charge>,
     _slot: OwnedSemaphorePermit,
 }
 
@@ -266,8 +267,9 @@ async fn serve_connection(
     let queue_budget = Budget::new(settings.queue_bytes);
     let (queue, replies) = mpsc::unbounded_channel();
     let write_timeout = settings.write_timeout;
+    let writing = Arc::clone(&pipeline);
     let mut writer = tokio::spawn(async move {
-        write_replies(write_half, replies, write_timeout).await;
+        write_replies(write_half, replies, write_timeout, &writing).await;
         drop(connection_slot);
     });
 
@@ -326,45 +328,30 @@ where
 
 async fn answer_tcp(
     pipeline: Arc<Pipeline>,
-    mut request: Vec<u8>,
+    request: Vec<u8>,
     slot: OwnedSemaphorePermit,
     queue: mpsc::UnboundedSender<QueuedReply>,
     queue_budget: Arc<Budget>,
 ) {
-    let mut out = Vec::new();
-    if !pipeline.answer(&mut request, Protocol::Tcp, &mut out).await {
+    let Some(prepared) = pipeline.prepare(request, Protocol::Tcp).await else {
         return;
-    }
+    };
 
-    let framed = frame_of(&out);
-    let charges = framed.as_ref().and_then(|frame| {
-        pipeline
-            .budget()
-            .try_charge(frame.len())
-            .zip(queue_budget.try_charge(frame.len()))
-    });
+    // A reply the connection's queue cannot hold is replaced by a SERVFAIL of a few dozen
+    // bytes, which is not charged.
+    let (prepared, charge) = match queue_budget.try_charge(prepared.held_bytes()) {
+        Some(charge) => (prepared, Some(charge)),
 
-    // A reply that cannot be framed or does not fit is replaced by a SERVFAIL
-    // of a few dozen bytes, which is not charged.
-    let frame = match framed {
-        Some(frame) if charges.is_some() => frame,
+        None => match pipeline.failure_of(&prepared) {
+            Some(failure) => (failure, None),
 
-        _ => {
-            if !pipeline.servfail(&request, Protocol::Tcp, &mut out) {
-                return;
-            }
-
-            let Some(frame) = frame_of(&out) else {
-                return;
-            };
-
-            frame
-        }
+            None => return,
+        },
     };
 
     let _ = queue.send(QueuedReply {
-        frame,
-        _charges: charges,
+        prepared,
+        _charge: charge,
         _slot: slot,
     });
 }
@@ -380,18 +367,41 @@ fn frame_of(message: &[u8]) -> Option<Vec<u8>> {
     Some(frame)
 }
 
-/// Writes queued replies in order. A write that takes longer than
-/// `write_timeout`, or fails, ends the connection: the receiver is dropped and
+/// The frame to write for `prepared`, decided now, with its charge on the pending-bytes
+/// budget. A reply that cannot be framed or does not fit is replaced by a SERVFAIL, which is
+/// not charged.
+fn frame_for(pipeline: &Pipeline, prepared: &Prepared) -> Option<(Vec<u8>, Option<Charge>)> {
+    let mut out = Vec::new();
+
+    if pipeline.finish(prepared, &mut out)
+        && let Some(frame) = frame_of(&out)
+        && let Some(charge) = pipeline.budget().try_charge(frame.len())
+    {
+        return Some((frame, Some(charge)));
+    }
+
+    let failure = pipeline.failure_of(prepared)?;
+    pipeline.finish(&failure, &mut out);
+
+    Some((frame_of(&out)?, None))
+}
+
+/// Writes queued replies in order, deciding each one when its turn comes. A write that takes
+/// longer than `write_timeout`, or fails, ends the connection: the receiver is dropped and
 /// with it everything still queued.
 async fn write_replies<W>(
     mut writer: W,
     mut replies: mpsc::UnboundedReceiver<QueuedReply>,
     write_timeout: Duration,
+    pipeline: &Pipeline,
 ) where
     W: AsyncWrite + Unpin,
 {
     while let Some(reply) = replies.recv().await {
-        let written = timeout(write_timeout, writer.write_all(&reply.frame)).await;
+        let Some((frame, _charge)) = frame_for(pipeline, &reply.prepared) else {
+            continue;
+        };
+        let written = timeout(write_timeout, writer.write_all(&frame)).await;
 
         if !matches!(written, Ok(Ok(()))) {
             return;
@@ -404,6 +414,11 @@ mod tests {
     use tokio::io::duplex;
 
     use super::*;
+    use crate::dns::test_util::parse;
+    use crate::filter::engine::{CompiledList, Engine};
+    use crate::filter::parse::ListFormat;
+    use crate::policy::Policy;
+    use crate::upstream::test_dns::{FakeDns, fake_dns, query_for};
 
     fn ipv6_available() -> bool {
         std::net::UdpSocket::bind("[::1]:0").is_ok()
@@ -514,43 +529,167 @@ mod tests {
         assert!(frame_of(&vec![7u8; 65_536]).is_none());
     }
 
-    fn queued(frame: Vec<u8>) -> QueuedReply {
+    fn queued(prepared: Prepared) -> QueuedReply {
         let slot = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
 
         QueuedReply {
-            frame,
-            _charges: None,
+            prepared,
+            _charge: None,
             _slot: slot,
         }
     }
 
+    fn fixed(reply: Vec<u8>) -> QueuedReply {
+        queued(Prepared::fixed(reply))
+    }
+
+    /// A pipeline whose upstream answers every A question with 1.2.3.4.
+    async fn pipeline_over(policy: &Arc<Policy>) -> (Arc<Pipeline>, FakeDns) {
+        let upstream = fake_dns(vec!["1.2.3.4".parse().unwrap()], Vec::new()).await;
+        let mut config = Config::default();
+        config.upstream.servers = vec![format!("udp://{}", upstream.address)];
+
+        (
+            Pipeline::new(&config, Arc::clone(policy)).unwrap(),
+            upstream,
+        )
+    }
+
+    fn blocking(rules: &str) -> Arc<Engine> {
+        let (list, _) = CompiledList::from_text(ListFormat::Adblock, rules);
+
+        Arc::new(Engine::new(vec![Arc::new(list)], Vec::new()))
+    }
+
+    /// Writes `replies` to a peer that starts reading only when this is awaited, so the
+    /// writer is stuck on the first frame until then, and returns the messages it got.
+    async fn written_to_a_slow_peer(
+        pipeline: &Pipeline,
+        replies: mpsc::UnboundedReceiver<QueuedReply>,
+    ) -> Vec<Vec<u8>> {
+        let (writer, mut peer) = duplex(8);
+        let mut received = Vec::new();
+        let (_, read) = tokio::join!(
+            write_replies(writer, replies, Duration::from_secs(5), pipeline),
+            peer.read_to_end(&mut received)
+        );
+        read.unwrap();
+
+        let mut messages = Vec::new();
+        let mut rest = &received[..];
+        while !rest.is_empty() {
+            let length = usize::from(u16::from_be_bytes([rest[0], rest[1]]));
+            messages.push(rest[2..2 + length].to_vec());
+            rest = &rest[2 + length..];
+        }
+
+        messages
+    }
+
+    fn first_address(message: &[u8]) -> String {
+        parse(message).answers[0].data.to_string()
+    }
+
     #[tokio::test]
     async fn replies_are_written_in_order() {
-        let (writer, mut peer) = duplex(4096);
+        let policy = Arc::new(Policy::new());
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
         let (queue, replies) = mpsc::unbounded_channel();
-        queue.send(queued(vec![1, 2, 3])).unwrap();
-        queue.send(queued(vec![4, 5])).unwrap();
+        queue.send(fixed(vec![1, 2, 3])).unwrap();
+        queue.send(fixed(vec![4, 5])).unwrap();
         drop(queue);
 
-        write_replies(writer, replies, Duration::from_secs(1)).await;
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
 
-        let mut received = Vec::new();
-        peer.read_to_end(&mut received).await.unwrap();
-        assert_eq!(received, [1, 2, 3, 4, 5]);
+        assert_eq!(messages, [vec![1, 2, 3], vec![4, 5]]);
     }
 
     #[tokio::test]
     async fn a_client_that_stops_reading_hits_the_write_deadline_and_frees_the_queue() {
+        let policy = Arc::new(Policy::new());
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
         let (writer, _peer_that_never_reads) = duplex(8);
         let (queue, replies) = mpsc::unbounded_channel();
-        queue.send(queued(vec![0; 1000])).unwrap();
-        queue.send(queued(vec![0; 1000])).unwrap();
+        queue.send(fixed(vec![0; 1000])).unwrap();
+        queue.send(fixed(vec![0; 1000])).unwrap();
         let started = std::time::Instant::now();
 
-        write_replies(writer, replies, Duration::from_millis(100)).await;
+        write_replies(writer, replies, Duration::from_millis(100), &pipeline).await;
 
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(queue.send(queued(vec![1])).is_err(), "receiver was dropped");
+        assert!(queue.send(fixed(vec![1])).is_err(), "receiver was dropped");
+    }
+
+    #[tokio::test]
+    async fn a_queued_upstream_reply_is_filtered_when_it_is_written_not_when_it_arrived() {
+        let policy = Arc::new(Policy::new());
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
+        let (queue, replies) = mpsc::unbounded_channel();
+        queue.send(fixed(vec![0; 1000])).unwrap();
+        for name in ["ads.example.", "fine.example."] {
+            let prepared = pipeline.prepare(query_for(name), Protocol::Tcp).await;
+            queue.send(queued(prepared.unwrap())).unwrap();
+        }
+
+        // The upstream replies have arrived and passed; now the policy changes while the
+        // writer is stuck behind the first frame.
+        policy.swap_engine(blocking("||ads.example^\n"));
+        drop(queue);
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
+
+        assert_eq!(first_address(&messages[1]), "0.0.0.0");
+        assert_eq!(first_address(&messages[2]), "1.2.3.4");
+    }
+
+    #[tokio::test]
+    async fn a_queued_cache_hit_is_filtered_when_it_is_written() {
+        let policy = Arc::new(Policy::new());
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
+        let mut out = Vec::new();
+        assert!(
+            pipeline
+                .answer(query_for("ads.example."), Protocol::Tcp, &mut out)
+                .await
+        );
+        assert_eq!(first_address(&out), "1.2.3.4");
+        let (queue, replies) = mpsc::unbounded_channel();
+        queue.send(fixed(vec![0; 1000])).unwrap();
+        let prepared = pipeline
+            .prepare(query_for("ads.example."), Protocol::Tcp)
+            .await;
+        queue.send(queued(prepared.unwrap())).unwrap();
+
+        policy.swap_engine(blocking("||ads.example^\n"));
+        drop(queue);
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
+
+        assert_eq!(first_address(&messages[1]), "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn a_queued_reply_is_filtered_again_when_a_pause_ends_while_it_waits() {
+        let policy = Arc::new(Policy::with_engine(blocking("||ads.example^\n")));
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
+        policy.pause(Duration::from_millis(300), std::time::Instant::now());
+        let (queue, replies) = mpsc::unbounded_channel();
+        queue.send(fixed(vec![0; 1000])).unwrap();
+        let prepared = pipeline
+            .prepare(query_for("ads.example."), Protocol::Tcp)
+            .await;
+        queue.send(queued(prepared.unwrap())).unwrap();
+        drop(queue);
+        assert!(
+            policy.view(std::time::Instant::now()).paused,
+            "the reply must have arrived during the pause"
+        );
+
+        while policy.view(std::time::Instant::now()).paused {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
+
+        assert_eq!(first_address(&messages[1]), "0.0.0.0");
     }
 
     #[tokio::test]

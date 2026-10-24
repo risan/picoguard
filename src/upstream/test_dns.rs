@@ -79,6 +79,7 @@ pub async fn fake_dns(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>) -> FakeDns {
             let mut reply = query[..question_end].to_vec();
             reply[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
             reply[6..8].copy_from_slice(&(rdata.len() as u16).to_be_bytes());
+            reply[10..12].copy_from_slice(&[0, 0]);
             for data in rdata {
                 reply.extend_from_slice(&[0xC0, 0x0C]);
                 reply.extend_from_slice(&asked.to_be_bytes());

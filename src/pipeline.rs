@@ -81,6 +81,42 @@ impl Delivery {
 
 type Outcome = Result<Arc<Delivery>, Failure>;
 
+/// A query that waited for everything except its decision. See `Pipeline::prepare`.
+pub struct Prepared(Inner);
+
+enum Inner {
+    /// A reply no policy can change: an error, or the answer to a malformed query.
+    Final(Vec<u8>),
+    /// The compact query, and the upstream reply it waited for (`None`: the cache answers).
+    Undecided {
+        request: Vec<u8>,
+        protocol: Protocol,
+        delivery: Option<Arc<Delivery>>,
+    },
+}
+
+impl Prepared {
+    #[cfg(test)]
+    pub(crate) fn fixed(reply: Vec<u8>) -> Prepared {
+        Prepared(Inner::Final(reply))
+    }
+
+    /// What the queued reply holds until it is written, for the byte limit of a queue. The
+    /// upstream reply is also charged to the pending-bytes budget for as long as it is held.
+    pub fn held_bytes(&self) -> usize {
+        match &self.0 {
+            Inner::Final(_) => 0,
+
+            Inner::Undecided {
+                request, delivery, ..
+            } => match delivery {
+                Some(delivery) => delivery.bytes.len(),
+                None => request.len(),
+            },
+        }
+    }
+}
+
 #[derive(Default)]
 struct Inflight {
     queries: HashMap<Vec<u8>, Vec<oneshot::Sender<Outcome>>>,
@@ -169,56 +205,136 @@ impl Pipeline {
     /// The whole pipeline for one request. Returns false when there is
     /// nothing to send. UDP overload drops the query, TCP overload answers
     /// SERVFAIL.
-    ///
-    /// Before waiting, `request` is replaced by a compact copy of what the
-    /// reply needs (see `build::compact_query`), so a padded query does not
-    /// stay in memory while the upstream is slow. It is still a query that
-    /// `servfail` accepts afterwards.
     pub async fn answer(
         self: &Arc<Pipeline>,
-        request: &mut Vec<u8>,
+        request: Vec<u8>,
         protocol: Protocol,
         out: &mut Vec<u8>,
     ) -> bool {
-        let quick = self.answer_quickly(request, protocol, out);
-        if quick != Quick::NeedsUpstream {
-            return quick == Quick::Replied;
+        match self.prepare(request, protocol).await {
+            Some(prepared) => self.finish(&prepared, out),
+            None => false,
         }
-
-        let Ok(query) = Query::parse(request) else {
-            return false;
-        };
-
-        let compact = build::compact_query(&query);
-        *request = compact;
-
-        let Ok(query) = Query::parse(request) else {
-            return false;
-        };
-
-        let reply = Reply::new(&query, self.udp_size, protocol);
-        let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
-            return self.overloaded(&reply, protocol, out);
-        };
-
-        let outcome = receiver.await;
-        if matches!(outcome, Ok(Err(Failure::Overloaded))) {
-            return self.overloaded(&reply, protocol, out);
-        }
-
-        if let Ok(Ok(delivery)) = outcome {
-            self.deliver(&query, &reply, &delivery, out);
-
-            return true;
-        }
-
-        reply.error(rcode::SERVFAIL, out);
-
-        true
     }
 
-    /// A SERVFAIL for `request`, for a reply that cannot be queued.
-    pub fn servfail(&self, request: &[u8], protocol: Protocol, out: &mut Vec<u8>) -> bool {
+    /// Steps 1 to 5: everything up to the decision. A stream reply may wait in a queue
+    /// behind a slow client, so its decision is left to `finish`, called when the reply is
+    /// about to be written (D20). `None` means there is nothing to send.
+    ///
+    /// Before waiting, the request is replaced by a compact copy of what the reply needs
+    /// (see `build::compact_query`), so a padded query does not stay in memory while the
+    /// upstream is slow.
+    pub async fn prepare(
+        self: &Arc<Pipeline>,
+        request: Vec<u8>,
+        protocol: Protocol,
+    ) -> Option<Prepared> {
+        let mut out = Vec::new();
+        let quick = self.answer_quickly(&request, protocol, &mut out);
+        if quick == Quick::Dropped {
+            return None;
+        }
+
+        let Ok(parsed) = Query::parse(&request) else {
+            // A malformed query: the header-only reply does not depend on any policy.
+            return Some(Prepared(Inner::Final(out)));
+        };
+        let compact = build::compact_query(&parsed);
+        drop(request);
+        if quick == Quick::Replied {
+            return Some(Prepared(Inner::Undecided {
+                request: compact,
+                protocol,
+                delivery: None,
+            }));
+        }
+
+        let query = Query::parse(&compact).ok()?;
+        let reply = Reply::new(&query, self.udp_size, protocol);
+        let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
+            return self
+                .overloaded(&reply, protocol, &mut out)
+                .then_some(Prepared(Inner::Final(out)));
+        };
+
+        match receiver.await {
+            Ok(Ok(delivery)) => Some(Prepared(Inner::Undecided {
+                request: compact,
+                protocol,
+                delivery: Some(delivery),
+            })),
+
+            Ok(Err(Failure::Overloaded)) => self
+                .overloaded(&reply, protocol, &mut out)
+                .then_some(Prepared(Inner::Final(out))),
+
+            _ => {
+                reply.error(rcode::SERVFAIL, &mut out);
+
+                Some(Prepared(Inner::Final(out)))
+            }
+        }
+    }
+
+    /// Steps 2 and 6 under the policy of this moment, and the reply in `out`. Returns false
+    /// when there is nothing to send.
+    pub fn finish(&self, prepared: &Prepared, out: &mut Vec<u8>) -> bool {
+        match &prepared.0 {
+            Inner::Final(bytes) => {
+                out.clear();
+                out.extend_from_slice(bytes);
+
+                true
+            }
+
+            Inner::Undecided {
+                request,
+                protocol,
+                delivery: Some(delivery),
+            } => {
+                let Ok(query) = Query::parse(request) else {
+                    return false;
+                };
+                let reply = Reply::new(&query, self.udp_size, *protocol);
+                self.deliver(&query, &reply, delivery, out);
+
+                true
+            }
+
+            // The cache entry may be gone by now; then there is no answer to give.
+            Inner::Undecided {
+                request,
+                protocol,
+                delivery: None,
+            } => {
+                self.answer_quickly(request, *protocol, out) == Quick::Replied
+                    || self.servfail(request, *protocol, out)
+            }
+        }
+    }
+
+    /// A SERVFAIL in place of `prepared`, for a reply that cannot be queued or written.
+    pub fn failure_of(&self, prepared: &Prepared) -> Option<Prepared> {
+        let mut out = Vec::new();
+
+        match &prepared.0 {
+            Inner::Final(bytes) => {
+                out.extend_from_slice(bytes);
+            }
+
+            Inner::Undecided {
+                request, protocol, ..
+            } => {
+                if !self.servfail(request, *protocol, &mut out) {
+                    return None;
+                }
+            }
+        }
+
+        Some(Prepared(Inner::Final(out)))
+    }
+
+    fn servfail(&self, request: &[u8], protocol: Protocol, out: &mut Vec<u8>) -> bool {
         let Ok(query) = Query::parse(request) else {
             return false;
         };
