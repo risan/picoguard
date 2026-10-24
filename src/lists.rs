@@ -318,7 +318,8 @@ fn remove_dot_segments(path_and_query: &str) -> String {
     }
 
     let mut result = format!("/{}", segments.join("/"));
-    if path.ends_with("/.") || path.ends_with("/..") {
+    let ends_in_dot_segment = path.ends_with("/.") || path.ends_with("/..");
+    if ends_in_dot_segment && !segments.is_empty() {
         result.push('/');
     }
 
@@ -1306,6 +1307,31 @@ mod tests {
             join("?only=query"),
             "true lists.example 8443 /a/b/list.txt?only=query"
         );
+    }
+
+    #[test]
+    fn dot_segments_at_the_root_never_produce_a_double_slash() {
+        let base = Target::parse("https://lists.example/list.txt").unwrap();
+        let join = |location: &str| base.redirect(location).unwrap().path;
+
+        for (location, expected) in [
+            (".", "/"),
+            ("./", "/"),
+            ("..", "/"),
+            ("../", "/"),
+            ("/..", "/"),
+            ("/.", "/"),
+            ("../../x.txt", "/x.txt"),
+            ("/a/../../b", "/b"),
+            ("/../../../c?q=1", "/c?q=1"),
+            ("/a/..", "/"),
+            ("/a/.", "/a/"),
+            ("/a/b/..", "/a/"),
+            ("/a/./b/../c.txt", "/a/c.txt"),
+            ("./x.txt", "/x.txt"),
+        ] {
+            assert_eq!(join(location), expected, "{location}");
+        }
     }
 
     #[test]
