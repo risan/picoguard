@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use super::wire::{CLASS_IN, HEADER_LEN, Header, Query, flags, rcode, rtype};
+use super::wire::{CLASS_IN, HEADER_LEN, Header, MAX_MESSAGE_LEN, Query, flags, rcode, rtype};
 
 const CLASSIC_UDP_LIMIT: u16 = 512;
 const OPT_RECORD_LEN: usize = 11;
@@ -153,6 +153,11 @@ impl<'q, 'a> Reply<'q, 'a> {
         }
 
         self.end(out);
+
+        // Our OPT record can be larger than the one it replaces.
+        if out.len() > MAX_MESSAGE_LEN {
+            self.error(rcode::SERVFAIL, out);
+        }
     }
 
     fn upstream_flags(&self, upstream: &[u8]) -> u16 {
@@ -775,6 +780,77 @@ mod tests {
         let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
 
         assert!(!parse(&out).metadata.truncation);
+    }
+
+    /// An upstream reply of exactly `total` bytes: one TXT answer, and the OPT
+    /// record last when `with_opt`.
+    fn reply_of_len(client: &QuerySpec, total: usize, with_opt: bool) -> Vec<u8> {
+        let mut bytes = client.bytes();
+        let question_end = if client.edns.is_some() {
+            bytes.len() - OPT_RECORD_LEN
+        } else {
+            bytes.len()
+        };
+        bytes.truncate(question_end);
+        bytes[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+        bytes[ANSWER_COUNT..ANSWER_COUNT + 2].copy_from_slice(&1u16.to_be_bytes());
+        bytes[ADDITIONAL_COUNT..HEADER_LEN].copy_from_slice(&u16::from(with_opt).to_be_bytes());
+        let opt_len = if with_opt { OPT_RECORD_LEN } else { 0 };
+        let rdata_len = total - question_end - 12 - opt_len;
+        bytes.extend_from_slice(&NAME_POINTER_TO_QUESTION);
+        bytes.extend_from_slice(&16u16.to_be_bytes());
+        bytes.extend_from_slice(&CLASS_IN.to_be_bytes());
+        bytes.extend_from_slice(&60u32.to_be_bytes());
+        bytes.extend_from_slice(&(rdata_len as u16).to_be_bytes());
+        let mut remaining = rdata_len;
+        while remaining > 0 {
+            let chunk = (remaining - 1).min(255);
+            bytes.push(chunk as u8);
+            bytes.resize(bytes.len() + chunk, b'x');
+            remaining -= 1 + chunk;
+        }
+
+        if with_opt {
+            push_opt_record(&mut bytes, 4096, false, 0);
+        }
+        assert_eq!(bytes.len(), total);
+
+        bytes
+    }
+
+    #[test]
+    fn adding_our_opt_never_pushes_a_reply_past_the_65535_byte_limit() {
+        let mut client = QuerySpec::new("big.example.com.", RecordType::TXT);
+        client.edns = Some((1232, false));
+        let cases = [
+            (65_523, false, ResponseCode::NoError),
+            (65_524, false, ResponseCode::NoError),
+            (65_525, false, ResponseCode::ServFail),
+            (65_535, false, ResponseCode::ServFail),
+            (65_535, true, ResponseCode::NoError),
+        ];
+
+        for (upstream_len, with_opt, expected) in cases {
+            let upstream = reply_of_len(&client, upstream_len, with_opt);
+
+            let out = from_upstream(&client, &upstream, Protocol::Tcp, no_aging());
+
+            assert!(out.len() <= 65_535, "{upstream_len}: {} bytes", out.len());
+            let message = parse(&out);
+            assert_eq!(message.metadata.response_code, expected, "{upstream_len}");
+            assert!(message.edns.is_some(), "{upstream_len}");
+        }
+    }
+
+    #[test]
+    fn a_client_without_edns_gets_the_largest_reply_unchanged() {
+        let client = QuerySpec::new("big.example.com.", RecordType::TXT);
+        let upstream = reply_of_len(&client, 65_535, false);
+
+        let out = from_upstream(&client, &upstream, Protocol::Tcp, no_aging());
+
+        assert_eq!(out.len(), 65_535);
+        assert_eq!(parse(&out).answers.len(), 1);
     }
 
     #[test]

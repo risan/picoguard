@@ -5,7 +5,8 @@ use std::ops::Range;
 pub const HEADER_LEN: usize = 12;
 pub const MAX_NAME_LEN: usize = 255;
 const MAX_LABEL_LEN: usize = 63;
-const MAX_MESSAGE_LEN: usize = 65535;
+/// The largest DNS message: the 16-bit length of a TCP frame.
+pub const MAX_MESSAGE_LEN: usize = 65535;
 
 pub mod rtype {
     pub const A: u16 = 1;

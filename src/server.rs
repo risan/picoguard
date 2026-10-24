@@ -336,21 +336,31 @@ async fn answer_tcp(
         return;
     }
 
-    let mut frame = frame_of(&out);
-    let charges = pipeline
-        .budget()
-        .try_charge(frame.len())
-        .zip(queue_budget.try_charge(frame.len()));
+    let framed = frame_of(&out);
+    let charges = framed.as_ref().and_then(|frame| {
+        pipeline
+            .budget()
+            .try_charge(frame.len())
+            .zip(queue_budget.try_charge(frame.len()))
+    });
 
-    // A reply that does not fit is replaced by a SERVFAIL of a few dozen
-    // bytes, which is not charged.
-    if charges.is_none() {
-        if !pipeline.servfail(&request, Protocol::Tcp, &mut out) {
-            return;
+    // A reply that cannot be framed or does not fit is replaced by a SERVFAIL
+    // of a few dozen bytes, which is not charged.
+    let frame = match framed {
+        Some(frame) if charges.is_some() => frame,
+
+        _ => {
+            if !pipeline.servfail(&request, Protocol::Tcp, &mut out) {
+                return;
+            }
+
+            let Some(frame) = frame_of(&out) else {
+                return;
+            };
+
+            frame
         }
-
-        frame = frame_of(&out);
-    }
+    };
 
     let _ = queue.send(QueuedReply {
         frame,
@@ -359,12 +369,15 @@ async fn answer_tcp(
     });
 }
 
-fn frame_of(message: &[u8]) -> Vec<u8> {
+/// The message with its 2-byte length prefix, or `None` when the length does
+/// not fit in 16 bits.
+fn frame_of(message: &[u8]) -> Option<Vec<u8>> {
+    let length = u16::try_from(message.len()).ok()?;
     let mut frame = Vec::with_capacity(message.len() + 2);
-    frame.extend_from_slice(&(message.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(message);
 
-    frame
+    Some(frame)
 }
 
 /// Writes queued replies in order. A write that takes longer than
@@ -487,6 +500,18 @@ mod tests {
 
         assert!(sent[0], "an idle socket sends");
         assert!(sent.contains(&false), "a full send buffer drops");
+    }
+
+    #[test]
+    fn a_message_is_framed_only_when_its_length_fits_in_16_bits() {
+        let largest = vec![7u8; 65_535];
+
+        let frame = frame_of(&largest).unwrap();
+
+        assert_eq!(frame.len(), 65_537);
+        assert_eq!(frame[..2], [0xFF, 0xFF]);
+        assert_eq!(frame_of(&[1, 2, 3]).unwrap(), [0, 3, 1, 2, 3]);
+        assert!(frame_of(&vec![7u8; 65_536]).is_none());
     }
 
     fn queued(frame: Vec<u8>) -> QueuedReply {
