@@ -4,6 +4,7 @@
 
 pub mod harness;
 pub mod http;
+pub mod process;
 
 use std::fs;
 use std::io::Read;

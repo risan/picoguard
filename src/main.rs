@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use picoguard::config::Config;
 use picoguard::filter::compile::CompileWorker;
@@ -10,8 +11,15 @@ use picoguard::pipeline::Pipeline;
 use picoguard::scheduler::{Scheduler, Timing};
 use picoguard::server::{self, Listeners};
 use picoguard::upstream::tls::Tls;
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/picoguard/picoguard.toml";
+/// After SIGTERM or SIGINT: how long the refresh in progress and the snapshot writer may take
+/// to finish before the process exits anyway.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+
 const USAGE: &str = "\
 Usage: picoguard [OPTIONS]
 
@@ -152,10 +160,12 @@ fn serve(config: Config) -> Result<(), String> {
         } else {
             SnapshotStore::disabled()
         };
+        let store = Arc::new(store);
         let scheduler =
-            Scheduler::boot(&config, worker, Arc::new(store), Timing::default()).await?;
+            Scheduler::boot(&config, worker, Arc::clone(&store), Timing::default()).await?;
         let pipeline = Pipeline::new(&config, scheduler.policy())?;
         let listeners = Listeners::bind(&config.server)?;
+        let mut stop_signals = StopSignals::install()?;
 
         for address in listeners.udp_addresses() {
             log::info!("listening on {address} (udp and tcp)");
@@ -165,12 +175,57 @@ fn serve(config: Config) -> Result<(), String> {
             resolver_over(Arc::clone(pipeline.upstreams())),
             Arc::new(Tls::with_webpki_roots()),
         );
-        tokio::spawn(scheduler.run(downloader));
+        let (stop_refreshing, stopped) = oneshot::channel::<()>();
+        let mut refreshing = tokio::spawn(scheduler.run(downloader, async {
+            let _ = stopped.await;
+        }));
         server::spawn(listeners, pipeline, &config);
-        std::future::pending::<()>().await;
+
+        stop_signals.received().await;
+        log::info!("stopping");
+        let _ = stop_refreshing.send(());
+
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
+        if tokio::time::timeout_at(deadline, &mut refreshing)
+            .await
+            .is_err()
+        {
+            log::warn!("the list refresh did not finish in time, stopping it");
+            refreshing.abort();
+        }
+
+        let writer_wait = deadline.saturating_duration_since(Instant::now());
+        if !store.drain(writer_wait).await {
+            log::warn!("the snapshot writer did not finish in time");
+        }
 
         Ok(())
     })
+}
+
+/// SIGTERM (the service manager) and SIGINT (Ctrl-C).
+struct StopSignals {
+    terminate: Signal,
+    interrupt: Signal,
+}
+
+impl StopSignals {
+    fn install() -> Result<StopSignals, String> {
+        let install =
+            |kind| signal(kind).map_err(|error| format!("cannot listen for signals: {error}"));
+
+        Ok(StopSignals {
+            terminate: install(SignalKind::terminate())?,
+            interrupt: install(SignalKind::interrupt())?,
+        })
+    }
+
+    async fn received(&mut self) {
+        tokio::select! {
+            _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => {}
+        }
+    }
 }
 
 #[cfg(test)]

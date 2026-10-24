@@ -27,6 +27,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128};
@@ -977,6 +978,12 @@ impl SnapshotStore {
         if writer.send(WriteJob::Barrier(done)).await.is_ok() {
             let _ = wait.await;
         }
+    }
+
+    /// Like `flush`, but gives up after `wait`. Returns false when the writer was still busy
+    /// (a stuck disk); what it holds then is lost if the process exits.
+    pub async fn drain(&self, wait: Duration) -> bool {
+        tokio::time::timeout(wait, self.flush()).await.is_ok()
     }
 
     /// Bytes written to snapshot files since the store was opened.
@@ -1939,6 +1946,33 @@ ads.*.tracker
 
         assert!(path.exists());
         assert_eq!(Arc::strong_count(&probe), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_a_busy_writer_but_not_forever() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let files = TestFiles::new();
+        files.set_gate(false);
+        let store = Arc::new(SnapshotStore::open_with(state.path(), files.clone()).unwrap());
+        let path = store.path_for(SOURCE).unwrap();
+        let snapshot = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
+        let saving = tokio::spawn({
+            let store = Arc::clone(&store);
+
+            async move { store.save(snapshot).await }
+        });
+        sleep_a_little().await;
+
+        // The writer is stuck on the gate: drain gives up, and the file is not there yet.
+        assert!(!store.drain(Duration::from_millis(100)).await);
+        assert!(!path.exists());
+
+        // Once the disk answers, drain returns after the write is done.
+        files.set_gate(true);
+        assert!(store.drain(Duration::from_secs(10)).await);
+        assert!(path.exists());
+        saving.await.unwrap().unwrap();
     }
 
     #[tokio::test]

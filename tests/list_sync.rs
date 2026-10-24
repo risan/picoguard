@@ -543,7 +543,7 @@ async fn refreshes_never_overlap() {
 
     let (scheduler, _) = boot(&config_of(&dir, lists)).await;
     let policy = scheduler.policy();
-    let running = tokio::spawn(scheduler.run(downloader()));
+    let running = tokio::spawn(scheduler.run(downloader(), std::future::pending()));
     tokio::time::sleep(Duration::from_millis(1500)).await;
     running.abort();
 
@@ -563,7 +563,7 @@ async fn the_loop_checks_lists_again_with_their_validators_and_retries_after_a_f
         url_list("loop-bad", server.url("/bad.txt")),
     ];
     let (scheduler, _) = boot(&config_of(&dir, lists)).await;
-    let running = tokio::spawn(scheduler.run(downloader()));
+    let running = tokio::spawn(scheduler.run(downloader(), std::future::pending()));
     tokio::time::sleep(Duration::from_millis(800)).await;
     running.abort();
 
@@ -967,7 +967,7 @@ async fn the_loop_writes_a_failed_snapshot_by_itself() {
     assert!(dir.snapshot_files().is_empty());
 
     disk.clear();
-    let running = tokio::spawn(scheduler.run(downloader()));
+    let running = tokio::spawn(scheduler.run(downloader(), std::future::pending()));
     let deadline = Instant::now() + Duration::from_secs(10);
     while dir.snapshot_files().is_empty() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -996,4 +996,53 @@ async fn a_newer_list_supersedes_a_snapshot_that_was_never_written() {
     let (offline, _) = boot(&config).await;
 
     assert!(blocked(&offline.policy(), "tracker.example."));
+}
+
+/// What SIGTERM asks of the loop: the refresh in progress completes and is saved, and no
+/// other refresh starts.
+#[tokio::test]
+async fn stopping_the_loop_finishes_the_refresh_in_progress_and_starts_no_other() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    server.set_delay(Duration::from_millis(300));
+    let config = config_of(&dir, vec![url_list("stopping", server.url("/l.txt"))]);
+    let (scheduler, _) = boot(&config).await;
+    let policy = scheduler.policy();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(scheduler.run(downloader(), async {
+        let _ = stopped.await;
+    }));
+
+    while server.requests() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the loop stops")
+        .unwrap();
+
+    assert!(blocked(&policy, "ads.example."), "the refresh was finished");
+    assert_eq!(dir.snapshot_files().len(), 1, "and saved");
+    // The intervals are milliseconds long, so a loop that went on would have asked again.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(server.requests(), 1);
+}
+
+#[tokio::test]
+async fn stopping_the_loop_tries_once_more_to_write_a_pending_snapshot() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("last-try", server.url("/l.txt"))]);
+    let (mut scheduler, _) = boot(&config).await;
+    let disk = BlockedSnapshots::new(&dir);
+    scheduler.refresh(0, &downloader()).await;
+    disk.clear();
+
+    scheduler.run(downloader(), async {}).await;
+
+    assert_eq!(dir.snapshot_files().len(), 1);
 }

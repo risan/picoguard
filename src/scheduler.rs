@@ -5,6 +5,7 @@
 //! snapshot to be written before the next refresh starts, so at most the current and one
 //! new copy are in memory (D13). Any failure keeps the copy in force.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -173,11 +174,22 @@ impl Scheduler {
             .map(|loaded| &loaded.list)
     }
 
-    /// Refreshes whichever list is due next and writes snapshots that failed to write, forever.
-    /// Never two at once.
-    pub async fn run(mut self, downloader: Downloader) {
+    /// Refreshes whichever list is due next and writes snapshots that failed to write, until
+    /// `stop` is ready. Never two at once. Work already started is finished; nothing new
+    /// starts after `stop`, except one last try to write the snapshots still pending.
+    pub async fn run(mut self, downloader: Downloader, stop: impl Future<Output = ()>) {
+        tokio::pin!(stop);
+
         while let Some((index, work, at)) = self.next_work() {
-            tokio::time::sleep_until(at).await;
+            tokio::select! {
+                biased;
+
+                () = &mut stop => {
+                    break;
+                }
+
+                () = tokio::time::sleep_until(at) => {}
+            }
 
             match work {
                 Work::Refresh => {
@@ -188,6 +200,10 @@ impl Scheduler {
                     self.retry_save(index).await;
                 }
             }
+        }
+
+        for index in 0..self.entries.len() {
+            self.retry_save(index).await;
         }
     }
 
