@@ -50,10 +50,7 @@ async fn loading_a_snapshot_costs_eight_bytes_per_plain_rule_and_no_scratch() {
     let state =
         std::env::temp_dir().join(format!("picoguard-snapshot-memory-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state);
-    let options = CompileOptions {
-        format: ListFormat::Adblock,
-        max_rules: MAX_RULES,
-    };
+    let options = CompileOptions::new(ListFormat::Adblock, MAX_RULES);
 
     let worker = CompileWorker::spawn().unwrap();
     let store = SnapshotStore::open(&state).unwrap();
@@ -89,7 +86,7 @@ async fn loading_a_snapshot_costs_eight_bytes_per_plain_rule_and_no_scratch() {
 
     let before = LIVE.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
-    let loaded = load(&path, MAX_RULES).unwrap();
+    let loaded = load(&path, &options).unwrap();
     let after = LIVE.load(Ordering::Relaxed);
     let peak = PEAK.load(Ordering::Relaxed);
 

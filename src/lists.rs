@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{
-    ACCEPT, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, HOST, HeaderMap, HeaderValue,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, USER_AGENT,
+    ACCEPT, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, HOST, HeaderMap, HeaderName,
+    HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, TRANSFER_ENCODING,
+    USER_AGENT,
 };
 use http::{Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty};
@@ -318,7 +319,8 @@ fn remove_dot_segments(path_and_query: &str) -> String {
     }
 
     let mut result = format!("/{}", segments.join("/"));
-    if path.ends_with("/.") || path.ends_with("/..") {
+    let ends_in_dot_segment = path.ends_with("/.") || path.ends_with("/..");
+    if ends_in_dot_segment && !segments.is_empty() {
         result.push('/');
     }
 
@@ -553,17 +555,37 @@ where
     Ok((head, body, connection))
 }
 
+/// The comma-separated values of every field named `name`, without empty items.
+fn header_tokens(headers: &HeaderMap, name: &HeaderName) -> impl Iterator<Item = String> {
+    headers
+        .get_all(name)
+        .into_iter()
+        .flat_map(|value| {
+            String::from_utf8_lossy(value.as_bytes())
+                .split(',')
+                .map(|token| token.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|token| !token.is_empty())
+}
+
 fn download(
     head: http::response::Parts,
     body: Incoming,
     connection: ConnectionTask,
     limits: &Limits,
 ) -> Result<Fetch, FetchError> {
-    if let Some(encoding) = head.headers.get(CONTENT_ENCODING) {
-        let encoding = encoding.to_str().unwrap_or_default().trim();
-        if !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity") {
-            return Err(FetchError::UnsupportedEncoding(encoding.to_string()));
-        }
+    if let Some(coding) = header_tokens(&head.headers, &CONTENT_ENCODING)
+        .find(|coding| !coding.eq_ignore_ascii_case("identity"))
+    {
+        return Err(FetchError::UnsupportedEncoding(coding));
+    }
+
+    // hyper removes the chunked framing only; any other transfer coding stays in the body.
+    if let Some(coding) = header_tokens(&head.headers, &TRANSFER_ENCODING)
+        .find(|coding| !coding.eq_ignore_ascii_case("chunked"))
+    {
+        return Err(FetchError::UnsupportedEncoding(coding));
     }
 
     let announced = head
@@ -711,9 +733,20 @@ where
     Fut: Future<Output = Result<(), FetchError>>,
 {
     let compilation = worker.start(options);
-    produce(compilation.pieces.clone())
-        .await
-        .map_err(RefreshError::Fetch)?;
+    let produced = produce(compilation.pieces.clone()).await;
+    match produced {
+        Ok(()) => {}
+
+        // The worker gave up on its own (over budget): its error says why.
+        Err(FetchError::SinkClosed) => {
+            return match compilation.result().await {
+                Err(error) => Err(RefreshError::Compile(error)),
+                Ok(_) => Err(RefreshError::Fetch(FetchError::SinkClosed)),
+            };
+        }
+
+        Err(error) => return Err(RefreshError::Fetch(error)),
+    }
 
     compilation.result().await.map_err(RefreshError::Compile)
 }
@@ -1309,6 +1342,31 @@ mod tests {
     }
 
     #[test]
+    fn dot_segments_at_the_root_never_produce_a_double_slash() {
+        let base = Target::parse("https://lists.example/list.txt").unwrap();
+        let join = |location: &str| base.redirect(location).unwrap().path;
+
+        for (location, expected) in [
+            (".", "/"),
+            ("./", "/"),
+            ("..", "/"),
+            ("../", "/"),
+            ("/..", "/"),
+            ("/.", "/"),
+            ("../../x.txt", "/x.txt"),
+            ("/a/../../b", "/b"),
+            ("/../../../c?q=1", "/c?q=1"),
+            ("/a/..", "/"),
+            ("/a/.", "/a/"),
+            ("/a/b/..", "/a/"),
+            ("/a/./b/../c.txt", "/a/c.txt"),
+            ("./x.txt", "/x.txt"),
+        ] {
+            assert_eq!(join(location), expected, "{location}");
+        }
+    }
+
+    #[test]
     fn urls_parse_with_defaults_and_ipv6() {
         let target = Target::parse("http://[::1]:8080/p?q=1").unwrap();
         assert_eq!(
@@ -1522,6 +1580,79 @@ mod tests {
             matches!(error, FetchError::UnsupportedEncoding(_)),
             "{error:?}"
         );
+    }
+
+    /// The server writes `head_lines` (after the status line) and `body` as they are.
+    async fn raw_reply(head_lines: &'static str, body: &'static [u8]) -> Server {
+        Server::start(move |_, _, mut stream| async move {
+            let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{head_lines}\r\n");
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            stream.flush().await.unwrap();
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn every_content_encoding_field_and_value_is_checked() {
+        for head in [
+            "Content-Encoding: identity\r\nContent-Encoding: gzip\r\nContent-Length: 2\r\n",
+            "Content-Encoding: gzip\r\nContent-Encoding: identity\r\nContent-Length: 2\r\n",
+            "Content-Encoding: identity, gzip\r\nContent-Length: 2\r\n",
+            "Content-Encoding: gzip, identity\r\nContent-Length: 2\r\n",
+            "Content-Encoding: GZip ,\r\nContent-Length: 2\r\n",
+            "Content-Encoding: br\r\nContent-Length: 2\r\n",
+        ] {
+            let server = raw_reply(head, b"ab").await;
+
+            let error = fetch_error(&local(), &server.url("/"), &Limits::default()).await;
+
+            assert!(
+                matches!(error, FetchError::UnsupportedEncoding(_)),
+                "{head:?}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_content_encodings_are_accepted() {
+        for head in [
+            "Content-Encoding: identity\r\nContent-Length: 2\r\n",
+            "Content-Encoding: identity, Identity\r\nContent-Encoding: identity\r\nContent-Length: 2\r\n",
+            "Content-Encoding:\r\nContent-Length: 2\r\n",
+        ] {
+            let server = raw_reply(head, b"ab").await;
+
+            let pumped = fetch_body(&local(), &server.url("/"), &Limits::default()).await;
+
+            assert!(pumped.result.is_ok(), "{head:?}: {:?}", pumped.result);
+            assert_eq!(pumped.text(), b"ab");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transfer_coding_other_than_chunked_is_refused() {
+        let chunked_body = b"2\r\nab\r\n0\r\n\r\n";
+        for head in [
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: deflate,chunked\r\n",
+            "Transfer-Encoding: chunked, gzip\r\n",
+        ] {
+            let server = raw_reply(head, chunked_body).await;
+
+            let error = fetch_error(&local(), &server.url("/"), &Limits::default()).await;
+
+            assert!(
+                matches!(error, FetchError::UnsupportedEncoding(_)),
+                "{head:?}: {error:?}"
+            );
+        }
+
+        let server = raw_reply("Transfer-Encoding: chunked\r\n", chunked_body).await;
+        let pumped = fetch_body(&local(), &server.url("/"), &Limits::default()).await;
+        assert!(pumped.result.is_ok(), "{:?}", pumped.result);
+        assert_eq!(pumped.text(), b"ab");
     }
 
     #[tokio::test]
@@ -1787,10 +1918,7 @@ mod tests {
     }
 
     fn compile_options() -> CompileOptions {
-        CompileOptions {
-            format: crate::filter::parse::ListFormat::Auto,
-            max_rules: 1000,
-        }
+        CompileOptions::new(crate::filter::parse::ListFormat::Auto, 1000)
     }
 
     fn blocks(compiled: &Compiled, name: &str) -> bool {
@@ -1900,6 +2028,68 @@ mod tests {
             panic!("the second download should work");
         };
         assert!(blocks(&updated.compiled, "a.example"));
+    }
+
+    #[tokio::test]
+    async fn a_list_over_the_slow_rule_budget_fails_the_refresh_and_the_worker_goes_on() {
+        let worker = CompileWorker::spawn().unwrap();
+        let heavy: String = (0..100_000).map(|n| format!("a{n}*b\n")).collect();
+        let heavy = heavy.into_bytes();
+        let server = Server::start(move |index, _, mut stream| {
+            let heavy = heavy.clone();
+            async move {
+                if index == 0 {
+                    respond(&mut stream, "200 OK", &[], &heavy).await;
+                } else {
+                    respond(&mut stream, "200 OK", &[], b"||a.example^\n").await;
+                }
+            }
+        })
+        .await;
+        let options = CompileOptions {
+            max_rules: 1_000_000,
+            ..compile_options()
+        };
+        let downloader = local();
+        let url = server.url("/");
+        let (previous, limits) = (Validators::default(), Limits::default());
+        let refresh = || downloader.refresh(&worker, &url, &previous, &limits, options);
+
+        let heavy = refresh().await;
+        let light = refresh().await;
+
+        assert!(
+            matches!(heavy, Err(RefreshError::Compile(CompileError::OverBudget))),
+            "{:?}",
+            heavy.err()
+        );
+        let Ok(Refresh::Updated(updated)) = light else {
+            panic!("the next download should work");
+        };
+        assert!(blocks(&updated.compiled, "a.example"));
+    }
+
+    #[tokio::test]
+    async fn a_local_file_over_the_slow_rule_budget_fails_the_refresh() {
+        let worker = CompileWorker::spawn().unwrap();
+        let dir = TestDir::new("lists-budget");
+        let path = dir.path().join("heavy.txt");
+        let heavy: String = (0..100_000)
+            .map(|n| format!("/track{n}[0-9]+/\n"))
+            .collect();
+        std::fs::write(&path, heavy).unwrap();
+        let options = CompileOptions {
+            max_rules: 1_000_000,
+            ..compile_options()
+        };
+
+        let result = refresh_file(&worker, path, 1 << 30, options).await;
+
+        assert!(
+            matches!(result, Err(RefreshError::Compile(CompileError::OverBudget))),
+            "{:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]

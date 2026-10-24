@@ -40,10 +40,7 @@ impl Drop for StateDir {
 }
 
 fn options() -> CompileOptions {
-    CompileOptions {
-        format: ListFormat::Auto,
-        max_rules: MAX_RULES,
-    }
+    CompileOptions::new(ListFormat::Auto, MAX_RULES)
 }
 
 fn source(index: usize) -> String {
@@ -110,7 +107,7 @@ async fn loaded_snapshots_of_the_real_lists_decide_like_the_compiled_lists() {
     let mut loaded = Vec::new();
     for (index, snapshot) in compiled.iter().enumerate() {
         let path = store.path_for(&source(index)).unwrap();
-        let from_disk = worker.load(path, MAX_RULES).await.unwrap();
+        let from_disk = worker.load(path, options()).await.unwrap();
         assert_eq!(from_disk.meta, snapshot.meta);
         assert_eq!(from_disk.counters, snapshot.counters);
         assert_eq!(from_disk.list.rule_count(), snapshot.list.rule_count());
@@ -176,7 +173,7 @@ async fn a_refresh_with_the_same_text_writes_nothing_even_after_a_restart() {
     let mut modified = Vec::new();
     for (index, text) in real.lists.iter().enumerate() {
         let path = store.path_for(&source(index)).unwrap();
-        let boot = worker.load(path.clone(), MAX_RULES).await.unwrap();
+        let boot = worker.load(path.clone(), options()).await.unwrap();
         assert!(boot.fits(&source(index), &options()));
         modified.push(fs::metadata(&path).unwrap().modified().unwrap());
 
@@ -232,7 +229,7 @@ async fn a_changed_format_with_the_same_text_is_rewritten_after_a_restart() {
     let worker = CompileWorker::spawn().unwrap();
     let store = SnapshotStore::open(state.path()).unwrap();
     let path = store.path_for(&source(0)).unwrap();
-    let boot = load(&path, MAX_RULES).unwrap();
+    let boot = load(&path, &options()).unwrap();
     assert!(boot.fits(&source(0), &options()));
     assert!(!boot.fits(&source(0), &as_domains));
 
@@ -261,6 +258,6 @@ async fn a_changed_format_with_the_same_text_is_rewritten_after_a_restart() {
     store.flush().await;
 
     assert!(store.bytes_written() > 0);
-    let rewritten = load(&path, MAX_RULES).unwrap();
+    let rewritten = load(&path, &options()).unwrap();
     assert_eq!(rewritten.meta.configured_format, ListFormat::Domains);
 }
