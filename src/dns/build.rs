@@ -1,6 +1,8 @@
 use std::net::IpAddr;
 
-use super::wire::{CLASS_IN, HEADER_LEN, Header, MAX_MESSAGE_LEN, Query, flags, rcode, rtype};
+use super::wire::{
+    CLASS_IN, HEADER_LEN, Header, MAX_MESSAGE_LEN, Query, flags, rcode, remove_opt, rtype,
+};
 
 const CLASSIC_UDP_LIMIT: u16 = 512;
 const OPT_RECORD_LEN: usize = 11;
@@ -122,27 +124,17 @@ impl<'q, 'a> Reply<'q, 'a> {
     /// RA, its question letter case, aged TTLs and our OPT record.
     pub fn from_upstream(&self, parts: ReplyParts<'_>, ttl_rule: TtlRule, out: &mut Vec<u8>) {
         let question_end = HEADER_LEN + self.query.question_bytes().len();
-        let body_end = parts.opt_start.map_or(parts.bytes.len(), usize::from);
-        let Some(body) = parts
-            .bytes
-            .get(..body_end)
-            .filter(|body| body.len() >= question_end)
-        else {
+        if parts.bytes.len() < question_end {
             self.error(rcode::SERVFAIL, out);
 
             return;
-        };
+        }
 
         out.clear();
-        out.extend_from_slice(body);
+        out.extend_from_slice(parts.bytes);
         out[HEADER_LEN..question_end].copy_from_slice(self.query.question_bytes());
         out[0..2].copy_from_slice(&self.query.id().to_be_bytes());
-        out[2..4].copy_from_slice(&self.upstream_flags(body).to_be_bytes());
-        if parts.opt_start.is_some() {
-            let additional = u16::from_be_bytes([out[ADDITIONAL_COUNT], out[ADDITIONAL_COUNT + 1]]);
-            out[ADDITIONAL_COUNT..ADDITIONAL_COUNT + 2]
-                .copy_from_slice(&additional.saturating_sub(1).to_be_bytes());
-        }
+        out[2..4].copy_from_slice(&self.upstream_flags(parts.bytes).to_be_bytes());
 
         for &offset in parts.ttl_offsets {
             let offset = usize::from(offset);
@@ -150,6 +142,14 @@ impl<'q, 'a> Reply<'q, 'a> {
                 let ttl = u32::from_be_bytes([field[0], field[1], field[2], field[3]]);
                 field.copy_from_slice(&ttl_rule.apply(ttl).to_be_bytes());
             }
+        }
+
+        if let Some(opt_start) = parts.opt_start
+            && remove_opt(out, usize::from(opt_start)).is_err()
+        {
+            self.error(rcode::SERVFAIL, out);
+
+            return;
         }
 
         self.end(out);
@@ -353,7 +353,10 @@ mod tests {
     use hickory_proto::rr::{RData, RecordType};
 
     use super::*;
-    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, cname, parse, soa, txt};
+    use crate::dns::test_util::{
+        QuerySpec, ResponseSpec, a, cname, parse, response_with_opt_before_other_additionals, soa,
+        txt,
+    };
     use crate::dns::wire::ResponseInfo;
 
     const SERVER_UDP_SIZE: u16 = 1232;
@@ -851,6 +854,46 @@ mod tests {
 
         assert_eq!(out.len(), 65_535);
         assert_eq!(parse(&out).answers.len(), 1);
+    }
+
+    #[test]
+    fn an_opt_record_before_other_additional_records_is_replaced_and_the_rest_kept() {
+        let upstream = response_with_opt_before_other_additionals();
+        let plain = QuerySpec::new("www.example.com.", RecordType::A);
+        let mut with_edns = QuerySpec::new("www.example.com.", RecordType::A);
+        with_edns.edns = Some((1400, true));
+        let rule = TtlRule {
+            age: 10,
+            ..no_aging()
+        };
+
+        for (client, expects_opt) in [(plain, false), (with_edns, true)] {
+            let out = from_upstream(&client, &upstream, Protocol::Tcp, rule);
+
+            let message = parse(&out);
+            assert_eq!(message.edns.is_some(), expects_opt);
+            if expects_opt {
+                assert_eq!(message.edns.unwrap().max_payload(), SERVER_UDP_SIZE);
+            }
+            assert_eq!(message.answers[0].ttl, 290);
+            let additionals: Vec<(String, u32)> = message
+                .additionals
+                .iter()
+                .map(|record| (record.name.to_ascii(), record.ttl))
+                .collect();
+            assert_eq!(
+                additionals,
+                [
+                    ("ns.example.com.".to_string(), 590),
+                    ("ns.example.com.".to_string(), 890),
+                    ("ns.example.com.".to_string(), 890),
+                ]
+            );
+            let RData::CNAME(target) = &message.additionals[2].data else {
+                panic!("expected a CNAME");
+            };
+            assert_eq!(target.0.to_ascii(), "alt.ns.example.com.");
+        }
     }
 
     #[test]

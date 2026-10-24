@@ -304,18 +304,26 @@ impl<'a> Iterator for Labels<'a> {
 /// real messages use one or two.
 const MAX_NAME_POINTERS: usize = 128;
 
+/// Where a name written at some offset ends.
+struct NameSpan {
+    /// The offset after the name as written, where the next field begins.
+    end: usize,
+    /// The offset of the pointer that ends the name, if it is compressed.
+    pointer_at: Option<usize>,
+}
+
 /// The one walker over names, for decompression, skipping and validation.
 /// Follows compression pointers, which must point strictly backward and at
 /// most `MAX_NAME_POINTERS` times, and fails when the expanded name passes
 /// 255 bytes, so no input can make it loop. Calls `on_label` for every label
-/// of the expanded name. Returns the offset after the name as written at
-/// `start`, where the next field begins.
-fn walk_name<F>(msg: &[u8], start: usize, mut on_label: F) -> Result<usize, WireError>
+/// of the expanded name.
+fn walk_name<F>(msg: &[u8], start: usize, mut on_label: F) -> Result<NameSpan, WireError>
 where
     F: FnMut(&[u8]) -> Result<(), WireError>,
 {
     let mut position = start;
-    let mut span_end = None;
+    let mut end = None;
+    let mut pointer_at = None;
     let mut pointers = 0;
     // The terminating zero label.
     let mut expanded_len = 1;
@@ -327,7 +335,10 @@ where
             0x00 => {
                 let length = usize::from(first);
                 if length == 0 {
-                    return Ok(span_end.unwrap_or(position + 1));
+                    return Ok(NameSpan {
+                        end: end.unwrap_or(position + 1),
+                        pointer_at,
+                    });
                 }
 
                 expanded_len += 1 + length;
@@ -345,8 +356,9 @@ where
             0xC0 => {
                 let second = *msg.get(position + 1).ok_or(WireError::Truncated)?;
                 let target = (usize::from(first & 0x3F) << 8) | usize::from(second);
-                if span_end.is_none() {
-                    span_end = Some(position + 2);
+                if end.is_none() {
+                    end = Some(position + 2);
+                    pointer_at = Some(position);
                 }
 
                 pointers += 1;
@@ -368,7 +380,7 @@ where
 /// lowercased name and the offset just after it in the original position.
 pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
     let mut name = Name::empty();
-    let end = walk_name(msg, start, |label| name.push_label(label))?;
+    let end = walk_name(msg, start, |label| name.push_label(label))?.end;
     name.push_terminator();
 
     Ok((name, end))
@@ -377,7 +389,7 @@ pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
 /// Returns the offset just after the name at `start`. The name is walked
 /// without being kept, so a bad pointer is an error here too.
 pub fn skip_name(msg: &[u8], start: usize) -> Result<usize, WireError> {
-    walk_name(msg, start, |_| Ok(()))
+    Ok(walk_name(msg, start, |_| Ok(()))?.end)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,7 +741,8 @@ pub struct ResponseInfo {
     pub header: Header,
     /// Offsets of the TTL field of every record except OPT.
     pub ttl_offsets: Vec<u16>,
-    /// Offset of the OPT record, which must be the last record.
+    /// Offset of the OPT record, which may be anywhere in the additional
+    /// section.
     pub opt_start: Option<u16>,
     /// Smallest TTL over all records except OPT.
     pub min_ttl: Option<u32>,
@@ -755,11 +768,15 @@ impl ResponseInfo {
         for record in Records::new(msg)? {
             let record = record?;
 
-            if info.opt_start.is_some() {
-                return Err(WireError::Malformed);
-            }
-
             if record.rtype == rtype::OPT {
+                let has_root_owner = record.ttl_offset == record.start + 1 + 4;
+                if record.section != Section::Additional
+                    || info.opt_start.is_some()
+                    || !has_root_owner
+                {
+                    return Err(WireError::Malformed);
+                }
+
                 info.opt_start = Some(offset(record.start)?);
 
                 continue;
@@ -780,6 +797,85 @@ impl ResponseInfo {
     }
 }
 
+/// Types whose rdata RFC 1035 lets a server compress (RFC 3597 section 4
+/// forbids it for every other type): one domain name first.
+const NAME_FIRST_TYPES: [u16; 8] = [2, 3, 4, 5, 7, 8, 9, 12];
+/// Two domain names: SOA, MINFO and RP.
+const TWO_NAMES_TYPES: [u16; 3] = [6, 14, 17];
+/// A 16-bit preference, then a domain name: MX, AFSDB and RT.
+const PREFERENCE_THEN_NAME_TYPES: [u16; 3] = [15, 18, 21];
+
+/// Removes the OPT record at `opt_start` and moves what follows it up, so a
+/// reply can carry our OPT instead of the upstream's, whichever place in the
+/// additional section the upstream gave it. The compression pointers of the
+/// records after it are lowered by the OPT's length. Fails if one of them
+/// points into the OPT.
+pub fn remove_opt(msg: &mut Vec<u8>, opt_start: usize) -> Result<(), WireError> {
+    let records: Vec<Record> = Records::new(msg)?.collect::<Result<_, _>>()?;
+    let opt = records
+        .iter()
+        .find(|record| record.start == opt_start && record.rtype == rtype::OPT)
+        .ok_or(WireError::Malformed)?;
+    let opt_end = opt.rdata.end;
+    let removed = opt_end - opt_start;
+
+    let mut pointers = Vec::new();
+    for record in records.iter().filter(|record| record.start >= opt_end) {
+        compression_pointers(msg, record, &mut pointers)?;
+    }
+
+    for at in pointers {
+        let target = (usize::from(msg[at] & 0x3F) << 8) | usize::from(msg[at + 1]);
+        if (opt_start..opt_end).contains(&target) {
+            return Err(WireError::BadName);
+        }
+
+        if target >= opt_end {
+            let moved = target - removed;
+            msg[at] = 0xC0 | (moved >> 8) as u8;
+            msg[at + 1] = moved as u8;
+        }
+    }
+
+    msg.drain(opt_start..opt_end);
+    let additional = read_u16(msg, 10)?.saturating_sub(1);
+    msg[10..12].copy_from_slice(&additional.to_be_bytes());
+
+    Ok(())
+}
+
+/// The offsets of the compression pointers written in the owner name and in
+/// the rdata names of `record`.
+fn compression_pointers(
+    msg: &[u8],
+    record: &Record,
+    pointers: &mut Vec<usize>,
+) -> Result<(), WireError> {
+    pointers.extend(walk_name(msg, record.start, |_| Ok(()))?.pointer_at);
+
+    let (mut name_at, name_count) = if NAME_FIRST_TYPES.contains(&record.rtype) {
+        (record.rdata.start, 1)
+    } else if TWO_NAMES_TYPES.contains(&record.rtype) {
+        (record.rdata.start, 2)
+    } else if PREFERENCE_THEN_NAME_TYPES.contains(&record.rtype) {
+        (record.rdata.start + 2, 1)
+    } else {
+        return Ok(());
+    };
+
+    for _ in 0..name_count {
+        let name = walk_name(msg, name_at, |_| Ok(()))?;
+        if name.end > record.rdata.end {
+            return Err(WireError::Malformed);
+        }
+
+        pointers.extend(name.pointer_at);
+        name_at = name.end;
+    }
+
+    Ok(())
+}
+
 fn offset(position: usize) -> Result<u16, WireError> {
     u16::try_from(position).map_err(|_| WireError::Malformed)
 }
@@ -787,12 +883,14 @@ fn offset(position: usize) -> Result<u16, WireError> {
 #[cfg(test)]
 mod tests {
     use hickory_proto::op::Message;
-    use hickory_proto::rr::RecordType;
+    use hickory_proto::rr::{RData as OracleRData, RecordType};
     use proptest::prelude::*;
 
     use super::*;
     use crate::dns::test_util::{
-        QuerySpec, ResponseSpec, a, aaaa, cname, https, parse as parse_with_oracle, soa,
+        OPT_BEFORE_ADDITIONALS_FIRST_START, OPT_BEFORE_ADDITIONALS_OPT_START, QuerySpec,
+        ResponseSpec, a, aaaa, cname, https, parse as parse_with_oracle,
+        response_with_opt_before_other_additionals, soa,
     };
 
     fn ttl_at(msg: &[u8], offset: u16) -> u32 {
@@ -1334,20 +1432,95 @@ mod tests {
     }
 
     #[test]
-    fn opt_must_be_the_last_record_and_unique() {
+    fn opt_must_be_unique_in_the_additional_section_with_the_root_as_owner() {
         let (_, bytes, _) = rich_response();
         let opt = bytes[bytes.len() - 11..].to_vec();
         let mut two_opts = bytes.clone();
         two_opts.extend_from_slice(&opt);
         two_opts[11] += 1;
-        let mut record_after_opt = bytes.clone();
-        record_after_opt.extend_from_slice(&[0, 0, 1, 0, 1, 0, 0, 0, 5, 0, 4, 1, 2, 3, 4]);
-        record_after_opt[11] += 1;
+        let mut named_opt = bytes.clone();
+        let opt_start = bytes.len() - 11;
+        named_opt.splice(opt_start..opt_start + 1, [1, b'x', 0]);
+        let opt_in_answers = response_of(EXAMPLE_COM, &[(&[0], rtype::OPT, &[])]);
 
         assert_eq!(ResponseInfo::parse(&two_opts), Err(WireError::Malformed));
+        assert_eq!(ResponseInfo::parse(&named_opt), Err(WireError::Malformed));
         assert_eq!(
-            ResponseInfo::parse(&record_after_opt),
+            ResponseInfo::parse(&opt_in_answers),
             Err(WireError::Malformed)
+        );
+    }
+
+    #[test]
+    fn opt_may_come_before_other_additional_records() {
+        let bytes = response_with_opt_before_other_additionals();
+        let oracle = parse_with_oracle(&bytes);
+        assert!(oracle.edns.is_some(), "the fixture is a valid message");
+        assert_eq!(oracle.additionals.len(), 3);
+
+        let info = ResponseInfo::parse(&bytes).unwrap();
+
+        assert_eq!(
+            info.opt_start,
+            Some(OPT_BEFORE_ADDITIONALS_OPT_START as u16)
+        );
+        let ttls: Vec<u32> = info
+            .ttl_offsets
+            .iter()
+            .map(|offset| ttl_at(&bytes, *offset))
+            .collect();
+        assert_eq!(ttls, [300, 600, 900, 900]);
+        assert_eq!(info.min_ttl, Some(300));
+    }
+
+    #[test]
+    fn removing_the_opt_record_moves_later_records_and_their_pointers() {
+        let mut bytes = response_with_opt_before_other_additionals();
+        let before = bytes.len();
+
+        remove_opt(&mut bytes, OPT_BEFORE_ADDITIONALS_OPT_START).unwrap();
+
+        assert_eq!(bytes.len(), before - 11);
+        let oracle = parse_with_oracle(&bytes);
+        assert!(oracle.edns.is_none());
+        let owners: Vec<String> = oracle
+            .additionals
+            .iter()
+            .map(|record| record.name.to_ascii())
+            .collect();
+        assert_eq!(owners, ["ns.example.com."; 3]);
+        let OracleRData::CNAME(target) = &oracle.additionals[2].data else {
+            panic!("expected a CNAME");
+        };
+        assert_eq!(target.0.to_ascii(), "alt.ns.example.com.");
+        let info = ResponseInfo::parse(&bytes).unwrap();
+        assert_eq!(info.opt_start, None);
+        assert_eq!(info.header.additional_count, 3);
+        assert_eq!(oracle.answers.len(), 1);
+    }
+
+    #[test]
+    fn removing_a_trailing_opt_record_just_cuts_it_off() {
+        let (_, mut bytes, _) = rich_response();
+        let opt_start = usize::from(ResponseInfo::parse(&bytes).unwrap().opt_start.unwrap());
+
+        remove_opt(&mut bytes, opt_start).unwrap();
+
+        assert_eq!(bytes.len(), opt_start);
+        assert!(parse_with_oracle(&bytes).edns.is_none());
+    }
+
+    #[test]
+    fn a_pointer_into_the_removed_opt_record_is_an_error() {
+        let mut bytes = response_with_opt_before_other_additionals();
+        // The second record after the OPT names its owner by the OPT's offset.
+        let second_start = OPT_BEFORE_ADDITIONALS_FIRST_START + 19;
+        bytes[second_start] = 0xC0;
+        bytes[second_start + 1] = OPT_BEFORE_ADDITIONALS_OPT_START as u8;
+
+        assert_eq!(
+            remove_opt(&mut bytes, OPT_BEFORE_ADDITIONALS_OPT_START),
+            Err(WireError::BadName)
         );
     }
 
@@ -1401,6 +1574,20 @@ mod tests {
                 }
             }
             let _ = ResponseInfo::parse(&bytes);
+        }
+
+        #[test]
+        fn removing_the_opt_record_of_a_mutated_response_never_panics(
+            position in 0usize..200,
+            value in any::<u8>(),
+        ) {
+            let mut bytes = response_with_opt_before_other_additionals();
+            let position = position % bytes.len();
+            bytes[position] = value;
+
+            if let Ok(ResponseInfo { opt_start: Some(opt_start), .. }) = ResponseInfo::parse(&bytes) {
+                let _ = remove_opt(&mut bytes, usize::from(opt_start));
+            }
         }
 
         #[test]
