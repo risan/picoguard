@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::io::{self, Read};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -25,6 +26,8 @@ pub const TYPE_A: u16 = 1;
 pub const TYPE_CNAME: u16 = 5;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_HTTPS: u16 = 65;
+
+const READ_PIECE_BYTES: usize = 64 * 1024;
 
 const SUB_BLOCK: usize = 0;
 const EXACT_BLOCK: usize = 1;
@@ -95,6 +98,30 @@ impl CompiledList {
         let summary = parser.finish(&mut sink);
 
         (builder.finish(summary.format), summary)
+    }
+
+    /// Parses and compiles a list read in pieces; at most `max_rules` rules are kept.
+    pub fn from_reader(
+        format: ListFormat,
+        max_rules: usize,
+        mut reader: impl Read,
+    ) -> io::Result<(CompiledList, ParseSummary)> {
+        let mut builder = ListBuilder::new();
+        let mut parser = Parser::new(format, max_rules);
+        let mut sink = |rule: Rule<'_>| builder.add(rule);
+        let mut piece = vec![0u8; READ_PIECE_BYTES];
+        loop {
+            let length = reader.read(&mut piece)?;
+            if length == 0 {
+                break;
+            }
+
+            parser.push(&piece[..length], &mut sink);
+        }
+
+        let summary = parser.finish(&mut sink);
+
+        Ok((builder.finish(summary.format), summary))
     }
 
     /// Distinct rules: plain rules, host names and slow rules.
@@ -918,6 +945,30 @@ mod tests {
         assert_eq!(list.slow_rule_count(), 1);
         assert!(list.fast[SUB_BLOCK].windows(2).all(|w| w[0] < w[1]));
         assert_eq!(list.fast[SUB_BLOCK].capacity(), 2);
+    }
+
+    #[test]
+    fn a_list_read_in_small_pieces_is_the_same_list() {
+        struct Dribble<'a>(&'a [u8]);
+
+        impl Read for Dribble<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let length = self.0.len().min(buffer.len()).min(3);
+                buffer[..length].copy_from_slice(&self.0[..length]);
+                self.0 = &self.0[length..];
+
+                Ok(length)
+            }
+        }
+
+        let text = "||a.example^\n0.0.0.0 h.example\n/x[0-9]/\n||b.example^$important\n";
+        let (whole, _) = CompiledList::from_text(ListFormat::Adblock, text);
+        let (pieces, summary) =
+            CompiledList::from_reader(ListFormat::Adblock, 3, Dribble(text.as_bytes())).unwrap();
+
+        assert_eq!(whole.rule_count(), 4);
+        assert_eq!(pieces.rule_count(), 3);
+        assert_eq!(summary.counters.over_cap, 1);
     }
 
     #[test]
