@@ -1,0 +1,576 @@
+//! What happens to one client query:
+//!
+//! 1. normalize the request and handle the special cases;
+//! 2. request filtering;
+//! 3. cache lookup (a hit goes straight to 6);
+//! 4. coalescing: one upstream query per distinct question in flight;
+//! 5. upstream;
+//! 6. response filtering, always under the policy current at delivery;
+//! 7. cache insert and the client reply.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use tokio::sync::oneshot;
+
+use crate::budget::{Budget, Charge};
+use crate::cache::{Cache, CacheKey};
+use crate::config::{Cidr, Config, is_allowed};
+use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
+use crate::dns::wire::{Name, Query, QueryError, ResponseInfo, rcode, rtype};
+use crate::policy::{Policy, PolicyView, RequestVerdict, ResponseVerdict};
+use crate::upstream::Upstreams;
+
+/// Reverse lookups of these ranges go to the local resolver.
+const PRIVATE_NETWORKS: [&str; 7] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "169.254.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+];
+const IPV4_REVERSE_LABELS: usize = 6;
+const IPV6_REVERSE_LABELS: usize = 34;
+
+/// What the steps that need no waiting settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quick {
+    /// A reply is in the output buffer.
+    Replied,
+    /// Nothing to send.
+    Dropped,
+    /// Steps 4 to 7 are needed: call `Pipeline::answer`.
+    NeedsUpstream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Default,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Failure {
+    Upstream,
+    Overloaded,
+}
+
+/// An upstream reply held until every waiting client has its answer.
+struct Delivery {
+    bytes: Vec<u8>,
+    info: ResponseInfo,
+    _charge: Charge,
+}
+
+impl Delivery {
+    fn parts(&self) -> ReplyParts<'_> {
+        ReplyParts {
+            bytes: &self.bytes,
+            ttl_offsets: &self.info.ttl_offsets,
+            opt_start: self.info.opt_start,
+        }
+    }
+}
+
+type Outcome = Result<Arc<Delivery>, Failure>;
+
+#[derive(Default)]
+struct Inflight {
+    queries: HashMap<Vec<u8>, Vec<oneshot::Sender<Outcome>>>,
+    /// Clients waiting for an upstream reply, coalesced ones included.
+    waiting: usize,
+}
+
+struct WaitingClient {
+    pipeline: Arc<Pipeline>,
+}
+
+impl Drop for WaitingClient {
+    fn drop(&mut self) {
+        self.pipeline.inflight.lock().unwrap().waiting -= 1;
+    }
+}
+
+pub struct Pipeline {
+    udp_size: u16,
+    refuse_any: bool,
+    cache_min_ttl: u32,
+    cache_max_ttl: u32,
+    max_inflight_queries: usize,
+    max_waiting_clients: usize,
+    blocked_hosts: Vec<Name>,
+    local_domains: Vec<Name>,
+    private_networks: Vec<Cidr>,
+    upstreams: Upstreams,
+    local_resolver: Option<Upstreams>,
+    cache: Mutex<Cache>,
+    inflight: Mutex<Inflight>,
+    policy: Arc<Policy>,
+    budget: Arc<Budget>,
+}
+
+impl Pipeline {
+    pub fn new(config: &Config, policy: Arc<Policy>) -> Result<Arc<Pipeline>, String> {
+        let upstreams = Upstreams::from_config(&config.upstream, &config.limits)?;
+        let local_resolver = config
+            .local
+            .resolver
+            .map(|resolver| Upstreams::plain(resolver, &config.upstream, &config.limits));
+
+        Ok(Arc::new(Pipeline {
+            udp_size: config.server.udp_size,
+            refuse_any: config.refuse_any,
+            cache_min_ttl: config.cache.min_ttl,
+            cache_max_ttl: config.cache.max_ttl,
+            max_inflight_queries: config.limits.max_inflight_queries,
+            max_waiting_clients: config.limits.max_waiting_clients,
+            blocked_hosts: parse_names("blocked_hosts", &config.blocked_hosts)?,
+            local_domains: parse_names("local.domains", &config.local.domains)?,
+            private_networks: PRIVATE_NETWORKS
+                .iter()
+                .map(|network| network.parse().expect("private network is valid"))
+                .collect(),
+            upstreams,
+            local_resolver,
+            cache: Mutex::new(Cache::new(&config.cache)),
+            inflight: Mutex::new(Inflight::default()),
+            policy,
+            budget: Budget::new(config.limits.pending_bytes),
+        }))
+    }
+
+    /// The budget for replies held for delivery. Queued TCP replies draw on it.
+    pub fn budget(&self) -> &Arc<Budget> {
+        &self.budget
+    }
+
+    /// Steps 1 to 3 and 6: everything that needs no waiting. A cache hit is
+    /// answered here, so a UDP listener can reply without spawning a task.
+    pub fn answer_quickly(&self, request: &[u8], protocol: Protocol, out: &mut Vec<u8>) -> Quick {
+        self.try_answer_quickly(request, protocol, out)
+            .unwrap_or_else(|quick| quick)
+    }
+
+    /// The whole pipeline for one request. Returns false when there is
+    /// nothing to send. UDP overload drops the query, TCP overload answers
+    /// SERVFAIL.
+    pub async fn answer(
+        self: &Arc<Pipeline>,
+        request: &[u8],
+        protocol: Protocol,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        let quick = self.answer_quickly(request, protocol, out);
+        if quick != Quick::NeedsUpstream {
+            return quick == Quick::Replied;
+        }
+
+        let Ok(query) = Query::parse(request) else {
+            return false;
+        };
+        let reply = Reply::new(&query, self.udp_size, protocol);
+        let Ok((_waiting, receiver)) = self.join_or_start(&CacheKey::new(&query), request) else {
+            return self.overloaded(&reply, protocol, out);
+        };
+
+        let outcome = receiver.await;
+        if matches!(outcome, Ok(Err(Failure::Overloaded))) {
+            return self.overloaded(&reply, protocol, out);
+        }
+
+        if let Ok(Ok(delivery)) = outcome {
+            let ResponseVerdict::Pass =
+                filter_response(self.policy.view(Instant::now()), &query, delivery.parts());
+            reply.from_upstream(delivery.parts(), self.ttl_rule(0), out);
+
+            return true;
+        }
+
+        reply.error(rcode::SERVFAIL, out);
+
+        true
+    }
+
+    /// A SERVFAIL for `request`, for a reply that cannot be queued.
+    pub fn servfail(&self, request: &[u8], protocol: Protocol, out: &mut Vec<u8>) -> bool {
+        let Ok(query) = Query::parse(request) else {
+            return false;
+        };
+        Reply::new(&query, self.udp_size, protocol).error(rcode::SERVFAIL, out);
+
+        true
+    }
+
+    fn try_answer_quickly(
+        &self,
+        request: &[u8],
+        protocol: Protocol,
+        out: &mut Vec<u8>,
+    ) -> Result<Quick, Quick> {
+        let query = Query::parse(request).map_err(|error| {
+            if let QueryError::Reject { header, rcode } = error {
+                build::header_only(&header, rcode, out);
+
+                return Quick::Replied;
+            }
+
+            Quick::Dropped
+        })?;
+        let reply = Reply::new(&query, self.udp_size, protocol);
+        let name = &query.question.name;
+
+        if self.blocked_hosts.contains(name) {
+            reply.error(rcode::REFUSED, out);
+
+            return Ok(Quick::Replied);
+        }
+
+        if self.refuse_any && query.question.qtype == rtype::ANY {
+            reply.error(rcode::NOTIMP, out);
+
+            return Ok(Quick::Replied);
+        }
+
+        if self.route_of(name) == Route::Local && self.local_resolver.is_none() {
+            reply.error(rcode::NXDOMAIN, out);
+
+            return Ok(Quick::Replied);
+        }
+
+        let now = Instant::now();
+        let RequestVerdict::Pass = filter_request(self.policy.view(now), &query);
+
+        let mut cache = self.cache.lock().unwrap();
+        let Some(hit) = cache.get(&CacheKey::new(&query), now) else {
+            return Ok(Quick::NeedsUpstream);
+        };
+
+        let ResponseVerdict::Pass = filter_response(self.policy.view(now), &query, hit.parts);
+        reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs), out);
+
+        Ok(Quick::Replied)
+    }
+
+    fn ttl_rule(&self, age: u32) -> TtlRule {
+        TtlRule {
+            min: self.cache_min_ttl,
+            max: self.cache_max_ttl,
+            age,
+        }
+    }
+
+    fn overloaded(&self, reply: &Reply<'_, '_>, protocol: Protocol, out: &mut Vec<u8>) -> bool {
+        if protocol == Protocol::Udp {
+            return false;
+        }
+
+        reply.error(rcode::SERVFAIL, out);
+
+        true
+    }
+
+    fn route_of(&self, name: &Name) -> Route {
+        let is_private_reverse = reverse_address(name)
+            .is_some_and(|address| is_allowed(&self.private_networks, address));
+        let is_local_domain = self
+            .local_domains
+            .iter()
+            .any(|domain| name.is_subdomain_of(domain));
+
+        if is_private_reverse || is_local_domain {
+            return Route::Local;
+        }
+
+        Route::Default
+    }
+
+    /// Step 4. Joins the upstream query already running for this question or
+    /// starts one. Fails when the limits on waiting clients, queries in
+    /// flight or held reply bytes are reached.
+    fn join_or_start(
+        self: &Arc<Pipeline>,
+        key: &CacheKey<'_>,
+        request: &[u8],
+    ) -> Result<(WaitingClient, oneshot::Receiver<Outcome>), Failure> {
+        let identity = key.identity();
+        let (sender, receiver) = oneshot::channel();
+        let mut inflight = self.inflight.lock().unwrap();
+
+        if inflight.waiting >= self.max_waiting_clients || self.budget.is_exhausted() {
+            return Err(Failure::Overloaded);
+        }
+
+        if let Some(waiters) = inflight.queries.get_mut(&identity) {
+            waiters.push(sender);
+        } else {
+            if inflight.queries.len() >= self.max_inflight_queries {
+                return Err(Failure::Overloaded);
+            }
+
+            inflight.queries.insert(identity.clone(), vec![sender]);
+            tokio::spawn(Arc::clone(self).resolve(identity, request.to_vec()));
+        }
+
+        inflight.waiting += 1;
+
+        Ok((
+            WaitingClient {
+                pipeline: Arc::clone(self),
+            },
+            receiver,
+        ))
+    }
+
+    /// Steps 5 and 7 for one question, then wakes everyone waiting for it.
+    async fn resolve(self: Arc<Pipeline>, identity: Vec<u8>, request: Vec<u8>) {
+        let outcome = self.fetch(&request).await;
+        let waiters = self
+            .inflight
+            .lock()
+            .unwrap()
+            .queries
+            .remove(&identity)
+            .unwrap_or_default();
+
+        for waiter in waiters {
+            let _ = waiter.send(outcome.clone());
+        }
+    }
+
+    async fn fetch(&self, request: &[u8]) -> Outcome {
+        let query = Query::parse(request).map_err(|_| Failure::Upstream)?;
+        let mut upstream_request = Vec::with_capacity(request.len());
+        build::upstream_query(&query, self.udp_size, &mut upstream_request);
+
+        let upstreams = if self.route_of(&query.question.name) == Route::Local {
+            self.local_resolver.as_ref().ok_or(Failure::Upstream)?
+        } else {
+            &self.upstreams
+        };
+        let bytes = upstreams
+            .query(&mut upstream_request)
+            .await
+            .map_err(|error| {
+                log::debug!("upstream query failed: {error}");
+
+                Failure::Upstream
+            })?;
+        let info = ResponseInfo::parse(&bytes).map_err(|_| Failure::Upstream)?;
+        let charge = self
+            .budget
+            .try_charge(bytes.len())
+            .ok_or(Failure::Overloaded)?;
+
+        let key = CacheKey::new(&query);
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(&key, &bytes, &info, Instant::now());
+
+        Ok(Arc::new(Delivery {
+            bytes,
+            info,
+            _charge: charge,
+        }))
+    }
+}
+
+/// Step 2. Always passes until the filter engine exists.
+fn filter_request(_policy: PolicyView, _query: &Query<'_>) -> RequestVerdict {
+    RequestVerdict::Pass
+}
+
+/// Step 6. Always passes until the filter engine exists.
+fn filter_response(
+    _policy: PolicyView,
+    _query: &Query<'_>,
+    _parts: ReplyParts<'_>,
+) -> ResponseVerdict {
+    ResponseVerdict::Pass
+}
+
+fn parse_names(field: &str, texts: &[String]) -> Result<Vec<Name>, String> {
+    texts
+        .iter()
+        .map(|text| {
+            Name::from_text(text)
+                .ok_or_else(|| format!("{field}: {text:?} is not a valid domain name"))
+        })
+        .collect()
+}
+
+/// The address named by a full `in-addr.arpa` or `ip6.arpa` name.
+fn reverse_address(name: &Name) -> Option<IpAddr> {
+    let mut labels: [&[u8]; IPV6_REVERSE_LABELS] = [&[]; IPV6_REVERSE_LABELS];
+    let mut count = 0;
+
+    for label in name.labels() {
+        if count == labels.len() {
+            return None;
+        }
+
+        labels[count] = label;
+        count += 1;
+    }
+
+    if count == IPV4_REVERSE_LABELS && labels[4] == b"in-addr" && labels[5] == b"arpa" {
+        let octet = |label: &[u8]| std::str::from_utf8(label).ok()?.parse::<u8>().ok();
+
+        return Some(IpAddr::V4(Ipv4Addr::new(
+            octet(labels[3])?,
+            octet(labels[2])?,
+            octet(labels[1])?,
+            octet(labels[0])?,
+        )));
+    }
+
+    if count == IPV6_REVERSE_LABELS && labels[32] == b"ip6" && labels[33] == b"arpa" {
+        let mut octets = [0u8; 16];
+
+        for (index, nibble_label) in labels[..32].iter().enumerate() {
+            let [character] = nibble_label else {
+                return None;
+            };
+            let nibble = (*character as char).to_digit(16)? as u8;
+            let position = 31 - index;
+            octets[position / 2] |= nibble << (4 * (1 - position % 2));
+        }
+
+        return Some(IpAddr::V6(Ipv6Addr::from(octets)));
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn address_of(text: &str) -> Option<IpAddr> {
+        reverse_address(&Name::from_text(text).unwrap())
+    }
+
+    #[test]
+    fn ipv4_reverse_names_give_the_address() {
+        assert_eq!(
+            address_of("4.3.2.10.in-addr.arpa."),
+            Some("10.2.3.4".parse().unwrap())
+        );
+        assert_eq!(
+            address_of("1.1.168.192.IN-ADDR.ARPA"),
+            Some("192.168.1.1".parse().unwrap())
+        );
+    }
+
+    fn ipv6_reverse(address: &str) -> String {
+        let octets = address.parse::<Ipv6Addr>().unwrap().octets();
+        let nibbles: Vec<String> = octets
+            .iter()
+            .rev()
+            .flat_map(|octet| [octet & 0x0F, octet >> 4])
+            .map(|nibble| format!("{nibble:x}"))
+            .collect();
+
+        format!("{}.ip6.arpa", nibbles.join("."))
+    }
+
+    #[test]
+    fn ipv6_reverse_names_give_the_address() {
+        assert_eq!(
+            address_of(&ipv6_reverse("fd00::1")),
+            Some("fd00::1".parse().unwrap())
+        );
+        assert_eq!(
+            address_of(&ipv6_reverse("fe80::1234:5678")),
+            Some("fe80::1234:5678".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn partial_and_odd_reverse_names_are_not_addresses() {
+        for name in [
+            "10.in-addr.arpa",
+            "3.2.10.in-addr.arpa",
+            "5.4.3.2.10.in-addr.arpa",
+            "256.3.2.10.in-addr.arpa",
+            "x.3.2.10.in-addr.arpa",
+            "4.3.2.10.example.com",
+            "example.com",
+            "1.0.0.0.ip6.arpa",
+        ] {
+            assert_eq!(address_of(name), None, "{name}");
+        }
+
+        let full = ipv6_reverse("fd00::1");
+        assert_eq!(address_of(&full.replacen('1', "g", 1)), None);
+        assert_eq!(address_of(&full.replacen('1', "10", 1)), None);
+        assert_eq!(address_of(&format!("0.{full}")), None);
+    }
+
+    fn pipeline_with_local(domains: &[&str], resolver: Option<&str>) -> Arc<Pipeline> {
+        let mut config = Config::default();
+        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
+        config.local.domains = domains.iter().map(|domain| domain.to_string()).collect();
+        config.local.resolver = resolver.map(|address| address.parse().unwrap());
+
+        Pipeline::new(&config, Arc::new(Policy::new())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn private_reverse_names_and_local_domains_take_the_local_route() {
+        let pipeline = pipeline_with_local(&["lan", "home.arpa."], Some("127.0.0.1:9"));
+        let route = |text: &str| pipeline.route_of(&Name::from_text(text).unwrap());
+
+        for local in [
+            "4.3.2.10.in-addr.arpa",
+            "9.0.16.172.in-addr.arpa",
+            "1.1.168.192.in-addr.arpa",
+            "5.0.64.100.in-addr.arpa",
+            "5.0.254.169.in-addr.arpa",
+            "printer.lan",
+            "lan",
+            "a.b.home.arpa",
+        ] {
+            assert_eq!(route(local), Route::Local, "{local}");
+        }
+
+        for public in [
+            "4.3.2.8.in-addr.arpa",
+            "1.0.32.172.in-addr.arpa",
+            "5.0.128.100.in-addr.arpa",
+            "example.com",
+            "scan",
+            "lan.example.com",
+        ] {
+            assert_eq!(route(public), Route::Default, "{public}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_names_in_the_config_are_reported() {
+        let mut config = Config::default();
+        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
+        config.blocked_hosts = vec!["a..b".to_string()];
+
+        let error = Pipeline::new(&config, Arc::new(Policy::new()))
+            .err()
+            .unwrap();
+
+        assert!(error.contains("blocked_hosts"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn encrypted_upstreams_are_refused_until_they_exist() {
+        let config = Config::default();
+
+        let error = Pipeline::new(&config, Arc::new(Policy::new()))
+            .err()
+            .unwrap();
+
+        assert!(error.contains("not supported yet"), "{error}");
+    }
+}

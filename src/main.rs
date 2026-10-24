@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use picoguard::config::Config;
+use picoguard::pipeline::Pipeline;
+use picoguard::policy::Policy;
+use picoguard::server::{self, Listeners};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/picoguard/picoguard.toml";
 const USAGE: &str = "\
@@ -34,12 +38,22 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
                     .ok_or_else(|| format!("{arg} needs a file argument"))?;
                 config_path = PathBuf::from(value);
             }
+
             "--check" => {
                 check = true;
             }
-            "--version" => return Ok(Command::Version),
-            "-h" | "--help" => return Ok(Command::Help),
-            _ => return Err(format!("unknown argument {arg}")),
+
+            "--version" => {
+                return Ok(Command::Version);
+            }
+
+            "-h" | "--help" => {
+                return Ok(Command::Help);
+            }
+
+            _ => {
+                return Err(format!("unknown argument {arg}"));
+            }
         }
     }
 
@@ -53,17 +67,21 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
 fn main() -> ExitCode {
     match parse_args(std::env::args().skip(1)) {
         Ok(Command::Run { config_path }) => run(&config_path),
+
         Ok(Command::Check { config_path }) => check(&config_path),
+
         Ok(Command::Version) => {
             println!("picoguard {}", env!("CARGO_PKG_VERSION"));
 
             ExitCode::SUCCESS
         }
+
         Ok(Command::Help) => {
             println!("{USAGE}");
 
             ExitCode::SUCCESS
         }
+
         Err(message) => {
             eprintln!("picoguard: {message}\n\n{USAGE}");
 
@@ -79,6 +97,7 @@ fn check(config_path: &Path) -> ExitCode {
 
             ExitCode::SUCCESS
         }
+
         Err(error) => {
             eprintln!("{error}");
 
@@ -90,6 +109,7 @@ fn check(config_path: &Path) -> ExitCode {
 fn run(config_path: &Path) -> ExitCode {
     let config = match Config::load(config_path) {
         Ok(config) => config,
+
         Err(error) => {
             eprintln!("{error}");
 
@@ -104,7 +124,34 @@ fn run(config_path: &Path) -> ExitCode {
         config_path.display()
     );
 
+    if let Err(message) = serve(config) {
+        log::error!("{message}");
+
+        return ExitCode::FAILURE;
+    }
+
     ExitCode::SUCCESS
+}
+
+fn serve(config: Config) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("cannot start the runtime: {error}"))?;
+
+    runtime.block_on(async {
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new()))?;
+        let listeners = Listeners::bind(&config.server)?;
+
+        for address in listeners.udp_addresses() {
+            log::info!("listening on {address} (udp and tcp)");
+        }
+
+        server::spawn(listeners, pipeline, &config);
+        std::future::pending::<()>().await;
+
+        Ok(())
+    })
 }
 
 #[cfg(test)]
