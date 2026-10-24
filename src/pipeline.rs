@@ -16,11 +16,12 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 use crate::budget::{Budget, Charge};
-use crate::cache::{Cache, CacheKey};
+use crate::cache::{Cache, CacheKey, Memo};
 use crate::config::{Cidr, Config, is_allowed};
 use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
 use crate::dns::wire::{Name, Query, QueryError, ResponseInfo, rcode, rtype};
-use crate::policy::{Policy, PolicyView, RequestVerdict, ResponseVerdict};
+use crate::filter::engine::{BlockedAnswer, Decision, blocked_answer};
+use crate::policy::{Policy, PolicyView};
 use crate::upstream::{UpstreamError, Upstreams};
 
 /// Reverse lookups of these ranges go to the local resolver.
@@ -100,6 +101,7 @@ pub struct Pipeline {
     refuse_any: bool,
     cache_min_ttl: u32,
     cache_max_ttl: u32,
+    blocked_ttl: u32,
     max_inflight_queries: usize,
     max_waiting_clients: usize,
     blocked_hosts: Vec<Name>,
@@ -126,6 +128,7 @@ impl Pipeline {
             refuse_any: config.refuse_any,
             cache_min_ttl: config.cache.min_ttl,
             cache_max_ttl: config.cache.max_ttl,
+            blocked_ttl: config.blocked_ttl,
             max_inflight_queries: config.limits.max_inflight_queries,
             max_waiting_clients: config.limits.max_waiting_clients,
             blocked_hosts: parse_names("blocked_hosts", &config.blocked_hosts)?,
@@ -196,9 +199,7 @@ impl Pipeline {
         }
 
         if let Ok(Ok(delivery)) = outcome {
-            let ResponseVerdict::Pass =
-                filter_response(self.policy.view(Instant::now()), &query, delivery.parts());
-            reply.from_upstream(delivery.parts(), self.ttl_rule(0), out);
+            self.deliver(&query, &reply, &delivery, out);
 
             return true;
         }
@@ -256,17 +257,87 @@ impl Pipeline {
         }
 
         let now = Instant::now();
-        let RequestVerdict::Pass = filter_request(self.policy.view(now), &query);
+        let view = self.policy.view(now);
+        if let Decision::Block { ips } = view.check_request(&query) {
+            self.write_blocked(&reply, query.question.qtype, &ips, out);
 
+            return Ok(Quick::Replied);
+        }
+
+        let key = CacheKey::new(&query);
         let mut cache = self.cache.lock().unwrap();
-        let Some(hit) = cache.get(&CacheKey::new(&query), now) else {
+        let Some(hit) = cache.get(&key, now) else {
             return Ok(Quick::NeedsUpstream);
         };
 
-        let ResponseVerdict::Pass = filter_response(self.policy.view(now), &query, hit.parts);
-        reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs), out);
+        let remembered = hit
+            .memo
+            .filter(|memo| !view.paused && memo.generation == view.generation);
+        let decision = match remembered {
+            Some(memo) => memo.decision,
+            None => view.check_response(hit.parts),
+        };
+        match &decision {
+            Decision::Pass => reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs), out),
+            Decision::Block { ips } => self.write_blocked(&reply, query.question.qtype, ips, out),
+        }
+
+        self.remember(&mut cache, &key, &view, &decision);
 
         Ok(Quick::Replied)
+    }
+
+    /// Step 6 for a reply that just arrived from the upstream, under the policy of this
+    /// moment: whatever was decided while the query was in flight does not count.
+    fn deliver(
+        &self,
+        query: &Query<'_>,
+        reply: &Reply<'_, '_>,
+        delivery: &Delivery,
+        out: &mut Vec<u8>,
+    ) {
+        let view = self.policy.view(Instant::now());
+        let decision = view.check_response(delivery.parts());
+        self.remember(
+            &mut self.cache.lock().unwrap(),
+            &CacheKey::new(query),
+            &view,
+            &decision,
+        );
+
+        match decision {
+            Decision::Pass => reply.from_upstream(delivery.parts(), self.ttl_rule(0), out),
+            Decision::Block { ips } => {
+                self.write_blocked(reply, query.question.qtype, &ips, out);
+            }
+        }
+    }
+
+    /// Keeps the decision with the cached reply. A paused policy decides nothing, so there
+    /// is nothing to keep.
+    fn remember(
+        &self,
+        cache: &mut Cache,
+        key: &CacheKey<'_>,
+        view: &PolicyView,
+        decision: &Decision,
+    ) {
+        if !view.paused {
+            let memo = Memo {
+                generation: view.generation,
+                decision: decision.clone(),
+            };
+            cache.set_memo(key, memo);
+        }
+    }
+
+    /// The reply AdGuard Home's default mode gives for a blocked name (plan 4.7).
+    fn write_blocked(&self, reply: &Reply<'_, '_>, qtype: u16, ips: &[IpAddr], out: &mut Vec<u8>) {
+        match blocked_answer(qtype, ips) {
+            BlockedAnswer::Ips(addresses) => reply.addresses(&addresses, self.blocked_ttl, out),
+            BlockedAnswer::Empty => reply.error(rcode::NOERROR, out),
+            BlockedAnswer::NoData => reply.blocked(self.blocked_ttl, out),
+        }
     }
 
     fn ttl_rule(&self, age: u32) -> TtlRule {
@@ -392,20 +463,6 @@ impl Pipeline {
             _charge: charge,
         }))
     }
-}
-
-/// Step 2. Always passes until the filter engine exists.
-fn filter_request(_policy: PolicyView, _query: &Query<'_>) -> RequestVerdict {
-    RequestVerdict::Pass
-}
-
-/// Step 6. Always passes until the filter engine exists.
-fn filter_response(
-    _policy: PolicyView,
-    _query: &Query<'_>,
-    _parts: ReplyParts<'_>,
-) -> ResponseVerdict {
-    ResponseVerdict::Pass
 }
 
 fn parse_names(field: &str, texts: &[String]) -> Result<Vec<Name>, String> {
