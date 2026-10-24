@@ -19,8 +19,10 @@ container, 2026-10-25):
 | Peak RSS | 16.3 MB | 58.5 MB |
 | CPU seconds, cold replay | 8.4 s | 66.1 s |
 
-AdGuard Home was not measured in this run. It is the reference for blocking decisions, not for
-memory. A plain domain rule costs picoguard about 8 bytes. Details, method and open measurements:
+For scale: AdGuard Home v0.107.79 used 80–93 MB RSS with only the AdGuard DNS filter (~191k
+rules) on two home LXC containers (2026-10-24, not the same workload, so not a benchmark).
+AdGuard Home is the reference for blocking decisions, not for memory. A plain domain rule costs
+picoguard about 8 bytes. Details, method and open measurements:
 [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Features

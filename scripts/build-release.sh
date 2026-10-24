@@ -24,3 +24,14 @@ if [ "$armv7_size" -gt "$armv7_size_limit" ]; then
     echo "error: $armv7_target binary is $armv7_size bytes, limit is $armv7_size_limit" >&2
     exit 1
 fi
+
+# Release assets: one file per target named picoguard-<target>, plus SHA256SUMS,
+# as docs/install.md expects.
+mkdir -p dist/release
+rm -f dist/release/picoguard-* dist/release/SHA256SUMS
+for target in "${targets[@]}"; do
+    cp "dist/bin/$target/picoguard" "dist/release/picoguard-$target"
+done
+
+(cd dist/release && sha256sum picoguard-* > SHA256SUMS)
+echo "release assets: dist/release/"
