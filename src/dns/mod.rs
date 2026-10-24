@@ -2,4 +2,4 @@ pub mod build;
 pub mod wire;
 
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
