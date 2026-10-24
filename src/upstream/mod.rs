@@ -3,6 +3,7 @@
 
 pub mod doh;
 pub mod endpoint;
+mod outage;
 pub mod stream;
 pub mod tls;
 mod udp;
@@ -31,6 +32,7 @@ use crate::dns::wire::{self, Header, flags};
 
 use doh::DohUpstream;
 use endpoint::Bootstrap;
+use outage::{Outage, Report};
 use stream::{Dial, StreamUpstream};
 use tls::{Alpn, Tls, TlsDialer};
 
@@ -197,6 +199,8 @@ struct Health {
     srtt_ms: f64,
     failures: u32,
     retry_at: Option<Instant>,
+    /// What has been logged about the current run of failures.
+    outage: Outage,
 }
 
 struct Upstream {
@@ -217,6 +221,7 @@ impl Upstream {
                 srtt_ms: INITIAL_SRTT_MS,
                 failures: 0,
                 retry_at: None,
+                outage: Outage::default(),
             }),
         }
     }
@@ -274,12 +279,31 @@ impl Upstream {
             health.srtt_ms * (1.0 - SRTT_WEIGHT_OF_NEW_SAMPLE) + sample * SRTT_WEIGHT_OF_NEW_SAMPLE;
         health.failures = 0;
         health.retry_at = None;
+
+        if let Some(recovered) = health.outage.succeeded(Instant::now()) {
+            log::info!(
+                "upstream {} answers again after {} failed queries",
+                self.label,
+                recovered.failures
+            );
+        }
     }
 
     fn record_failure(&self, error: &UpstreamError) {
         let mut health = self.health.lock().unwrap();
-        if health.failures == 0 {
-            log::warn!("upstream {} failed: {error}", self.label);
+        match health.outage.failed(Instant::now()) {
+            Report::Silent => {}
+
+            Report::Started => {
+                log::warn!("upstream {} failed: {error}", self.label);
+            }
+
+            Report::Continues { suppressed } => {
+                log::warn!(
+                    "upstream {} is still failing, {suppressed} more failures not logged: {error}",
+                    self.label
+                );
+            }
         }
 
         health.failures += 1;
