@@ -447,6 +447,48 @@ async fn a_tcp_upstream_answer_truncated_over_udp_is_fetched_over_tcp() {
     assert_eq!(tcp_queries.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn a_truncated_reply_from_a_tcp_upstream_reaches_the_client_marked_truncated_and_is_not_cached()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&queries);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let counter = Arc::clone(&counter);
+            tokio::spawn(async move {
+                loop {
+                    let mut length = [0u8; 2];
+                    if stream.read_exact(&mut length).await.is_err() {
+                        return;
+                    }
+
+                    let mut query = vec![0u8; usize::from(u16::from_be_bytes(length))];
+                    stream.read_exact(&mut query).await.unwrap();
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut reply = answer_a(&Message::from_vec(&query).unwrap(), 60);
+                    reply.metadata.truncation = true;
+                    write_framed(&mut stream, &reply.to_vec().unwrap()).await;
+                }
+            });
+        }
+    });
+    let mut config = Config::default();
+    config.server.bind = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+    config.server.port = 0;
+    config.upstream.servers = vec![format!("tcp://{address}")];
+    let server = start(config).await;
+    let ask = Ask::new("cut.example.", RecordType::A);
+
+    let first = tcp_ask(&server, &ask).await.unwrap();
+    let second = tcp_ask(&server, &ask).await.unwrap();
+
+    assert!(first.metadata.truncation);
+    assert!(second.metadata.truncation);
+    assert_eq!(queries.load(Ordering::SeqCst), 2, "not cached");
+}
+
 // ------------------------------------------------------------- coalescing
 
 #[tokio::test]

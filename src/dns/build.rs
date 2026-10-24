@@ -162,7 +162,7 @@ impl<'q, 'a> Reply<'q, 'a> {
 
     fn upstream_flags(&self, upstream: &[u8]) -> u16 {
         let upstream_flags = u16::from_be_bytes([upstream[2], upstream[3]]);
-        let kept = upstream_flags & (flags::AA | flags::RCODE_MASK);
+        let kept = upstream_flags & (flags::AA | flags::TC | flags::RCODE_MASK);
         let authenticated = if self.query.dnssec_ok() {
             upstream_flags & flags::AD
         } else {
@@ -851,6 +851,25 @@ mod tests {
 
         assert_eq!(out.len(), 65_535);
         assert_eq!(parse(&out).answers.len(), 1);
+    }
+
+    #[test]
+    fn a_truncated_upstream_reply_stays_truncated_over_tcp_and_udp() {
+        let client = QuerySpec::new("example.com.", RecordType::A);
+        let mut upstream = ResponseSpec {
+            answers: vec![a("example.com.", 120, [192, 0, 2, 1].into())],
+            ..ResponseSpec::default()
+        }
+        .bytes(&client);
+        upstream[2] |= 0x02;
+
+        for protocol in [Protocol::Tcp, Protocol::Udp] {
+            let out = from_upstream(&client, &upstream, protocol, no_aging());
+
+            let message = parse(&out);
+            assert!(message.metadata.truncation, "{protocol:?}");
+            assert_eq!(message.answers.len(), 1, "{protocol:?}");
+        }
     }
 
     #[test]
