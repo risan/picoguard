@@ -540,13 +540,13 @@ impl Record {
             rtype::A => {
                 let octets: [u8; 4] = rdata.try_into().map_err(|_| WireError::Malformed)?;
 
-                Ok(RData::A(octets.into()))
+                return Ok(RData::A(octets.into()));
             }
 
             rtype::AAAA => {
                 let octets: [u8; 16] = rdata.try_into().map_err(|_| WireError::Malformed)?;
 
-                Ok(RData::Aaaa(octets.into()))
+                return Ok(RData::Aaaa(octets.into()));
             }
 
             rtype::CNAME => {
@@ -555,7 +555,7 @@ impl Record {
                     return Err(WireError::Malformed);
                 }
 
-                Ok(RData::Cname(Box::new(name)))
+                return Ok(RData::Cname(Box::new(name)));
             }
 
             rtype::SOA => {
@@ -565,9 +565,9 @@ impl Record {
                     return Err(WireError::Malformed);
                 }
 
-                Ok(RData::Soa {
+                return Ok(RData::Soa {
                     minimum: read_u32(msg, after_rname + 16)?,
-                })
+                });
             }
 
             rtype::HTTPS => {
@@ -576,15 +576,17 @@ impl Record {
                     return Err(WireError::Malformed);
                 }
 
-                Ok(RData::Https(AddressHints {
+                return Ok(RData::Https(AddressHints {
                     params: &msg[after_target..self.rdata.end],
                     current: &[],
                     current_is_ipv6: false,
-                }))
+                }));
             }
 
-            _ => Ok(RData::Other),
+            _ => {}
         }
+
+        Ok(RData::Other)
     }
 }
 

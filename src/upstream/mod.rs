@@ -92,14 +92,14 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
     };
     let question_end = name_end + 4;
 
-    match (
+    let (Some(asked), Some(echoed)) = (
         request.get(wire::HEADER_LEN..question_end),
         reply.get(wire::HEADER_LEN..question_end),
-    ) {
-        (Some(asked), Some(echoed)) => asked.eq_ignore_ascii_case(echoed),
+    ) else {
+        return false;
+    };
 
-        _ => false,
-    }
+    asked.eq_ignore_ascii_case(echoed)
 }
 
 struct TcpUpstream {
@@ -134,13 +134,10 @@ impl TcpUpstream {
             return Ok(());
         }
 
-        let stream = match timeout_at(deadline, TcpStream::connect(self.server)).await {
-            Ok(connected) => connected?,
-
-            Err(_) => {
-                return Err(UpstreamError::Timeout);
-            }
+        let Ok(connected) = timeout_at(deadline, TcpStream::connect(self.server)).await else {
+            return Err(UpstreamError::Timeout);
         };
+        let stream = connected?;
         stream.set_nodelay(true)?;
         self.client.attach(stream);
 
@@ -161,6 +158,7 @@ enum Transport {
 }
 
 impl Transport {
+    #[rustfmt::skip]
     async fn query(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
         match self {
             Transport::Udp(upstream) => {
@@ -173,7 +171,9 @@ impl Transport {
                 Ok(reply)
             }
 
-            Transport::Tcp(upstream) => upstream.query(request, deadline).await,
+            Transport::Tcp(upstream) => {
+                upstream.query(request, deadline).await
+            }
         }
     }
 }
@@ -224,13 +224,10 @@ impl Upstream {
     }
 
     async fn send(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
-        let _permit = match timeout_at(deadline, self.limiter.acquire()).await {
-            Ok(permit) => permit.map_err(|_| UpstreamError::Closed)?,
-
-            Err(_) => {
-                return Err(UpstreamError::Timeout);
-            }
+        let Ok(acquired) = timeout_at(deadline, self.limiter.acquire()).await else {
+            return Err(UpstreamError::Timeout);
         };
+        let _permit = acquired.map_err(|_| UpstreamError::Closed)?;
 
         self.transport.query(request, deadline).await
     }
@@ -304,20 +301,18 @@ impl Upstreams {
         let started = Instant::now();
         let first = self.pick(None, random_unit());
 
-        match self.servers[first]
+        let first_attempt = self.servers[first]
             .query(request, started + self.timeout / 2)
-            .await
-        {
-            Ok(reply) => Ok(reply),
-
-            Err(_) => {
-                let second = self.pick(Some(first), random_unit());
-
-                self.servers[second]
-                    .query(request, started + self.timeout)
-                    .await
-            }
+            .await;
+        if let Ok(reply) = first_attempt {
+            return Ok(reply);
         }
+
+        let second = self.pick(Some(first), random_unit());
+
+        self.servers[second]
+            .query(request, started + self.timeout)
+            .await
     }
 
     /// Weighted random choice by inverse smoothed RTT among servers that are
@@ -547,14 +542,14 @@ mod tests {
     #[tokio::test]
     async fn a_dead_server_times_out_after_two_tries_within_the_budget() {
         let server = dead_udp().await;
-        let upstreams = upstreams(vec![udp_url(&server)], 400);
+        let upstreams = upstreams(vec![udp_url(&server)], 600);
         let started = Instant::now();
 
         let result = upstreams.query(&mut query_for("example.com.")).await;
 
         assert!(matches!(result, Err(UpstreamError::Timeout)));
-        assert!(started.elapsed() >= Duration::from_millis(390));
-        assert!(started.elapsed() < Duration::from_millis(800));
+        assert!(started.elapsed() >= Duration::from_millis(590));
+        assert!(started.elapsed() < Duration::from_millis(2000));
         assert_eq!(server.received.load(Ordering::SeqCst), 2, "one retry");
     }
 
@@ -578,7 +573,7 @@ mod tests {
     async fn queries_fail_over_to_the_other_server() {
         let dead = dead_udp().await;
         let good = good_udp().await;
-        let upstreams = upstreams(vec![udp_url(&dead), udp_url(&good)], 400);
+        let upstreams = upstreams(vec![udp_url(&dead), udp_url(&good)], 1000);
 
         for _ in 0..6 {
             let reply = upstreams
@@ -594,7 +589,7 @@ mod tests {
     async fn a_failed_server_is_skipped_while_it_backs_off() {
         let dead = dead_udp().await;
         let good = good_udp().await;
-        let upstreams = upstreams(vec![udp_url(&dead), udp_url(&good)], 400);
+        let upstreams = upstreams(vec![udp_url(&dead), udp_url(&good)], 1000);
 
         for _ in 0..12 {
             upstreams

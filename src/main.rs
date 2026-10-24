@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use picoguard::config::Config;
+use picoguard::pipeline::Pipeline;
+use picoguard::policy::Policy;
+use picoguard::server::{self, Listeners};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/picoguard/picoguard.toml";
 const USAGE: &str = "\
@@ -128,7 +132,34 @@ fn run(config_path: &Path) -> ExitCode {
         config_path.display()
     );
 
+    if let Err(message) = serve(config) {
+        log::error!("{message}");
+
+        return ExitCode::FAILURE;
+    }
+
     ExitCode::SUCCESS
+}
+
+fn serve(config: Config) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("cannot start the runtime: {error}"))?;
+
+    runtime.block_on(async {
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new()))?;
+        let listeners = Listeners::bind(&config.server)?;
+
+        for address in listeners.udp_addresses() {
+            log::info!("listening on {address} (udp and tcp)");
+        }
+
+        server::spawn(listeners, pipeline, &config);
+        std::future::pending::<()>().await;
+
+        Ok(())
+    })
 }
 
 #[cfg(test)]

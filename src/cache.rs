@@ -740,6 +740,9 @@ mod tests {
         assert_ne!(identity(&plain), identity(&aaaa));
     }
 
+    /// Time to insert `measured` new names into a cache already holding
+    /// `preload`. Messages are built once and only the 7-letter first label
+    /// (at offset 13) changes, so building them costs almost nothing.
     fn time_inserts(preload: usize, measured: usize) -> Duration {
         let mut cache = Cache::new(&CacheConfig {
             max_entries: preload,
@@ -747,23 +750,32 @@ mod tests {
             ..config()
         });
         let start = Instant::now();
-        let fixture = |index: usize| Fixture::new(&format!("host{index}.example."));
+        let template = Fixture::new("h000000.example.");
+        let reply_template = template.positive(60);
+        let messages = |index: usize| {
+            let label = format!("h{index:06}");
+            let mut query = template.query_bytes.clone();
+            let mut reply = reply_template.clone();
+            query[13..20].copy_from_slice(label.as_bytes());
+            reply[13..20].copy_from_slice(label.as_bytes());
+
+            (query, reply)
+        };
+        let insert_index = |cache: &mut Cache, index: usize| {
+            let (query_bytes, reply) = messages(index);
+            let query = Query::parse(&query_bytes).unwrap();
+            let info = ResponseInfo::parse(&reply).unwrap();
+
+            cache.insert(&CacheKey::new(&query), &reply, &info, start);
+        };
+
         for index in 0..preload {
-            let fixture = fixture(index);
-            insert(&mut cache, &fixture, &fixture.positive(60), start);
+            insert_index(&mut cache, index);
         }
 
-        let prepared: Vec<(Fixture, Vec<u8>)> = (preload..preload + measured)
-            .map(|index| {
-                let fixture = fixture(index);
-                let reply = fixture.positive(60);
-
-                (fixture, reply)
-            })
-            .collect();
         let timer = Instant::now();
-        for (fixture, reply) in &prepared {
-            insert(&mut cache, fixture, reply, start);
+        for index in preload..preload + measured {
+            insert_index(&mut cache, index);
         }
 
         timer.elapsed()
@@ -771,8 +783,8 @@ mod tests {
 
     #[test]
     fn insert_cost_stays_flat_when_the_cache_is_full() {
-        let small = time_inserts(10_000, 10_000);
-        let large = time_inserts(100_000, 10_000);
+        let small = time_inserts(10_000, 20_000);
+        let large = time_inserts(100_000, 20_000);
 
         assert!(
             large < small * 5 + Duration::from_millis(50),

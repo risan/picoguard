@@ -30,13 +30,10 @@ pub async fn exchange(
 
     let mut buffer = vec![0u8; RECEIVE_BUFFER];
     loop {
-        let length = match timeout_at(deadline, socket.recv(&mut buffer)).await {
-            Ok(received) => received?,
-
-            Err(_) => {
-                return Err(UpstreamError::Timeout);
-            }
+        let Ok(received) = timeout_at(deadline, socket.recv(&mut buffer)).await else {
+            return Err(UpstreamError::Timeout);
         };
+        let length = received?;
 
         if is_answer_to(request, &buffer[..length]) {
             buffer.truncate(length);

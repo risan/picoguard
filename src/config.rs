@@ -1,6 +1,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::Deserialize;
 
@@ -9,6 +10,127 @@ const LIST_URL_SCHEMES: [&str; 2] = ["http://", "https://"];
 const MIN_UDP_SIZE: u16 = 512;
 const MAX_UDP_SIZE: u16 = 4096;
 const MAX_H2_WINDOW: u32 = (1 << 31) - 1;
+
+/// Networks that may talk to picoguard: loopback, private ranges, CGNAT
+/// (which covers Tailscale) and link-local.
+const DEFAULT_ALLOW_FROM: [&str; 9] = [
+    "127.0.0.0/8",
+    "::1/128",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",
+    "169.254.0.0/16",
+    "fc00::/7",
+    "fe80::/10",
+];
+
+/// An IP network such as `192.168.0.0/16`. A bare address means one host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Cidr {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl Cidr {
+    pub fn contains(&self, address: IpAddr) -> bool {
+        if let (IpAddr::V4(network), IpAddr::V4(address)) = (self.network, address.to_canonical()) {
+            let mask = v4_mask(self.prefix_len);
+
+            return u32::from(network) & mask == u32::from(address) & mask;
+        }
+
+        if let (IpAddr::V6(network), IpAddr::V6(address)) = (self.network, address.to_canonical()) {
+            let mask = v6_mask(self.prefix_len);
+
+            return u128::from(network) & mask == u128::from(address) & mask;
+        }
+
+        false
+    }
+}
+
+fn v4_mask(prefix_len: u8) -> u32 {
+    u32::MAX
+        .checked_shl(32 - u32::from(prefix_len))
+        .unwrap_or(0)
+}
+
+fn v6_mask(prefix_len: u8) -> u128 {
+    u128::MAX
+        .checked_shl(128 - u32::from(prefix_len))
+        .unwrap_or(0)
+}
+
+impl FromStr for Cidr {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Cidr, String> {
+        let invalid = |reason: &str| format!("invalid network {text:?}: {reason}");
+        let (address, prefix) = text
+            .split_once('/')
+            .map_or((text, None), |(address, prefix)| (address, Some(prefix)));
+        let address: IpAddr = address.parse().map_err(|_| invalid("not an IP address"))?;
+        let max_prefix_len = if address.is_ipv4() { 32 } else { 128 };
+
+        let mut prefix_len = max_prefix_len;
+        if let Some(prefix) = prefix {
+            prefix_len = prefix
+                .parse::<u8>()
+                .map_err(|_| invalid("prefix length is not a number"))?;
+        }
+
+        if prefix_len > max_prefix_len {
+            return Err(invalid(&format!("prefix length is above {max_prefix_len}")));
+        }
+
+        let network = match address {
+            IpAddr::V4(address) => {
+                let masked = u32::from(address) & v4_mask(prefix_len);
+
+                IpAddr::V4(masked.into())
+            }
+
+            IpAddr::V6(address) => {
+                let masked = u128::from(address) & v6_mask(prefix_len);
+
+                IpAddr::V6(masked.into())
+            }
+        };
+
+        Ok(Cidr {
+            network,
+            prefix_len,
+        })
+    }
+}
+
+impl TryFrom<String> for Cidr {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Cidr, String> {
+        text.parse()
+    }
+}
+
+impl fmt::Display for Cidr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
+/// True when `address` is in one of the networks.
+pub fn is_allowed(allowed: &[Cidr], address: IpAddr) -> bool {
+    allowed.iter().any(|network| network.contains(address))
+}
+
+fn default_allow_from() -> Vec<Cidr> {
+    DEFAULT_ALLOW_FROM
+        .iter()
+        .map(|text| text.parse().expect("default network is valid"))
+        .collect()
+}
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -126,9 +248,10 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    pub bind: IpAddr,
+    pub bind: Vec<IpAddr>,
     pub port: u16,
     pub udp_size: u16,
+    pub allow_from: Vec<Cidr>,
 }
 
 fn default_bind() -> Vec<IpAddr> {
@@ -138,15 +261,18 @@ fn default_bind() -> Vec<IpAddr> {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            bind: Ipv4Addr::UNSPECIFIED.into(),
+            bind: default_bind(),
             port: 53,
             udp_size: 1232,
+            allow_from: default_allow_from(),
         }
     }
 }
 
 impl ServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        validate_listen("server", &self.bind, &self.allow_from)?;
+
         if !(MIN_UDP_SIZE..=MAX_UDP_SIZE).contains(&self.udp_size) {
             return invalid(format!(
                 "server.udp_size must be between {MIN_UDP_SIZE} and {MAX_UDP_SIZE}"
@@ -316,9 +442,10 @@ fn has_host(url_after_scheme: &str) -> bool {
         .next()
         .unwrap_or_default();
     let host_and_port = authority.rsplit('@').next().unwrap_or_default();
-    let host = match host_and_port.strip_prefix('[') {
-        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
-        None => host_and_port.split(':').next().unwrap_or_default(),
+    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        host_and_port.split(':').next().unwrap_or_default()
     };
 
     !host.is_empty() && !host.contains(char::is_whitespace)
@@ -449,6 +576,7 @@ pub struct WebConfig {
     pub enabled: bool,
     pub bind: Vec<IpAddr>,
     pub port: u16,
+    pub allow_from: Vec<Cidr>,
     pub hostnames: Vec<String>,
     pub user: Option<String>,
     pub password: Option<String>,
@@ -461,6 +589,7 @@ impl Default for WebConfig {
             enabled: true,
             bind: default_bind(),
             port: 8080,
+            allow_from: default_allow_from(),
             hostnames: Vec::new(),
             user: None,
             password: None,
@@ -471,6 +600,8 @@ impl Default for WebConfig {
 
 impl WebConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        validate_listen("web", &self.bind, &self.allow_from)?;
+
         match (&self.user, &self.password) {
             (Some(_), None) => {
                 return invalid("web.password must be set when web.user is set");
@@ -538,6 +669,20 @@ pub enum LogLevel {
 #[serde(default, deny_unknown_fields)]
 pub struct LogConfig {
     pub level: LogLevel,
+}
+
+fn validate_listen(section: &str, bind: &[IpAddr], allow_from: &[Cidr]) -> Result<(), ConfigError> {
+    if bind.is_empty() {
+        return invalid(format!("{section}.bind must not be empty"));
+    }
+
+    if allow_from.is_empty() {
+        return invalid(format!(
+            "{section}.allow_from must not be empty, use [\"0.0.0.0/0\", \"::/0\"] to allow everyone"
+        ));
+    }
+
+    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> Result<(), ConfigError> {
@@ -670,8 +815,9 @@ mod tests {
             rules = ["||ads.example^", "@@||ok.example^"]
 
             [server]
-            bind = "127.0.0.1"
+            bind = ["127.0.0.1", "::1"]
             port = 5353
+            allow_from = ["192.168.1.0/24", "10.1.2.3"]
             udp_size = 1400
 
             [upstream]
@@ -998,13 +1144,158 @@ mod tests {
     }
 
     #[test]
+    fn cidr_matches_networks_and_single_hosts() {
+        let lan: Cidr = "192.168.0.0/16".parse().unwrap();
+        let host: Cidr = "10.1.2.3".parse().unwrap();
+        let v6: Cidr = "fc00::/7".parse().unwrap();
+        let everything: Cidr = "0.0.0.0/0".parse().unwrap();
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+
+        assert!(lan.contains(ip("192.168.255.1")));
+        assert!(!lan.contains(ip("192.169.0.1")));
+        assert!(host.contains(ip("10.1.2.3")));
+        assert!(!host.contains(ip("10.1.2.4")));
+        assert!(v6.contains(ip("fd12:3456::1")));
+        assert!(!v6.contains(ip("fe80::1")));
+        assert!(everything.contains(ip("8.8.8.8")));
+        assert!(!everything.contains(ip("::1")), "families do not mix");
+        assert_eq!(lan.to_string(), "192.168.0.0/16");
+    }
+
+    #[test]
+    fn cidr_treats_an_ipv4_mapped_address_as_ipv4() {
+        let lan: Cidr = "192.168.0.0/16".parse().unwrap();
+
+        assert!(lan.contains("::ffff:192.168.1.1".parse().unwrap()));
+        assert!(!lan.contains("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_masks_host_bits_of_the_network() {
+        let cidr: Cidr = "10.9.8.7/8".parse().unwrap();
+
+        assert_eq!(cidr.to_string(), "10.0.0.0/8");
+        assert!(cidr.contains("10.200.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn invalid_cidrs_are_rejected() {
+        for text in [
+            "",
+            "lan",
+            "10.0.0.0/33",
+            "::/129",
+            "10.0.0.0/x",
+            "10.0.0.0/-1",
+            "/8",
+        ] {
+            assert!(text.parse::<Cidr>().is_err(), "{text:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn default_access_lists_cover_private_ranges_only() {
+        let config = Config::default();
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+
+        for allowed in [
+            "127.0.0.1",
+            "::1",
+            "10.2.3.4",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "169.254.1.1",
+            "fd00::1",
+            "fe80::1",
+        ] {
+            assert!(
+                is_allowed(&config.server.allow_from, ip(allowed)),
+                "{allowed}"
+            );
+            assert!(is_allowed(&config.web.allow_from, ip(allowed)), "{allowed}");
+        }
+
+        for denied in [
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.128.0.1",
+            "192.169.0.1",
+            "2001:db8::1",
+            "fec0::1",
+        ] {
+            assert!(
+                !is_allowed(&config.server.allow_from, ip(denied)),
+                "{denied}"
+            );
+            assert!(!is_allowed(&config.web.allow_from, ip(denied)), "{denied}");
+        }
+    }
+
+    #[test]
+    fn server_bind_defaults_to_both_families_and_accepts_one_family() {
+        let both = ["0.0.0.0".parse::<IpAddr>().unwrap(), "::".parse().unwrap()];
+        let ipv4 = Config::parse("[server]\nbind = [\"127.0.0.1\"]").unwrap();
+        let ipv6 = Config::parse("[server]\nbind = [\"::1\"]").unwrap();
+
+        assert_eq!(Config::default().server.bind, both);
+        assert_eq!(ipv4.server.bind, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(ipv6.server.bind, ["::1".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn allow_from_is_read_from_both_sections() {
+        let config = Config::parse(
+            "[server]\nallow_from = [\"203.0.113.0/24\"]\n[web]\nallow_from = [\"::1\"]",
+        )
+        .unwrap();
+
+        assert_eq!(config.server.allow_from.len(), 1);
+        assert!(is_allowed(
+            &config.server.allow_from,
+            "203.0.113.9".parse().unwrap()
+        ));
+        assert!(!is_allowed(
+            &config.server.allow_from,
+            "127.0.0.1".parse().unwrap()
+        ));
+        assert!(is_allowed(&config.web.allow_from, "::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn bad_listen_settings_are_rejected_with_the_field_name() {
+        let cases = [
+            ("[server]\nbind = []", "server.bind must not be empty"),
+            ("[web]\nbind = []", "web.bind must not be empty"),
+            (
+                "[server]\nallow_from = []",
+                "server.allow_from must not be empty",
+            ),
+            ("[web]\nallow_from = []", "web.allow_from must not be empty"),
+            (
+                "[server]\nallow_from = [\"10.0.0.0/40\"]",
+                "prefix length is above 32",
+            ),
+            ("[web]\nallow_from = [\"lan\"]", "not an IP address"),
+        ];
+
+        for (text, expected) in cases {
+            let message = error_of(text);
+
+            assert!(message.contains(expected), "{text:?}: {message}");
+        }
+    }
+
+    #[test]
     fn negative_number_is_rejected() {
         assert!(Config::parse("[cache]\nmax_entries = -1").is_err());
     }
 
     #[test]
     fn invalid_ip_address_is_rejected() {
-        let message = error_of("[server]\nbind = \"not-an-ip\"");
+        let message = error_of("[server]\nbind = [\"not-an-ip\"]");
 
         assert!(message.contains("invalid IP address"), "{message}");
     }

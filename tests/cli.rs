@@ -1,5 +1,7 @@
+use std::net::UdpSocket;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 fn picoguard(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_picoguard"))
@@ -72,24 +74,105 @@ fn check_rejects_a_missing_file() {
     assert!(text(&output.stderr).contains("/nonexistent/picoguard.toml"));
 }
 
+/// Runs the server on a free port until it answers, then stops it and
+/// returns what it wrote to stderr.
+fn run_until_ready(name: &str, log_level: &str) -> (u16, String) {
+    let port = {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap().port()
+    };
+    let config = format!(
+        "[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+         [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
+         [log]\nlevel = \"{log_level}\"\n"
+    );
+    let path = write_config(name, &config);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_picoguard"))
+        .args(["-c", path.to_str().unwrap()])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("picoguard binary should start");
+
+    let ready = wait_for_refused_version_bind(port);
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(ready, "the server never answered");
+
+    (port, text(&output.stderr))
+}
+
+/// `version.bind` is refused without any upstream, which makes it a probe.
+fn wait_for_refused_version_bind(port: u16) -> bool {
+    let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    query.extend_from_slice(b"\x07version\x04bind\x00");
+    query.extend_from_slice(&[0, 16, 0, 3]);
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+
+    for _ in 0..50 {
+        socket.send_to(&query, ("127.0.0.1", port)).unwrap();
+        let mut reply = [0u8; 512];
+        if let Ok((length, _)) = socket.recv_from(&mut reply)
+            && length >= 12
+        {
+            return reply[3] & 0x0F == 5;
+        }
+    }
+
+    false
+}
+
 #[test]
-fn running_with_a_good_config_logs_one_info_line_and_exits_zero() {
-    let path = write_config("info-level.toml", "[log]\nlevel = \"info\"\n");
+fn running_logs_the_listening_address_at_info_level() {
+    let (port, stderr) = run_until_ready("info-level.toml", "info");
 
-    let output = picoguard(&["-c", path.to_str().unwrap()]);
-
-    assert_eq!(output.status.code(), Some(0));
-    let stderr = text(&output.stderr);
-    assert_eq!(stderr.lines().count(), 1, "{stderr}");
-    assert!(stderr.starts_with("INFO "), "{stderr}");
+    assert!(
+        stderr.lines().all(|line| line.starts_with("INFO ")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("listening on 127.0.0.1:{port}")),
+        "{stderr}"
+    );
 }
 
 #[test]
 fn running_at_the_default_log_level_prints_nothing() {
-    let output = picoguard(&["-c", &example_config()]);
+    let (_, stderr) = run_until_ready("warn-level.toml", "warn");
 
-    assert_eq!(output.status.code(), Some(0));
-    assert!(text(&output.stderr).is_empty());
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn running_with_an_encrypted_upstream_exits_one_until_those_exist() {
+    let path = write_config(
+        "https-upstream.toml",
+        "[server]\nbind = [\"127.0.0.1\"]\nport = 0\n",
+    );
+
+    let output = picoguard(&["-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("not supported yet"));
+}
+
+#[test]
+fn running_with_a_port_in_use_exits_one() {
+    let taken = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let config = format!(
+        "[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+         [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n"
+    );
+    let path = write_config("port-in-use.toml", &config);
+
+    let output = picoguard(&["-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains(&format!("127.0.0.1:{port}")));
 }
 
 #[test]

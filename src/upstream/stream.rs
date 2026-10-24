@@ -110,13 +110,11 @@ impl StreamClient {
             }
         }
 
-        match timeout_at(deadline, reply).await {
-            Ok(Ok(bytes)) => Ok(bytes),
+        let Ok(received) = timeout_at(deadline, reply).await else {
+            return Err(UpstreamError::Timeout);
+        };
 
-            Ok(Err(_)) => Err(UpstreamError::Closed),
-
-            Err(_) => Err(UpstreamError::Timeout),
-        }
+        received.map_err(|_| UpstreamError::Closed)
     }
 
     fn register(
@@ -251,16 +249,17 @@ async fn write_frame<W>(writer: &mut W, frame: &[u8], limit: Duration) -> io::Re
 where
     W: AsyncWrite + Unpin,
 {
-    match timeout(limit, async {
+    let written = timeout(limit, async {
         writer.write_all(frame).await?;
         writer.flush().await
     })
-    .await
-    {
-        Ok(result) => result,
+    .await;
 
-        Err(_) => Err(io::ErrorKind::TimedOut.into()),
-    }
+    let Ok(result) = written else {
+        return Err(io::ErrorKind::TimedOut.into());
+    };
+
+    result
 }
 
 #[cfg(test)]

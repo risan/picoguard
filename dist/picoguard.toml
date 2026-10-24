@@ -22,8 +22,15 @@
 # ]
 
 [server]
-# bind = "0.0.0.0"
+# Addresses to listen on; :: is IPv6 only, so both entries can share the port.
+# bind = ["0.0.0.0", "::"]
 # port = 53
+# Only these networks may query: loopback, private ranges, 100.64.0.0/10
+# (Tailscale), link-local. Others get no answer.
+# allow_from = [
+#     "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+#     "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10",
+# ]
 # EDNS UDP payload size advertised to clients and upstreams.
 # udp_size = 1232
 
@@ -91,6 +98,11 @@ format = "adblock"
 # enabled = true
 # bind = ["0.0.0.0", "::"]
 # port = 8080
+# Same format and default as server.allow_from.
+# allow_from = [
+#     "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+#     "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10",
+# ]
 # Host names the status page answers to, besides IP addresses.
 # hostnames = []
 # Set both to require basic auth.
