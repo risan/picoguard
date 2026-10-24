@@ -135,3 +135,34 @@ pub fn txt(owner: &str, ttl: u32, size: usize) -> Record {
 
     Record::from_rdata(name(owner), ttl, RData::TXT(TXT::new(strings)))
 }
+
+/// Offsets inside `response_with_opt_before_other_additionals`.
+pub const OPT_BEFORE_ADDITIONALS_OPT_START: usize = 49;
+pub const OPT_BEFORE_ADDITIONALS_FIRST_START: usize = 60;
+
+/// A reply to `www.example.com A` written by hand because hickory always
+/// puts the OPT record last: one A answer, then the additional section
+/// `OPT, ns.example.com A, ns.example.com AAAA, ns.example.com CNAME
+/// alt.ns.example.com`. The last two records point back at the first one
+/// (owner name, CNAME target), so moving anything before them breaks their
+/// compression pointers.
+pub fn response_with_opt_before_other_additionals() -> Vec<u8> {
+    let mut bytes = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 4];
+    bytes.extend_from_slice(b"\x03www\x07example\x03com\x00\x00\x01\x00\x01");
+    bytes.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 192, 0, 2, 1]);
+    assert_eq!(bytes.len(), OPT_BEFORE_ADDITIONALS_OPT_START);
+
+    bytes.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(bytes.len(), OPT_BEFORE_ADDITIONALS_FIRST_START);
+
+    bytes.extend_from_slice(&[2, b'n', b's', 0xC0, 16, 0, 1, 0, 1, 0, 0, 2, 88, 0, 4]);
+    bytes.extend_from_slice(&[192, 0, 2, 53]);
+    bytes.extend_from_slice(&[0xC0, 60, 0, 28, 0, 1, 0, 0, 3, 132, 0, 16]);
+    bytes.extend_from_slice(&[
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+    ]);
+    bytes.extend_from_slice(&[0xC0, 60, 0, 5, 0, 1, 0, 0, 3, 132, 0, 6]);
+    bytes.extend_from_slice(&[3, b'a', b'l', b't', 0xC0, 60]);
+
+    bytes
+}

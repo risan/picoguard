@@ -5,7 +5,8 @@ use std::ops::Range;
 pub const HEADER_LEN: usize = 12;
 pub const MAX_NAME_LEN: usize = 255;
 const MAX_LABEL_LEN: usize = 63;
-const MAX_MESSAGE_LEN: usize = 65535;
+/// The largest DNS message: the 16-bit length of a TCP frame.
+pub const MAX_MESSAGE_LEN: usize = 65535;
 
 pub mod rtype {
     pub const A: u16 = 1;
@@ -189,6 +190,7 @@ impl Name {
         for (target, byte) in self.bytes[start + 1..].iter_mut().zip(label) {
             *target = byte.to_ascii_lowercase();
         }
+
         self.len += 1 + label.len() as u8;
 
         Ok(())
@@ -299,12 +301,33 @@ impl<'a> Iterator for Labels<'a> {
     }
 }
 
-/// Reads the name at `start`, following compression pointers. Returns the
-/// lowercased name and the offset just after it in the original position.
-pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
-    let mut name = Name::empty();
+/// A name reached through at most this many compression pointers is accepted;
+/// real messages use one or two.
+const MAX_NAME_POINTERS: usize = 128;
+
+/// Where a name written at some offset ends.
+struct NameSpan {
+    /// The offset after the name as written, where the next field begins.
+    end: usize,
+    /// The offset of the pointer that ends the name, if it is compressed.
+    pointer_at: Option<usize>,
+}
+
+/// The one walker over names, for decompression, skipping and validation.
+/// Follows compression pointers, which must point strictly backward and at
+/// most `MAX_NAME_POINTERS` times, and fails when the expanded name passes
+/// 255 bytes, so no input can make it loop. Calls `on_label` for every label
+/// of the expanded name.
+fn walk_name<F>(msg: &[u8], start: usize, mut on_label: F) -> Result<NameSpan, WireError>
+where
+    F: FnMut(&[u8]) -> Result<(), WireError>,
+{
     let mut position = start;
     let mut end = None;
+    let mut pointer_at = None;
+    let mut pointers = 0;
+    // The terminating zero label.
+    let mut expanded_len = 1;
 
     loop {
         let first = *msg.get(position).ok_or(WireError::Truncated)?;
@@ -313,15 +336,21 @@ pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
             0x00 => {
                 let length = usize::from(first);
                 if length == 0 {
-                    name.push_terminator();
+                    return Ok(NameSpan {
+                        end: end.unwrap_or(position + 1),
+                        pointer_at,
+                    });
+                }
 
-                    return Ok((name, end.unwrap_or(position + 1)));
+                expanded_len += 1 + length;
+                if expanded_len > MAX_NAME_LEN {
+                    return Err(WireError::BadName);
                 }
 
                 let label = msg
                     .get(position + 1..position + 1 + length)
                     .ok_or(WireError::Truncated)?;
-                name.push_label(label)?;
+                on_label(label)?;
                 position += 1 + length;
             }
 
@@ -330,11 +359,11 @@ pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
                 let target = (usize::from(first & 0x3F) << 8) | usize::from(second);
                 if end.is_none() {
                     end = Some(position + 2);
+                    pointer_at = Some(position);
                 }
 
-                // Only backward pointers: cycles then need label bytes, which
-                // the 255-byte name limit stops.
-                if target >= position {
+                pointers += 1;
+                if target >= position || pointers > MAX_NAME_POINTERS {
                     return Err(WireError::BadName);
                 }
 
@@ -348,35 +377,20 @@ pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
     }
 }
 
-/// Returns the offset just after the name at `start` without decompressing it.
+/// Reads the name at `start`, following compression pointers. Returns the
+/// lowercased name and the offset just after it in the original position.
+pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
+    let mut name = Name::empty();
+    let end = walk_name(msg, start, |label| name.push_label(label))?.end;
+    name.push_terminator();
+
+    Ok((name, end))
+}
+
+/// Returns the offset just after the name at `start`. The name is walked
+/// without being kept, so a bad pointer is an error here too.
 pub fn skip_name(msg: &[u8], start: usize) -> Result<usize, WireError> {
-    let mut position = start;
-
-    loop {
-        let first = *msg.get(position).ok_or(WireError::Truncated)?;
-
-        match first & 0xC0 {
-            0x00 => {
-                if first == 0 {
-                    return Ok(position + 1);
-                }
-
-                position += 1 + usize::from(first);
-            }
-
-            0xC0 => {
-                if position + 2 > msg.len() {
-                    return Err(WireError::Truncated);
-                }
-
-                return Ok(position + 2);
-            }
-
-            _ => {
-                return Err(WireError::BadName);
-            }
-        }
-    }
+    Ok(walk_name(msg, start, |_| Ok(()))?.end)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -496,6 +510,7 @@ fn read_query_edns(msg: &[u8], start: usize, count: u16) -> Result<Option<Edns>,
                 dnssec_ok: ttl & EDNS_DO != 0,
             });
         }
+
         position = end;
     }
 
@@ -728,12 +743,26 @@ pub struct ResponseInfo {
     pub header: Header,
     /// Offsets of the TTL field of every record except OPT.
     pub ttl_offsets: Vec<u16>,
-    /// Offset of the OPT record, which must be the last record.
+    /// Offset of the OPT record, which may be anywhere in the additional
+    /// section.
     pub opt_start: Option<u16>,
     /// Smallest TTL over all records except OPT.
     pub min_ttl: Option<u32>,
     /// RFC 2308 negative TTL: smallest of the authority SOA's TTL and minimum.
     pub negative_ttl: Option<u32>,
+    /// NXDOMAIN, or NOERROR where the name at the end of the answer's CNAME
+    /// chain (the queried name when there is no chain) has no data.
+    pub is_negative: bool,
+    /// The upper 8 bits of the 12-bit RCODE, from the OPT record (0 without
+    /// one).
+    pub extended_rcode: u8,
+    soas: Vec<AuthoritySoa>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthoritySoa {
+    ttl_offset: u16,
+    minimum: u32,
 }
 
 impl ResponseInfo {
@@ -749,17 +778,25 @@ impl ResponseInfo {
             opt_start: None,
             min_ttl: None,
             negative_ttl: None,
+            is_negative: false,
+            extended_rcode: 0,
+            soas: Vec::new(),
         };
 
         for record in Records::new(msg)? {
             let record = record?;
 
-            if info.opt_start.is_some() {
-                return Err(WireError::Malformed);
-            }
-
             if record.rtype == rtype::OPT {
+                let has_root_owner = record.ttl_offset == record.start + 1 + 4;
+                if record.section != Section::Additional
+                    || info.opt_start.is_some()
+                    || !has_root_owner
+                {
+                    return Err(WireError::Malformed);
+                }
+
                 info.opt_start = Some(offset(record.start)?);
+                info.extended_rcode = (record.ttl >> 24) as u8;
 
                 continue;
             }
@@ -772,11 +809,197 @@ impl ResponseInfo {
             {
                 let ttl = record.ttl.min(minimum);
                 info.negative_ttl = Some(info.negative_ttl.map_or(ttl, |min| min.min(ttl)));
+                info.soas.push(AuthoritySoa {
+                    ttl_offset: offset(record.ttl_offset)?,
+                    minimum,
+                });
             }
         }
 
+        info.is_negative = is_negative(msg, &header)?;
+
         Ok(info)
     }
+}
+
+impl ResponseInfo {
+    /// RFC 2308 section 5: in a negative reply the TTL of the SOA is the smaller
+    /// of its own TTL and its MINIMUM. Writing that into `msg` as the reply
+    /// arrives makes the SOA TTL clients see age together with the lifetime
+    /// the cache gives the reply. `msg` must be the bytes this was parsed from.
+    pub fn cap_soa_ttls(&mut self, msg: &mut [u8]) {
+        if !self.is_negative {
+            return;
+        }
+
+        for soa in &self.soas {
+            let at = usize::from(soa.ttl_offset);
+            let Ok(ttl) = read_u32(msg, at) else {
+                continue;
+            };
+
+            let capped = ttl.min(soa.minimum);
+
+            msg[at..at + 4].copy_from_slice(&capped.to_be_bytes());
+            self.min_ttl = Some(self.min_ttl.map_or(capped, |min| min.min(capped)));
+        }
+    }
+}
+
+/// A CNAME chain this long is not followed further; it is left unclassified
+/// rather than called empty.
+const MAX_CNAME_HOPS: usize = 8;
+
+fn is_negative(msg: &[u8], header: &Header) -> Result<bool, WireError> {
+    match header.rcode() {
+        rcode::NXDOMAIN => {
+            return Ok(true);
+        }
+
+        rcode::NOERROR => {}
+
+        _ => {
+            return Ok(false);
+        }
+    }
+
+    if header.answer_count == 0 {
+        return Ok(true);
+    }
+
+    if header.question_count != 1 {
+        return Ok(false);
+    }
+
+    let (question, _) = read_question(msg, HEADER_LEN)?;
+    if question.qtype == rtype::CNAME || question.qtype == rtype::ANY {
+        return Ok(false);
+    }
+
+    let mut current = question.name;
+    let mut reached_the_end = false;
+    for _ in 0..MAX_CNAME_HOPS {
+        let Some(target) = cname_target_of(msg, &current)? else {
+            reached_the_end = true;
+
+            break;
+        };
+
+        current = target;
+    }
+
+    Ok(reached_the_end && !has_answer_for(msg, &current)?)
+}
+
+fn answers(msg: &[u8]) -> Result<impl Iterator<Item = Result<Record, WireError>>, WireError> {
+    Ok(Records::new(msg)?.take_while(|record| {
+        record
+            .as_ref()
+            .map_or(true, |record| record.section == Section::Answer)
+    }))
+}
+
+fn cname_target_of(msg: &[u8], owner: &Name) -> Result<Option<Name>, WireError> {
+    for record in answers(msg)? {
+        let record = record?;
+        if record.rtype == rtype::CNAME
+            && read_name(msg, record.start)?.0 == *owner
+            && let RData::Cname(target) = record.data(msg)?
+        {
+            return Ok(Some(*target));
+        }
+    }
+
+    Ok(None)
+}
+
+fn has_answer_for(msg: &[u8], owner: &Name) -> Result<bool, WireError> {
+    for record in answers(msg)? {
+        if read_name(msg, record?.start)?.0 == *owner {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Types whose rdata RFC 1035 lets a server compress (RFC 3597 section 4
+/// forbids it for every other type): one domain name first.
+const NAME_FIRST_TYPES: [u16; 8] = [2, 3, 4, 5, 7, 8, 9, 12];
+/// Two domain names: SOA, MINFO and RP.
+const TWO_NAMES_TYPES: [u16; 3] = [6, 14, 17];
+/// A 16-bit preference, then a domain name: MX, AFSDB and RT.
+const PREFERENCE_THEN_NAME_TYPES: [u16; 3] = [15, 18, 21];
+
+/// Removes the OPT record at `opt_start` and moves what follows it up, so a
+/// reply can carry our OPT instead of the upstream's, whichever place in the
+/// additional section the upstream gave it. The compression pointers of the
+/// records after it are lowered by the OPT's length. Fails if one of them
+/// points into the OPT.
+pub fn remove_opt(msg: &mut Vec<u8>, opt_start: usize) -> Result<(), WireError> {
+    let records: Vec<Record> = Records::new(msg)?.collect::<Result<_, _>>()?;
+    let opt = records
+        .iter()
+        .find(|record| record.start == opt_start && record.rtype == rtype::OPT)
+        .ok_or(WireError::Malformed)?;
+    let opt_end = opt.rdata.end;
+    let removed = opt_end - opt_start;
+
+    let mut pointers = Vec::new();
+    for record in records.iter().filter(|record| record.start >= opt_end) {
+        compression_pointers(msg, record, &mut pointers)?;
+    }
+
+    for at in pointers {
+        let target = (usize::from(msg[at] & 0x3F) << 8) | usize::from(msg[at + 1]);
+        if (opt_start..opt_end).contains(&target) {
+            return Err(WireError::BadName);
+        }
+
+        if target >= opt_end {
+            let moved = target - removed;
+            msg[at] = 0xC0 | (moved >> 8) as u8;
+            msg[at + 1] = moved as u8;
+        }
+    }
+
+    msg.drain(opt_start..opt_end);
+    let additional = read_u16(msg, 10)?.saturating_sub(1);
+    msg[10..12].copy_from_slice(&additional.to_be_bytes());
+
+    Ok(())
+}
+
+/// The offsets of the compression pointers written in the owner name and in
+/// the rdata names of `record`.
+fn compression_pointers(
+    msg: &[u8],
+    record: &Record,
+    pointers: &mut Vec<usize>,
+) -> Result<(), WireError> {
+    pointers.extend(walk_name(msg, record.start, |_| Ok(()))?.pointer_at);
+
+    let (mut name_at, name_count) = if NAME_FIRST_TYPES.contains(&record.rtype) {
+        (record.rdata.start, 1)
+    } else if TWO_NAMES_TYPES.contains(&record.rtype) {
+        (record.rdata.start, 2)
+    } else if PREFERENCE_THEN_NAME_TYPES.contains(&record.rtype) {
+        (record.rdata.start + 2, 1)
+    } else {
+        return Ok(());
+    };
+
+    for _ in 0..name_count {
+        let name = walk_name(msg, name_at, |_| Ok(()))?;
+        if name.end > record.rdata.end {
+            return Err(WireError::Malformed);
+        }
+
+        pointers.extend(name.pointer_at);
+        name_at = name.end;
+    }
+
+    Ok(())
 }
 
 fn offset(position: usize) -> Result<u16, WireError> {
@@ -786,12 +1009,14 @@ fn offset(position: usize) -> Result<u16, WireError> {
 #[cfg(test)]
 mod tests {
     use hickory_proto::op::Message;
-    use hickory_proto::rr::RecordType;
+    use hickory_proto::rr::{RData as OracleRData, RecordType};
     use proptest::prelude::*;
 
     use super::*;
     use crate::dns::test_util::{
-        QuerySpec, ResponseSpec, a, aaaa, cname, https, parse as parse_with_oracle, soa,
+        OPT_BEFORE_ADDITIONALS_FIRST_START, OPT_BEFORE_ADDITIONALS_OPT_START, QuerySpec,
+        ResponseSpec, a, aaaa, cname, https, parse as parse_with_oracle,
+        response_with_opt_before_other_additionals, soa,
     };
 
     fn ttl_at(msg: &[u8], offset: u16) -> u32 {
@@ -968,6 +1193,154 @@ mod tests {
         assert_eq!(result, Err(WireError::BadName));
     }
 
+    fn pointer_to(target: usize) -> [u8; 2] {
+        [0xC0 | (target >> 8) as u8, target as u8]
+    }
+
+    /// A response with the given question name and one record per `(owner,
+    /// rtype, rdata)`; every record is class IN with TTL 60.
+    fn response_of(question_name: &[u8], records: &[(&[u8], u16, &[u8])]) -> Vec<u8> {
+        let mut bytes = vec![
+            0x12,
+            0x34,
+            0x81,
+            0x80,
+            0,
+            1,
+            0,
+            records.len() as u8,
+            0,
+            0,
+            0,
+            0,
+        ];
+        bytes.extend_from_slice(question_name);
+        bytes.extend_from_slice(&[0, 1, 0, 1]);
+
+        for (owner, rtype, rdata) in records {
+            bytes.extend_from_slice(owner);
+            bytes.extend_from_slice(&rtype.to_be_bytes());
+            bytes.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+            bytes.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(rdata);
+        }
+
+        bytes
+    }
+
+    const EXAMPLE_COM: &[u8] = b"\x07example\x03com\x00";
+    const A_RDATA: &[u8] = &[192, 0, 2, 1];
+
+    fn owner_offset(question_name: &[u8]) -> usize {
+        HEADER_LEN + question_name.len() + 4
+    }
+
+    #[test]
+    fn a_response_with_a_good_compressed_owner_name_parses() {
+        let owner = pointer_to(HEADER_LEN);
+
+        let info = ResponseInfo::parse(&response_of(EXAMPLE_COM, &[(&owner, 1, A_RDATA)])).unwrap();
+
+        assert_eq!(info.ttl_offsets.len(), 1);
+    }
+
+    #[test]
+    fn response_owner_names_with_bad_pointers_are_rejected_not_skipped() {
+        let at = owner_offset(EXAMPLE_COM);
+        let with_owner = |owner: &[u8]| response_of(EXAMPLE_COM, &[(owner, 1, A_RDATA)]);
+        let cases = [
+            ("pointer to itself", with_owner(&pointer_to(at))),
+            ("pointer forward", with_owner(&pointer_to(at + 2))),
+            ("pointer past the message", with_owner(&pointer_to(9000))),
+            (
+                "label, then a pointer back to the label",
+                with_owner(&[1, b'a', pointer_to(at)[0], pointer_to(at)[1]]),
+            ),
+            ("reserved label type", with_owner(&[0x40, 0])),
+        ];
+
+        for (label, bytes) in cases {
+            assert!(ResponseInfo::parse(&bytes).is_err(), "{label}");
+        }
+    }
+
+    #[test]
+    fn an_owner_name_that_expands_past_255_bytes_is_rejected() {
+        let mut long_question = Vec::new();
+        for _ in 0..4 {
+            long_question.push(50);
+            long_question.extend_from_slice(&[b'a'; 50]);
+        }
+
+        long_question.push(0);
+        let mut owner = vec![60];
+        owner.extend_from_slice(&[b'b'; 60]);
+        owner.extend_from_slice(&pointer_to(HEADER_LEN));
+
+        let bytes = response_of(&long_question, &[(&owner, 1, A_RDATA)]);
+
+        assert_eq!(ResponseInfo::parse(&bytes), Err(WireError::BadName));
+    }
+
+    #[test]
+    fn a_chain_of_pointers_beyond_the_limit_is_rejected() {
+        // Record 1 carries 200 pointers, each aimed at the one before it, in
+        // opaque rdata. Record 2's owner points at the last of them.
+        let rdata_start = owner_offset(EXAMPLE_COM) + 2 + 2 + 2 + 4 + 2;
+        let mut chain = vec![0u8];
+        let mut previous = rdata_start;
+        for _ in 0..200 {
+            let this = rdata_start + chain.len();
+            chain.extend_from_slice(&pointer_to(previous));
+            previous = this;
+        }
+
+        let owner = pointer_to(HEADER_LEN);
+        let last_hop = pointer_to(previous);
+
+        let bytes = response_of(
+            EXAMPLE_COM,
+            &[(&owner, 99, &chain), (&last_hop, 1, A_RDATA)],
+        );
+
+        assert_eq!(ResponseInfo::parse(&bytes), Err(WireError::BadName));
+        assert_eq!(
+            skip_name(&bytes, rdata_start + chain.len() - 2),
+            Err(WireError::BadName)
+        );
+    }
+
+    #[test]
+    fn bad_pointers_in_soa_names_and_the_question_are_rejected() {
+        let owner = pointer_to(HEADER_LEN);
+        let rdata_start = owner_offset(EXAMPLE_COM) + 2 + 2 + 2 + 4 + 2;
+        let soa_with_mname = |mname: [u8; 2]| {
+            let mut rdata = mname.to_vec();
+            rdata.extend_from_slice(&pointer_to(HEADER_LEN));
+            rdata.extend_from_slice(&[0; 20]);
+            let mut bytes = response_of(EXAMPLE_COM, &[(&owner, rtype::SOA, &rdata)]);
+            // Move the record from the answer to the authority section.
+            bytes[6..10].copy_from_slice(&[0, 0, 0, 1]);
+
+            bytes
+        };
+
+        assert!(ResponseInfo::parse(&soa_with_mname(pointer_to(HEADER_LEN))).is_ok());
+        assert_eq!(
+            ResponseInfo::parse(&soa_with_mname(pointer_to(rdata_start))),
+            Err(WireError::BadName)
+        );
+        assert_eq!(
+            ResponseInfo::parse(&soa_with_mname(pointer_to(rdata_start + 8))),
+            Err(WireError::BadName)
+        );
+        let forward_question = response_of(&pointer_to(HEADER_LEN + 2), &[]);
+        assert_eq!(
+            ResponseInfo::parse(&forward_question),
+            Err(WireError::BadName)
+        );
+    }
+
     #[test]
     fn name_and_label_limits_are_enforced() {
         let mut long_label = vec![64];
@@ -978,12 +1351,14 @@ mod tests {
             long_name.push(60);
             long_name.extend_from_slice(&[b'a'; 60]);
         }
+
         long_name.push(0);
         let mut longest_valid = Vec::new();
         for _ in 0..3 {
             longest_valid.push(63);
             longest_valid.extend_from_slice(&[b'a'; 63]);
         }
+
         longest_valid.push(61);
         longest_valid.extend_from_slice(&[b'a'; 61]);
         longest_valid.push(0);
@@ -1087,6 +1462,134 @@ mod tests {
     }
 
     #[test]
+    fn replies_are_negative_when_the_name_at_the_end_of_the_cname_chain_has_no_data() {
+        let cases = [
+            ("NODATA", vec![], rcode::NOERROR, true),
+            ("NXDOMAIN", vec![], rcode::NXDOMAIN, true),
+            (
+                "NODATA behind a CNAME",
+                vec![cname("www.example.com.", 300, "edge.example.net.")],
+                rcode::NOERROR,
+                true,
+            ),
+            (
+                "NXDOMAIN behind two CNAMEs",
+                vec![
+                    cname("www.example.com.", 300, "mid.example.net."),
+                    cname("mid.example.net.", 300, "edge.example.net."),
+                ],
+                rcode::NXDOMAIN,
+                true,
+            ),
+            (
+                "data behind a CNAME",
+                vec![
+                    cname("www.example.com.", 300, "edge.example.net."),
+                    a("edge.example.net.", 60, [192, 0, 2, 1].into()),
+                ],
+                rcode::NOERROR,
+                false,
+            ),
+            (
+                "data listed before its CNAME",
+                vec![
+                    a("edge.example.net.", 60, [192, 0, 2, 1].into()),
+                    cname("www.example.com.", 300, "edge.example.net."),
+                ],
+                rcode::NOERROR,
+                false,
+            ),
+            (
+                "data without a CNAME",
+                vec![a("www.example.com.", 60, [192, 0, 2, 1].into())],
+                rcode::NOERROR,
+                false,
+            ),
+            ("SERVFAIL", vec![], rcode::SERVFAIL, false),
+        ];
+
+        for (label, answers, rcode, expected) in cases {
+            let bytes = ResponseSpec {
+                answers,
+                authorities: vec![soa("example.net.", 900, 45)],
+                rcode,
+                ..ResponseSpec::default()
+            }
+            .bytes(&QuerySpec::new("www.example.com.", RecordType::A));
+
+            let info = ResponseInfo::parse(&bytes).unwrap();
+
+            assert_eq!(info.is_negative, expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_cname_query_answered_by_a_cname_is_not_negative() {
+        let bytes = ResponseSpec {
+            answers: vec![cname("www.example.com.", 300, "edge.example.net.")],
+            ..ResponseSpec::default()
+        }
+        .bytes(&QuerySpec::new("www.example.com.", RecordType::CNAME));
+
+        assert!(!ResponseInfo::parse(&bytes).unwrap().is_negative);
+    }
+
+    #[test]
+    fn a_cname_chain_longer_than_the_hop_limit_is_not_called_negative() {
+        let answers = (0..20)
+            .map(|hop| {
+                cname(
+                    &format!("h{hop}.example.com."),
+                    300,
+                    &format!("h{}.example.com.", hop + 1),
+                )
+            })
+            .collect();
+        let bytes = ResponseSpec {
+            answers,
+            authorities: vec![soa("example.com.", 900, 45)],
+            ..ResponseSpec::default()
+        }
+        .bytes(&QuerySpec::new("h0.example.com.", RecordType::A));
+
+        assert!(!ResponseInfo::parse(&bytes).unwrap().is_negative);
+    }
+
+    #[test]
+    fn a_negative_reply_gets_its_soa_ttl_capped_by_the_minimum() {
+        let query = QuerySpec::new("nx.example.com.", RecordType::A);
+        let reply = |ttl, minimum, rcode| {
+            ResponseSpec {
+                authorities: vec![soa("example.com.", ttl, minimum)],
+                rcode,
+                ..ResponseSpec::default()
+            }
+            .bytes(&query)
+        };
+        let soa_ttl = |bytes: &[u8], info: &ResponseInfo| ttl_at(bytes, info.ttl_offsets[0]);
+
+        let mut nxdomain = reply(900, 45, rcode::NXDOMAIN);
+        let mut info = ResponseInfo::parse(&nxdomain).unwrap();
+        info.cap_soa_ttls(&mut nxdomain);
+        let mut already_lower = reply(30, 45, rcode::NXDOMAIN);
+        let mut lower_info = ResponseInfo::parse(&already_lower).unwrap();
+        lower_info.cap_soa_ttls(&mut already_lower);
+        let mut positive = ResponseSpec {
+            answers: vec![a("nx.example.com.", 300, [192, 0, 2, 1].into())],
+            authorities: vec![soa("example.com.", 900, 45)],
+            ..ResponseSpec::default()
+        }
+        .bytes(&query);
+        let mut positive_info = ResponseInfo::parse(&positive).unwrap();
+        positive_info.cap_soa_ttls(&mut positive);
+
+        assert_eq!(soa_ttl(&nxdomain, &info), 45);
+        assert_eq!(info.min_ttl, Some(45));
+        assert_eq!(soa_ttl(&already_lower, &lower_info), 30);
+        assert_eq!(ttl_at(&positive, positive_info.ttl_offsets[1]), 900);
+    }
+
+    #[test]
     fn record_data_matches_the_oracle() {
         let (_, bytes, _) = rich_response();
 
@@ -1183,24 +1686,101 @@ mod tests {
                 "prefix of {length} bytes parsed"
             );
         }
+
         assert!(ResponseInfo::parse(&bytes).is_ok());
     }
 
     #[test]
-    fn opt_must_be_the_last_record_and_unique() {
+    fn opt_must_be_unique_in_the_additional_section_with_the_root_as_owner() {
         let (_, bytes, _) = rich_response();
         let opt = bytes[bytes.len() - 11..].to_vec();
         let mut two_opts = bytes.clone();
         two_opts.extend_from_slice(&opt);
         two_opts[11] += 1;
-        let mut record_after_opt = bytes.clone();
-        record_after_opt.extend_from_slice(&[0, 0, 1, 0, 1, 0, 0, 0, 5, 0, 4, 1, 2, 3, 4]);
-        record_after_opt[11] += 1;
+        let mut named_opt = bytes.clone();
+        let opt_start = bytes.len() - 11;
+        named_opt.splice(opt_start..opt_start + 1, [1, b'x', 0]);
+        let opt_in_answers = response_of(EXAMPLE_COM, &[(&[0], rtype::OPT, &[])]);
 
         assert_eq!(ResponseInfo::parse(&two_opts), Err(WireError::Malformed));
+        assert_eq!(ResponseInfo::parse(&named_opt), Err(WireError::Malformed));
         assert_eq!(
-            ResponseInfo::parse(&record_after_opt),
+            ResponseInfo::parse(&opt_in_answers),
             Err(WireError::Malformed)
+        );
+    }
+
+    #[test]
+    fn opt_may_come_before_other_additional_records() {
+        let bytes = response_with_opt_before_other_additionals();
+        let oracle = parse_with_oracle(&bytes);
+        assert!(oracle.edns.is_some(), "the fixture is a valid message");
+        assert_eq!(oracle.additionals.len(), 3);
+
+        let info = ResponseInfo::parse(&bytes).unwrap();
+
+        assert_eq!(
+            info.opt_start,
+            Some(OPT_BEFORE_ADDITIONALS_OPT_START as u16)
+        );
+        let ttls: Vec<u32> = info
+            .ttl_offsets
+            .iter()
+            .map(|offset| ttl_at(&bytes, *offset))
+            .collect();
+        assert_eq!(ttls, [300, 600, 900, 900]);
+        assert_eq!(info.min_ttl, Some(300));
+    }
+
+    #[test]
+    fn removing_the_opt_record_moves_later_records_and_their_pointers() {
+        let mut bytes = response_with_opt_before_other_additionals();
+        let before = bytes.len();
+
+        remove_opt(&mut bytes, OPT_BEFORE_ADDITIONALS_OPT_START).unwrap();
+
+        assert_eq!(bytes.len(), before - 11);
+        let oracle = parse_with_oracle(&bytes);
+        assert!(oracle.edns.is_none());
+        let owners: Vec<String> = oracle
+            .additionals
+            .iter()
+            .map(|record| record.name.to_ascii())
+            .collect();
+        assert_eq!(owners, ["ns.example.com."; 3]);
+        let OracleRData::CNAME(target) = &oracle.additionals[2].data else {
+            panic!("expected a CNAME");
+        };
+
+        assert_eq!(target.0.to_ascii(), "alt.ns.example.com.");
+        let info = ResponseInfo::parse(&bytes).unwrap();
+        assert_eq!(info.opt_start, None);
+        assert_eq!(info.header.additional_count, 3);
+        assert_eq!(oracle.answers.len(), 1);
+    }
+
+    #[test]
+    fn removing_a_trailing_opt_record_just_cuts_it_off() {
+        let (_, mut bytes, _) = rich_response();
+        let opt_start = usize::from(ResponseInfo::parse(&bytes).unwrap().opt_start.unwrap());
+
+        remove_opt(&mut bytes, opt_start).unwrap();
+
+        assert_eq!(bytes.len(), opt_start);
+        assert!(parse_with_oracle(&bytes).edns.is_none());
+    }
+
+    #[test]
+    fn a_pointer_into_the_removed_opt_record_is_an_error() {
+        let mut bytes = response_with_opt_before_other_additionals();
+        // The second record after the OPT names its owner by the OPT's offset.
+        let second_start = OPT_BEFORE_ADDITIONALS_FIRST_START + 19;
+        bytes[second_start] = 0xC0;
+        bytes[second_start + 1] = OPT_BEFORE_ADDITIONALS_OPT_START as u8;
+
+        assert_eq!(
+            remove_opt(&mut bytes, OPT_BEFORE_ADDITIONALS_OPT_START),
+            Err(WireError::BadName)
         );
     }
 
@@ -1253,7 +1833,22 @@ mod tests {
                     let _ = record.data(&bytes);
                 }
             }
+
             let _ = ResponseInfo::parse(&bytes);
+        }
+
+        #[test]
+        fn removing_the_opt_record_of_a_mutated_response_never_panics(
+            position in 0usize..200,
+            value in any::<u8>(),
+        ) {
+            let mut bytes = response_with_opt_before_other_additionals();
+            let position = position % bytes.len();
+            bytes[position] = value;
+
+            if let Ok(ResponseInfo { opt_start: Some(opt_start), .. }) = ResponseInfo::parse(&bytes) {
+                let _ = remove_opt(&mut bytes, usize::from(opt_start));
+            }
         }
 
         #[test]

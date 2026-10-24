@@ -177,7 +177,7 @@ async fn serve_udp(socket: UdpSocket, pipeline: Arc<Pipeline>, allowed: Arc<[Cid
         let request = &buffer[..length];
         match pipeline.answer_quickly(request, Protocol::Udp, &mut out) {
             Quick::Replied => {
-                let _ = socket.send_to(&out, peer).await;
+                send_now(&socket, &out, peer);
             }
 
             Quick::Dropped => {}
@@ -194,16 +194,23 @@ async fn serve_udp(socket: UdpSocket, pipeline: Arc<Pipeline>, allowed: Arc<[Cid
     }
 }
 
+/// UDP replies are never queued (D21): a socket that cannot take the datagram
+/// right now loses it, as the network may. Waiting would hold the reply, and
+/// the task holding it, outside every limit.
+fn send_now(socket: &UdpSocket, reply: &[u8], peer: SocketAddr) -> bool {
+    socket.try_send_to(reply, peer).is_ok()
+}
+
 async fn answer_udp(
     pipeline: Arc<Pipeline>,
     socket: Arc<UdpSocket>,
-    request: Vec<u8>,
+    mut request: Vec<u8>,
     peer: SocketAddr,
 ) {
     let mut out = Vec::new();
 
-    if pipeline.answer(&request, Protocol::Udp, &mut out).await {
-        let _ = socket.send_to(&out, peer).await;
+    if pipeline.answer(&mut request, Protocol::Udp, &mut out).await {
+        send_now(&socket, &out, peer);
     }
 }
 
@@ -319,31 +326,41 @@ where
 
 async fn answer_tcp(
     pipeline: Arc<Pipeline>,
-    request: Vec<u8>,
+    mut request: Vec<u8>,
     slot: OwnedSemaphorePermit,
     queue: mpsc::UnboundedSender<QueuedReply>,
     queue_budget: Arc<Budget>,
 ) {
     let mut out = Vec::new();
-    if !pipeline.answer(&request, Protocol::Tcp, &mut out).await {
+    if !pipeline.answer(&mut request, Protocol::Tcp, &mut out).await {
         return;
     }
 
-    let mut frame = frame_of(&out);
-    let charges = pipeline
-        .budget()
-        .try_charge(frame.len())
-        .zip(queue_budget.try_charge(frame.len()));
+    let framed = frame_of(&out);
+    let charges = framed.as_ref().and_then(|frame| {
+        pipeline
+            .budget()
+            .try_charge(frame.len())
+            .zip(queue_budget.try_charge(frame.len()))
+    });
 
-    // A reply that does not fit is replaced by a SERVFAIL of a few dozen
-    // bytes, which is not charged.
-    if charges.is_none() {
-        if !pipeline.servfail(&request, Protocol::Tcp, &mut out) {
-            return;
+    // A reply that cannot be framed or does not fit is replaced by a SERVFAIL
+    // of a few dozen bytes, which is not charged.
+    let frame = match framed {
+        Some(frame) if charges.is_some() => frame,
+
+        _ => {
+            if !pipeline.servfail(&request, Protocol::Tcp, &mut out) {
+                return;
+            }
+
+            let Some(frame) = frame_of(&out) else {
+                return;
+            };
+
+            frame
         }
-
-        frame = frame_of(&out);
-    }
+    };
 
     let _ = queue.send(QueuedReply {
         frame,
@@ -352,12 +369,15 @@ async fn answer_tcp(
     });
 }
 
-fn frame_of(message: &[u8]) -> Vec<u8> {
+/// The message with its 2-byte length prefix, or `None` when the length does
+/// not fit in 16 bits.
+fn frame_of(message: &[u8]) -> Option<Vec<u8>> {
+    let length = u16::try_from(message.len()).ok()?;
     let mut frame = Vec::with_capacity(message.len() + 2);
-    frame.extend_from_slice(&(message.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(message);
 
-    frame
+    Some(frame)
 }
 
 /// Writes queued replies in order. A write that takes longer than
@@ -459,6 +479,39 @@ mod tests {
             .unwrap();
 
         assert!(error.contains("no address"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_the_socket_cannot_take_now_is_dropped_not_waited_for() {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(SocketProtocol::UDP)).unwrap();
+        socket.set_send_buffer_size(1).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let socket = UdpSocket::from_std(socket.into()).unwrap();
+        let receiver_that_never_reads = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = receiver_that_never_reads.local_addr().unwrap();
+        socket.writable().await.unwrap();
+
+        let sent: Vec<bool> = (0..100)
+            .map(|_| send_now(&socket, &[0u8; 1000], peer))
+            .collect();
+
+        assert!(sent[0], "an idle socket sends");
+        assert!(sent.contains(&false), "a full send buffer drops");
+    }
+
+    #[test]
+    fn a_message_is_framed_only_when_its_length_fits_in_16_bits() {
+        let largest = vec![7u8; 65_535];
+
+        let frame = frame_of(&largest).unwrap();
+
+        assert_eq!(frame.len(), 65_537);
+        assert_eq!(frame[..2], [0xFF, 0xFF]);
+        assert_eq!(frame_of(&[1, 2, 3]).unwrap(), [0, 3, 1, 2, 3]);
+        assert!(frame_of(&vec![7u8; 65_536]).is_none());
     }
 
     fn queued(frame: Vec<u8>) -> QueuedReply {

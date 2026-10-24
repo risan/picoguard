@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
-use hickory_proto::rr::rdata::{A, TXT};
+use hickory_proto::rr::rdata::{A, SOA, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use picoguard::config::Config;
 use picoguard::pipeline::Pipeline;
@@ -91,6 +91,26 @@ fn answer_a(query: &Message, ttl: u32) -> Message {
     reply
 }
 
+/// NXDOMAIN with a SOA whose TTL is 900 and whose MINIMUM is 45, so RFC 2308
+/// says the answer is good for 45 seconds.
+fn nxdomain_with_soa(query: &Message) -> Message {
+    let mut reply = answer_a(query, 0);
+    reply.answers.clear();
+    reply.metadata.response_code = ResponseCode::NXDomain;
+    let soa = SOA::new(
+        name("ns.example."),
+        name("hostmaster.example."),
+        1,
+        3600,
+        600,
+        86400,
+        45,
+    );
+    reply.add_authority(Record::from_rdata(name("example."), 900, RData::SOA(soa)));
+
+    reply
+}
+
 /// About 1.3 KB: over 512 and 1232, and under what this machine's loopback
 /// delivers without fragmenting UDP.
 fn big_txt(query: &Message) -> Message {
@@ -153,6 +173,7 @@ async fn fake_upstream(
             let Ok(query) = Message::from_vec(&buffer[..length]) else {
                 continue;
             };
+
             let replies = handler(&query);
             let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             highest.fetch_max(now, Ordering::SeqCst);
@@ -162,6 +183,7 @@ async fn fake_upstream(
                     tokio::time::sleep(delay).await;
                     let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
                 }
+
                 in_flight.fetch_sub(1, Ordering::SeqCst);
             });
         }
@@ -316,6 +338,7 @@ async fn the_answer_keeps_the_clients_letter_case_from_the_upstream_and_from_the
     for reply in [fresh, cached] {
         assert_eq!(reply.queries[0].name().to_ascii(), "MiXeD.Example.COM.");
     }
+
     assert_eq!(upstream.count(), 1);
     assert_eq!(
         upstream.last_query().queries[0].name().to_ascii(),
@@ -338,6 +361,51 @@ async fn repeated_queries_come_from_the_cache_with_an_aged_ttl() {
     assert_eq!(second.answers[0].ttl, 300);
     assert_eq!(third.answers[0].ttl, 299);
     assert_eq!(upstream.count(), 1);
+}
+
+#[tokio::test]
+async fn a_cached_negative_reply_shows_the_effective_soa_ttl_and_ages_it() {
+    let upstream = fake_upstream(|query| vec![(Duration::ZERO, nxdomain_with_soa(query))]).await;
+    let server = start(config_for(&upstream)).await;
+    let ask = Ask::new("gone.example.", RecordType::A);
+
+    let fresh = udp_ask(&server, &ask).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let cached = udp_ask(&server, &ask).await.unwrap();
+
+    assert_eq!(fresh.authorities[0].ttl, 45);
+    assert_eq!(cached.authorities[0].ttl, 44);
+    assert_eq!(cached.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(upstream.count(), 1);
+}
+
+#[tokio::test]
+async fn an_extended_rcode_reaches_an_edns_client_and_becomes_servfail_for_a_plain_one() {
+    let upstream = fake_upstream(|query| {
+        let mut reply = answer_a(query, 60);
+        reply.answers.clear();
+        reply.metadata.response_code = ResponseCode::BADVERS;
+        reply.set_edns(Edns::new());
+
+        vec![(Duration::ZERO, reply)]
+    })
+    .await;
+    let server = start(config_for(&upstream)).await;
+
+    let with_edns = udp_ask(
+        &server,
+        &Ask::new("old.example.", RecordType::A).with_edns(1232),
+    )
+    .await
+    .unwrap();
+    let without_edns = udp_ask(&server, &Ask::new("old.example.", RecordType::A))
+        .await
+        .unwrap();
+
+    assert_eq!(u16::from(with_edns.metadata.response_code), 16, "BADVERS");
+    assert_eq!(without_edns.metadata.response_code, ResponseCode::ServFail);
+    assert!(without_edns.edns.is_none());
+    assert_eq!(upstream.count(), 2, "an extended rcode is not cached");
 }
 
 #[tokio::test]
@@ -393,10 +461,12 @@ async fn a_big_answer_is_truncated_over_udp_and_complete_over_tcp() {
         assert!(truncated.metadata.truncation);
         assert!(truncated.answers.is_empty());
     }
+
     for complete in [&tcp_plain, &tcp_edns] {
         assert!(!complete.metadata.truncation);
         assert_eq!(complete.answers.len(), 1);
     }
+
     assert_eq!(upstream.count(), 1, "the TCP retry is a cache hit");
 }
 
@@ -447,6 +517,48 @@ async fn a_tcp_upstream_answer_truncated_over_udp_is_fetched_over_tcp() {
     assert_eq!(tcp_queries.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn a_truncated_reply_from_a_tcp_upstream_reaches_the_client_marked_truncated_and_is_not_cached()
+ {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&queries);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let counter = Arc::clone(&counter);
+            tokio::spawn(async move {
+                loop {
+                    let mut length = [0u8; 2];
+                    if stream.read_exact(&mut length).await.is_err() {
+                        return;
+                    }
+
+                    let mut query = vec![0u8; usize::from(u16::from_be_bytes(length))];
+                    stream.read_exact(&mut query).await.unwrap();
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut reply = answer_a(&Message::from_vec(&query).unwrap(), 60);
+                    reply.metadata.truncation = true;
+                    write_framed(&mut stream, &reply.to_vec().unwrap()).await;
+                }
+            });
+        }
+    });
+    let mut config = Config::default();
+    config.server.bind = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+    config.server.port = 0;
+    config.upstream.servers = vec![format!("tcp://{address}")];
+    let server = start(config).await;
+    let ask = Ask::new("cut.example.", RecordType::A);
+
+    let first = tcp_ask(&server, &ask).await.unwrap();
+    let second = tcp_ask(&server, &ask).await.unwrap();
+
+    assert!(first.metadata.truncation);
+    assert!(second.metadata.truncation);
+    assert_eq!(queries.load(Ordering::SeqCst), 2, "not cached");
+}
+
 // ------------------------------------------------------------- coalescing
 
 #[tokio::test]
@@ -472,6 +584,7 @@ async fn identical_queries_in_flight_share_one_upstream_query() {
         assert_eq!(reply.metadata.id, id as u16);
         assert_eq!(first_a(&reply), ANSWER);
     }
+
     assert_eq!(upstream.count(), 1);
 }
 
@@ -490,6 +603,7 @@ async fn queries_with_different_rd_are_not_coalesced() {
             udp_ask(&server, &ask).await
         }));
     }
+
     for client in clients {
         assert!(client.await.unwrap().is_some());
     }
@@ -735,6 +849,7 @@ async fn too_many_queries_in_flight_are_dropped_over_udp() {
             udp_ask(&server, &ask).await
         }));
     }
+
     let mut answered = 0;
     for client in clients {
         answered += usize::from(client.await.unwrap().is_some());
@@ -762,6 +877,7 @@ async fn too_many_waiting_clients_are_dropped_over_udp_even_when_coalesced() {
             .await
         }));
     }
+
     let mut answered = 0;
     for client in clients {
         answered += usize::from(client.await.unwrap().is_some());
@@ -895,6 +1011,7 @@ async fn pipelined_tcp_queries_are_limited_per_connection() {
     for _ in 0..6 {
         ids.push(read_framed(&mut stream).await.unwrap().metadata.id);
     }
+
     ids.sort_unstable();
 
     assert_eq!(ids, [0, 1, 2, 3, 4, 5]);

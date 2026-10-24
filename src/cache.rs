@@ -239,6 +239,7 @@ impl Cache {
             let Some((_, evicted)) = self.entries.pop_lru() else {
                 break;
             };
+
             self.bytes -= evicted.cost();
         }
 
@@ -273,21 +274,19 @@ impl Cache {
     }
 
     /// How long a reply may be served, or `None` if it must not be cached:
-    /// only NOERROR and NXDOMAIN, never truncated; empty answers (NODATA and
-    /// NXDOMAIN) live as long as the SOA's negative TTL, and are skipped
-    /// without a SOA.
+    /// only NOERROR and NXDOMAIN, never truncated. Negative replies (NXDOMAIN,
+    /// and NODATA, also behind a CNAME chain) live as long as the SOA's
+    /// negative TTL and every record they carry, and are skipped without a
+    /// SOA; other replies live as long as their smallest TTL.
     fn lifetime_of(&self, info: &ResponseInfo) -> Option<u32> {
         let header = &info.header;
-        if !header.is_response() || header.flags & flags::TC != 0 {
+        if !header.is_response() || header.flags & flags::TC != 0 || info.extended_rcode != 0 {
             return None;
         }
 
-        let rcode = header.rcode();
-        let is_empty =
-            rcode == rcode::NXDOMAIN || (rcode == rcode::NOERROR && header.answer_count == 0);
-        let lifetime = if is_empty {
-            info.negative_ttl?
-        } else if rcode == rcode::NOERROR {
+        let lifetime = if info.is_negative {
+            info.negative_ttl?.min(info.min_ttl?)
+        } else if header.rcode() == rcode::NOERROR {
             info.min_ttl?
         } else {
             return None;
@@ -305,7 +304,7 @@ mod tests {
     use hickory_proto::rr::RecordType;
 
     use super::*;
-    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, soa};
+    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, cname, soa};
 
     fn config() -> CacheConfig {
         CacheConfig::default()
@@ -467,6 +466,125 @@ mod tests {
         assert!(age_of_hit(&mut cache, &nodata, after).is_none());
     }
 
+    fn chain_reply(
+        fixture: &Fixture,
+        rcode: u8,
+        cname_ttl: u32,
+        terminal_answers: Vec<hickory_proto::rr::Record>,
+        authorities: Vec<hickory_proto::rr::Record>,
+    ) -> Vec<u8> {
+        let mut answers = vec![cname(&fixture.spec.name, cname_ttl, "edge.example.net.")];
+        answers.extend(terminal_answers);
+
+        ResponseSpec {
+            answers,
+            authorities,
+            rcode,
+            ..ResponseSpec::default()
+        }
+        .bytes(&fixture.spec)
+    }
+
+    fn lifetime_in_secs(cache: &mut Cache, fixture: &Fixture, start: Instant) -> Option<u64> {
+        (0..=1000u64)
+            .find(|secs| age_of_hit(cache, fixture, start + Duration::from_secs(*secs)).is_none())
+    }
+
+    #[test]
+    fn nodata_behind_a_cname_chain_lives_as_long_as_the_negative_ttl() {
+        let mut cache = Cache::new(&config());
+        let fixture = Fixture::new("www.example.com.");
+        let start = Instant::now();
+        let reply = chain_reply(&fixture, 0, 300, vec![], vec![soa("example.net.", 900, 45)]);
+
+        assert!(insert(&mut cache, &fixture, &reply, start));
+
+        assert_eq!(lifetime_in_secs(&mut cache, &fixture, start), Some(45));
+    }
+
+    #[test]
+    fn a_short_cname_ttl_bounds_a_negative_reply_behind_the_chain() {
+        let soa_record = || vec![soa("example.net.", 900, 45)];
+        let fixture = Fixture::new("www.example.com.");
+        let start = Instant::now();
+
+        for rcode in [0, 3] {
+            let mut cache = Cache::new(&config());
+            let reply = chain_reply(&fixture, rcode, 20, vec![], soa_record());
+
+            assert!(insert(&mut cache, &fixture, &reply, start));
+
+            assert_eq!(
+                lifetime_in_secs(&mut cache, &fixture, start),
+                Some(20),
+                "rcode {rcode}"
+            );
+        }
+    }
+
+    #[test]
+    fn nxdomain_behind_a_cname_chain_uses_the_negative_ttl_when_it_is_shorter() {
+        let mut cache = Cache::new(&config());
+        let fixture = Fixture::new("www.example.com.");
+        let start = Instant::now();
+        let reply = chain_reply(&fixture, 3, 300, vec![], vec![soa("example.net.", 900, 45)]);
+
+        assert!(insert(&mut cache, &fixture, &reply, start));
+
+        assert_eq!(lifetime_in_secs(&mut cache, &fixture, start), Some(45));
+    }
+
+    #[test]
+    fn nodata_behind_a_cname_chain_without_a_soa_is_not_cached() {
+        let mut cache = Cache::new(&config());
+        let fixture = Fixture::new("www.example.com.");
+        let reply = chain_reply(&fixture, 0, 300, vec![], vec![]);
+
+        assert!(!insert(&mut cache, &fixture, &reply, Instant::now()));
+    }
+
+    #[test]
+    fn a_cname_chain_that_ends_in_data_is_a_positive_reply_whatever_the_record_order() {
+        let fixture = Fixture::new("www.example.com.");
+        let start = Instant::now();
+        let terminal = || vec![a("edge.example.net.", 120, [192, 0, 2, 1].into())];
+        let authority = || vec![soa("example.net.", 900, 45)];
+        let in_order = chain_reply(&fixture, 0, 300, terminal(), authority());
+        let out_of_order = ResponseSpec {
+            answers: vec![
+                a("edge.example.net.", 120, [192, 0, 2, 1].into()),
+                cname("www.example.com.", 300, "edge.example.net."),
+            ],
+            authorities: authority(),
+            ..ResponseSpec::default()
+        }
+        .bytes(&fixture.spec);
+
+        for reply in [in_order, out_of_order] {
+            let mut cache = Cache::new(&config());
+
+            assert!(insert(&mut cache, &fixture, &reply, start));
+
+            assert_eq!(lifetime_in_secs(&mut cache, &fixture, start), Some(120));
+        }
+    }
+
+    #[test]
+    fn a_reply_with_an_extended_rcode_is_not_cached() {
+        let mut cache = Cache::new(&config());
+        let fixture = Fixture::new("example.com.");
+        let mut reply = ResponseSpec {
+            authorities: vec![soa("example.com.", 900, 45)],
+            edns: Some(1232),
+            ..ResponseSpec::default()
+        }
+        .bytes(&fixture.spec);
+        let opt_start = reply.len() - 11;
+        reply[opt_start + 5] = 1;
+
+        assert!(!insert(&mut cache, &fixture, &reply, Instant::now()));
+    }
+
     #[test]
     fn replies_that_must_not_be_cached_are_refused() {
         let mut cache = Cache::new(&config());
@@ -592,6 +710,7 @@ mod tests {
         for fixture in &fixtures[..3] {
             insert(&mut cache, fixture, &fixture.positive(60), start);
         }
+
         assert!(age_of_hit(&mut cache, &fixtures[0], start).is_some());
 
         insert(&mut cache, &fixtures[3], &fixtures[3].positive(60), start);

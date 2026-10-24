@@ -158,9 +158,14 @@ impl Pipeline {
     /// The whole pipeline for one request. Returns false when there is
     /// nothing to send. UDP overload drops the query, TCP overload answers
     /// SERVFAIL.
+    ///
+    /// Before waiting, `request` is replaced by a compact copy of what the
+    /// reply needs (see `build::compact_query`), so a padded query does not
+    /// stay in memory while the upstream is slow. It is still a query that
+    /// `servfail` accepts afterwards.
     pub async fn answer(
         self: &Arc<Pipeline>,
-        request: &[u8],
+        request: &mut Vec<u8>,
         protocol: Protocol,
         out: &mut Vec<u8>,
     ) -> bool {
@@ -172,8 +177,16 @@ impl Pipeline {
         let Ok(query) = Query::parse(request) else {
             return false;
         };
+
+        let compact = build::compact_query(&query);
+        *request = compact;
+
+        let Ok(query) = Query::parse(request) else {
+            return false;
+        };
+
         let reply = Reply::new(&query, self.udp_size, protocol);
-        let Ok((_waiting, receiver)) = self.join_or_start(&CacheKey::new(&query), request) else {
+        let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
             return self.overloaded(&reply, protocol, out);
         };
 
@@ -200,6 +213,7 @@ impl Pipeline {
         let Ok(query) = Query::parse(request) else {
             return false;
         };
+
         Reply::new(&query, self.udp_size, protocol).error(rcode::SERVFAIL, out);
 
         true
@@ -293,10 +307,9 @@ impl Pipeline {
     /// flight or held reply bytes are reached.
     fn join_or_start(
         self: &Arc<Pipeline>,
-        key: &CacheKey<'_>,
-        request: &[u8],
+        query: &Query<'_>,
     ) -> Result<(WaitingClient, oneshot::Receiver<Outcome>), Failure> {
-        let identity = key.identity();
+        let identity = CacheKey::new(query).identity();
         let (sender, receiver) = oneshot::channel();
         let mut inflight = self.inflight.lock().unwrap();
 
@@ -312,7 +325,11 @@ impl Pipeline {
             }
 
             inflight.queries.insert(identity.clone(), vec![sender]);
-            tokio::spawn(Arc::clone(self).resolve(identity, request.to_vec()));
+            tokio::spawn(Arc::clone(self).resolve(
+                identity,
+                build::upstream_query(query, self.udp_size),
+                self.route_of(&query.question.name),
+            ));
         }
 
         inflight.waiting += 1;
@@ -326,8 +343,10 @@ impl Pipeline {
     }
 
     /// Steps 5 and 7 for one question, then wakes everyone waiting for it.
-    async fn resolve(self: Arc<Pipeline>, identity: Vec<u8>, request: Vec<u8>) {
-        let outcome = self.fetch(&request).await;
+    /// `request` is the normalized upstream query, the only copy of the
+    /// question that is kept while waiting.
+    async fn resolve(self: Arc<Pipeline>, identity: Vec<u8>, request: Vec<u8>, route: Route) {
+        let outcome = self.fetch(request, route).await;
         let waiters = self
             .inflight
             .lock()
@@ -341,35 +360,29 @@ impl Pipeline {
         }
     }
 
-    async fn fetch(&self, request: &[u8]) -> Outcome {
-        let query = Query::parse(request).map_err(|_| Failure::Upstream)?;
-        let mut upstream_request = Vec::with_capacity(request.len());
-        build::upstream_query(&query, self.udp_size, &mut upstream_request);
-
-        let upstreams = if self.route_of(&query.question.name) == Route::Local {
+    async fn fetch(&self, mut request: Vec<u8>, route: Route) -> Outcome {
+        let upstreams = if route == Route::Local {
             self.local_resolver.as_ref().ok_or(Failure::Upstream)?
         } else {
             &self.upstreams
         };
-        let bytes = upstreams
-            .query(&mut upstream_request)
-            .await
-            .map_err(|error| {
-                log::debug!("upstream query failed: {error}");
+        let mut bytes = upstreams.query(&mut request).await.map_err(|error| {
+            log::debug!("upstream query failed: {error}");
 
-                Failure::Upstream
-            })?;
-        let info = ResponseInfo::parse(&bytes).map_err(|_| Failure::Upstream)?;
+            Failure::Upstream
+        })?;
+        let mut info = ResponseInfo::parse(&bytes).map_err(|_| Failure::Upstream)?;
+        info.cap_soa_ttls(&mut bytes);
         let charge = self
             .budget
             .try_charge(bytes.len())
             .ok_or(Failure::Overloaded)?;
 
-        let key = CacheKey::new(&query);
+        let query = Query::parse(&request).map_err(|_| Failure::Upstream)?;
         self.cache
             .lock()
             .unwrap()
-            .insert(&key, &bytes, &info, Instant::now());
+            .insert(&CacheKey::new(&query), &bytes, &info, Instant::now());
 
         Ok(Arc::new(Delivery {
             bytes,
@@ -435,6 +448,7 @@ fn reverse_address(name: &Name) -> Option<IpAddr> {
             let [character] = nibble_label else {
                 return None;
             };
+
             let nibble = (*character as char).to_digit(16)? as u8;
             let position = 31 - index;
             octets[position / 2] |= nibble << (4 * (1 - position % 2));
