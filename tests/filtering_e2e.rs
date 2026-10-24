@@ -394,7 +394,12 @@ async fn a_name_with_200_000_host_addresses_is_answered_fast_with_tc_or_servfail
     for _ in 0..20 {
         assert!(
             pipeline
-                .answer(query.clone(), Protocol::Tcp, &mut out)
+                .answer(
+                    query.clone(),
+                    Protocol::Tcp,
+                    "127.0.0.1".parse().unwrap(),
+                    &mut out
+                )
                 .await
         );
         let reply = Message::from_vec(&out).unwrap();

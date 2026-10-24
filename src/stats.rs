@@ -6,6 +6,8 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+
 pub const DEFAULT_TOP_K: usize = 50;
 pub const DEFAULT_QUERY_LOG_ENTRIES: usize = 1_000;
 pub const HOURS: usize = 24;
@@ -30,7 +32,8 @@ impl Default for StatsSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QueryResult {
     /// Resolved by an upstream and not blocked.
     Pass,
@@ -54,7 +57,7 @@ pub struct Event<'a> {
     pub latency: Duration,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Counters {
     pub total: u64,
     pub blocked_request: u64,
@@ -66,7 +69,7 @@ pub struct Counters {
     pub dropped: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct HourlyBucket {
     /// Unix seconds at the start of the UTC hour.
     pub hour_start: u64,
@@ -75,14 +78,14 @@ pub struct HourlyBucket {
 }
 
 /// Space-Saving entry: the true count lies in `count - max_error..=count`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TopEntry<K> {
     pub key: K,
     pub count: u64,
     pub max_error: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct QueryLogEntry {
     pub time: u64,
     pub client: IpAddr,

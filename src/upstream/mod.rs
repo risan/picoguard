@@ -144,6 +144,14 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
 /// holding it. Dropping the charge gives the bytes back.
 pub type Charged = (Vec<u8>, Charge);
 
+/// A `Charged` reply and the position of the configured server that gave it.
+#[derive(Debug)]
+pub struct Answered {
+    pub reply: Vec<u8>,
+    pub charge: Charge,
+    pub server: usize,
+}
+
 /// UDP with a fall back to TCP on the same address for truncated answers.
 struct UdpUpstream {
     server: SocketAddr,
@@ -381,7 +389,7 @@ impl Upstreams {
     pub async fn query(&self, request: &mut [u8]) -> Result<Vec<u8>, UpstreamError> {
         let unlimited = Budget::new(usize::MAX);
 
-        Ok(self.query_charged(request, &unlimited).await?.0)
+        Ok(self.query_charged(request, &unlimited).await?.reply)
     }
 
     /// Sends `request` to the best server and, if that fails, once more to the
@@ -394,7 +402,7 @@ impl Upstreams {
         &self,
         request: &mut [u8],
         budget: &Arc<Budget>,
-    ) -> Result<Charged, UpstreamError> {
+    ) -> Result<Answered, UpstreamError> {
         let started = Instant::now();
         let first = self.pick(None, random_unit());
 
@@ -402,8 +410,12 @@ impl Upstreams {
             .query(request, budget, started + self.timeout / 2)
             .await;
         match first_attempt {
-            Ok(reply) => {
-                return Ok(reply);
+            Ok((reply, charge)) => {
+                return Ok(Answered {
+                    reply,
+                    charge,
+                    server: first,
+                });
             }
 
             Err(UpstreamError::BudgetExhausted) => {
@@ -415,9 +427,15 @@ impl Upstreams {
 
         let second = self.pick(Some(first), random_unit());
 
-        self.servers[second]
+        let (reply, charge) = self.servers[second]
             .query(request, budget, started + self.timeout)
-            .await
+            .await?;
+
+        Ok(Answered {
+            reply,
+            charge,
+            server: second,
+        })
     }
 
     /// Weighted random choice by inverse smoothed RTT among servers that are
@@ -719,7 +737,7 @@ mod tests {
         let upstreams = upstreams(vec![udp_url(&udp)], 1000);
         let budget = Budget::new(10_000);
 
-        let (reply, charge) = upstreams
+        let Answered { reply, charge, .. } = upstreams
             .query_charged(&mut query_for("example.com."), &budget)
             .await
             .unwrap();
@@ -869,7 +887,7 @@ mod tests {
         let upstreams = upstreams(vec![format!("tcp://{address}")], 1000);
         let budget = Budget::new(10_000);
 
-        let (reply, charge) = upstreams
+        let Answered { reply, charge, .. } = upstreams
             .query_charged(&mut query_for("example.com."), &budget)
             .await
             .unwrap();

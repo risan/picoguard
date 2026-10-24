@@ -148,6 +148,15 @@ impl Policy {
         std::mem::replace(&mut state.engine, engine)
     }
 
+    /// How much longer filtering stays off, if it is off at `now`.
+    pub fn pause_remaining(&self, now: Instant) -> Option<Duration> {
+        let deadline = self.state.lock().unwrap().paused_until?;
+
+        deadline
+            .checked_duration_since(now)
+            .filter(|left| !left.is_zero())
+    }
+
     pub fn pause(&self, duration: Duration, now: Instant) {
         let mut state = self.state.lock().unwrap();
         state.paused_until = Some(now + duration);
@@ -182,6 +191,30 @@ mod tests {
 
         assert_eq!(view.generation, 0);
         assert!(!view.paused);
+    }
+
+    #[test]
+    fn the_time_left_of_a_pause_counts_down_to_nothing() {
+        let policy = Policy::new();
+        let start = Instant::now();
+
+        assert_eq!(policy.pause_remaining(start), None);
+
+        policy.pause(Duration::from_secs(60), start);
+
+        assert_eq!(
+            policy.pause_remaining(start + Duration::from_secs(20)),
+            Some(Duration::from_secs(40))
+        );
+        assert_eq!(
+            policy.pause_remaining(start + Duration::from_secs(60)),
+            None
+        );
+
+        policy.pause(Duration::from_secs(60), start);
+        policy.resume();
+
+        assert_eq!(policy.pause_remaining(start), None);
     }
 
     #[test]

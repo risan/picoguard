@@ -21,7 +21,7 @@ use picoguard::filter::engine::Decision;
 use picoguard::filter::snapshot::{self, SnapshotStore};
 use picoguard::lists::{Downloader, resolver_over};
 use picoguard::policy::Policy;
-use picoguard::scheduler::{Scheduler, Timing};
+use picoguard::scheduler::{Role, Scheduler, Timing};
 use picoguard::upstream::Upstreams;
 use picoguard::upstream::tls::Tls;
 
@@ -1045,4 +1045,126 @@ async fn stopping_the_loop_tries_once_more_to_write_a_pending_snapshot() {
     scheduler.run(downloader(), async {}).await;
 
     assert_eq!(dir.snapshot_files().len(), 1);
+}
+
+fn slow_timing() -> Timing {
+    Timing {
+        hour: Duration::from_secs(3600),
+        retries: [Duration::from_secs(3600); 4],
+        first_check: Duration::from_secs(3600 * 1000),
+    }
+}
+
+async fn wait_for_requests(server: &ListServer, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while server.requests() < count {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} of {count} requests", server.requests()));
+}
+
+#[tokio::test]
+async fn asking_for_a_refresh_checks_every_list_once_and_one_at_a_time() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.set_delay(Duration::from_millis(40));
+    let mut lists = Vec::new();
+    for index in 0..3 {
+        let path = format!("/l{index}.txt");
+        server.serve(&path, &format!("||list{index}.example^\n"), Some("\"e\""));
+        lists.push(url_list(&format!("manual-{index}"), server.url(&path)));
+    }
+    let config = config_of(&dir, lists);
+    let scheduler = Scheduler::boot(
+        &config,
+        CompileWorker::spawn().unwrap(),
+        Arc::new(SnapshotStore::disabled()),
+        slow_timing(),
+    )
+    .await
+    .unwrap();
+    let control = scheduler.control();
+    let running = tokio::spawn(scheduler.run(downloader(), std::future::pending()));
+
+    // Lists without a snapshot are fetched at once; after that the interval is a day.
+    wait_for_requests(&server, 3).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.requests(), 3);
+
+    control.refresh_all();
+    wait_for_requests(&server, 6).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.abort();
+
+    assert_eq!(server.requests(), 6, "once per list");
+    assert_eq!(server.not_modified(), 3, "the validators were sent");
+    assert_eq!(server.most_active(), 1);
+}
+
+#[tokio::test]
+async fn the_status_of_a_list_follows_its_refreshes() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/good.txt", "0.0.0.0 ads.example\n", Some("\"g\""));
+    server.fail("/bad.txt", 503);
+    let mut config = config_of(
+        &dir,
+        vec![
+            ListConfig {
+                format: ListFormat::Hosts,
+                ..url_list("good", server.url("/good.txt"))
+            },
+            url_list("bad", server.url("/bad.txt")),
+        ],
+    );
+    config.allowlists = vec![url_list("allow", server.url("/good.txt"))];
+    let (mut scheduler, _) = boot(&config).await;
+    let control = scheduler.control();
+
+    let before = control.statuses();
+    assert_eq!(
+        before
+            .iter()
+            .map(|list| list.name.as_str())
+            .collect::<Vec<_>>(),
+        ["good", "bad", "allow"]
+    );
+    assert_eq!(
+        before.iter().map(|list| list.role).collect::<Vec<_>>(),
+        [Role::Blocklist, Role::Blocklist, Role::Allowlist]
+    );
+    assert!(before.iter().all(|list| {
+        list.format.is_none()
+            && list.rules == 0
+            && list.checked.is_none()
+            && list.last_error.is_none()
+    }));
+
+    scheduler.refresh(0, &downloader()).await;
+    scheduler.refresh(1, &downloader()).await;
+
+    let after = control.statuses();
+    assert_eq!(after[0].format, Some(ListFormat::Hosts));
+    assert_eq!(after[0].rules, 1);
+    assert!(after[0].checked.is_some() && after[0].last_error.is_none());
+    assert!(after[1].checked.is_none());
+    assert!(
+        after[1]
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("503")),
+        "{:?}",
+        after[1].last_error
+    );
+    assert_eq!(after[2].rules, 0);
+
+    server.serve("/bad.txt", V1, None);
+    scheduler.refresh(1, &downloader()).await;
+
+    let recovered = control.statuses();
+    assert_eq!(recovered[1].rules, 1);
+    assert_eq!(recovered[1].format, Some(ListFormat::Adblock));
+    assert!(recovered[1].last_error.is_none());
 }
