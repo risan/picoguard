@@ -1,0 +1,21 @@
+[package]
+name = "picoguard"
+version = "0.1.0"
+edition = "2024"
+description = "DNS ad and malware blocker for 256 MB boards"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = false
+
+[[bin]]
+name = "picoguard"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
