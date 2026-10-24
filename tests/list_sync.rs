@@ -16,9 +16,9 @@ use hickory_proto::op::{Message, Query as DnsQuery};
 use hickory_proto::rr::{Name, RecordType};
 use picoguard::config::{Config, ListConfig, ListFormat, StateConfig};
 use picoguard::dns::wire::Query;
-use picoguard::filter::compile::CompileWorker;
+use picoguard::filter::compile::{CompileOptions, CompileWorker};
 use picoguard::filter::engine::Decision;
-use picoguard::filter::snapshot::SnapshotStore;
+use picoguard::filter::snapshot::{self, SnapshotStore};
 use picoguard::lists::{Downloader, resolver_over};
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Scheduler, Timing};
@@ -757,4 +757,84 @@ async fn queries_in_flight_during_a_swap_get_the_new_policy_and_none_are_lost() 
     );
     assert!(blocked_replies[0] && blocked_replies[1]);
     assert_eq!(steady.await.unwrap(), 0);
+}
+
+/// Rewrites the snapshot of the first list as if an older compiler had written it.
+async fn age_snapshot(config: &Config, version: u32) {
+    let list = &config.lists[0];
+    let options = CompileOptions::new(list.format, list.max_rules);
+    let store = SnapshotStore::open(&config.state.dir).unwrap();
+    let path = store.path_for(list.url.as_ref().unwrap()).unwrap();
+    let mut snapshot = CompileWorker::spawn()
+        .unwrap()
+        .load(path, options)
+        .await
+        .unwrap();
+
+    snapshot.meta.compiler_version = version;
+    snapshot.meta.fingerprint = snapshot::fingerprint(
+        snapshot.meta.content_hash,
+        snapshot.meta.configured_format,
+        snapshot.meta.effective_format,
+        snapshot.meta.max_rules,
+        version,
+    );
+    store.save(snapshot).await;
+}
+
+/// Compiler version 2 is the one that kept `$ORIGIN .` in RPZ owners (fixed in 3). Whatever
+/// it wrote must be compiled again, whether or not the server would answer 304.
+#[tokio::test]
+async fn a_snapshot_of_the_previous_compiler_is_compiled_again_without_validators() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, None);
+    let config = config_of(&dir, vec![url_list("upgrade-plain", server.url("/l.txt"))]);
+    {
+        let (mut scheduler, _) = boot(&config).await;
+        scheduler.refresh(0, &downloader()).await;
+    }
+
+    age_snapshot(&config, 2).await;
+    let (mut scheduler, store) = boot(&config).await;
+    let policy = scheduler.policy();
+
+    assert!(scheduler.list(0).is_none(), "the old snapshot is not used");
+    assert!(!blocked(&policy, "ads.example."));
+
+    scheduler.refresh(0, &downloader()).await;
+
+    assert!(blocked(&policy, "ads.example."));
+    assert!(store.bytes_written() > 0, "the snapshot is rewritten");
+    server.stop().await;
+    let (offline, _) = boot(&config).await;
+    assert!(blocked(&offline.policy(), "ads.example."));
+}
+
+#[tokio::test]
+async fn a_snapshot_of_the_previous_compiler_is_compiled_again_whatever_its_validators() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("upgrade-tagged", server.url("/l.txt"))]);
+    {
+        let (mut scheduler, _) = boot(&config).await;
+        scheduler.refresh(0, &downloader()).await;
+    }
+
+    age_snapshot(&config, 2).await;
+    let (mut scheduler, store) = boot(&config).await;
+    let policy = scheduler.policy();
+    scheduler.refresh(0, &downloader()).await;
+
+    assert_eq!(
+        server.not_modified(),
+        0,
+        "no validator is sent for a snapshot that was not used"
+    );
+    assert!(blocked(&policy, "ads.example."));
+    assert!(store.bytes_written() > 0);
+    server.stop().await;
+    let (offline, _) = boot(&config).await;
+    assert!(blocked(&offline.policy(), "ads.example."));
 }
