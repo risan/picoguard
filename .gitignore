@@ -2,3 +2,4 @@
 *.swp
 /bench/out/
 /dist/bin/
+/.claude/
