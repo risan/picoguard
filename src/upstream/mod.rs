@@ -166,32 +166,28 @@ impl Transport {
         budget: &Arc<Budget>,
         deadline: Instant,
     ) -> Result<Charged, UpstreamError> {
-        let reply = match self {
+        match self {
             Transport::Udp(upstream) => {
                 let reply =
                     udp::exchange(upstream.server, request, upstream.max_reply, deadline).await?;
                 let truncated = Header::parse(&reply).is_ok_and(|header| header.truncated());
                 if truncated {
-                    upstream.tcp.query(request, deadline).await?
-                } else {
-                    reply
+                    return upstream.tcp.query_charged(request, budget, deadline).await;
                 }
+
+                let charge = budget
+                    .try_charge(reply.len())
+                    .ok_or(UpstreamError::BudgetExhausted)?;
+
+                Ok((reply, charge))
             }
 
             Transport::Tcp(upstream) | Transport::Dot(upstream) => {
-                upstream.query(request, deadline).await?
+                upstream.query_charged(request, budget, deadline).await
             }
 
-            Transport::Doh(upstream) => {
-                return upstream.query_charged(request, budget, deadline).await;
-            }
-        };
-
-        let charge = budget
-            .try_charge(reply.len())
-            .ok_or(UpstreamError::BudgetExhausted)?;
-
-        Ok((reply, charge))
+            Transport::Doh(upstream) => upstream.query_charged(request, budget, deadline).await,
+        }
     }
 }
 
@@ -854,6 +850,35 @@ mod tests {
         }
 
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_tcp_reply_is_charged_and_one_that_does_not_fit_is_not_blamed_on_the_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_tcp(listener, Arc::new(AtomicUsize::new(0)), None));
+        let upstreams = upstreams(vec![format!("tcp://{address}")], 1000);
+        let budget = Budget::new(10_000);
+
+        let (reply, charge) = upstreams
+            .query_charged(&mut query_for("example.com."), &budget)
+            .await
+            .unwrap();
+        assert_eq!((charge.bytes(), budget.used()), (reply.len(), reply.len()));
+        drop(charge);
+        assert_eq!(budget.used(), 0);
+
+        let tiny = Budget::new(10);
+        let result = upstreams
+            .query_charged(&mut query_for("example.com."), &tiny)
+            .await;
+
+        assert!(
+            matches!(result, Err(UpstreamError::BudgetExhausted)),
+            "{result:?}"
+        );
+        assert_eq!(upstreams.servers[0].health.lock().unwrap().failures, 0);
+        assert_eq!(tiny.used(), 0);
     }
 
     #[tokio::test]

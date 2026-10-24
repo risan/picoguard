@@ -9,13 +9,14 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::tls::TlsDialer;
-use super::{UpstreamError, is_answer_to, random_u64};
+use super::{Charged, UpstreamError, is_answer_to, random_u64};
+use crate::budget::Budget;
 use crate::config::LimitsConfig;
 
 const READ_CHUNK: usize = 4096;
@@ -45,19 +46,32 @@ impl StreamUpstream {
         }
     }
 
+    /// The reply comes with its charge on `budget`, taken before the bytes were read.
+    pub(super) async fn query_charged(
+        &self,
+        request: &mut [u8],
+        budget: &Arc<Budget>,
+        deadline: Instant,
+    ) -> Result<Charged, UpstreamError> {
+        self.ensure_connected(deadline).await?;
+
+        let (reply, charge) = self.client.query_charged(request, budget, deadline).await?;
+        if !is_answer_to(request, &reply) {
+            return Err(UpstreamError::BadReply);
+        }
+
+        Ok((reply, charge))
+    }
+
+    #[cfg(test)]
     pub(super) async fn query(
         &self,
         request: &mut [u8],
         deadline: Instant,
     ) -> Result<Vec<u8>, UpstreamError> {
-        self.ensure_connected(deadline).await?;
+        let unlimited = Budget::new(usize::MAX);
 
-        let reply = self.client.query(request, deadline).await?;
-        if !is_answer_to(request, &reply) {
-            return Err(UpstreamError::BadReply);
-        }
-
-        Ok(reply)
+        Ok(self.query_charged(request, &unlimited, deadline).await?.0)
     }
 
     async fn ensure_connected(&self, deadline: Instant) -> Result<(), UpstreamError> {
@@ -112,18 +126,20 @@ struct Registration {
 struct Pending {
     /// Tells this registration apart from a later one that reuses the ID.
     token: u64,
-    reply: oneshot::Sender<Vec<u8>>,
+    /// Pays for the reply while it is read.
+    budget: Arc<Budget>,
+    reply: oneshot::Sender<Result<Charged, UpstreamError>>,
 }
 
 /// One logical connection to an upstream that is reopened by `attach`.
 pub struct StreamClient {
     state: Arc<Mutex<State>>,
     max_reply: usize,
-    write_timeout: Duration,
+    io_timeout: Duration,
 }
 
 impl StreamClient {
-    pub fn new(max_reply: usize, write_timeout: Duration) -> StreamClient {
+    pub fn new(max_reply: usize, io_timeout: Duration) -> StreamClient {
         StreamClient {
             state: Arc::new(Mutex::new(State {
                 writer: None,
@@ -132,7 +148,7 @@ impl StreamClient {
                 next_token: 0,
             })),
             max_reply,
-            write_timeout,
+            io_timeout,
         }
     }
 
@@ -164,19 +180,34 @@ impl StreamClient {
             state: Arc::clone(&self.state),
             epoch,
             max_reply: self.max_reply,
-            write_timeout: self.write_timeout,
+            io_timeout: self.io_timeout,
         };
         tokio::spawn(session.run(stream, outgoing));
     }
 
-    /// Sends `request` (its ID is replaced) and waits for the matching reply.
+    #[cfg(test)]
     pub async fn query(
         &self,
         request: &mut [u8],
         deadline: Instant,
     ) -> Result<Vec<u8>, UpstreamError> {
+        let unlimited = Budget::new(usize::MAX);
+
+        Ok(self.query_charged(request, &unlimited, deadline).await?.0)
+    }
+
+    /// Sends `request` (its ID is replaced) and waits for the matching reply. The bytes of
+    /// the reply are charged to `budget` before they are read, and the charge goes to the
+    /// caller with the reply. A reply the budget cannot hold is skipped unread:
+    /// `BudgetExhausted`.
+    pub async fn query_charged(
+        &self,
+        request: &mut [u8],
+        budget: &Arc<Budget>,
+        deadline: Instant,
+    ) -> Result<Charged, UpstreamError> {
         let (reply_sender, reply) = oneshot::channel();
-        let registration = self.register(reply_sender)?;
+        let registration = self.register(reply_sender, budget)?;
         let id = registration.id;
         let _unregister = Unregister {
             state: &self.state,
@@ -207,12 +238,13 @@ impl StreamClient {
             return Err(UpstreamError::Timeout);
         };
 
-        received.map_err(|_| UpstreamError::Closed)
+        received.map_err(|_| UpstreamError::Closed)?
     }
 
     fn register(
         &self,
-        reply_sender: oneshot::Sender<Vec<u8>>,
+        reply_sender: oneshot::Sender<Result<Charged, UpstreamError>>,
+        budget: &Arc<Budget>,
     ) -> Result<Registration, UpstreamError> {
         let mut state = self.state.lock().unwrap();
         let writer = state.writer.clone().ok_or(UpstreamError::Closed)?;
@@ -223,6 +255,7 @@ impl StreamClient {
             if let Entry::Vacant(slot) = state.pending.entry(id) {
                 slot.insert(Pending {
                     token,
+                    budget: Arc::clone(budget),
                     reply: reply_sender,
                 });
                 state.next_token += 1;
@@ -264,7 +297,8 @@ struct Session {
     state: Arc<Mutex<State>>,
     epoch: u64,
     max_reply: usize,
-    write_timeout: Duration,
+    /// Longest a write, or the rest of a reply once its start has arrived, may take.
+    io_timeout: Duration,
 }
 
 impl Session {
@@ -285,23 +319,73 @@ impl Session {
         self.close();
     }
 
-    async fn read_frames<R>(&self, mut reader: R)
+    async fn read_frames<R>(&self, reader: R)
     where
         R: AsyncRead + Unpin,
     {
-        let mut scratch = [0u8; READ_CHUNK];
-        let mut buffered = Vec::new();
+        let mut reader = BufReader::with_capacity(READ_CHUNK, reader);
 
-        loop {
-            let Ok(count @ 1..) = reader.read(&mut scratch).await else {
-                return;
-            };
+        while self.read_frame(&mut reader).await.is_ok() {}
+    }
 
-            buffered.extend_from_slice(&scratch[..count]);
-            if self.dispatch_frames(&mut buffered).is_err() {
-                return;
-            }
+    /// Reads one reply. Its length and ID come first; the ID says which query is waiting, and
+    /// that query's budget is charged for the whole reply before a byte of it is kept. A reply
+    /// nobody waits for, or one the budget cannot hold, is read and thrown away.
+    async fn read_frame<R>(&self, reader: &mut BufReader<R>) -> Result<(), UpstreamError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut start = [0u8; 4];
+        reader.read_exact(&mut start).await?;
+
+        let length = usize::from(u16::from_be_bytes([start[0], start[1]]));
+        if length < MIN_MESSAGE_LEN || length > self.max_reply {
+            return Err(UpstreamError::BadReply);
         }
+
+        let id = u16::from_be_bytes([start[2], start[3]]);
+        let waiting = self.state.lock().unwrap().pending.remove(&id);
+        let rest = (length - 2) as u64;
+        let Some(waiting) = waiting else {
+            return self.skip(reader, rest).await;
+        };
+
+        let Some(charge) = waiting.budget.try_charge(length) else {
+            let _ = waiting.reply.send(Err(UpstreamError::BudgetExhausted));
+
+            return self.skip(reader, rest).await;
+        };
+
+        let mut message = Vec::with_capacity(length);
+        message.extend_from_slice(&start[2..]);
+        let read = timeout(self.io_timeout, reader.take(rest).read_to_end(&mut message))
+            .await
+            .map_err(|_| UpstreamError::Timeout)??;
+        if read as u64 != rest {
+            return Err(UpstreamError::Closed);
+        }
+
+        let _ = waiting.reply.send(Ok((message, charge)));
+
+        Ok(())
+    }
+
+    async fn skip<R>(&self, reader: &mut BufReader<R>, bytes: u64) -> Result<(), UpstreamError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let skipped = timeout(
+            self.io_timeout,
+            tokio::io::copy(&mut reader.take(bytes), &mut tokio::io::sink()),
+        )
+        .await
+        .map_err(|_| UpstreamError::Timeout)??;
+
+        if skipped != bytes {
+            return Err(UpstreamError::Closed);
+        }
+
+        Ok(())
     }
 
     async fn write_frames<W>(&self, mut writer: W, mut outgoing: mpsc::Receiver<Vec<u8>>)
@@ -309,48 +393,12 @@ impl Session {
         W: AsyncWrite + Unpin,
     {
         while let Some(frame) = outgoing.recv().await {
-            if write_frame(&mut writer, &frame, self.write_timeout)
+            if write_frame(&mut writer, &frame, self.io_timeout)
                 .await
                 .is_err()
             {
                 return;
             }
-        }
-    }
-
-    /// Hands every complete frame in `buffered` to its waiting query.
-    fn dispatch_frames(&self, buffered: &mut Vec<u8>) -> Result<(), UpstreamError> {
-        let mut consumed = 0;
-
-        while let Some(length_bytes) = buffered.get(consumed..consumed + 2) {
-            let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
-            if length < MIN_MESSAGE_LEN || length > self.max_reply {
-                return Err(UpstreamError::BadReply);
-            }
-
-            let Some(message) = buffered.get(consumed + 2..consumed + 2 + length) else {
-                break;
-            };
-
-            self.deliver(message);
-            consumed += 2 + length;
-        }
-
-        buffered.drain(..consumed);
-
-        Ok(())
-    }
-
-    fn deliver(&self, message: &[u8]) {
-        let id = u16::from_be_bytes([message[0], message[1]]);
-        let waiting = {
-            let mut state = self.state.lock().unwrap();
-
-            state.pending.remove(&id)
-        };
-
-        if let Some(waiting) = waiting {
-            let _ = waiting.reply.send(message.to_vec());
         }
     }
 
@@ -516,6 +564,206 @@ mod tests {
         assert_eq!(&reply[12..], b"split");
     }
 
+    /// A reply message of `length` bytes for `id`.
+    fn reply_of(id: [u8; 2], length: usize) -> Vec<u8> {
+        let mut message = id.to_vec();
+        message.extend_from_slice(&[0x81, 0x80]);
+        message.extend_from_slice(&[0; 8]);
+        message.resize(length, 7);
+
+        message
+    }
+
+    fn framed(message: &[u8]) -> Vec<u8> {
+        let mut frame = (message.len() as u16).to_be_bytes().to_vec();
+        frame.extend_from_slice(message);
+
+        frame
+    }
+
+    async fn until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("the condition never came true");
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_charged_before_it_is_read_in_full() {
+        let client = Arc::new(client());
+        let (ours, mut server) = duplex(4096);
+        client.attach(ours);
+        let budget = Budget::new(100_000);
+        let (task_client, task_budget) = (Arc::clone(&client), Arc::clone(&budget));
+        let query = tokio::spawn(async move {
+            task_client
+                .query_charged(&mut request("a.example."), &task_budget, deadline())
+                .await
+        });
+
+        let received = read_frame(&mut server).await;
+        let frame = framed(&reply_of([received[0], received[1]], 30_000));
+        server.write_all(&frame[..10_000]).await.unwrap();
+
+        // 10,000 bytes have arrived; all 30,000 of the announced reply are paid for.
+        until(|| budget.used() == 30_000).await;
+        assert!(!query.is_finished());
+
+        server.write_all(&frame[10_000..]).await.unwrap();
+        let (reply, charge) = query.await.unwrap().unwrap();
+
+        assert_eq!((reply.len(), charge.bytes()), (30_000, 30_000));
+        drop(charge);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_budget_cannot_hold_is_skipped_and_the_connection_goes_on() {
+        let client = client();
+        let (ours, mut server) = duplex(4096);
+        client.attach(ours);
+        let budget = Budget::new(20_000);
+
+        let server_task = tokio::spawn(async move {
+            let first = read_frame(&mut server).await;
+            server
+                .write_all(&framed(&reply_of([first[0], first[1]], 30_000)))
+                .await
+                .unwrap();
+            let second = read_frame(&mut server).await;
+            write_reply(&mut server, [second[0], second[1]], b"small").await;
+            server
+        });
+        let refused = client
+            .query_charged(&mut request("a.example."), &budget, deadline())
+            .await;
+        let (small, _charge) = client
+            .query_charged(&mut request("b.example."), &budget, deadline())
+            .await
+            .unwrap();
+
+        assert!(matches!(refused, Err(UpstreamError::BudgetExhausted)));
+        assert_eq!(&small[12..], b"small");
+        assert_eq!(budget.used(), small.len());
+        drop(server_task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn concurrent_large_replies_never_hold_more_than_the_budget() {
+        const REPLY: usize = 30_000;
+        let client = Arc::new(client());
+        let (ours, mut server) = duplex(4096);
+        client.attach(ours);
+        let budget = Budget::new(100_000);
+
+        let mut queries = Vec::new();
+        for index in 0..8 {
+            let (client, budget) = (Arc::clone(&client), Arc::clone(&budget));
+            queries.push(tokio::spawn(async move {
+                client
+                    .query_charged(
+                        &mut request(&format!("n{index}.example.")),
+                        &budget,
+                        deadline(),
+                    )
+                    .await
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            let received = read_frame(&mut server).await;
+            ids.push([received[0], received[1]]);
+        }
+
+        for id in ids {
+            server
+                .write_all(&framed(&reply_of(id, REPLY)))
+                .await
+                .unwrap();
+        }
+
+        let mut held = Vec::new();
+        let mut refused = 0;
+        for query in queries {
+            match query.await.unwrap() {
+                Ok((reply, charge)) => {
+                    assert_eq!((reply.len(), charge.bytes()), (REPLY, REPLY));
+                    held.push(charge);
+                }
+
+                Err(UpstreamError::BudgetExhausted) => {
+                    refused += 1;
+                }
+
+                Err(error) => panic!("{error}"),
+            }
+        }
+
+        assert_eq!((held.len(), refused), (3, 5), "three fit in 100,000");
+        assert_eq!(budget.used(), 90_000);
+        drop(held);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_nobody_waits_for_is_skipped_unbuffered() {
+        let client = client();
+        let (ours, mut server) = duplex(4096);
+        client.attach(ours);
+        let budget = Budget::new(100);
+
+        tokio::spawn(async move {
+            let received = read_frame(&mut server).await;
+            let id = [received[0], received[1]];
+            let stray = [id[0] ^ 0xFF, id[1]];
+            server
+                .write_all(&framed(&reply_of(stray, 50_000)))
+                .await
+                .unwrap();
+            write_reply(&mut server, id, b"ok").await;
+            server
+        });
+
+        let (reply, _charge) = client
+            .query_charged(&mut request("a.example."), &budget, deadline())
+            .await
+            .unwrap();
+
+        assert_eq!(&reply[12..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_stalls_halfway_closes_the_connection_and_frees_its_charge() {
+        let client = StreamClient::new(64 * 1024, Duration::from_millis(100));
+        let (ours, mut server) = duplex(4096);
+        client.attach(ours);
+        let budget = Budget::new(100_000);
+
+        tokio::spawn(async move {
+            let received = read_frame(&mut server).await;
+            let frame = framed(&reply_of([received[0], received[1]], 30_000));
+            server.write_all(&frame[..5_000]).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = client
+            .query_charged(
+                &mut request("a.example."),
+                &budget,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await;
+
+        assert!(matches!(result, Err(UpstreamError::Closed)), "{result:?}");
+        assert_eq!(budget.used(), 0);
+        until(|| !client.is_connected()).await;
+    }
+
     #[tokio::test]
     async fn closing_the_connection_fails_waiting_queries_and_disconnects() {
         let client = client();
@@ -594,7 +842,8 @@ mod tests {
         let (ours, _server) = duplex(4096);
         client.attach(ours);
         let (old_sender, _old_reply) = oneshot::channel();
-        let old = client.register(old_sender).unwrap();
+        let unlimited = Budget::new(usize::MAX);
+        let old = client.register(old_sender, &unlimited).unwrap();
         let (id, epoch, old_token) = (old.id, old.epoch, old.token);
         // The reply was delivered, which removes the entry before the query's
         // guard runs; a new query then draws the same ID.
@@ -605,6 +854,7 @@ mod tests {
             id,
             Pending {
                 token: new_token,
+                budget: unlimited,
                 reply: new_sender,
             },
         );
