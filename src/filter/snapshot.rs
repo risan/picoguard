@@ -21,6 +21,7 @@
 //! Strings are a u32 length and UTF-8 text. Every length is checked against the limits of
 //! plan D12 before anything is allocated.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::IpAddr;
@@ -993,6 +994,8 @@ impl SnapshotStore {
 }
 
 fn write_loop(mut jobs: mpsc::Receiver<WriteJob>, files: &dyn Files, written: &AtomicU64) {
+    let mut unsynced = BTreeSet::new();
+
     while let Some(job) = jobs.blocking_recv() {
         match job {
             WriteJob::Write {
@@ -1000,9 +1003,10 @@ fn write_loop(mut jobs: mpsc::Receiver<WriteJob>, files: &dyn Files, written: &A
                 snapshot,
                 done,
             } => {
-                let result = write_if_changed(files, written, &path, &snapshot).map_err(|error| {
-                    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-                });
+                let result = write_if_changed(files, written, &path, &snapshot, &mut unsynced)
+                    .map_err(|error| {
+                        io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+                    });
                 drop(snapshot);
 
                 let _ = done.send(result);
@@ -1022,9 +1026,13 @@ fn parent_of(path: &Path) -> &Path {
     }
 }
 
-/// Creates `directory` and the missing directories above it, outermost first, and returns
-/// those this call created.
-fn create_missing_directories(files: &dyn Files, directory: &Path) -> io::Result<Vec<PathBuf>> {
+/// Creates `directory` and the missing directories above it, outermost first. The parent of
+/// each one created is added to `unsynced` at once, so a failure further down forgets none.
+fn create_missing_directories(
+    files: &dyn Files,
+    directory: &Path,
+    unsynced: &mut BTreeSet<PathBuf>,
+) -> io::Result<()> {
     let mut missing = Vec::new();
     let mut current = directory;
     while !current.is_dir() {
@@ -1037,11 +1045,10 @@ fn create_missing_directories(files: &dyn Files, directory: &Path) -> io::Result
         current = parent;
     }
 
-    let mut created = Vec::new();
     for path in missing.into_iter().rev() {
         match files.create_dir(path) {
             Ok(()) => {
-                created.push(path.to_path_buf());
+                unsynced.insert(parent_of(path).to_path_buf());
             }
 
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
@@ -1050,27 +1057,49 @@ fn create_missing_directories(files: &dyn Files, directory: &Path) -> io::Result
         }
     }
 
-    Ok(created)
+    Ok(())
 }
 
-/// Writes the snapshot unless the file already holds it. Bytes are counted into `written` as
-/// they reach the file, whether or not the write succeeds.
+/// Syncs the directories whose entries are not known to be durable yet. One that fails stays
+/// in `unsynced` for the next call, so a retry finishes the work even when the file is
+/// already in place.
+fn sync_owed_directories(files: &dyn Files, unsynced: &mut BTreeSet<PathBuf>) -> io::Result<()> {
+    // Parents sort before their children.
+    while let Some(directory) = unsynced.first().cloned() {
+        match files.sync_dir(&directory) {
+            Ok(()) => {}
+
+            // Removed since: there is nothing left to make durable.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+
+            Err(error) => return Err(error),
+        }
+
+        unsynced.remove(&directory);
+    }
+
+    Ok(())
+}
+
+/// Writes the snapshot unless the file already holds it, then syncs the directories whose
+/// entries it created (a new directory is only durable once its parent is synced, and a new
+/// file once its directory is; without that the snapshot could vanish after a power loss).
+/// Bytes are counted into `written` as they reach the file, whether or not the write
+/// succeeds.
 fn write_if_changed(
     files: &dyn Files,
     written: &AtomicU64,
     path: &Path,
     snapshot: &Snapshot,
+    unsynced: &mut BTreeSet<PathBuf>,
 ) -> io::Result<()> {
     if holds_fingerprint(path, snapshot.meta.fingerprint) {
-        return Ok(());
+        return sync_owed_directories(files, unsynced);
     }
 
     let directory = parent_of(path);
-    // A new directory is only durable once its parent is synced; without that the first
-    // snapshot could vanish with the directory after a power loss.
-    for created in create_missing_directories(files, directory)? {
-        files.sync_dir(parent_of(&created))?;
-    }
+    create_missing_directories(files, directory, unsynced)?;
+    sync_owed_directories(files, unsynced)?;
 
     let temporary = path.with_extension("pgs.tmp");
     let result = write_synced(files, written, &temporary, snapshot)
@@ -1081,7 +1110,9 @@ fn write_if_changed(
         return Err(error);
     }
 
-    files.sync_dir(directory)
+    unsynced.insert(directory.to_path_buf());
+
+    sync_owed_directories(files, unsynced)
 }
 
 fn write_synced(
@@ -2129,36 +2160,98 @@ ads.*.tracker
     }
 
     #[tokio::test]
-    async fn a_failed_directory_sync_keeps_the_file_and_the_retry_writes_nothing_more() {
+    async fn the_sync_of_a_new_directory_that_failed_is_retried_before_anything_is_written() {
+        let worker = CompileWorker::spawn().unwrap();
         let state = TestDir::new("snap");
-        let size = size_of_a_good_file(MIXED).await;
-        let faults = Faults {
+        let files = TestFiles::new();
+        let base = state.path().join("deep");
+        let store = SnapshotStore::open_with(&base, files.clone()).unwrap();
+        files.set_faults(Faults {
             fail_dir_sync: true,
             ..Faults::default()
-        };
+        });
 
-        let (store, files, left) = save_with_faults(&state, MIXED, faults).await;
+        // The directories are created, the sync of their parents fails, nothing is written.
+        for _ in 0..2 {
+            store
+                .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+                .await
+                .unwrap_err();
+        }
 
-        // The new directory's parent could not be synced, so nothing was written.
         assert_eq!(store.bytes_written(), 0);
-        assert!(left.is_empty());
-
-        // The directory exists now. The file sync of the final directory fails: the file is
-        // in place and counted once.
-        let worker = CompileWorker::spawn().unwrap();
-        store
-            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
-            .await
-            .unwrap_err();
-        assert_eq!(store.bytes_written(), size);
-        assert_eq!(files_in(&lists_dir(&state)).len(), 1);
+        assert!(files_in(&base.join("lists")).is_empty());
+        files.calls();
 
         files.set_faults(Faults::default());
         store
             .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
             .await
             .unwrap();
-        assert_eq!(store.bytes_written(), size);
+
+        // The directories exist, but the syncs that were owed are made before the file.
+        assert_eq!(
+            files.calls(),
+            [
+                Call::SyncDir(state.path().to_path_buf()),
+                Call::SyncDir(base.clone()),
+                Call::Rename,
+                Call::SyncDir(base.join("lists")),
+            ]
+        );
+        assert!(store.bytes_written() > 0);
+    }
+
+    #[tokio::test]
+    async fn a_directory_sync_after_the_rename_is_retried_without_writing_the_file_again() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let files = TestFiles::new();
+        let store = SnapshotStore::open_with(state.path(), files.clone()).unwrap();
+        store
+            .save(snapshot_of(&worker, "||a.example^\n", ListFormat::Auto).await)
+            .await
+            .unwrap();
+        let size_before = store.bytes_written();
+        files.calls();
+        files.set_faults(Faults {
+            fail_dir_sync: true,
+            ..Faults::default()
+        });
+
+        store
+            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+            .await
+            .unwrap_err();
+        let size_after_the_failure = store.bytes_written();
+        assert!(size_after_the_failure > size_before);
+        let path = store.path_for(SOURCE).unwrap();
+        assert!(load(&path, &caps()).is_ok(), "the file is in place");
+        files.calls();
+
+        // The same text again: the file already holds it, but the directory is not synced.
+        store
+            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+            .await
+            .unwrap_err();
+        assert_eq!(files.calls(), [Call::SyncDir(lists_dir(&state))]);
+
+        files.set_faults(Faults::default());
+        store
+            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+            .await
+            .unwrap();
+
+        assert_eq!(files.calls(), [Call::SyncDir(lists_dir(&state))]);
+        assert_eq!(store.bytes_written(), size_after_the_failure);
+
+        // Nothing is owed any more: the same text again touches no directory.
+        store
+            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
+            .await
+            .unwrap();
+
+        assert_eq!(files.calls(), []);
     }
 
     #[test]
