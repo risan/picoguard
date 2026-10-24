@@ -82,7 +82,7 @@ fn run_until_ready(name: &str, log_level: &str) -> (u16, String) {
         socket.local_addr().unwrap().port()
     };
     let config = format!(
-        "[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+        "lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
          [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
          [log]\nlevel = \"{log_level}\"\n"
     );
@@ -179,7 +179,16 @@ fn running_with_the_default_encrypted_upstreams_starts() {
     let output = child.wait_with_output().unwrap();
 
     assert!(ready, "the server never answered");
-    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+
+    // The default lists have a url, which is not downloaded yet: one warning each.
+    let stderr = text(&output.stderr);
+    assert_eq!(stderr.lines().count(), 2, "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .all(|line| line.starts_with("WARN list ") && line.contains("skipped")),
+        "{stderr}"
+    );
 }
 
 #[test]

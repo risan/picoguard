@@ -1,0 +1,70 @@
+# Go regexp corners that the regex crate treats differently: octal escapes, capture names
+# (numeric, repeated, invalid), and repetition counts (leading zeros make `{` literal text).
+[main]
+/^(?:\141ds)\.octal\.example$/
+/^[\141-\143]x\.octalclass\.example$/
+/^\1411\.octal3\.example$/
+/^a[\060-\071]\.octaldigit\.example$/
+/^\777\.octalbig\.example$/
+/^\1\.octalbackref\.example$/
+/^\8\.octaleight\.example$/
+/^\18\.octalone\.example$/
+/^(?P<1>numeric)\.named1\.example$/
+/^(?P<a>x)(?P<a>y)\.dupname\.example$/
+/^(?<n_1>angle)\.angle\.example$/
+/^(?P<bad-name>x)\.badname\.example$/
+/^(?P<>x)\.emptyname\.example$/
+/^(?<>x)\.emptyangle\.example$/
+/^(?P<é>x)\.unicodename\.example$/
+/^(?P<unclosed\.noclose\.example$/
+/^lead{01}\.leadzero\.example$/
+/^lead{1,02}\.leadzero2\.example$/
+/^lead{00}\.leadzero3\.example$/
+/^cc{1,2}\.ok\.example$/
+/^d{0}e\.zero\.example$/
+/^f{0,0}g\.zerozero\.example$/
+/^h{2,1}\.inverted\.example$/
+/^i{1001}\.toobig\.example$/
+/^j{1000}\.limit\.example$/
+/^k{99999999999}\.huge\.example$/
+/^m{1,\.example$/
+[queries]
+ads.octal.example A
+ad.octal.example A
+\141ds.octal.example A
+bx.octalclass.example A
+dx.octalclass.example A
+a1.octal3.example A
+a.octal3.example A
+a5.octaldigit.example A
+ax.octaldigit.example A
+ǿ.octalbig.example A
+x.octalbackref.example A
+x.octaleight.example A
+x.octalone.example A
+numeric.named1.example A
+xy.dupname.example A
+angle.angle.example A
+x.badname.example A
+x.emptyname.example A
+x.emptyangle.example A
+x.unicodename.example A
+x.noclose.example A
+lead{01}.leadzero.example A
+lead.leadzero.example A
+lead1.leadzero.example A
+lead{1,02}.leadzero2.example A
+lead.leadzero2.example A
+lead{00}.leadzero3.example A
+lead.leadzero3.example A
+cc.ok.example A
+c.ok.example A
+ccc.ok.example A
+e.zero.example A
+dde.zero.example A
+g.zerozero.example A
+hh.inverted.example A
+i.toobig.example A
+j.limit.example A
+k.huge.example A
+m{1,.example A

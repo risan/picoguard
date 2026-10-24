@@ -27,6 +27,9 @@ picoguard makes the same block/pass decision as AdGuard Home v0.107.79 on the sa
   never do).
 - IP addresses of a host rule that appears on several lines of one list are answered grouped
   by address, not in line order.
+- Non-ASCII input names are compared after lowercase only. Go folds case with the Unicode
+  simple folding table (`σ` and `ς`, `ſ` and `s` match each other in a `(?i)` rule); picoguard
+  does not. DNS names arrive as ASCII (punycode), so this only affects rules written in Unicode.
 
 ## License
 

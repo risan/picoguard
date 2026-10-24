@@ -18,7 +18,7 @@ use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 
 /// Bump when parsing or compiling changes what a list means: snapshots written by an older
 /// compiler are then ignored and the lists compile again (plan D14).
-pub const COMPILER_VERSION: u32 = 1;
+pub const COMPILER_VERSION: u32 = 2;
 
 /// Default memory budget of the slow rules of one list. Plan section 5 leaves about 8 MB
 /// between the steady total (20 MB) and the refresh peak (28 MB). The real lists are far

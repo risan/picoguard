@@ -10,11 +10,11 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::config::CacheConfig;
 use crate::dns::build::ReplyParts;
 use crate::dns::wire::{HEADER_LEN, Name, Query, ResponseInfo, flags, rcode};
-use crate::policy::ResponseVerdict;
+use crate::filter::engine::Decision;
 
 /// Struct, LRU node, hash slot and allocator overhead of one entry, counted
 /// against `max_bytes` on top of the payload.
-const ENTRY_OVERHEAD: usize = 128;
+const ENTRY_OVERHEAD: usize = 160;
 const FLAG_RD: u8 = 1;
 const FLAG_DO: u8 = 2;
 const FLAG_CD: u8 = 4;
@@ -89,10 +89,10 @@ impl<'q> CacheKey<'q> {
 }
 
 /// A filter decision remembered with the policy generation that produced it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memo {
     pub generation: u64,
-    pub verdict: ResponseVerdict,
+    pub decision: Decision,
 }
 
 struct Entry {
@@ -200,7 +200,7 @@ impl Cache {
                 opt_start: entry.opt_start,
             },
             age_secs: entry.age_secs(now),
-            memo: entry.memo,
+            memo: entry.memo.clone(),
         })
     }
 
@@ -818,9 +818,9 @@ mod tests {
 
         let memo = Memo {
             generation: 7,
-            verdict: ResponseVerdict::Pass,
+            decision: Decision::Pass,
         };
-        cache.set_memo(&key, memo);
+        cache.set_memo(&key, memo.clone());
 
         assert_eq!(cache.get(&key, start).unwrap().memo, Some(memo));
         insert(&mut cache, &fixture, &fixture.positive(60), start);
@@ -837,7 +837,7 @@ mod tests {
             &CacheKey::new(&query),
             Memo {
                 generation: 1,
-                verdict: ResponseVerdict::Pass,
+                decision: Decision::Pass,
             },
         );
 

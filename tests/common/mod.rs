@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod harness;
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -119,6 +121,8 @@ pub struct Case {
     pub main: Vec<String>,
     pub user: String,
     pub allow: Vec<String>,
+    /// The scripted upstream answers of a full-flow case.
+    pub upstream: String,
     pub queries: Vec<Query>,
     /// Queries where picoguard is expected to differ from the oracle, with its outcome.
     pub deviations: Vec<(Query, Outcome)>,
@@ -160,6 +164,9 @@ pub fn parse_case(name: &str, text: &str) -> Case {
             }
             "user" => {
                 case.user.push_str(line);
+            }
+            "upstream" => {
+                case.upstream.push_str(line);
             }
             "queries" => {
                 let query = trimmed.trim();
@@ -230,4 +237,11 @@ pub fn load_real() -> RealLists {
             .collect(),
         expected: parse_expected(&read_text(&dir.join("golden/real/expected.txt"))),
     }
+}
+
+/// The full-flow case: lists, user rules, allowlists, the scripted upstream and the queries.
+pub fn load_flow_case() -> Case {
+    let path = fixtures_dir().join("golden/flow/flow.case");
+
+    parse_case("flow", &read_text(&path))
 }

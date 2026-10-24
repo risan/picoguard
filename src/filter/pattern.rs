@@ -98,6 +98,12 @@ impl Matcher {
         })
     }
 
+    /// The lowercase text a URL must contain for the rule to match; empty when the rule has
+    /// no usable shortcut.
+    pub fn shortcut(&self) -> &str {
+        &self.shortcut
+    }
+
     /// `host` is the lowercase input; `url` is `http://` followed by `host`.
     pub fn is_match(&self, host: &str, url: &str) -> bool {
         if !self.shortcut.is_empty() && !url.contains(&self.shortcut) {
@@ -425,7 +431,9 @@ fn replace_class_text(chars: &[char]) -> Vec<char> {
 /// Translates the differences between Go's `regexp` syntax and the `regex` crate's.
 ///
 /// - `\Q..\E` quotes, `\<` and `\>` are literals, `\_` and other punctuation escapes;
-/// - `{` that does not start a valid `{n}`, `{n,}` or `{n,m}` is a literal;
+/// - `{` that does not start a valid `{n}`, `{n,}` or `{n,m}` (counts without leading
+///   zeros) is a literal;
+/// - octal escapes become hex literals, named captures become plain groups;
 /// - `\d \w \s \b` are ASCII only, the `regex` crate's are Unicode;
 /// - inside a class `[` and `&&` `~~` are literals;
 /// - flags other than `i m s U` and lookaround groups are errors in Go;
@@ -533,6 +541,7 @@ fn translate_escape(
 
             Ok(at + 2)
         }
+        '0'..='7' => translate_octal(chars, at, out),
         'p' | 'P' | 'x' => {
             out.push('\\');
             out.push(c);
@@ -563,6 +572,24 @@ fn translate_escape(
             Ok(at + 2)
         }
     }
+}
+
+/// Go's octal escape: `\0` or a non-zero digit followed by an octal digit, then up to two
+/// more octal digits. A single non-zero digit is a backreference, which Go rejects.
+fn translate_octal(chars: &[char], at: usize, out: &mut String) -> Result<usize, PatternError> {
+    let digits: Vec<u32> = chars[at + 1..]
+        .iter()
+        .map_while(|c| c.to_digit(8))
+        .take(3)
+        .collect();
+    if digits.len() == 1 && digits[0] != 0 {
+        return Err(syntax_error("backreferences are not supported"));
+    }
+
+    let value = digits.iter().fold(0, |value, digit| value * 8 + digit);
+    out.push_str(&format!("\\x{{{value:X}}}"));
+
+    Ok(at + 1 + digits.len())
 }
 
 fn translate_class(chars: &[char], start: usize, out: &mut String) -> Result<usize, PatternError> {
@@ -624,16 +651,22 @@ fn translate_group(chars: &[char], at: usize, out: &mut String) -> Result<usize,
     }
 
     let rest: String = chars[at + 2..].iter().collect();
-    if rest.starts_with("P<")
-        || (rest.starts_with('<') && !rest.starts_with("<=") && !rest.starts_with("<!"))
-    {
-        let name_end = rest
+    let name_start = rest.strip_prefix("P<").or_else(|| rest.strip_prefix('<'));
+    if let Some(name_start) = name_start {
+        let name_end = name_start
             .find('>')
             .ok_or_else(|| syntax_error("unclosed group name"))?;
-        out.push_str("(?");
-        out.push_str(&rest[..=name_end]);
+        let name = &name_start[..name_end];
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(syntax_error("invalid named capture"));
+        }
 
-        return Ok(at + 2 + rest[..=name_end].chars().count());
+        // Go accepts numeric and repeated names, which the regex crate rejects; nothing
+        // can refer to a capture here, so a plain group is equivalent.
+        out.push_str("(?:");
+        let header = &rest[..rest.len() - name_start.len() + name_end + 1];
+
+        return Ok(at + 2 + header.chars().count());
     }
 
     let flags_end = rest
@@ -664,7 +697,12 @@ fn translate_brace(chars: &[char], at: usize, out: &mut String) -> Result<usize,
         Some((low, high)) => (low, Some(high)),
         None => (body, None),
     };
-    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    // Go's parseInt: digits without a leading zero.
+    let digits = |text: &str| {
+        !text.is_empty()
+            && text.bytes().all(|b| b.is_ascii_digit())
+            && (text.len() == 1 || !text.starts_with('0'))
+    };
     let valid = digits(low) && high.is_none_or(|high| high.is_empty() || digits(high));
     if !valid {
         out.push_str("\\{");
@@ -1012,8 +1050,61 @@ mod tests {
         assert_eq!(translated("[[:alpha:]x]"), "[[:alpha:]x]");
         assert_eq!(translated("\\pL+\\p{Greek}"), "\\pL+\\p{Greek}");
         assert_eq!(translated("\\x{4e2d}\\x61"), "\\x{4e2d}\\x61");
-        assert_eq!(translated("(?i)a(?:b)(?P<n>c)"), "(?i)a(?:b)(?P<n>c)");
+        assert_eq!(translated("(?i)a(?:b)(?P<n>c)"), "(?i)a(?:b)(?:c)");
         assert_eq!(translated("a.b"), "a.b");
+    }
+
+    #[test]
+    fn octal_escapes_become_hex_literals() {
+        let translated = |source: &str| translate_go_regex(source).unwrap();
+        assert_eq!(translated("\\141"), "\\x{61}");
+        assert_eq!(translated("\\0"), "\\x{0}");
+        assert_eq!(translated("\\012"), "\\x{A}");
+        assert_eq!(translated("\\1411"), "\\x{61}1");
+        assert_eq!(translated("\\777"), "\\x{1FF}");
+        assert!(translate_go_regex("\\18").is_err());
+    }
+
+    #[test]
+    fn named_captures_become_plain_groups() {
+        let translated = |source: &str| translate_go_regex(source).unwrap();
+        assert_eq!(translated("(?P<1>a)"), "(?:a)");
+        assert_eq!(translated("(?P<a>x)(?P<a>y)"), "(?:x)(?:y)");
+        assert_eq!(translated("(?<n_1>z)"), "(?:z)");
+        for source in [
+            "(?P<bad-name>x)",
+            "(?P<>x)",
+            "(?<>x)",
+            "(?P<\u{e9}>x)",
+            "(?P<open",
+            "(?<=look)",
+            "(?<!look)",
+        ] {
+            assert!(translate_go_regex(source).is_err(), "{source} should fail");
+        }
+    }
+
+    #[test]
+    fn repetition_counts_follow_go_syntax() {
+        let translated = |source: &str| translate_go_regex(source).unwrap();
+        assert_eq!(translated("a{01}"), "a\\{01}");
+        assert_eq!(translated("a{1,02}"), "a\\{1,02}");
+        assert_eq!(translated("a{00}"), "a\\{00}");
+        assert_eq!(translated("a{0}"), "a{0}");
+        assert_eq!(translated("a{10,20}"), "a{10,20}");
+        assert_eq!(translated("a{0,}"), "a{0,}");
+        assert!(translate_go_regex("a{1001}").is_err());
+    }
+
+    #[test]
+    fn go_octal_names_and_counts_match_like_go() {
+        assert!(matches("/^(?:\\141ds)\\.example$/", "ads.example"));
+        assert!(matches("/^[\\141-\\143]x\\.example$/", "bx.example"));
+        assert!(matches("/^\\1411\\.example$/", "a1.example"));
+        assert!(matches("/^(?P<1>n)(?P<1>m)\\.example$/", "nm.example"));
+        assert!(matches("/^lead{01}\\.example$/", "lead{01}.example"));
+        assert!(!matches("/^lead{01}\\.example$/", "lead.example"));
+        assert!(matches("/^cc{1,2}\\.example$/", "ccc.example"));
     }
 
     #[test]
@@ -1027,7 +1118,9 @@ mod tests {
             "(unclosed",
             "\\y",
             "\\1",
+            "\\8",
             "\\Z",
+            "(?P<bad-name>x)",
             "(?i",
             "\\\u{e9}",
         ] {
