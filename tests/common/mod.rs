@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod harness;
+pub mod http;
 
 use std::fs;
 use std::io::Read;

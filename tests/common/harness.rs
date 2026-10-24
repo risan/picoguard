@@ -119,7 +119,10 @@ pub fn config_for(upstream: &FakeUpstream) -> Config {
 }
 
 pub async fn start(config: &Config, engine: Arc<Engine>) -> Running {
-    let policy = Arc::new(Policy::with_engine(engine));
+    start_with_policy(config, Arc::new(Policy::with_engine(engine))).await
+}
+
+pub async fn start_with_policy(config: &Config, policy: Arc<Policy>) -> Running {
     let pipeline = Pipeline::new(config, Arc::clone(&policy)).unwrap();
     let listeners = Listeners::bind(&config.server).unwrap();
     let udp = listeners.udp_addresses()[0];

@@ -166,7 +166,7 @@ fn running_with_the_default_encrypted_upstreams_starts() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.local_addr().unwrap().port()
     };
-    let config = format!("[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n");
+    let config = format!("lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n");
     let path = write_config("default-upstreams.toml", &config);
     let mut child = Command::new(env!("CARGO_BIN_EXE_picoguard"))
         .args(["-c", path.to_str().unwrap()])
@@ -180,15 +180,7 @@ fn running_with_the_default_encrypted_upstreams_starts() {
 
     assert!(ready, "the server never answered");
 
-    // The default lists have a url, which is not downloaded yet: one warning each.
-    let stderr = text(&output.stderr);
-    assert_eq!(stderr.lines().count(), 2, "{stderr}");
-    assert!(
-        stderr
-            .lines()
-            .all(|line| line.starts_with("WARN list ") && line.contains("skipped")),
-        "{stderr}"
-    );
+    assert!(text(&output.stderr).is_empty(), "{}", text(&output.stderr));
 }
 
 #[test]
