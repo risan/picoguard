@@ -12,6 +12,9 @@ name = "picoguard"
 path = "src/main.rs"
 
 [dependencies]
+log = "0.4.34"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = { version = "1.1.8", default-features = false, features = ["parse", "serde"] }
 
 [profile.release]
 opt-level = 3

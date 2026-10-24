@@ -1,0 +1,109 @@
+# picoguard configuration. Every value below is the default; uncommented
+# sections are the ones most people touch. Check a file with:
+#   picoguard --check -c picoguard.toml
+#
+# TOML rule: top-level keys (blocked_ttl, rules, ...) must come before the
+# first [section] header.
+
+# TTL in seconds of blocked answers.
+# blocked_ttl = 10
+
+# Answer ANY queries with NOTIMP.
+# refuse_any = true
+
+# Names answered with REFUSED.
+# blocked_hosts = ["version.bind", "id.server", "hostname.bind"]
+
+# Your own rules, one per line, adblock syntax or hosts lines. They join the
+# lists below, so `||example.com^$important` in a list still beats `@@||example.com^` here.
+# rules = [
+#     "||ads.example.com^",
+#     "@@||good.example.com^",
+# ]
+
+[server]
+# bind = "0.0.0.0"
+# port = 53
+# EDNS UDP payload size advertised to clients and upstreams.
+# udp_size = 1232
+
+[upstream]
+# Forwarding servers. Several are load balanced by speed, a failing one is
+# skipped. Forms: https://IP/path, https://host/path (needs bootstrap),
+# tls://IP#name, udp://IP:port, tcp://IP:port.
+servers = [
+    "https://1.1.1.1/dns-query",
+    "https://1.0.0.1/dns-query",
+    "https://9.9.9.10/dns-query",
+    "https://149.112.112.10/dns-query",
+]
+# Plain IPs used to resolve upstream host names.
+# bootstrap = ["9.9.9.9", "1.1.1.1"]
+# timeout_ms = 5000
+
+# [local]
+# Your router: gets reverse lookups of private addresses and the local domains.
+# resolver = "192.168.1.1:53"
+# domains = ["lan", "home.arpa"]
+
+# Blocklists. format is "auto" (default), "adblock", "hosts", "domains",
+# "wildcard", "dnsmasq" or "rpz". A list has either url or path. Per list:
+# refresh_hours = 24, max_rules = 3000000, max_body_bytes = 67108864.
+[[lists]]
+name = "hagezi-pro"
+url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"
+format = "adblock"
+
+[[lists]]
+name = "hagezi-tif-mini"
+url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.mini.txt"
+format = "adblock"
+
+# Lists of names that are never blocked. Same keys as [[lists]].
+# [[allowlists]]
+# path = "/etc/picoguard/allow.txt"
+
+# [cache]
+# max_entries = 10000
+# max_bytes = 4194304
+# min_ttl = 0
+# max_ttl = 86400
+# Larger upstream answers are served but not cached.
+# max_response_size = 4096
+
+# [limits]
+# h2_stream_window = 65536
+# h2_connection_window = 131072
+# h2_max_header_list = 16384
+# upstream_concurrency = 32
+# max_inflight_queries = 128
+# max_waiting_clients = 256
+# tcp_max_connections = 16
+# tcp_idle_secs = 30
+# tcp_read_buffer = 2048
+# tcp_queue_replies = 4
+# tcp_queue_bytes = 131072
+# tcp_write_timeout_secs = 5
+# upstream_reply_max = 65536
+# pending_bytes = 1048576
+
+# [web]
+# enabled = true
+# bind = "0.0.0.0"
+# port = 8080
+# Host names the status page answers to, besides IP addresses.
+# hostnames = []
+# Set both to require basic auth.
+# user = "admin"
+# password = "change-me"
+# query_log_entries = 1000
+
+# [state]
+# dir = "/var/lib/picoguard"
+# Keep a copy of each changed list on disk (the only routine write). When
+# false, lists live in memory and download again at boot.
+# persist_lists = true
+
+# [log]
+# One of: error, warn, info, debug, trace.
+# level = "warn"
