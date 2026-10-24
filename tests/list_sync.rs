@@ -1141,6 +1141,52 @@ async fn asking_for_a_refresh_checks_every_list_once_and_one_at_a_time() {
 }
 
 #[tokio::test]
+async fn repeated_requests_during_a_refresh_still_refresh_every_list() {
+    let dir = StateDir::new();
+    let mut servers = Vec::new();
+    let mut lists = Vec::new();
+    for index in 0..3 {
+        let server = ListServer::start().await;
+        server.set_delay(Duration::from_millis(40));
+        server.serve(
+            "/l.txt",
+            &format!("||list{index}.example^\n"),
+            Some("\"e\""),
+        );
+        lists.push(url_list(&format!("starved-{index}"), server.url("/l.txt")));
+        servers.push(server);
+    }
+    let config = config_of(&dir, lists);
+    let scheduler = Scheduler::boot(
+        &config,
+        CompileWorker::spawn().unwrap(),
+        Arc::new(SnapshotStore::disabled()),
+        slow_timing(),
+    )
+    .await
+    .unwrap();
+    let control = scheduler.control();
+    let running = tokio::spawn(scheduler.run(downloader(), std::future::pending()));
+    for server in &servers {
+        wait_for_requests(server, 1).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Asks faster than a refresh takes, for long enough to refresh every list twice.
+    for _ in 0..60 {
+        control.refresh_all();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    running.abort();
+
+    let requests: Vec<usize> = servers.iter().map(ListServer::requests).collect();
+    assert!(
+        requests.iter().all(|count| *count >= 2),
+        "requests per list: {requests:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_status_of_a_list_follows_its_refreshes() {
     let dir = StateDir::new();
     let server = ListServer::start().await;

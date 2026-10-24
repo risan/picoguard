@@ -272,11 +272,13 @@ impl Scheduler {
         self.control.statuses.lock().unwrap()[index] = self.entries[index].status();
     }
 
+    /// Makes every list due. A list that is due already keeps its earlier time, so lists that
+    /// wait for their turn go before the ones just refreshed, however often this is asked.
     fn refresh_all_now(&mut self) {
         let now = Instant::now();
 
         for entry in &mut self.entries {
-            entry.due = now;
+            entry.due = entry.due.min(now);
         }
     }
 
