@@ -376,22 +376,24 @@ fn frame_of(message: &[u8]) -> Option<Vec<u8>> {
 
 /// The frame to write for `prepared`, decided now, with its charge on the pending-bytes
 /// budget. A reply that cannot be framed or does not fit is replaced by a SERVFAIL, which is
-/// not charged.
+/// not charged. The query is counted with the reply that is chosen.
 async fn frame_for(
     pipeline: &Arc<Pipeline>,
     prepared: &Prepared,
 ) -> Option<(Vec<u8>, Option<Charge>)> {
     let mut out = Vec::new();
 
-    if pipeline.finish(prepared, &mut out).await
+    if let Some(finished) = pipeline.finish(prepared, &mut out).await
         && let Some(frame) = frame_of(&out)
         && let Some(charge) = pipeline.budget().try_charge(frame.len())
     {
+        pipeline.count(prepared, finished);
+
         return Some((frame, Some(charge)));
     }
 
     let failure = pipeline.failure_of(prepared)?;
-    pipeline.finish(&failure, &mut out).await;
+    let _ = pipeline.finish(&failure, &mut out).await;
 
     Some((frame_of(&out)?, None))
 }
@@ -859,6 +861,63 @@ mod tests {
             ResponseCode::ServFail
         );
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    fn counters_of(pipeline: &Pipeline) -> crate::stats::Counters {
+        pipeline.stats().snapshot().counters
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_connection_queue_cannot_hold_is_counted_once_as_an_error() {
+        let policy = Arc::new(Policy::new());
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
+        let (queue, replies) = mpsc::unbounded_channel();
+        let slot = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+
+        answer_tcp(
+            Arc::clone(&pipeline),
+            query_for("full.example."),
+            CLIENT,
+            slot,
+            queue,
+            Budget::new(1),
+        )
+        .await;
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
+
+        assert_eq!(
+            parse(&messages[0]).metadata.response_code,
+            ResponseCode::ServFail
+        );
+        let counters = counters_of(&pipeline);
+        assert_eq!((counters.total, counters.errors), (1, 1));
+        assert_eq!(counters.upstream, 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_whose_frame_does_not_fit_the_budget_is_counted_as_the_servfail_it_became() {
+        let policy = Arc::new(Policy::new());
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
+        let prepared = pipeline
+            .prepare(query_for("tight.example."), Protocol::Tcp, CLIENT)
+            .await
+            .unwrap();
+        let capacity = Config::default().limits.pending_bytes;
+        let _all_but_one_byte = pipeline
+            .budget()
+            .try_charge(capacity - pipeline.budget().used() - 1)
+            .unwrap();
+
+        let (frame, charge) = frame_for(&pipeline, &prepared).await.unwrap();
+
+        assert!(charge.is_none(), "a SERVFAIL is not charged");
+        assert_eq!(
+            parse(&frame[2..]).metadata.response_code,
+            ResponseCode::ServFail
+        );
+        let counters = counters_of(&pipeline);
+        assert_eq!((counters.total, counters.errors), (1, 1));
+        assert_eq!(counters.upstream, 0);
     }
 
     #[tokio::test]

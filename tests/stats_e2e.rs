@@ -9,7 +9,7 @@ use std::time::Duration;
 use common::harness::{
     Running, a_record, ask, config_for, engine_of, fake_upstream, name, reply_to, start,
 };
-use hickory_proto::op::{Message, Query};
+use hickory_proto::op::{Edns, Message, Query, ResponseCode};
 use hickory_proto::rr::RecordType;
 use picoguard::dns::build::Protocol;
 use picoguard::stats::{QueryResult, StatsSnapshot};
@@ -173,8 +173,54 @@ async fn a_queued_stream_reply_is_counted_when_it_is_written_and_only_once() {
     assert_eq!(snapshot_of(&server).counters.total, 0);
 
     let mut out = Vec::new();
-    assert!(pipeline.finish(&prepared, &mut out).await);
+    let finished = pipeline.finish(&prepared, &mut out).await.unwrap();
+    assert_eq!(snapshot_of(&server).counters.total, 0, "not yet final");
+    pipeline.count(&prepared, finished);
 
     let counters = snapshot_of(&server).counters;
     assert_eq!((counters.total, counters.upstream), (1, 1));
+}
+
+#[tokio::test]
+async fn an_upstream_servfail_is_counted_as_an_error_not_as_a_pass() {
+    let upstream = fake_upstream(|query| {
+        let mut reply = reply_to(query, Vec::new());
+        reply.metadata.response_code = ResponseCode::ServFail;
+
+        vec![(Duration::ZERO, reply)]
+    })
+    .await;
+    let server = start(&config_for(&upstream), engine_of(&[], &[])).await;
+
+    let reply = ask(&server, "broken.example.", RecordType::A).await;
+
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    let counters = snapshot_of(&server).counters;
+    assert_eq!((counters.total, counters.errors), (1, 1));
+    assert_eq!(counters.upstream, 0);
+    let log = server.pipeline.stats().query_log(1);
+    assert_eq!(
+        (log[0].result, log[0].upstream),
+        (QueryResult::Error, Some(0))
+    );
+}
+
+#[tokio::test]
+async fn a_reply_that_cannot_be_rebuilt_for_the_client_is_counted_as_an_error() {
+    let upstream = fake_upstream(|query| {
+        let mut reply = reply_to(query, Vec::new());
+        reply.metadata.response_code = ResponseCode::BADVERS;
+        reply.set_edns(Edns::new());
+
+        vec![(Duration::ZERO, reply)]
+    })
+    .await;
+    let server = start(&config_for(&upstream), engine_of(&[], &[])).await;
+
+    let reply = ask(&server, "old.example.", RecordType::A).await;
+
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    let counters = snapshot_of(&server).counters;
+    assert_eq!((counters.total, counters.errors), (1, 1));
+    assert_eq!(counters.upstream, 0);
 }
