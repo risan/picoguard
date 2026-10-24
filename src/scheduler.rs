@@ -171,7 +171,11 @@ impl Scheduler {
     /// was compiled, assembled into an engine and swapped in.
     pub async fn refresh(&mut self, index: usize, downloader: &Downloader) {
         let outcome = match self.fetch(index, downloader).await {
-            Ok(Refresh::NotModified) => Ok(()),
+            Ok(Refresh::NotModified) => {
+                log::info!("{}: not modified", self.entries[index].label);
+
+                Ok(())
+            }
             Ok(Refresh::Updated(updated)) => self.install(index, updated).await,
             Err(error) => Err(error.to_string()),
         };
@@ -248,6 +252,7 @@ impl Scheduler {
         if let Some(loaded) = &mut entry.loaded
             && loaded.fingerprint == updated.compiled.fingerprint
         {
+            log::info!("{}: downloaded again, same content", entry.label);
             loaded.validators = updated.validators.clone();
             self.worker.discard(updated);
 
