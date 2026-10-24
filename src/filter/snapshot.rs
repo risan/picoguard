@@ -22,7 +22,7 @@
 //! plan D12 before anything is allocated.
 
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -456,12 +456,20 @@ fn encode<W: Write>(snapshot: &Snapshot, mut out: W) -> io::Result<u64> {
 
 // ---- Reading ----
 
+/// The least bytes one host group and one slow rule take in the file: a length field that
+/// promises more of them than the file holds is refused before anything is reserved.
+const MIN_HOST_GROUP_BYTES: u64 = 4 + 2 + 8;
+const MIN_SLOW_RULE_BYTES: u64 = 1 + 4 + 6 * 4;
+
+/// Decodes the body of a file whose checksum already matched, so damage by accident is
+/// ruled out; the length checks still guard against a file made on purpose.
 struct Decoder<R: Read> {
     input: R,
-    hasher: Xxh3,
     /// Body bytes the file still holds; no length field may ask for more.
     remaining: u64,
-    /// Rules the list may still hold under its cap.
+    /// The rule cap of the list: no count of anything may exceed it.
+    max_rules: u64,
+    /// Rules (plain, host names and slow rules) the list may still hold under its cap.
     rules_left: u64,
     slow_budget: SlowRuleBudget,
 }
@@ -473,7 +481,6 @@ impl<R: Read> Decoder<R> {
         }
 
         self.input.read_exact(buffer)?;
-        self.hasher.update(buffer);
         self.remaining -= buffer.len() as u64;
 
         Ok(())
@@ -571,14 +578,35 @@ impl<R: Read> Decoder<R> {
         Ok(())
     }
 
+    /// A count of items that take at least `least_bytes` each in the rest of the file.
+    fn count_within_file(
+        &mut self,
+        least_bytes: u64,
+        what: &'static str,
+    ) -> Result<u64, SnapshotError> {
+        let count = u64::from(self.u32()?);
+        if count > self.max_rules {
+            return Err(SnapshotError::TooLarge(what));
+        }
+
+        match count.checked_mul(least_bytes) {
+            Some(bytes) if bytes <= self.remaining => Ok(count),
+            _ => Err(SnapshotError::Truncated),
+        }
+    }
+
     fn u64s(&mut self, what: &'static str) -> Result<Vec<u64>, SnapshotError> {
         let length = self.u64()?;
         self.charge(length, what)?;
-        if length.saturating_mul(8) > self.remaining {
-            return Err(SnapshotError::Truncated);
+        match length.checked_mul(8) {
+            Some(bytes) if bytes <= self.remaining => {}
+            _ => return Err(SnapshotError::Truncated),
         }
 
-        let mut values = Vec::with_capacity(length as usize);
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(length as usize)
+            .map_err(|_| SnapshotError::Io(io::ErrorKind::OutOfMemory.into()))?;
         let mut buffer = [0u8; 8192];
         let mut left = length as usize;
         while left > 0 {
@@ -613,6 +641,7 @@ impl<R: Read> Decoder<R> {
             ctag_key: self.text(MAX_LINE_BYTES, "tag key")?,
         };
 
+        self.charge(1, "slow rules")?;
         self.slow_budget
             .charge(&rule)
             .map_err(|_| SnapshotError::TooLarge("slow rule memory"))?;
@@ -621,17 +650,35 @@ impl<R: Read> Decoder<R> {
     }
 }
 
-/// Reads and checks a snapshot file against the caps of the list's options.
-pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotError> {
-    let file = File::open(path)?;
+/// Hashes the body between the preamble and the trailing checksum and compares the two.
+/// The file position is left at the end of the file.
+fn body_checksum_matches(file: &mut File, body_bytes: u64) -> io::Result<bool> {
+    file.seek(SeekFrom::Start(PREAMBLE_BYTES))?;
+    let mut hasher = Xxh3::new();
+    let mut buffer = vec![0u8; IO_BUFFER_BYTES];
+    let mut left = body_bytes;
+    while left > 0 {
+        let count = left.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..count])?;
+        hasher.update(&buffer[..count]);
+        left -= count as u64;
+    }
+
+    let mut trailer = [0u8; CHECKSUM_BYTES as usize];
+    file.read_exact(&mut trailer)?;
+
+    Ok(u128::from_le_bytes(trailer) == hasher.digest128())
+}
+
+/// Reads the magic and the file version, and returns the size of the body.
+fn check_preamble(file: &mut File) -> Result<u64, SnapshotError> {
     let length = file.metadata()?.len();
     if length < PREAMBLE_BYTES + CHECKSUM_BYTES {
         return Err(SnapshotError::Truncated);
     }
 
-    let mut input = BufReader::with_capacity(IO_BUFFER_BYTES, file);
     let mut preamble = [0u8; PREAMBLE_BYTES as usize];
-    input.read_exact(&mut preamble)?;
+    file.read_exact(&mut preamble)?;
     if preamble[..8] != MAGIC {
         return Err(SnapshotError::BadMagic);
     }
@@ -641,10 +688,24 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         return Err(SnapshotError::BadVersion(version));
     }
 
+    Ok(length - PREAMBLE_BYTES - CHECKSUM_BYTES)
+}
+
+/// Reads and checks a snapshot file against the caps of the list's options. The checksum is
+/// verified in a pass of its own before anything is decoded, so no count of a damaged file
+/// is ever acted on.
+pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotError> {
+    let mut file = File::open(path)?;
+    let body_bytes = check_preamble(&mut file)?;
+    if !body_checksum_matches(&mut file, body_bytes)? {
+        return Err(SnapshotError::BadChecksum);
+    }
+
+    file.seek(SeekFrom::Start(PREAMBLE_BYTES))?;
     let mut decoder = Decoder {
-        input,
-        hasher: Xxh3::new(),
-        remaining: length - PREAMBLE_BYTES - CHECKSUM_BYTES,
+        input: BufReader::with_capacity(IO_BUFFER_BYTES, file),
+        remaining: body_bytes,
+        max_rules: u64::from(options.max_rules),
         rules_left: u64::from(options.max_rules),
         slow_budget: SlowRuleBudget::new(options.slow_rule_budget),
     };
@@ -671,9 +732,11 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         *array = decoder.u64s("plain rule array")?;
     }
 
-    let group_count = decoder.u32()?;
-    decoder.charge(u64::from(group_count), "host groups")?;
-    let mut hosts = Vec::with_capacity(group_count as usize);
+    // Host groups are not rules: the names in them are charged, the groups are bounded by
+    // their own count. Neither vector is reserved up front, so a count the file cannot back
+    // costs nothing.
+    let group_count = decoder.count_within_file(MIN_HOST_GROUP_BYTES, "host groups")?;
+    let mut hosts = Vec::new();
     for _ in 0..group_count {
         let ip: IpAddr = decoder
             .text(64, "host address")?
@@ -685,21 +748,17 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         });
     }
 
-    let slow_count = decoder.u32()?;
-    decoder.charge(u64::from(slow_count), "slow rules")?;
-    let mut slow = Vec::with_capacity((slow_count as usize).min(decoder.remaining as usize));
+    let slow_count = decoder.count_within_file(MIN_SLOW_RULE_BYTES, "slow rules")?;
+    let mut slow = Vec::new();
     for _ in 0..slow_count {
         slow.push(decoder.rule()?);
     }
 
+    hosts.shrink_to_fit();
+    slow.shrink_to_fit();
+
     if decoder.remaining != 0 {
         return Err(SnapshotError::Corrupt("data after the last rule"));
-    }
-
-    let mut stored = [0u8; CHECKSUM_BYTES as usize];
-    decoder.input.read_exact(&mut stored)?;
-    if u128::from_le_bytes(stored) != decoder.hasher.digest128() {
-        return Err(SnapshotError::BadChecksum);
     }
 
     if compiler_version != COMPILER_VERSION {
@@ -747,44 +806,17 @@ fn holds_fingerprint(path: &Path, fingerprint: u128) -> bool {
     let Ok(mut file) = File::open(path) else {
         return false;
     };
-    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+    let Ok(body_bytes) = check_preamble(&mut file) else {
         return false;
     };
-    if length < PREAMBLE_BYTES + 16 + CHECKSUM_BYTES {
+    if body_bytes < 16 || !body_checksum_matches(&mut file, body_bytes).unwrap_or(false) {
         return false;
     }
 
-    let mut preamble = [0u8; PREAMBLE_BYTES as usize];
-    if file.read_exact(&mut preamble).is_err()
-        || preamble[..8] != MAGIC
-        || preamble[8..] != FILE_VERSION.to_le_bytes()
-    {
-        return false;
-    }
-
-    let mut hasher = Xxh3::new();
-    let mut buffer = vec![0u8; IO_BUFFER_BYTES];
-    let mut left = length - PREAMBLE_BYTES - CHECKSUM_BYTES;
-    let mut stored_fingerprint = None;
-    while left > 0 {
-        let count = left.min(buffer.len() as u64) as usize;
-        if file.read_exact(&mut buffer[..count]).is_err() {
-            return false;
-        }
-
-        if stored_fingerprint.is_none() {
-            let bytes: [u8; 16] = buffer[..16].try_into().expect("a first block of 16 bytes");
-            stored_fingerprint = Some(u128::from_le_bytes(bytes));
-        }
-
-        hasher.update(&buffer[..count]);
-        left -= count as u64;
-    }
-
-    let mut trailer = [0u8; CHECKSUM_BYTES as usize];
-    file.read_exact(&mut trailer).is_ok()
-        && u128::from_le_bytes(trailer) == hasher.digest128()
-        && stored_fingerprint == Some(fingerprint)
+    let mut stored = [0u8; 16];
+    file.seek(SeekFrom::Start(PREAMBLE_BYTES)).is_ok()
+        && file.read_exact(&mut stored).is_ok()
+        && u128::from_le_bytes(stored) == fingerprint
 }
 
 // ---- The disk writer ----
@@ -1417,6 +1449,111 @@ ads.*.tracker
         fs::write(&path, &bad).unwrap();
 
         assert!(matches!(rejected(&path), SnapshotError::TooLarge(_)));
+    }
+
+    /// Compiles `text` with a rule cap of exactly its rules, saves it and loads it back.
+    async fn reloads_at_its_exact_rule_cap(text: &str, format: ListFormat, rules: u32) {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let store = SnapshotStore::open(state.path()).unwrap();
+        let options = CompileOptions::new(format, rules);
+        let compiled = compile(&worker, text, options).await;
+        assert_eq!(compiled.summary.counters.over_cap, 0, "{text:?}");
+        assert_eq!(compiled.list.rule_count(), rules as usize, "{text:?}");
+        let snapshot = Snapshot::new(&compiled, &options, SOURCE, Validators::default());
+        store.save(snapshot).await;
+        store.flush().await;
+        let path = store.path_for(SOURCE).unwrap();
+
+        let loaded = load(&path, &options).unwrap_or_else(|error| panic!("{text:?}: {error}"));
+
+        assert_eq!(loaded.list.rule_count(), rules as usize, "{text:?}");
+        let one_less = CompileOptions {
+            max_rules: rules - 1,
+            ..options
+        };
+        assert!(
+            matches!(
+                load(&path, &one_less).err(),
+                Some(SnapshotError::TooLarge(_))
+            ),
+            "{text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_list_reloads_at_exactly_its_rule_cap_whatever_its_groups_and_names() {
+        // One hosts line: one group, one rule.
+        reloads_at_its_exact_rule_cap("0.0.0.0 a.example\n", ListFormat::Hosts, 1).await;
+        // Bare domains.
+        reloads_at_its_exact_rule_cap("a.example\nb.example\nc.example\n", ListFormat::Domains, 3)
+            .await;
+        // Plain rules only.
+        reloads_at_its_exact_rule_cap("||a.example^\n|b.example^\n", ListFormat::Adblock, 2).await;
+        // Three groups, a plain rule and a slow rule: six rules in all.
+        let mixed = "||a.example^\n0.0.0.0 b.example c.example\n127.0.0.1 d.example\n\
+                     2001:db8::1 e.example\nx*y\n";
+        reloads_at_its_exact_rule_cap(mixed, ListFormat::Adblock, 6).await;
+    }
+
+    /// A file whose body ends with the two counts of a list without host or slow rules.
+    fn with_counts(good: &[u8], groups: u32, slow: u32, fix: bool) -> Vec<u8> {
+        let mut bytes = good.to_vec();
+        let end = bytes.len() - CHECKSUM_BYTES as usize;
+        bytes[end - 8..end - 4].copy_from_slice(&groups.to_le_bytes());
+        bytes[end - 4..end].copy_from_slice(&slow.to_le_bytes());
+        if fix {
+            fix_checksum(&mut bytes);
+        }
+
+        bytes
+    }
+
+    #[tokio::test]
+    async fn counts_the_file_cannot_back_are_refused_with_a_valid_checksum() {
+        let state = TestDir::new("snap");
+        let (path, good) = saved_bytes(&state, "||a.example^\n").await;
+        let generous = CompileOptions::new(ListFormat::Auto, 3_000_000);
+
+        // Within the rule cap, but far more groups or rules than the bytes left could hold.
+        for (groups, slow) in [(2_000_000, 0), (0, 2_000_000), (1, 0), (0, 1)] {
+            fs::write(&path, with_counts(&good, groups, slow, true)).unwrap();
+            let error = load(&path, &generous).err().expect("refused");
+
+            assert!(
+                matches!(error, SnapshotError::Truncated),
+                "{groups}/{slow}: {error:?}"
+            );
+        }
+
+        // Over the rule cap.
+        for (groups, slow) in [(u32::MAX, 0), (0, u32::MAX), (5001, 0), (0, 5001)] {
+            fs::write(&path, with_counts(&good, groups, slow, true)).unwrap();
+            let error = load(&path, &caps()).err().expect("refused");
+
+            assert!(
+                matches!(error, SnapshotError::TooLarge(_)),
+                "{groups}/{slow}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_checksum_is_checked_before_any_count_is_read() {
+        let state = TestDir::new("snap");
+        let (path, good) = saved_bytes(&state, "||a.example^\n").await;
+        let generous = CompileOptions::new(ListFormat::Auto, 3_000_000);
+
+        // Counts that would fail every other check; only the checksum can be the answer.
+        for (groups, slow) in [(1, 0), (0, 1), (2_000_000, 2_000_000), (u32::MAX, u32::MAX)] {
+            fs::write(&path, with_counts(&good, groups, slow, false)).unwrap();
+            let error = load(&path, &generous).err().expect("refused");
+
+            assert!(
+                matches!(error, SnapshotError::BadChecksum),
+                "{groups}/{slow}: {error:?}"
+            );
+        }
     }
 
     #[tokio::test]
