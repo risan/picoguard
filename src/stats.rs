@@ -184,9 +184,60 @@ struct Hour {
     blocked: u64,
 }
 
+/// A slot of the query log ring. Its name text is reused for every entry the slot holds.
+struct LogSlot {
+    time: u64,
+    client: IpAddr,
+    qname: String,
+    qtype: u16,
+    result: QueryResult,
+    upstream: Option<u8>,
+    latency_us: u32,
+}
+
+impl LogSlot {
+    fn new(time: u64, event: &Event) -> LogSlot {
+        let mut slot = LogSlot {
+            time,
+            client: event.client,
+            qname: String::new(),
+            qtype: event.qtype,
+            result: event.result,
+            upstream: event.upstream,
+            latency_us: 0,
+        };
+        slot.set(time, event);
+
+        slot
+    }
+
+    fn set(&mut self, time: u64, event: &Event) {
+        self.time = time;
+        self.client = event.client;
+        self.qname.clear();
+        self.qname.push_str(event.qname);
+        self.qtype = event.qtype;
+        self.result = event.result;
+        self.upstream = event.upstream;
+        self.latency_us = u32::try_from(event.latency.as_micros()).unwrap_or(u32::MAX);
+    }
+
+    fn entry(&self) -> QueryLogEntry {
+        QueryLogEntry {
+            time: self.time,
+            client: self.client,
+            qname: self.qname.as_str().into(),
+            qtype: self.qtype,
+            result: self.result,
+            upstream: self.upstream,
+            latency_us: self.latency_us,
+        }
+    }
+}
+
 struct QueryLog {
     capacity: usize,
-    entries: Vec<QueryLogEntry>,
+    slots: Vec<LogSlot>,
     /// Once the ring is full, the slot of the oldest entry and the next to overwrite.
     oldest: usize,
 }
@@ -195,29 +246,29 @@ impl QueryLog {
     fn new(capacity: usize) -> QueryLog {
         QueryLog {
             capacity,
-            entries: Vec::with_capacity(capacity),
+            slots: Vec::with_capacity(capacity),
             oldest: 0,
         }
     }
 
-    fn push(&mut self, entry: QueryLogEntry) {
+    fn push(&mut self, time: u64, event: &Event) {
         if self.capacity == 0 {
             return;
         }
 
-        if self.entries.len() < self.capacity {
-            self.entries.push(entry);
+        if self.slots.len() < self.capacity {
+            self.slots.push(LogSlot::new(time, event));
         } else {
-            self.entries[self.oldest] = entry;
+            self.slots[self.oldest].set(time, event);
             self.oldest = (self.oldest + 1) % self.capacity;
         }
     }
 
     fn newest_first(&self, limit: usize) -> Vec<QueryLogEntry> {
-        let length = self.entries.len();
+        let length = self.slots.len();
 
         (0..length.min(limit))
-            .map(|age| self.entries[(self.oldest + length - 1 - age) % length].clone())
+            .map(|age| self.slots[(self.oldest + length - 1 - age) % length].entry())
             .collect()
     }
 }
@@ -293,15 +344,7 @@ impl Stats {
         let client = event.client;
         inner.clients.record(|key| *key == client, || client);
 
-        inner.log.push(QueryLogEntry {
-            time: now,
-            client,
-            qname: qname.into(),
-            qtype: event.qtype,
-            result: event.result,
-            upstream: event.upstream,
-            latency_us: u32::try_from(event.latency.as_micros()).unwrap_or(u32::MAX),
-        });
+        inner.log.push(now, event);
     }
 
     /// A query shed before it was read, so there is no name to log.
