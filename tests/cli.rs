@@ -147,16 +147,39 @@ fn running_at_the_default_log_level_prints_nothing() {
 }
 
 #[test]
-fn running_with_an_encrypted_upstream_exits_one_until_those_exist() {
+fn running_with_a_host_name_upstream_and_no_bootstrap_exits_one() {
     let path = write_config(
-        "https-upstream.toml",
-        "[server]\nbind = [\"127.0.0.1\"]\nport = 0\n",
+        "https-host-upstream.toml",
+        "[server]\nbind = [\"127.0.0.1\"]\nport = 0\n\
+         [upstream]\nservers = [\"https://dns.example/dns-query\"]\n",
     );
 
     let output = picoguard(&["-c", path.to_str().unwrap()]);
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(text(&output.stderr).contains("not supported yet"));
+    assert!(text(&output.stderr).contains("upstream.bootstrap"));
+}
+
+#[test]
+fn running_with_the_default_encrypted_upstreams_starts() {
+    let port = {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap().port()
+    };
+    let config = format!("[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n");
+    let path = write_config("default-upstreams.toml", &config);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_picoguard"))
+        .args(["-c", path.to_str().unwrap()])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("picoguard binary should start");
+
+    let ready = wait_for_refused_version_bind(port);
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(ready, "the server never answered");
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
 }
 
 #[test]

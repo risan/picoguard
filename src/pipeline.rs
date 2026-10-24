@@ -564,13 +564,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_upstreams_are_refused_until_they_exist() {
+    async fn the_default_encrypted_upstreams_build_a_pipeline() {
         let config = Config::default();
 
-        let error = Pipeline::new(&config, Arc::new(Policy::new()))
-            .err()
-            .unwrap();
-
-        assert!(error.contains("not supported yet"), "{error}");
+        assert!(Pipeline::new(&config, Arc::new(Policy::new())).is_ok());
     }
 }

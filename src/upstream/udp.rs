@@ -11,10 +11,12 @@ const RECEIVE_BUFFER: usize = 4096;
 
 /// Sends `request` from a fresh socket (so every query has its own source
 /// port) and returns the first datagram that answers it. Datagrams with a
-/// wrong ID or question are ignored until the deadline.
+/// wrong ID or question are ignored until the deadline. An answer longer than
+/// `max_reply` is an error.
 pub async fn exchange(
     server: SocketAddr,
     request: &mut [u8],
+    max_reply: usize,
     deadline: Instant,
 ) -> Result<Vec<u8>, UpstreamError> {
     let local: SocketAddr = if server.is_ipv4() {
@@ -36,6 +38,10 @@ pub async fn exchange(
         let length = received?;
 
         if is_answer_to(request, &buffer[..length]) {
+            if length > max_reply {
+                return Err(UpstreamError::ReplyTooLarge);
+            }
+
             buffer.truncate(length);
             buffer.shrink_to_fit();
 

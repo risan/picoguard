@@ -1,25 +1,37 @@
 //! Forwarding to upstream resolvers: one transport per server, picked by
 //! speed, with one retry on the next best server.
 
+pub mod doh;
+pub mod endpoint;
 pub mod stream;
+pub mod tls;
 mod udp;
+
+#[cfg(test)]
+mod test_dns;
+#[cfg(test)]
+mod test_doh;
+#[cfg(test)]
+mod test_tls;
 
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::BuildHasher;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
 use crate::config::{LimitsConfig, UpstreamConfig};
 use crate::dns::wire::{self, Header, flags};
 
-use stream::StreamClient;
+use doh::DohUpstream;
+use endpoint::Bootstrap;
+use stream::{Dial, StreamUpstream};
+use tls::{Alpn, Tls, TlsDialer};
 
 const DEFAULT_DNS_PORT: u16 = 53;
 const INITIAL_SRTT_MS: f64 = 100.0;
@@ -34,6 +46,9 @@ pub enum UpstreamError {
     /// The connection went away before a reply arrived.
     Closed,
     BadReply,
+    /// A DoH server answered with something other than HTTP 200.
+    HttpStatus(u16),
+    ReplyTooLarge,
 }
 
 impl fmt::Display for UpstreamError {
@@ -54,6 +69,14 @@ impl fmt::Display for UpstreamError {
             UpstreamError::BadReply => {
                 write!(formatter, "invalid reply")
             }
+
+            UpstreamError::HttpStatus(status) => {
+                write!(formatter, "HTTP status {status}")
+            }
+
+            UpstreamError::ReplyTooLarge => {
+                write!(formatter, "reply too large")
+            }
         }
     }
 }
@@ -72,8 +95,9 @@ pub(crate) fn random_u64() -> u64 {
     RandomState::new().hash_one(0u8)
 }
 
-/// True when `reply` is a response to `request`: same ID, QR set, and the same
-/// question (compared without regard to letter case).
+/// True when `reply` is a response to `request`: same ID and opcode, QR set,
+/// and the same question. The name is compared without regard to letter case,
+/// the type and class exactly.
 pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
     let (Ok(request_header), Ok(reply_header)) = (Header::parse(request), Header::parse(reply))
     else {
@@ -82,6 +106,7 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
 
     if request_header.id != reply_header.id
         || reply_header.flags & flags::QR == 0
+        || request_header.opcode() != reply_header.opcode()
         || reply_header.question_count != 1
     {
         return false;
@@ -98,70 +123,33 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
     ) else {
         return false;
     };
+    let name_len = name_end - wire::HEADER_LEN;
 
-    asked.eq_ignore_ascii_case(echoed)
-}
-
-struct TcpUpstream {
-    server: SocketAddr,
-    client: StreamClient,
-    connect_lock: tokio::sync::Mutex<()>,
-}
-
-impl TcpUpstream {
-    fn new(server: SocketAddr, limits: &LimitsConfig, timeout: Duration) -> TcpUpstream {
-        TcpUpstream {
-            server,
-            client: StreamClient::new(limits.upstream_reply_max, timeout),
-            connect_lock: tokio::sync::Mutex::new(()),
-        }
-    }
-
-    async fn query(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
-        self.ensure_connected(deadline).await?;
-
-        let reply = self.client.query(request, deadline).await?;
-        if !is_answer_to(request, &reply) {
-            return Err(UpstreamError::BadReply);
-        }
-
-        Ok(reply)
-    }
-
-    async fn ensure_connected(&self, deadline: Instant) -> Result<(), UpstreamError> {
-        let _serialize_connects = self.connect_lock.lock().await;
-        if self.client.is_connected() {
-            return Ok(());
-        }
-
-        let Ok(connected) = timeout_at(deadline, TcpStream::connect(self.server)).await else {
-            return Err(UpstreamError::Timeout);
-        };
-        let stream = connected?;
-        stream.set_nodelay(true)?;
-        self.client.attach(stream);
-
-        Ok(())
-    }
+    asked[..name_len].eq_ignore_ascii_case(&echoed[..name_len])
+        && asked[name_len..] == echoed[name_len..]
 }
 
 /// UDP with a fall back to TCP on the same address for truncated answers.
 struct UdpUpstream {
     server: SocketAddr,
-    tcp: TcpUpstream,
+    max_reply: usize,
+    tcp: StreamUpstream,
 }
 
-/// How to reach one upstream server. DoH and DoT join in a later phase.
+/// How to reach one upstream server.
 enum Transport {
     Udp(UdpUpstream),
-    Tcp(TcpUpstream),
+    Tcp(StreamUpstream),
+    Dot(StreamUpstream),
+    Doh(DohUpstream),
 }
 
 impl Transport {
     async fn query(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
         match self {
             Transport::Udp(upstream) => {
-                let reply = udp::exchange(upstream.server, request, deadline).await?;
+                let reply =
+                    udp::exchange(upstream.server, request, upstream.max_reply, deadline).await?;
                 let truncated = Header::parse(&reply).is_ok_and(|header| header.truncated());
                 if truncated {
                     return upstream.tcp.query(request, deadline).await;
@@ -170,7 +158,11 @@ impl Transport {
                 Ok(reply)
             }
 
-            Transport::Tcp(upstream) => upstream.query(request, deadline).await,
+            Transport::Tcp(upstream) | Transport::Dot(upstream) => {
+                upstream.query(request, deadline).await
+            }
+
+            Transport::Doh(upstream) => upstream.query(request, deadline).await,
         }
     }
 }
@@ -226,7 +218,11 @@ impl Upstream {
         };
         let _permit = acquired.map_err(|_| UpstreamError::Closed)?;
 
-        self.transport.query(request, deadline).await
+        let Ok(result) = timeout_at(deadline, self.transport.query(request, deadline)).await else {
+            return Err(UpstreamError::Timeout);
+        };
+
+        result
     }
 
     fn record_success(&self, elapsed: Duration) {
@@ -259,17 +255,40 @@ pub struct Upstreams {
 }
 
 impl Upstreams {
-    /// Builds the servers named in the config. Only `udp://` and `tcp://` work
-    /// until the encrypted transports exist.
+    /// Builds the servers named in the config.
     pub fn from_config(
         upstream: &UpstreamConfig,
         limits: &LimitsConfig,
     ) -> Result<Upstreams, String> {
+        let bootstrap = Bootstrap::new(&upstream.bootstrap);
+
+        Upstreams::with_parts(
+            upstream,
+            limits,
+            Arc::new(Tls::with_webpki_roots()),
+            Arc::new(bootstrap),
+        )
+    }
+
+    /// Like `from_config`, with the TLS settings (roots, AES policy) and the
+    /// bootstrap resolver given.
+    pub fn with_parts(
+        upstream: &UpstreamConfig,
+        limits: &LimitsConfig,
+        tls: Arc<Tls>,
+        bootstrap: Arc<Bootstrap>,
+    ) -> Result<Upstreams, String> {
         let timeout = Duration::from_millis(upstream.timeout_ms);
+        let context = Context {
+            limits,
+            timeout,
+            tls: &tls,
+            bootstrap: &bootstrap,
+        };
         let mut servers = Vec::new();
 
         for spec in &upstream.servers {
-            let transport = parse_server(spec, limits, timeout)?;
+            let transport = parse_server(spec, &context)?;
             servers.push(Upstream::new(spec.clone(), transport, limits));
         }
 
@@ -364,23 +383,68 @@ fn random_unit() -> f64 {
 fn udp_transport(server: SocketAddr, limits: &LimitsConfig, timeout: Duration) -> Transport {
     Transport::Udp(UdpUpstream {
         server,
-        tcp: TcpUpstream::new(server, limits, timeout),
+        max_reply: limits.upstream_reply_max,
+        tcp: StreamUpstream::new(Dial::Plain(server), limits, timeout),
     })
 }
 
-fn parse_server(spec: &str, limits: &LimitsConfig, timeout: Duration) -> Result<Transport, String> {
+/// What building a transport from a server URL needs besides the URL.
+struct Context<'a> {
+    limits: &'a LimitsConfig,
+    timeout: Duration,
+    tls: &'a Arc<Tls>,
+    bootstrap: &'a Arc<Bootstrap>,
+}
+
+fn parse_server(spec: &str, context: &Context) -> Result<Transport, String> {
+    let (limits, timeout) = (context.limits, context.timeout);
+
     if let Some(address) = spec.strip_prefix("udp://") {
         return Ok(udp_transport(
-            parse_address(spec, address)?,
+            parse_address(spec, address, DEFAULT_DNS_PORT)?,
             limits,
             timeout,
         ));
     }
 
     if let Some(address) = spec.strip_prefix("tcp://") {
-        let server = parse_address(spec, address)?;
+        let server = parse_address(spec, address, DEFAULT_DNS_PORT)?;
 
-        return Ok(Transport::Tcp(TcpUpstream::new(server, limits, timeout)));
+        return Ok(Transport::Tcp(StreamUpstream::new(
+            Dial::Plain(server),
+            limits,
+            timeout,
+        )));
+    }
+
+    if let Some(rest) = spec.strip_prefix("tls://") {
+        let target = endpoint::parse_tls(spec, rest, context.bootstrap)?;
+        let dialer = TlsDialer::new(
+            Arc::clone(context.tls),
+            Alpn::Dot,
+            target.server_name,
+            target.remote,
+            spec.to_string(),
+        );
+
+        return Ok(Transport::Dot(StreamUpstream::new(
+            Dial::Tls(dialer),
+            limits,
+            timeout,
+        )));
+    }
+
+    if let Some(rest) = spec.strip_prefix("https://") {
+        let (target, uri) = endpoint::parse_https(spec, rest, context.bootstrap)?;
+        let dialer = TlsDialer::new(
+            Arc::clone(context.tls),
+            Alpn::H2,
+            target.server_name,
+            target.remote,
+            spec.to_string(),
+        );
+
+        return Ok(Transport::Doh(DohUpstream::new(dialer, uri, limits)));
     }
 
     Err(format!(
@@ -388,14 +452,14 @@ fn parse_server(spec: &str, limits: &LimitsConfig, timeout: Duration) -> Result<
     ))
 }
 
-fn parse_address(spec: &str, address: &str) -> Result<SocketAddr, String> {
+fn parse_address(spec: &str, address: &str, default_port: u16) -> Result<SocketAddr, String> {
     if let Ok(server) = address.parse::<SocketAddr>() {
         return Ok(server);
     }
 
     address
         .parse::<IpAddr>()
-        .map(|ip| SocketAddr::new(ip, DEFAULT_DNS_PORT))
+        .map(|ip| SocketAddr::new(ip, default_port))
         .map_err(|_| format!("upstream {spec}: expected an IP address and optional port"))
 }
 
@@ -404,38 +468,15 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use hickory_proto::rr::RecordType;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
 
     use super::*;
-    use crate::dns::test_util::QuerySpec;
-    use crate::dns::wire::rtype;
-
-    const ANSWER_MARKER: [u8; 4] = [192, 0, 2, 1];
-
-    fn query_for(name: &str) -> Vec<u8> {
-        QuerySpec::new(name, RecordType::A).bytes()
-    }
-
-    /// A reply to `request` with one A record, optionally with TC set.
-    fn answer(request: &[u8], address: [u8; 4], truncated: bool) -> Vec<u8> {
-        let question_end = wire::skip_name(request, wire::HEADER_LEN).unwrap() + 4;
-        let mut reply = request[..question_end].to_vec();
-        let reply_flags = 0x8180u16 | if truncated { flags::TC } else { 0 };
-        reply[2..4].copy_from_slice(&reply_flags.to_be_bytes());
-        reply[6..12].copy_from_slice(&[0, 1, 0, 0, 0, 0]);
-        reply.extend_from_slice(&[0xC0, 0x0C]);
-        reply.extend_from_slice(&rtype::A.to_be_bytes());
-        reply.extend_from_slice(&[0, 1, 0, 0, 0, 60, 0, 4]);
-        reply.extend_from_slice(&address);
-
-        reply
-    }
-
-    fn address_of(reply: &[u8]) -> [u8; 4] {
-        reply[reply.len() - 4..].try_into().unwrap()
-    }
+    use crate::upstream::test_dns::{
+        ANSWER_MARKER, FakeDns, address_of, answer, fake_dns, query_for,
+    };
+    use crate::upstream::test_doh::{doh_server, respond_with_answer};
+    use crate::upstream::test_tls::{TestPki, TlsServer};
 
     struct Fake {
         address: SocketAddr,
@@ -600,9 +641,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_truncated_udp_answer_is_fetched_again_over_tcp() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The same port number for TCP and UDP; another test may hold the UDP
+        // side of a port that was free for TCP, so draw again.
+        let (listener, udp) = loop {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            if let Ok(udp) = UdpSocket::bind(address).await {
+                break (listener, udp);
+            }
+        };
         let address = listener.local_addr().unwrap();
-        let udp = UdpSocket::bind(address).await.unwrap();
         tokio::spawn(async move {
             let mut buffer = [0u8; 2048];
             while let Ok((length, peer)) = udp.recv_from(&mut buffer).await {
@@ -834,14 +882,26 @@ mod tests {
         assert!(health.retry_at.is_none());
     }
 
+    fn parse(spec: &str, bootstrap: &[&str]) -> Result<Transport, String> {
+        let tls = Arc::new(Tls::with_webpki_roots());
+        let limits = LimitsConfig::default();
+        let bootstrap: Vec<IpAddr> = bootstrap.iter().map(|ip| ip.parse().unwrap()).collect();
+        let bootstrap = Arc::new(Bootstrap::new(&bootstrap));
+        let context = Context {
+            limits: &limits,
+            timeout: Duration::from_secs(1),
+            tls: &tls,
+            bootstrap: &bootstrap,
+        };
+
+        parse_server(spec, &context)
+    }
+
     #[test]
     fn server_urls_parse_with_default_ports() {
-        let limits = LimitsConfig::default();
-        let timeout = Duration::from_secs(1);
-
-        let udp = parse_server("udp://9.9.9.10", &limits, timeout);
-        let v6 = parse_server("udp://[::1]:5353", &limits, timeout);
-        let tcp = parse_server("tcp://192.168.1.1:5300", &limits, timeout);
+        let udp = parse("udp://9.9.9.10", &[]);
+        let v6 = parse("udp://[::1]:5353", &[]);
+        let tcp = parse("tcp://192.168.1.1:5300", &[]);
 
         assert!(
             matches!(udp, Ok(Transport::Udp(ref u)) if u.server == "9.9.9.10:53".parse().unwrap())
@@ -850,24 +910,162 @@ mod tests {
             matches!(v6, Ok(Transport::Udp(ref u)) if u.server == "[::1]:5353".parse().unwrap())
         );
         assert!(
-            matches!(tcp, Ok(Transport::Tcp(ref t)) if t.server == "192.168.1.1:5300".parse().unwrap())
+            matches!(tcp, Ok(Transport::Tcp(ref t)) if matches!(t.dial, Dial::Plain(server) if server == "192.168.1.1:5300".parse().unwrap()))
         );
     }
 
     #[test]
-    fn bad_and_encrypted_server_urls_are_errors() {
-        let limits = LimitsConfig::default();
-        let timeout = Duration::from_secs(1);
+    fn encrypted_urls_map_to_dot_and_doh_transports() {
+        let doh_ip = parse("https://1.1.1.1/dns-query", &[]);
+        let doh_host = parse("https://dns.example/dns-query", &["9.9.9.9"]);
+        let dot_ip = parse("tls://1.1.1.1#cloudflare-dns.com", &[]);
+        let dot_host = parse("tls://dns.quad9.net", &["9.9.9.9"]);
 
-        let encrypted = parse_server("https://1.1.1.1/dns-query", &limits, timeout)
-            .err()
-            .unwrap();
-        let hostname = parse_server("udp://dns.example", &limits, timeout)
-            .err()
-            .unwrap();
+        assert!(matches!(doh_ip, Ok(Transport::Doh(_))));
+        assert!(matches!(doh_host, Ok(Transport::Doh(_))));
+        assert!(matches!(
+            dot_ip,
+            Ok(Transport::Dot(StreamUpstream {
+                dial: Dial::Tls(_),
+                ..
+            }))
+        ));
+        assert!(matches!(dot_host, Ok(Transport::Dot(_))));
+    }
 
-        assert!(encrypted.contains("not supported yet"), "{encrypted}");
+    #[test]
+    fn bad_server_urls_are_errors() {
+        let hostname = parse("udp://dns.example", &[]).err().unwrap();
+        let no_bootstrap = parse("https://dns.example/dns-query", &[]).err().unwrap();
+        let no_bootstrap_dot = parse("tls://dns.example", &[]).err().unwrap();
+        let bad_name = parse("tls://1.1.1.1#not a name", &[]).err().unwrap();
+
         assert!(hostname.contains("IP address"), "{hostname}");
+        assert!(
+            no_bootstrap.contains("upstream.bootstrap"),
+            "{no_bootstrap}"
+        );
+        assert!(no_bootstrap_dot.contains("upstream.bootstrap"));
+        assert!(bad_name.contains("server name"), "{bad_name}");
+    }
+
+    #[test]
+    fn the_default_config_builds_four_doh_upstreams_without_a_bootstrap() {
+        let upstreams =
+            Upstreams::from_config(&UpstreamConfig::default(), &LimitsConfig::default()).unwrap();
+
+        assert_eq!(upstreams.servers.len(), 4);
+        assert!(
+            upstreams
+                .servers
+                .iter()
+                .all(|server| matches!(server.transport, Transport::Doh(_)))
+        );
+    }
+
+    async fn dot_echo_server(pki: &TestPki) -> TlsServer {
+        let config = pki.server_config(&["dot"], rustls::crypto::ring::default_provider());
+
+        TlsServer::start(config, |mut stream| async move {
+            loop {
+                let mut length = [0u8; 2];
+                if stream.read_exact(&mut length).await.is_err() {
+                    break;
+                }
+
+                let mut query = vec![0; usize::from(u16::from_be_bytes(length))];
+                if stream.read_exact(&mut query).await.is_err() {
+                    break;
+                }
+
+                let reply = answer(&query, ANSWER_MARKER, false);
+                let mut frame = (reply.len() as u16).to_be_bytes().to_vec();
+                frame.extend_from_slice(&reply);
+                if stream.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+    }
+
+    /// Queries `spec` through a full `Upstreams`, trusting the test CA and
+    /// resolving host names through `dns`.
+    async fn query_encrypted(pki: &TestPki, dns: &FakeDns, spec: String) -> Vec<u8> {
+        let config = UpstreamConfig {
+            servers: vec![spec],
+            timeout_ms: 3000,
+            ..UpstreamConfig::default()
+        };
+        let tls = Arc::new(Tls::with_roots(pki.roots(), true));
+        let bootstrap = Arc::new(Bootstrap::at(vec![dns.address]));
+        let upstreams =
+            Upstreams::with_parts(&config, &LimitsConfig::default(), tls, bootstrap).unwrap();
+
+        upstreams
+            .query(&mut query_for("example.com."))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn doh_urls_with_an_ip_or_a_bootstrapped_host_name_answer() {
+        let pki = TestPki::new();
+        let dns = fake_dns(vec![std::net::Ipv4Addr::LOCALHOST], Vec::new()).await;
+        let server = doh_server(&pki, |_, body| respond_with_answer(body)).await;
+        let port = server.address.port();
+
+        let by_ip =
+            query_encrypted(&pki, &dns, format!("https://127.0.0.1:{port}/dns-query")).await;
+        let by_name =
+            query_encrypted(&pki, &dns, format!("https://localhost:{port}/dns-query")).await;
+
+        assert_eq!(address_of(&by_ip), ANSWER_MARKER);
+        assert_eq!(address_of(&by_name), ANSWER_MARKER);
+        assert_eq!(
+            dns.queries.load(Ordering::SeqCst),
+            2,
+            "only the host name was resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn dot_urls_with_an_ip_a_server_name_or_a_bootstrapped_host_answer() {
+        let pki = TestPki::new();
+        let dns = fake_dns(vec![std::net::Ipv4Addr::LOCALHOST], Vec::new()).await;
+        let server = dot_echo_server(&pki).await;
+        let port = server.address.port();
+
+        let by_ip = query_encrypted(&pki, &dns, format!("tls://127.0.0.1:{port}")).await;
+        let named = query_encrypted(&pki, &dns, format!("tls://127.0.0.1:{port}#localhost")).await;
+        let by_name = query_encrypted(&pki, &dns, format!("tls://localhost:{port}")).await;
+
+        assert_eq!(address_of(&by_ip), ANSWER_MARKER);
+        assert_eq!(address_of(&named), ANSWER_MARKER);
+        assert_eq!(address_of(&by_name), ANSWER_MARKER);
+        assert_eq!(dns.queries.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_certificate_for_another_name_is_refused() {
+        let pki = TestPki::new();
+        let server = dot_echo_server(&pki).await;
+        let config = UpstreamConfig {
+            servers: vec![format!(
+                "tls://127.0.0.1:{}#other.example",
+                server.address.port()
+            )],
+            timeout_ms: 1000,
+            ..UpstreamConfig::default()
+        };
+        let tls = Arc::new(Tls::with_roots(pki.roots(), true));
+        let bootstrap = Arc::new(Bootstrap::at(Vec::new()));
+        let upstreams =
+            Upstreams::with_parts(&config, &LimitsConfig::default(), tls, bootstrap).unwrap();
+
+        let result = upstreams.query(&mut query_for("example.com.")).await;
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -891,5 +1089,129 @@ mod tests {
         assert!(!is_answer_to(&query, &wrong_id));
         assert!(!is_answer_to(&query, &other_name));
         assert!(!is_answer_to(&query, &good[..10]));
+    }
+
+    #[test]
+    fn the_question_type_and_class_must_match_exactly() {
+        let query = query_for("example.com.");
+        let name_end = wire::skip_name(&query, wire::HEADER_LEN).unwrap();
+        let good = answer(&query, ANSWER_MARKER, false);
+        // Types 65 (0x41) and 97 (0x61) differ only in an ASCII case bit.
+        let mut other_type = good.clone();
+        other_type[name_end + 1] = 33;
+        let mut other_class = good.clone();
+        other_class[name_end + 3] = 3;
+        let mut asked_65 = query.clone();
+        asked_65[name_end + 1] = 0x41;
+        let mut replied_97 = answer(&asked_65, ANSWER_MARKER, false);
+        replied_97[name_end + 1] = 0x61;
+        let mut other_opcode = good.clone();
+        other_opcode[2] |= 0x08;
+
+        assert!(!is_answer_to(&query, &other_type));
+        assert!(!is_answer_to(&query, &other_class));
+        assert!(is_answer_to(
+            &asked_65,
+            &answer(&asked_65, ANSWER_MARKER, false)
+        ));
+        assert!(!is_answer_to(&asked_65, &replied_97));
+        assert!(!is_answer_to(&query, &other_opcode));
+    }
+
+    fn small_reply_limit() -> LimitsConfig {
+        LimitsConfig {
+            upstream_reply_max: 30,
+            ..LimitsConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_udp_answer_over_the_reply_limit_is_an_error() {
+        let server = good_udp().await;
+        let config = UpstreamConfig {
+            servers: vec![udp_url(&server)],
+            timeout_ms: 1000,
+            ..UpstreamConfig::default()
+        };
+        let upstreams = Upstreams::from_config(&config, &small_reply_limit()).unwrap();
+
+        let result = upstreams.query(&mut query_for("example.com.")).await;
+
+        assert!(
+            matches!(result, Err(UpstreamError::ReplyTooLarge)),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tcp_answer_over_the_reply_limit_is_an_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_tcp(listener, Arc::new(AtomicUsize::new(0)), None));
+        let config = UpstreamConfig {
+            servers: vec![format!("tcp://{address}")],
+            timeout_ms: 1000,
+            ..UpstreamConfig::default()
+        };
+        let upstreams = Upstreams::from_config(&config, &small_reply_limit()).unwrap();
+
+        let result = upstreams.query(&mut query_for("example.com.")).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn queries_waiting_behind_a_connect_keep_their_own_deadlines() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_tcp(listener, Arc::new(AtomicUsize::new(0)), None));
+        let upstreams = Arc::new(upstreams(vec![format!("tcp://{address}")], 5000));
+        let connecting = {
+            let upstreams = Arc::clone(&upstreams);
+            tokio::spawn(async move {
+                let Transport::Tcp(tcp) = &upstreams.servers[0].transport else {
+                    unreachable!();
+                };
+                let _held = tcp.connect_lock.lock().await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        let started = Instant::now();
+
+        let impatient = {
+            let upstreams = Arc::clone(&upstreams);
+            tokio::spawn(async move {
+                upstreams.servers[0]
+                    .query(
+                        &mut query_for("a.example."),
+                        Instant::now() + Duration::from_millis(80),
+                    )
+                    .await
+            })
+        };
+        let patient = {
+            let upstreams = Arc::clone(&upstreams);
+            tokio::spawn(async move {
+                upstreams.servers[0]
+                    .query(
+                        &mut query_for("b.example."),
+                        Instant::now() + Duration::from_secs(3),
+                    )
+                    .await
+            })
+        };
+
+        let impatient = impatient.await.unwrap();
+        let impatient_took = started.elapsed();
+        let patient = patient.await.unwrap();
+
+        assert!(matches!(impatient, Err(UpstreamError::Timeout)));
+        assert!(
+            impatient_took < Duration::from_millis(250),
+            "{impatient_took:?}"
+        );
+        assert!(patient.is_ok());
+        connecting.await.unwrap();
     }
 }
