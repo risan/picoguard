@@ -12,12 +12,20 @@ name = "picoguard"
 path = "src/main.rs"
 
 [dependencies]
+bytes = "1.12.1"
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["client", "http2"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 log = "0.4.34"
 lru = "0.19.0"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 socket2 = "0.6.5"
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "macros", "sync", "io-util"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde"] }
+webpki-roots = "1.0.11"
 xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh3"] }
 
 [profile.release]
@@ -29,4 +37,6 @@ strip = true
 
 [dev-dependencies]
 hickory-proto = "0.26.3"
+hyper = { version = "1.12.0", features = ["server"] }
 proptest = "1.12.0"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
