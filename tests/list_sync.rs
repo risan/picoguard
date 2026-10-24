@@ -689,11 +689,14 @@ async fn queries_in_flight_during_a_swap_get_the_new_policy_and_none_are_lost() 
     scheduler.refresh(0, &downloader()).await;
     let policy = scheduler.policy();
 
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::from_millis(400)).await;
-    let dns = start_with_policy(&config_for(&upstream), Arc::clone(&policy)).await;
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::from_millis(800)).await;
+    let mut dns_config = config_for(&upstream);
+    dns_config.upstream.timeout_ms = 10_000;
+    let dns = start_with_policy(&dns_config, Arc::clone(&policy)).await;
 
-    // 40 queries wait for the slow upstream; the swap lands while they wait.
-    let waiting: Vec<_> = (0..40)
+    // 30 queries wait for the slow upstream (the pool lets 32 wait at once); the swap lands
+    // while they wait.
+    let waiting: Vec<_> = (0..30)
         .map(|index| {
             let dns = dns.clone();
             tokio::spawn(async move {
@@ -703,7 +706,15 @@ async fn queries_in_flight_during_a_swap_get_the_new_policy_and_none_are_lost() 
             })
         })
         .collect();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..600 {
+        if upstream.count() >= 30 {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(upstream.count(), 30, "every query waits for the upstream");
 
     // Names the old and the new list both decide the same way are asked all the time.
     let steady = {
