@@ -287,8 +287,9 @@ impl Pipeline {
         Ok(Quick::Replied)
     }
 
-    /// Step 6 for a reply that just arrived from the upstream, under the policy of this
-    /// moment: whatever was decided while the query was in flight does not count.
+    /// Steps 2 and 6 for a reply that just arrived from the upstream, under the policy of
+    /// this moment: whatever was decided while the query was in flight does not count, the
+    /// question included (a rule may have been added, or a pause may have ended).
     fn deliver(
         &self,
         query: &Query<'_>,
@@ -297,6 +298,12 @@ impl Pipeline {
         out: &mut Vec<u8>,
     ) {
         let view = self.policy.view(Instant::now());
+        if let Decision::Block { ips } = view.check_request(query) {
+            self.write_blocked(reply, query.question.qtype, &ips, out);
+
+            return;
+        }
+
         let decision = view.check_response(delivery.parts());
         self.remember(
             &mut self.cache.lock().unwrap(),
