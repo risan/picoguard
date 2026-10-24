@@ -9,10 +9,11 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use super::parse::{FastKind, ListFormat, NetworkRule, ParseSummary, Parser, Rule, fast_rule};
 use super::pattern::{
@@ -211,27 +212,21 @@ fn sort_dedup(hashes: &mut Vec<u64>) {
     hashes.shrink_to_fit();
 }
 
+/// Hashes the typed identity; `Hash` prefixes every string and list with its length, so
+/// no two identities share an input.
 fn identity_hash(rule: &NetworkRule) -> u64 {
-    let identity = rule.identity();
-    let key = format!(
-        "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
-        identity.whitelist,
-        identity.important,
-        identity.restricted_types,
-        identity.client_key,
-        identity.ctag_key,
-        identity.pattern
-    );
+    let mut hasher = Xxh3::new();
+    rule.identity().hash(&mut hasher);
 
-    hash(&key)
+    hasher.finish()
 }
 
 /// The fast-path array and hash a rule with this identity would have, if it has one.
 fn fast_key(rule: &NetworkRule) -> Option<(usize, u64)> {
     if rule.important
         || rule.restricted_types != 0
-        || !rule.client_key.is_empty()
-        || !rule.ctag_key.is_empty()
+        || !rule.restricted_clients.is_empty()
+        || !rule.restricted_ctags.is_empty()
     {
         return None;
     }
