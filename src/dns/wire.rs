@@ -748,6 +748,9 @@ pub struct ResponseInfo {
     pub min_ttl: Option<u32>,
     /// RFC 2308 negative TTL: smallest of the authority SOA's TTL and minimum.
     pub negative_ttl: Option<u32>,
+    /// NXDOMAIN, or NOERROR where the name at the end of the answer's CNAME
+    /// chain (the queried name when there is no chain) has no data.
+    pub is_negative: bool,
 }
 
 impl ResponseInfo {
@@ -763,6 +766,7 @@ impl ResponseInfo {
             opt_start: None,
             min_ttl: None,
             negative_ttl: None,
+            is_negative: false,
         };
 
         for record in Records::new(msg)? {
@@ -793,8 +797,86 @@ impl ResponseInfo {
             }
         }
 
+        info.is_negative = is_negative(msg, &header)?;
+
         Ok(info)
     }
+}
+
+/// A CNAME chain this long is not followed further; it is left unclassified
+/// rather than called empty.
+const MAX_CNAME_HOPS: usize = 8;
+
+fn is_negative(msg: &[u8], header: &Header) -> Result<bool, WireError> {
+    match header.rcode() {
+        rcode::NXDOMAIN => {
+            return Ok(true);
+        }
+
+        rcode::NOERROR => {}
+
+        _ => {
+            return Ok(false);
+        }
+    }
+
+    if header.answer_count == 0 {
+        return Ok(true);
+    }
+
+    if header.question_count != 1 {
+        return Ok(false);
+    }
+
+    let (question, _) = read_question(msg, HEADER_LEN)?;
+    if question.qtype == rtype::CNAME || question.qtype == rtype::ANY {
+        return Ok(false);
+    }
+
+    let mut current = question.name;
+    let mut reached_the_end = false;
+    for _ in 0..MAX_CNAME_HOPS {
+        let Some(target) = cname_target_of(msg, &current)? else {
+            reached_the_end = true;
+
+            break;
+        };
+        current = target;
+    }
+
+    Ok(reached_the_end && !has_answer_for(msg, &current)?)
+}
+
+fn answers(msg: &[u8]) -> Result<impl Iterator<Item = Result<Record, WireError>>, WireError> {
+    Ok(Records::new(msg)?.take_while(|record| {
+        record
+            .as_ref()
+            .map_or(true, |record| record.section == Section::Answer)
+    }))
+}
+
+fn cname_target_of(msg: &[u8], owner: &Name) -> Result<Option<Name>, WireError> {
+    for record in answers(msg)? {
+        let record = record?;
+        if record.rtype == rtype::CNAME
+            && read_name(msg, record.start)?.0 == *owner
+            && let RData::Cname(target) = record.data(msg)?
+        {
+            return Ok(Some(*target));
+        }
+    }
+
+    Ok(None)
+}
+
+fn has_answer_for(msg: &[u8], owner: &Name) -> Result<bool, WireError> {
+    for record in answers(msg)? {
+        if read_name(msg, record?.start)?.0 == *owner {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// Types whose rdata RFC 1035 lets a server compress (RFC 3597 section 4
@@ -1329,6 +1411,100 @@ mod tests {
         assert_eq!(info.min_ttl, Some(30));
         assert_eq!(info.header.rcode(), rcode::NXDOMAIN);
         assert_eq!(info.opt_start, None);
+    }
+
+    #[test]
+    fn replies_are_negative_when_the_name_at_the_end_of_the_cname_chain_has_no_data() {
+        let cases = [
+            ("NODATA", vec![], rcode::NOERROR, true),
+            ("NXDOMAIN", vec![], rcode::NXDOMAIN, true),
+            (
+                "NODATA behind a CNAME",
+                vec![cname("www.example.com.", 300, "edge.example.net.")],
+                rcode::NOERROR,
+                true,
+            ),
+            (
+                "NXDOMAIN behind two CNAMEs",
+                vec![
+                    cname("www.example.com.", 300, "mid.example.net."),
+                    cname("mid.example.net.", 300, "edge.example.net."),
+                ],
+                rcode::NXDOMAIN,
+                true,
+            ),
+            (
+                "data behind a CNAME",
+                vec![
+                    cname("www.example.com.", 300, "edge.example.net."),
+                    a("edge.example.net.", 60, [192, 0, 2, 1].into()),
+                ],
+                rcode::NOERROR,
+                false,
+            ),
+            (
+                "data listed before its CNAME",
+                vec![
+                    a("edge.example.net.", 60, [192, 0, 2, 1].into()),
+                    cname("www.example.com.", 300, "edge.example.net."),
+                ],
+                rcode::NOERROR,
+                false,
+            ),
+            (
+                "data without a CNAME",
+                vec![a("www.example.com.", 60, [192, 0, 2, 1].into())],
+                rcode::NOERROR,
+                false,
+            ),
+            ("SERVFAIL", vec![], rcode::SERVFAIL, false),
+        ];
+
+        for (label, answers, rcode, expected) in cases {
+            let bytes = ResponseSpec {
+                answers,
+                authorities: vec![soa("example.net.", 900, 45)],
+                rcode,
+                ..ResponseSpec::default()
+            }
+            .bytes(&QuerySpec::new("www.example.com.", RecordType::A));
+
+            let info = ResponseInfo::parse(&bytes).unwrap();
+
+            assert_eq!(info.is_negative, expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_cname_query_answered_by_a_cname_is_not_negative() {
+        let bytes = ResponseSpec {
+            answers: vec![cname("www.example.com.", 300, "edge.example.net.")],
+            ..ResponseSpec::default()
+        }
+        .bytes(&QuerySpec::new("www.example.com.", RecordType::CNAME));
+
+        assert!(!ResponseInfo::parse(&bytes).unwrap().is_negative);
+    }
+
+    #[test]
+    fn a_cname_chain_longer_than_the_hop_limit_is_not_called_negative() {
+        let answers = (0..20)
+            .map(|hop| {
+                cname(
+                    &format!("h{hop}.example.com."),
+                    300,
+                    &format!("h{}.example.com.", hop + 1),
+                )
+            })
+            .collect();
+        let bytes = ResponseSpec {
+            answers,
+            authorities: vec![soa("example.com.", 900, 45)],
+            ..ResponseSpec::default()
+        }
+        .bytes(&QuerySpec::new("h0.example.com.", RecordType::A));
+
+        assert!(!ResponseInfo::parse(&bytes).unwrap().is_negative);
     }
 
     #[test]
