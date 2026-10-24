@@ -1,7 +1,8 @@
 use std::net::IpAddr;
 
 use super::wire::{
-    CLASS_IN, HEADER_LEN, Header, MAX_MESSAGE_LEN, Query, flags, rcode, remove_opt, rtype,
+    CLASS_IN, HEADER_LEN, Header, MAX_MESSAGE_LEN, MAX_NAME_LEN, Query, flags, rcode, remove_opt,
+    rtype,
 };
 
 const CLASSIC_UDP_LIMIT: u16 = 512;
@@ -229,7 +230,11 @@ impl<'q, 'a> Reply<'q, 'a> {
 
         rdata.push(SOA_RNAME_LABEL.len() as u8);
         rdata.extend_from_slice(SOA_RNAME_LABEL);
-        if self.query.question.name.is_root() {
+        // The pointer expands to the label followed by the question name, which
+        // is too long for a name when the question name is nearly at the limit.
+        let question_name_len = self.query.question.name.as_wire().len();
+        let mailbox_fits = SOA_RNAME_LABEL.len() + 1 + question_name_len <= MAX_NAME_LEN;
+        if self.query.question.name.is_root() || !mailbox_fits {
             rdata.push(0);
         } else {
             rdata.extend_from_slice(&NAME_POINTER_TO_QUESTION);
@@ -387,7 +392,7 @@ mod tests {
         parse(&out)
     }
 
-    fn blocked(name: &'static str, rtype: RecordType) -> Message {
+    fn blocked(name: &str, rtype: RecordType) -> Message {
         built(&QuerySpec::new(name, rtype), Protocol::Udp, |reply, out| {
             reply.blocked(10, out);
         })
@@ -497,6 +502,36 @@ mod tests {
             panic!("expected a SOA record");
         };
         assert_eq!(data.rname.to_ascii(), "hostmaster.");
+    }
+
+    /// A name of three 63-byte labels and a last one of `last_label` bytes,
+    /// which is `194 + last_label` bytes on the wire.
+    fn long_name(last_label: usize) -> String {
+        let long = "a".repeat(63);
+
+        format!("{long}.{long}.{long}.{}.", "b".repeat(last_label))
+    }
+
+    fn mailbox_of_nodata_soa(name: &str) -> String {
+        let message = blocked(name, RecordType::TXT);
+        assert_eq!(message.authorities[0].name.to_ascii(), name);
+        let RData::SOA(data) = &message.authorities[0].data else {
+            panic!("expected a SOA record");
+        };
+
+        data.rname.to_ascii()
+    }
+
+    #[test]
+    fn the_nodata_mailbox_falls_back_when_hostmaster_plus_the_name_would_pass_255_bytes() {
+        // "hostmaster." adds 11 bytes: a 244-byte name still fits, 245 does not.
+        let fits = long_name(50);
+        let one_too_long = long_name(51);
+        let longest = long_name(61);
+
+        assert_eq!(mailbox_of_nodata_soa(&fits), format!("hostmaster.{fits}"));
+        assert_eq!(mailbox_of_nodata_soa(&one_too_long), "hostmaster.");
+        assert_eq!(mailbox_of_nodata_soa(&longest), "hostmaster.");
     }
 
     #[test]
