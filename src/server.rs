@@ -197,12 +197,12 @@ async fn serve_udp(socket: UdpSocket, pipeline: Arc<Pipeline>, allowed: Arc<[Cid
 async fn answer_udp(
     pipeline: Arc<Pipeline>,
     socket: Arc<UdpSocket>,
-    request: Vec<u8>,
+    mut request: Vec<u8>,
     peer: SocketAddr,
 ) {
     let mut out = Vec::new();
 
-    if pipeline.answer(&request, Protocol::Udp, &mut out).await {
+    if pipeline.answer(&mut request, Protocol::Udp, &mut out).await {
         let _ = socket.send_to(&out, peer).await;
     }
 }
@@ -319,13 +319,13 @@ where
 
 async fn answer_tcp(
     pipeline: Arc<Pipeline>,
-    request: Vec<u8>,
+    mut request: Vec<u8>,
     slot: OwnedSemaphorePermit,
     queue: mpsc::UnboundedSender<QueuedReply>,
     queue_budget: Arc<Budget>,
 ) {
     let mut out = Vec::new();
-    if !pipeline.answer(&request, Protocol::Tcp, &mut out).await {
+    if !pipeline.answer(&mut request, Protocol::Tcp, &mut out).await {
         return;
     }
 

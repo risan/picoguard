@@ -258,13 +258,7 @@ impl<'q, 'a> Reply<'q, 'a> {
     }
 
     fn push_opt(&self, out: &mut Vec<u8>) {
-        let ttl_field = if self.query.dnssec_ok() { EDNS_DO } else { 0 };
-
-        out.push(0);
-        out.extend_from_slice(&rtype::OPT.to_be_bytes());
-        out.extend_from_slice(&self.udp_size.to_be_bytes());
-        out.extend_from_slice(&ttl_field.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes());
+        push_opt_record(out, self.udp_size, self.query.dnssec_ok(), 0);
         add_to_count(out, ADDITIONAL_COUNT);
     }
 }
@@ -287,10 +281,35 @@ pub fn header_only(request: &Header, rcode: u8, out: &mut Vec<u8>) {
     out.extend_from_slice(&[0; 8]);
 }
 
+/// What the pipeline keeps of a client query while it waits for the upstream:
+/// the ID, flags, the question as sent, and an OPT record with the client's
+/// size and DO bit. A padded 64 KiB query shrinks to a few dozen bytes.
+pub fn compact_query(query: &Query<'_>) -> Vec<u8> {
+    let question = query.question_bytes();
+    let opt_len = if query.edns.is_some() {
+        OPT_RECORD_LEN
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(HEADER_LEN + question.len() + opt_len);
+
+    out.extend_from_slice(&query.id().to_be_bytes());
+    out.extend_from_slice(&query.header.flags.to_be_bytes());
+    out.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
+    out.extend_from_slice(&u16::from(query.edns.is_some()).to_be_bytes());
+    out.extend_from_slice(question);
+
+    if let Some(edns) = query.edns {
+        push_opt_record(&mut out, edns.udp_size, query.dnssec_ok(), 0);
+    }
+
+    out
+}
+
 /// The query picoguard sends upstream: ID 0 (the transport sets it), RD and CD
 /// from the client, a lowercase question, and an OPT record with our size and
 /// the client's DO bit but none of its options.
-pub fn upstream_query(query: &Query<'_>, udp_size: u16, out: &mut Vec<u8>) {
+pub fn upstream_query(query: &Query<'_>, udp_size: u16) -> Vec<u8> {
     let mut query_flags = 0;
     if query.header.recursion_desired() {
         query_flags |= flags::RD;
@@ -300,15 +319,22 @@ pub fn upstream_query(query: &Query<'_>, udp_size: u16, out: &mut Vec<u8>) {
         query_flags |= flags::CD;
     }
 
-    out.clear();
+    let name = query.question.name.as_wire();
+    let mut out = Vec::with_capacity(HEADER_LEN + name.len() + 4 + OPT_RECORD_LEN);
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(&query_flags.to_be_bytes());
     out.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 1]);
-    out.extend_from_slice(query.question.name.as_wire());
+    out.extend_from_slice(name);
     out.extend_from_slice(&query.question.qtype.to_be_bytes());
     out.extend_from_slice(&query.question.qclass.to_be_bytes());
+    push_opt_record(&mut out, udp_size, query.dnssec_ok(), 0);
 
-    let ttl_field = if query.dnssec_ok() { EDNS_DO } else { 0 };
+    out
+}
+
+fn push_opt_record(out: &mut Vec<u8>, udp_size: u16, dnssec_ok: bool, extended_rcode: u8) {
+    let ttl_field = (u32::from(extended_rcode) << 24) | if dnssec_ok { EDNS_DO } else { 0 };
+
     out.push(0);
     out.extend_from_slice(&rtype::OPT.to_be_bytes());
     out.extend_from_slice(&udp_size.to_be_bytes());
@@ -780,6 +806,38 @@ mod tests {
     }
 
     #[test]
+    fn a_compact_query_keeps_what_the_reply_needs_and_drops_the_rest() {
+        let mut client = QuerySpec::new("WWW.Example.COM.", RecordType::AAAA);
+        client.id = 0x4242;
+        client.checking_disabled = true;
+        client.edns = Some((1400, true));
+        let mut bytes = client.bytes();
+        let rdata_length_at = bytes.len() - 2;
+        bytes[rdata_length_at..].copy_from_slice(&5000u16.to_be_bytes());
+        bytes.resize(bytes.len() + 5000, 0);
+        let query = Query::parse(&bytes).unwrap();
+
+        let compact = compact_query(&query);
+
+        assert_eq!(compact.capacity(), compact.len());
+        assert!(compact.len() < 64, "{} bytes", compact.len());
+        let again = Query::parse(&compact).unwrap();
+        assert_eq!(again.id(), 0x4242);
+        assert_eq!(again.header.flags, query.header.flags);
+        assert_eq!(again.question_bytes(), query.question_bytes());
+        assert_eq!(
+            again.edns,
+            Some(crate::dns::wire::Edns {
+                udp_size: 1400,
+                dnssec_ok: true
+            })
+        );
+        let without_edns = QuerySpec::new("example.com.", RecordType::A).bytes();
+        let plain = compact_query(&Query::parse(&without_edns).unwrap());
+        assert_eq!(Query::parse(&plain).unwrap().edns, None);
+    }
+
+    #[test]
     fn upstream_query_is_normalized() {
         let mut client = QuerySpec::new("WWW.Example.COM.", RecordType::AAAA);
         client.id = 0x4242;
@@ -788,9 +846,8 @@ mod tests {
         client.edns = Some((512, true));
         let bytes = client.bytes();
         let query = Query::parse(&bytes).unwrap();
-        let mut out = Vec::new();
 
-        upstream_query(&query, SERVER_UDP_SIZE, &mut out);
+        let out = upstream_query(&query, SERVER_UDP_SIZE);
 
         let message = parse(&out);
         assert_eq!(message.metadata.id, 0);
@@ -809,9 +866,8 @@ mod tests {
         let client = QuerySpec::new("example.com.", RecordType::A);
         let bytes = client.bytes();
         let query = Query::parse(&bytes).unwrap();
-        let mut out = Vec::new();
 
-        upstream_query(&query, SERVER_UDP_SIZE, &mut out);
+        let out = upstream_query(&query, SERVER_UDP_SIZE);
 
         let message = parse(&out);
         assert!(message.metadata.recursion_desired);
