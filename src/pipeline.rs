@@ -21,7 +21,7 @@ use crate::config::{Cidr, Config, is_allowed};
 use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
 use crate::dns::wire::{Name, Query, QueryError, ResponseInfo, rcode, rtype};
 use crate::policy::{Policy, PolicyView, RequestVerdict, ResponseVerdict};
-use crate::upstream::Upstreams;
+use crate::upstream::{UpstreamError, Upstreams};
 
 /// Reverse lookups of these ranges go to the local resolver.
 const PRIVATE_NETWORKS: [&str; 7] = [
@@ -366,17 +366,19 @@ impl Pipeline {
         } else {
             &self.upstreams
         };
-        let mut bytes = upstreams.query(&mut request).await.map_err(|error| {
-            log::debug!("upstream query failed: {error}");
+        let (mut bytes, charge) = upstreams
+            .query_charged(&mut request, &self.budget)
+            .await
+            .map_err(|error| {
+                log::debug!("upstream query failed: {error}");
 
-            Failure::Upstream
-        })?;
+                match error {
+                    UpstreamError::BudgetExhausted => Failure::Overloaded,
+                    _ => Failure::Upstream,
+                }
+            })?;
         let mut info = ResponseInfo::parse(&bytes).map_err(|_| Failure::Upstream)?;
         info.cap_soa_ttls(&mut bytes);
-        let charge = self
-            .budget
-            .try_charge(bytes.len())
-            .ok_or(Failure::Overloaded)?;
 
         let query = Query::parse(&request).map_err(|_| Failure::Upstream)?;
         self.cache
