@@ -8,7 +8,7 @@ pub mod tls;
 mod udp;
 
 #[cfg(test)]
-mod test_dns;
+pub(crate) mod test_dns;
 #[cfg(test)]
 mod test_doh;
 #[cfg(test)]

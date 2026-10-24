@@ -2,6 +2,7 @@
 //! delivery rebuilds the reply and takes the filter decision under the policy
 //! of that moment.
 
+use std::net::IpAddr;
 use std::time::Instant;
 
 use lru::LruCache;
@@ -19,6 +20,11 @@ const FLAG_RD: u8 = 1;
 const FLAG_DO: u8 = 2;
 const FLAG_CD: u8 = 4;
 const QUESTION_TAIL_LEN: usize = 4;
+/// A blocked decision with more answer IPs than this is not remembered: the entry is checked
+/// again on the next hit instead of holding a long list next to a small reply.
+const MAX_MEMO_IPS: usize = 16;
+/// Allocator header and rounding for the one allocation a memo can own.
+const MEMO_ALLOCATION_OVERHEAD: usize = 16;
 
 /// Identifies what was asked: lowercase name, type, class, and the request bits
 /// that change the answer (RD, DO, CD). It is also the coalescing identity.
@@ -88,6 +94,11 @@ impl<'q> CacheKey<'q> {
     }
 }
 
+/// Names one stored entry for as long as it lives: a replacement of the same question gets
+/// a new token, so a late writer cannot attach what it knows about old bytes to new ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryToken(u64);
+
 /// A filter decision remembered with the policy generation that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memo {
@@ -96,6 +107,7 @@ pub struct Memo {
 }
 
 struct Entry {
+    token: EntryToken,
     bytes: Box<[u8]>,
     ttl_offsets: Box<[u16]>,
     opt_start: Option<u16>,
@@ -107,7 +119,7 @@ struct Entry {
 
 impl Entry {
     fn cost(&self) -> usize {
-        cost_of(self.bytes.len(), self.ttl_offsets.len())
+        cost_of(self.bytes.len(), self.ttl_offsets.len()) + self.memo.as_ref().map_or(0, memo_cost)
     }
 
     fn age_secs(&self, now: Instant) -> u32 {
@@ -125,7 +137,25 @@ fn cost_of(payload_len: usize, ttl_count: usize) -> usize {
     payload_len + ttl_count * size_of::<u16>() + ENTRY_OVERHEAD
 }
 
+/// The heap a memo owns, beyond the struct that `ENTRY_OVERHEAD` already counts.
+fn memo_cost(memo: &Memo) -> usize {
+    match &memo.decision {
+        Decision::Block { ips } if ips.capacity() > 0 => {
+            ips.capacity() * size_of::<IpAddr>() + MEMO_ALLOCATION_OVERHEAD
+        }
+        _ => 0,
+    }
+}
+
+fn is_worth_remembering(memo: &Memo) -> bool {
+    match &memo.decision {
+        Decision::Block { ips } => ips.len() <= MAX_MEMO_IPS,
+        Decision::Pass => true,
+    }
+}
+
 pub struct Hit<'a> {
+    pub token: EntryToken,
     pub parts: ReplyParts<'a>,
     pub age_secs: u32,
     pub memo: Option<Memo>,
@@ -133,6 +163,7 @@ pub struct Hit<'a> {
 
 pub struct Cache {
     entries: LruCache<u64, Entry>,
+    next_token: u64,
     bytes: usize,
     max_entries: usize,
     max_bytes: usize,
@@ -145,6 +176,7 @@ impl Cache {
     pub fn new(config: &CacheConfig) -> Cache {
         Cache {
             entries: LruCache::unbounded(),
+            next_token: 0,
             bytes: 0,
             max_entries: config.max_entries,
             max_bytes: config.max_bytes,
@@ -194,6 +226,7 @@ impl Cache {
         let entry = self.entries.get(&key.hash)?;
 
         Some(Hit {
+            token: entry.token,
             parts: ReplyParts {
                 bytes: &entry.bytes,
                 ttl_offsets: &entry.ttl_offsets,
@@ -204,7 +237,7 @@ impl Cache {
         })
     }
 
-    /// Stores `reply` if it may be cached and returns whether it was stored.
+    /// Stores `reply` if it may be cached and returns the token of the new entry.
     /// The question echoed in `reply` is rewritten to the key's lowercase form.
     pub fn insert(
         &mut self,
@@ -212,26 +245,24 @@ impl Cache {
         reply: &[u8],
         info: &ResponseInfo,
         now: Instant,
-    ) -> bool {
-        let Some(lifetime_secs) = self.lifetime_of(info) else {
-            return false;
-        };
+    ) -> Option<EntryToken> {
+        let lifetime_secs = self.lifetime_of(info)?;
 
         let cost = cost_of(reply.len(), info.ttl_offsets.len());
         if reply.len() > self.max_response_size || cost > self.max_bytes {
-            return false;
+            return None;
         }
 
         let name_len = key.name.as_wire().len();
         let echoed_name = reply.get(HEADER_LEN..HEADER_LEN + name_len);
         if !echoed_name.is_some_and(|echoed| echoed.eq_ignore_ascii_case(key.name.as_wire())) {
-            return false;
+            return None;
         }
 
         let mut bytes = reply.to_vec();
         bytes[HEADER_LEN..HEADER_LEN + name_len].copy_from_slice(key.name.as_wire());
         if !key.question_matches(&bytes) {
-            return false;
+            return None;
         }
 
         self.remove(key.hash);
@@ -243,7 +274,10 @@ impl Cache {
             self.bytes -= evicted.cost();
         }
 
+        let token = EntryToken(self.next_token);
+        self.next_token += 1;
         let entry = Entry {
+            token,
             bytes: bytes.into_boxed_slice(),
             ttl_offsets: info.ttl_offsets.clone().into_boxed_slice(),
             opt_start: info.opt_start,
@@ -255,15 +289,32 @@ impl Cache {
         self.bytes += entry.cost();
         self.entries.put(key.hash, entry);
 
-        true
+        Some(token)
     }
 
-    /// Remembers a filter decision on the entry for `key`, if it is still there.
-    pub fn set_memo(&mut self, key: &CacheKey<'_>, memo: Memo) {
-        if let Some(entry) = self.entries.peek_mut(&key.hash)
-            && entry.matches(key)
-        {
-            entry.memo = Some(memo);
+    /// Remembers a filter decision on the entry `token` named, if that very entry is still
+    /// there: an entry replaced since has other bytes. The memo's heap counts against
+    /// `max_bytes`; a decision with many IPs is not kept and clears the earlier memo.
+    pub fn set_memo(&mut self, key: &CacheKey<'_>, token: EntryToken, memo: Memo) {
+        let Some(entry) = self.entries.peek_mut(&key.hash) else {
+            return;
+        };
+
+        if entry.token != token || !entry.matches(key) {
+            return;
+        }
+
+        let cost_before = entry.cost();
+        entry.memo = is_worth_remembering(&memo).then_some(memo);
+        let cost_after = entry.cost();
+        self.bytes = self.bytes - cost_before + cost_after;
+
+        while self.bytes > self.max_bytes {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+
+            self.bytes -= evicted.cost();
         }
     }
 
@@ -341,11 +392,20 @@ mod tests {
         }
     }
 
-    fn insert(cache: &mut Cache, fixture: &Fixture, reply: &[u8], now: Instant) -> bool {
+    fn insert_entry(
+        cache: &mut Cache,
+        fixture: &Fixture,
+        reply: &[u8],
+        now: Instant,
+    ) -> Option<EntryToken> {
         let query = fixture.query();
         let info = ResponseInfo::parse(reply).unwrap();
 
         cache.insert(&CacheKey::new(&query), reply, &info, now)
+    }
+
+    fn insert(cache: &mut Cache, fixture: &Fixture, reply: &[u8], now: Instant) -> bool {
+        insert_entry(cache, fixture, reply, now).is_some()
     }
 
     fn age_of_hit(cache: &mut Cache, fixture: &Fixture, now: Instant) -> Option<u32> {
@@ -813,18 +873,142 @@ mod tests {
         let fixture = Fixture::new("example.com.");
         let query = fixture.query();
         let key = CacheKey::new(&query);
-        insert(&mut cache, &fixture, &fixture.positive(60), start);
+        let token = insert_entry(&mut cache, &fixture, &fixture.positive(60), start).unwrap();
         assert_eq!(cache.get(&key, start).unwrap().memo, None);
 
         let memo = Memo {
             generation: 7,
             decision: Decision::Pass,
         };
-        cache.set_memo(&key, memo.clone());
+        cache.set_memo(&key, token, memo.clone());
 
         assert_eq!(cache.get(&key, start).unwrap().memo, Some(memo));
         insert(&mut cache, &fixture, &fixture.positive(60), start);
         assert_eq!(cache.get(&key, start).unwrap().memo, None);
+    }
+
+    #[test]
+    fn a_memo_for_an_entry_that_was_replaced_is_refused() {
+        let mut cache = Cache::new(&config());
+        let start = Instant::now();
+        let fixture = Fixture::new("example.com.");
+        let query = fixture.query();
+        let key = CacheKey::new(&query);
+        let old = insert_entry(&mut cache, &fixture, &fixture.positive(60), start).unwrap();
+        let new = insert_entry(&mut cache, &fixture, &fixture.positive(60), start).unwrap();
+        assert_ne!(old, new);
+
+        let pass = Memo {
+            generation: 3,
+            decision: Decision::Pass,
+        };
+        cache.set_memo(&key, old, pass.clone());
+        assert_eq!(cache.get(&key, start).unwrap().memo, None);
+
+        cache.set_memo(&key, new, pass.clone());
+        assert_eq!(cache.get(&key, start).unwrap().memo, Some(pass));
+    }
+
+    fn block_with(ip_count: usize) -> Memo {
+        let ips = (0..ip_count)
+            .map(|index| IpAddr::from([10, 0, (index / 256) as u8, index as u8]))
+            .collect();
+
+        Memo {
+            generation: 1,
+            decision: Decision::Block { ips },
+        }
+    }
+
+    #[test]
+    fn the_heap_of_a_memo_counts_against_the_byte_cap_until_the_memo_goes() {
+        let mut cache = Cache::new(&config());
+        let start = Instant::now();
+        let fixture = Fixture::new("example.com.");
+        let query = fixture.query();
+        let key = CacheKey::new(&query);
+        let token = insert_entry(&mut cache, &fixture, &fixture.positive(60), start).unwrap();
+        let bare = cache.bytes();
+
+        cache.set_memo(&key, token, block_with(16));
+        let one_ip = size_of::<IpAddr>();
+        assert_eq!(cache.bytes(), bare + 16 * one_ip + MEMO_ALLOCATION_OVERHEAD);
+
+        cache.set_memo(&key, token, block_with(2));
+        assert_eq!(cache.bytes(), bare + 2 * one_ip + MEMO_ALLOCATION_OVERHEAD);
+
+        cache.set_memo(
+            &key,
+            token,
+            Memo {
+                generation: 2,
+                decision: Decision::Pass,
+            },
+        );
+        assert_eq!(cache.bytes(), bare);
+
+        cache.set_memo(&key, token, block_with(3));
+        let expired = start + Duration::from_secs(61);
+        assert!(cache.get(&key, expired).is_none());
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn a_decision_with_many_ips_is_not_remembered_and_drops_the_earlier_memo() {
+        let mut cache = Cache::new(&config());
+        let start = Instant::now();
+        let fixture = Fixture::new("example.com.");
+        let query = fixture.query();
+        let key = CacheKey::new(&query);
+        let token = insert_entry(&mut cache, &fixture, &fixture.positive(60), start).unwrap();
+        let bare = cache.bytes();
+        cache.set_memo(&key, token, block_with(MAX_MEMO_IPS));
+        assert!(cache.get(&key, start).unwrap().memo.is_some());
+
+        cache.set_memo(&key, token, block_with(MAX_MEMO_IPS + 1));
+        assert_eq!(cache.get(&key, start).unwrap().memo, None);
+        assert_eq!(cache.bytes(), bare);
+
+        cache.set_memo(&key, token, block_with(5_000));
+        assert_eq!(cache.get(&key, start).unwrap().memo, None);
+        assert_eq!(cache.bytes(), bare);
+    }
+
+    #[test]
+    fn a_memo_that_overfills_the_cache_evicts_the_oldest_entries() {
+        let fixture = Fixture::new("example.com.");
+        let other = Fixture::new("other.example.");
+        let reply = fixture.positive(60);
+        let entry_cost = cost_of(reply.len(), 1);
+        let mut cache = Cache::new(&CacheConfig {
+            max_bytes: 2 * entry_cost + 100,
+            ..config()
+        });
+        let start = Instant::now();
+        insert(&mut cache, &other, &other.positive(60), start);
+        let token = insert_entry(&mut cache, &fixture, &reply, start).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        let query = fixture.query();
+        cache.set_memo(&CacheKey::new(&query), token, block_with(16));
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.bytes() <= 2 * entry_cost + 100);
+        assert!(cache.get(&CacheKey::new(&query), start).is_some());
+    }
+
+    #[test]
+    fn a_hit_carries_the_token_of_its_entry() {
+        let mut cache = Cache::new(&config());
+        let start = Instant::now();
+        let fixture = Fixture::new("example.com.");
+        let query = fixture.query();
+        let token = insert_entry(&mut cache, &fixture, &fixture.positive(60), start).unwrap();
+
+        assert_eq!(
+            cache.get(&CacheKey::new(&query), start).unwrap().token,
+            token
+        );
     }
 
     #[test]
@@ -835,6 +1019,7 @@ mod tests {
 
         cache.set_memo(
             &CacheKey::new(&query),
+            EntryToken(0),
             Memo {
                 generation: 1,
                 decision: Decision::Pass,

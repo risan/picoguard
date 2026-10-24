@@ -5,11 +5,15 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 
+use crate::filter::compile::DEFAULT_SLOW_RULE_BUDGET;
+
 const UPSTREAM_SCHEMES: [&str; 4] = ["https://", "tls://", "udp://", "tcp://"];
 const LIST_URL_SCHEMES: [&str; 2] = ["http://", "https://"];
 const MIN_UDP_SIZE: u16 = 512;
 const MAX_UDP_SIZE: u16 = 4096;
 const MAX_H2_WINDOW: u32 = (1 << 31) - 1;
+const MAX_QUERY_LOG_ENTRIES: usize = 100_000;
+const MAX_TOP_K: usize = 1000;
 
 /// Networks that may talk to picoguard: loopback, private ranges, CGNAT
 /// (which covers Tailscale) and link-local.
@@ -174,6 +178,7 @@ pub struct Config {
     pub cache: CacheConfig,
     pub limits: LimitsConfig,
     pub web: WebConfig,
+    pub stats: StatsConfig,
     pub state: StateConfig,
     pub log: LogConfig,
     pub blocked_ttl: u32,
@@ -202,6 +207,7 @@ impl Default for Config {
             cache: CacheConfig::default(),
             limits: LimitsConfig::default(),
             web: WebConfig::default(),
+            stats: StatsConfig::default(),
             state: StateConfig::default(),
             log: LogConfig::default(),
             blocked_ttl: 10,
@@ -239,6 +245,7 @@ impl Config {
         self.cache.validate()?;
         self.limits.validate()?;
         self.web.validate()?;
+        self.stats.validate()?;
         self.state.validate()?;
 
         Ok(())
@@ -374,6 +381,8 @@ pub struct ListConfig {
     pub refresh_hours: u32,
     pub max_rules: u32,
     pub max_body_bytes: u64,
+    /// Estimated bytes the slow rules and regexes of the list may cost.
+    pub slow_rule_budget: usize,
 }
 
 impl Default for ListConfig {
@@ -386,6 +395,7 @@ impl Default for ListConfig {
             refresh_hours: 24,
             max_rules: 3_000_000,
             max_body_bytes: 64 * 1024 * 1024,
+            slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
         }
     }
 }
@@ -432,7 +442,8 @@ impl ListConfig {
 
         positive(&format!("{field}.refresh_hours"), self.refresh_hours)?;
         positive(&format!("{field}.max_rules"), self.max_rules)?;
-        positive(&format!("{field}.max_body_bytes"), self.max_body_bytes)
+        positive(&format!("{field}.max_body_bytes"), self.max_body_bytes)?;
+        positive(&format!("{field}.slow_rule_budget"), self.slow_rule_budget)
     }
 }
 
@@ -580,7 +591,6 @@ pub struct WebConfig {
     pub hostnames: Vec<String>,
     pub user: Option<String>,
     pub password: Option<String>,
-    pub query_log_entries: usize,
 }
 
 impl Default for WebConfig {
@@ -593,7 +603,6 @@ impl Default for WebConfig {
             hostnames: Vec::new(),
             user: None,
             password: None,
-            query_log_entries: 1000,
         }
     }
 }
@@ -624,7 +633,36 @@ impl WebConfig {
             (None, None) => {}
         }
 
-        positive("web.query_log_entries", self.query_log_entries)
+        Ok(())
+    }
+}
+
+/// Sizes of the statistics. Both are allocated in full, so they have an upper bound.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatsConfig {
+    pub query_log_entries: usize,
+    pub top_k: usize,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        StatsConfig {
+            query_log_entries: 1000,
+            top_k: 50,
+        }
+    }
+}
+
+impl StatsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        in_range(
+            "stats.query_log_entries",
+            self.query_log_entries,
+            MAX_QUERY_LOG_ENTRIES,
+        )?;
+
+        in_range("stats.top_k", self.top_k, MAX_TOP_K)
     }
 }
 
@@ -689,6 +727,16 @@ fn invalid(message: impl Into<String>) -> Result<(), ConfigError> {
     Err(ConfigError::Invalid(message.into()))
 }
 
+fn in_range(field: &str, value: usize, max: usize) -> Result<(), ConfigError> {
+    positive(field, value)?;
+
+    if value > max {
+        return invalid(format!("{field} must be <= {max}"));
+    }
+
+    Ok(())
+}
+
 fn positive<T: Default + PartialOrd>(field: &str, value: T) -> Result<(), ConfigError> {
     if value > T::default() {
         return Ok(());
@@ -728,6 +776,8 @@ mod tests {
         assert_eq!(config.cache.max_entries, 10_000);
         assert_eq!(config.cache.max_bytes, 4 * 1024 * 1024);
         assert_eq!(config.cache.max_response_size, 4096);
+        assert_eq!(config.stats.query_log_entries, 1000);
+        assert_eq!(config.stats.top_k, 50);
         assert_eq!(config.log.level, LogLevel::Warn);
         assert!(config.state.persist_lists);
         assert!(config.rules.is_empty());
@@ -784,6 +834,12 @@ mod tests {
                 .all(|list| list.format == ListFormat::Adblock)
         );
         assert!(config.lists.iter().all(|list| list.refresh_hours == 24));
+        assert!(
+            config
+                .lists
+                .iter()
+                .all(|list| list.slow_rule_budget == 8 * 1024 * 1024)
+        );
         assert_eq!(
             config.upstream.servers,
             [
@@ -835,6 +891,7 @@ mod tests {
             refresh_hours = 6
             max_rules = 1000
             max_body_bytes = 1048576
+            slow_rule_budget = 1048576
 
             [[lists]]
             path = "/etc/picoguard/mine.txt"
@@ -857,6 +914,10 @@ mod tests {
             user = "admin"
             password = "secret"
 
+            [stats]
+            query_log_entries = 200
+            top_k = 20
+
             [state]
             dir = "/tmp/picoguard"
             persist_lists = false
@@ -877,7 +938,10 @@ mod tests {
         assert_eq!(config.lists.len(), 2);
         assert_eq!(config.lists[0].format, ListFormat::Hosts);
         assert_eq!(config.lists[1].format, ListFormat::Auto);
+        assert_eq!(config.lists[0].slow_rule_budget, 1_048_576);
         assert_eq!(config.lists[1].refresh_hours, 24);
+        assert_eq!(config.stats.query_log_entries, 200);
+        assert_eq!(config.stats.top_k, 20);
         assert_eq!(config.allowlists.len(), 1);
         assert_eq!(config.cache.max_ttl, 3600);
         assert_eq!(config.web.user.as_deref(), Some("admin"));
@@ -1077,8 +1141,26 @@ mod tests {
                 "web.password must not be empty",
             ),
             (
-                "[web]\nquery_log_entries = 0",
-                "web.query_log_entries must be > 0",
+                "[stats]\nquery_log_entries = 0",
+                "stats.query_log_entries must be > 0",
+            ),
+            (
+                "[stats]\nquery_log_entries = 100001",
+                "stats.query_log_entries must be <= 100000",
+            ),
+            ("[stats]\ntop_k = 0", "stats.top_k must be > 0"),
+            ("[stats]\ntop_k = 1001", "stats.top_k must be <= 1000"),
+            (
+                "[web]\nquery_log_entries = 10",
+                "unknown field `query_log_entries`",
+            ),
+            (
+                "[[lists]]\npath = \"/l\"\nslow_rule_budget = 0",
+                "lists[0].slow_rule_budget must be > 0",
+            ),
+            (
+                "[[allowlists]]\npath = \"/l\"\nslow_rule_budget = 0",
+                "allowlists[0].slow_rule_budget must be > 0",
             ),
             ("[state]\ndir = \"\"", "state.dir must not be empty"),
             ("[[lists]]\npath = \"\"", "lists[0].path must not be empty"),

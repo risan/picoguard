@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::harness::{
-    Running, a_record, answering_upstream, ask, config_for, engine_of, fake_upstream, name,
-    reply_to, start,
+    FakeUpstream, Running, a_record, answering_upstream, ask, config_for, engine_of, fake_upstream,
+    name, reply_to, start,
 };
 use hickory_proto::op::Message;
 use hickory_proto::rr::{RData, Record, RecordType};
@@ -133,6 +133,102 @@ async fn a_generation_change_between_send_and_reply_filters_the_reply_again() {
     // The other way round: the engine that would block is gone when the reply arrives.
     let server = start(&config_for(&upstream), engine_of(&["||9.9.9.9^\n"], &[])).await;
     let reply = late_answer(&server, || engine_of(&[], &[])).await;
+    assert_eq!(answer_addresses(&reply), ["9.9.9.9"]);
+}
+
+fn ask_in_background(server: &Running, text: &'static str) -> tokio::task::JoinHandle<Message> {
+    let server = server.clone();
+
+    tokio::spawn(async move { ask(&server, text, RecordType::A).await })
+}
+
+/// Waits until the upstream has seen `count` queries, so a test acts relative to what
+/// happened and not to a clock that a busy machine can stretch.
+async fn wait_for_queries(upstream: &FakeUpstream, count: usize) {
+    for _ in 0..600 {
+        if upstream.count() >= count {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    panic!("the upstream never saw {count} queries");
+}
+
+/// The wait for a slow reply must not end in a retry, which would be a second query.
+fn patient_config(upstream: &FakeUpstream) -> picoguard::config::Config {
+    let mut config = config_for(upstream);
+    config.upstream.timeout_ms = 10_000;
+
+    config
+}
+
+#[tokio::test]
+async fn a_rule_added_for_the_question_during_the_wait_blocks_every_waiting_client() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::from_millis(900)).await;
+    let server = start(&patient_config(&upstream), engine_of(&[], &[])).await;
+
+    let first = ask_in_background(&server, "late.example.");
+    wait_for_queries(&upstream, 1).await;
+    let coalesced = ask_in_background(&server, "late.example.");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    server
+        .policy
+        .swap_engine(engine_of(&["||late.example^\n"], &[]));
+
+    let first = first.await.unwrap();
+    let coalesced = coalesced.await.unwrap();
+
+    assert!(is_blocked_a(&first), "{:?}", answer_addresses(&first));
+    assert!(
+        is_blocked_a(&coalesced),
+        "{:?}",
+        answer_addresses(&coalesced)
+    );
+    assert_eq!(upstream.count(), 1, "the two clients shared one query");
+}
+
+#[tokio::test]
+async fn a_request_admitted_during_a_pause_is_blocked_when_the_reply_comes_after_it() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::from_millis(1200)).await;
+    let server = start(
+        &patient_config(&upstream),
+        engine_of(&["||late.example^\n"], &[]),
+    )
+    .await;
+
+    server
+        .policy
+        .pause(Duration::from_millis(700), Instant::now());
+    let first = ask_in_background(&server, "late.example.");
+    wait_for_queries(&upstream, 1).await;
+    let coalesced = ask_in_background(&server, "late.example.");
+
+    let first = first.await.unwrap();
+    let coalesced = coalesced.await.unwrap();
+
+    assert!(is_blocked_a(&first), "{:?}", answer_addresses(&first));
+    assert!(
+        is_blocked_a(&coalesced),
+        "{:?}",
+        answer_addresses(&coalesced)
+    );
+    assert_eq!(upstream.count(), 1);
+}
+
+#[tokio::test]
+async fn a_request_still_paused_when_the_reply_comes_is_answered() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::from_millis(300)).await;
+    let server = start(
+        &config_for(&upstream),
+        engine_of(&["||late.example^\n"], &[]),
+    )
+    .await;
+
+    server.policy.pause(Duration::from_secs(60), Instant::now());
+    let reply = ask(&server, "late.example.", RecordType::A).await;
+
     assert_eq!(answer_addresses(&reply), ["9.9.9.9"]);
 }
 

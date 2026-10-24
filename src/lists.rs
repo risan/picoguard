@@ -33,7 +33,9 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
+use crate::dns::wire::{CLASS_IN, Name, RData, Records, Section, rtype};
 use crate::filter::compile::{CompileError, CompileOptions, CompileWorker, Compiled};
+use crate::upstream::Upstreams;
 use crate::upstream::tls::{Alpn, Tls, lacks_shared_cipher};
 
 pub const MAX_PIECE_BYTES: usize = 64 * 1024;
@@ -189,6 +191,83 @@ impl std::error::Error for FetchError {}
 /// without filtering; the system resolver is never used.
 pub type ResolveFuture = Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>>;
 pub type Resolver = Arc<dyn Fn(String) -> ResolveFuture + Send + Sync>;
+
+/// The production [`Resolver`]: list host names go through picoguard's own upstream pool,
+/// unfiltered. A and AAAA are asked together; IPv4 addresses come first, because a board
+/// often has no IPv6 route.
+pub fn resolver_over(upstreams: Arc<Upstreams>) -> Resolver {
+    Arc::new(move |host: String| {
+        let upstreams = Arc::clone(&upstreams);
+
+        Box::pin(async move {
+            let (v4, v6) = tokio::join!(
+                look_up(&upstreams, &host, rtype::A),
+                look_up(&upstreams, &host, rtype::AAAA)
+            );
+            let mut addresses = Vec::new();
+            let mut failure = None;
+
+            for answer in [v4, v6] {
+                match answer {
+                    Ok(found) => {
+                        addresses.extend(found);
+                    }
+
+                    Err(message) => {
+                        failure.get_or_insert(message);
+                    }
+                }
+            }
+
+            if addresses.is_empty() {
+                return Err(io::Error::other(
+                    failure.unwrap_or_else(|| "the name has no address".to_string()),
+                ));
+            }
+
+            Ok(addresses)
+        })
+    })
+}
+
+async fn look_up(
+    upstreams: &Upstreams,
+    host: &str,
+    record_type: u16,
+) -> Result<Vec<IpAddr>, String> {
+    let name = Name::from_text(host).ok_or_else(|| format!("{host:?} is not a domain name"))?;
+    let mut request = vec![0, 0, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    request.extend_from_slice(name.as_wire());
+    request.extend_from_slice(&record_type.to_be_bytes());
+    request.extend_from_slice(&CLASS_IN.to_be_bytes());
+
+    let reply = upstreams
+        .query(&mut request)
+        .await
+        .map_err(|error| error.to_string())?;
+    let records = Records::new(&reply).map_err(|_| "malformed reply".to_string())?;
+    let mut addresses = Vec::new();
+
+    for record in records.map_while(Result::ok) {
+        if record.section != Section::Answer {
+            break;
+        }
+
+        match record.data(&reply) {
+            Ok(RData::A(address)) if record_type == rtype::A => {
+                addresses.push(IpAddr::V4(address));
+            }
+
+            Ok(RData::Aaaa(address)) if record_type == rtype::AAAA => {
+                addresses.push(IpAddr::V6(address));
+            }
+
+            _ => {}
+        }
+    }
+
+    Ok(addresses)
+}
 
 /// A parsed `http://` or `https://` URL.
 #[derive(Debug, Clone)]
@@ -842,7 +921,9 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+    use crate::config::{LimitsConfig, UpstreamConfig};
     use crate::test_dir::TestDir;
+    use crate::upstream::test_dns::fake_dns;
     use crate::upstream::test_tls::{TestPki, TlsServer};
 
     #[derive(Clone, Debug)]
@@ -2090,6 +2171,55 @@ mod tests {
             "{:?}",
             result.err()
         );
+    }
+
+    #[tokio::test]
+    async fn list_hosts_resolve_through_the_upstream_pool_ipv4_first() {
+        let dns = fake_dns(
+            vec!["192.0.2.7".parse().unwrap()],
+            vec!["2001:db8::7".parse().unwrap()],
+        )
+        .await;
+        let upstreams = Arc::new(Upstreams::plain(
+            dns.address,
+            &UpstreamConfig::default(),
+            &LimitsConfig::default(),
+        ));
+        let resolver = resolver_over(upstreams);
+
+        let addresses = resolver("lists.example".to_string()).await.unwrap();
+
+        assert_eq!(
+            addresses,
+            [
+                "192.0.2.7".parse::<IpAddr>().unwrap(),
+                "2001:db8::7".parse().unwrap()
+            ]
+        );
+        assert_eq!(dns.queries.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_name_without_addresses_or_a_dead_pool_is_an_error() {
+        let dns = fake_dns(Vec::new(), Vec::new()).await;
+        let config = UpstreamConfig {
+            timeout_ms: 200,
+            ..UpstreamConfig::default()
+        };
+        let empty = resolver_over(Arc::new(Upstreams::plain(
+            dns.address,
+            &config,
+            &LimitsConfig::default(),
+        )));
+        let dead = resolver_over(Arc::new(Upstreams::plain(
+            "127.0.0.1:9".parse().unwrap(),
+            &config,
+            &LimitsConfig::default(),
+        )));
+
+        assert!(empty("lists.example".to_string()).await.is_err());
+        assert!(dead("lists.example".to_string()).await.is_err());
+        assert!(empty("a..b".to_string()).await.is_err());
     }
 
     #[tokio::test]

@@ -7,6 +7,8 @@ use super::wire::{
 
 const CLASSIC_UDP_LIMIT: u16 = 512;
 const OPT_RECORD_LEN: usize = 11;
+/// Owner pointer, type, class, TTL and RDLENGTH: an answer record without its data.
+const ANSWER_FIXED_LEN: usize = 12;
 /// Owner (1 byte), type and class (4): the TTL field starts here, and its
 /// first byte is the extended RCODE.
 const OPT_EXTENDED_RCODE_AT: usize = 5;
@@ -103,21 +105,52 @@ impl<'q, 'a> Reply<'q, 'a> {
         self.end(out, 0);
     }
 
-    /// Answers an A or AAAA question with the addresses of that family.
+    /// Answers an A or AAAA question with the addresses of that family. A list that does not
+    /// fit the reply is never built: UDP gets an empty reply with TC, TCP gets SERVFAIL.
     pub fn addresses(&self, addresses: &[IpAddr], ttl: u32, out: &mut Vec<u8>) {
+        let queried = self.query.question.qtype;
+        let in_family = |address: &&IpAddr| {
+            matches!(
+                (queried, address),
+                (rtype::A, IpAddr::V4(_)) | (rtype::AAAA, IpAddr::V6(_))
+            )
+        };
+        let answers_len: usize = addresses
+            .iter()
+            .filter(in_family)
+            .map(|address| ANSWER_FIXED_LEN + if address.is_ipv4() { 4 } else { 16 })
+            .sum();
+        let opt_len = if self.query.edns.is_some() {
+            OPT_RECORD_LEN
+        } else {
+            0
+        };
+        let total_len = HEADER_LEN + self.query.question_bytes().len() + answers_len + opt_len;
+
+        if self.protocol == Protocol::Tcp && total_len > MAX_MESSAGE_LEN {
+            self.error(rcode::SERVFAIL, out);
+
+            return;
+        }
+
         self.begin(rcode::NOERROR, out);
 
-        for address in addresses {
-            match (self.query.question.qtype, address) {
-                (rtype::A, IpAddr::V4(address)) => {
+        if self.protocol == Protocol::Udp && total_len > self.udp_limit() {
+            out[2..4].copy_from_slice(&(self.client_flags() | flags::TC).to_be_bytes());
+            self.end(out, 0);
+
+            return;
+        }
+
+        for address in addresses.iter().filter(in_family) {
+            match address {
+                IpAddr::V4(address) => {
                     self.push_answer(rtype::A, ttl, &address.octets(), out);
                 }
 
-                (rtype::AAAA, IpAddr::V6(address)) => {
+                IpAddr::V6(address) => {
                     self.push_answer(rtype::AAAA, ttl, &address.octets(), out);
                 }
-
-                _ => {}
             }
         }
 
@@ -287,7 +320,7 @@ impl<'q, 'a> Reply<'q, 'a> {
 }
 
 fn add_to_count(message: &mut [u8], at: usize) {
-    let count = u16::from_be_bytes([message[at], message[at + 1]]) + 1;
+    let count = u16::from_be_bytes([message[at], message[at + 1]]).saturating_add(1);
     message[at..at + 2].copy_from_slice(&count.to_be_bytes());
 }
 
@@ -634,6 +667,104 @@ mod tests {
         assert_eq!(v4.answers.len(), 2);
         assert_eq!(v6.answers.len(), 1);
         assert_eq!(v4.answers[0].ttl, 10);
+    }
+
+    fn many_v4(count: usize) -> Vec<IpAddr> {
+        (0..count)
+            .map(|index| IpAddr::from([10, (index >> 16) as u8, (index >> 8) as u8, index as u8]))
+            .collect()
+    }
+
+    fn address_reply(
+        spec: &QuerySpec,
+        protocol: Protocol,
+        addresses: &[IpAddr],
+    ) -> (Vec<u8>, Message) {
+        let bytes = spec.bytes();
+        let query = Query::parse(&bytes).unwrap();
+        let mut out = Vec::new();
+
+        Reply::new(&query, SERVER_UDP_SIZE, protocol).addresses(addresses, 10, &mut out);
+        let message = parse(&out);
+
+        (out, message)
+    }
+
+    #[test]
+    fn too_many_addresses_for_a_udp_reply_truncate_it() {
+        let addresses = many_v4(100);
+
+        for (edns, fits) in [(None, false), (Some((4096, false)), true)] {
+            let mut spec = QuerySpec::new("host.example.", RecordType::A);
+            spec.edns = edns;
+
+            let (_, message) = address_reply(&spec, Protocol::Udp, &addresses);
+
+            assert_eq!(message.metadata.truncation, !fits, "{edns:?}");
+            assert_eq!(message.answers.len(), if fits { 100 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn oversized_address_lists_never_overflow_the_record_counters() {
+        let spec = QuerySpec::new("host.example.", RecordType::A);
+
+        for count in [65_535, 65_536, 65_537, 200_000] {
+            let addresses = many_v4(count);
+
+            let (out, message) = address_reply(&spec, Protocol::Tcp, &addresses);
+            assert_eq!(
+                message.metadata.response_code,
+                ResponseCode::ServFail,
+                "{count} over TCP"
+            );
+            assert!(message.answers.is_empty());
+            assert!(out.len() <= MAX_MESSAGE_LEN);
+
+            let (_, message) = address_reply(&spec, Protocol::Udp, &addresses);
+            assert!(message.metadata.truncation, "{count} over UDP");
+            assert!(message.answers.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_tcp_address_list_fits_up_to_the_message_limit() {
+        let spec = QuerySpec::new("host.example.", RecordType::A);
+        let (empty, _) = address_reply(&spec, Protocol::Tcp, &[]);
+        let answer_len = 2 + 2 + 2 + 4 + 2 + 4;
+        let most = (MAX_MESSAGE_LEN - empty.len()) / answer_len;
+
+        let (out, message) = address_reply(&spec, Protocol::Tcp, &many_v4(most));
+        assert_eq!(message.answers.len(), most);
+        assert!(out.len() <= MAX_MESSAGE_LEN);
+
+        let (_, message) = address_reply(&spec, Protocol::Tcp, &many_v4(most + 1));
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+        assert!(message.answers.is_empty());
+    }
+
+    #[test]
+    fn addresses_of_the_other_family_do_not_count() {
+        let other_family: Vec<IpAddr> = (0..70_000u32)
+            .map(|index| {
+                IpAddr::from([
+                    0x2001,
+                    0xdb8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    (index >> 16) as u16,
+                    index as u16,
+                ])
+            })
+            .collect();
+        let spec = QuerySpec::new("host.example.", RecordType::A);
+
+        let (_, message) = address_reply(&spec, Protocol::Tcp, &other_family);
+
+        assert_eq!(message.metadata.response_code, ResponseCode::NoError);
+        assert!(message.answers.is_empty());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 use crate::budget::{Budget, Charge};
-use crate::cache::{Cache, CacheKey, Memo};
+use crate::cache::{Cache, CacheKey, EntryToken, Memo};
 use crate::config::{Cidr, Config, is_allowed};
 use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
 use crate::dns::wire::{Name, Query, QueryError, ResponseInfo, rcode, rtype};
@@ -64,6 +64,8 @@ enum Failure {
 struct Delivery {
     bytes: Vec<u8>,
     info: ResponseInfo,
+    /// The cache entry made from these bytes, if they were cached.
+    cached_as: Option<EntryToken>,
     _charge: Charge,
 }
 
@@ -107,7 +109,7 @@ pub struct Pipeline {
     blocked_hosts: Vec<Name>,
     local_domains: Vec<Name>,
     private_networks: Vec<Cidr>,
-    upstreams: Upstreams,
+    upstreams: Arc<Upstreams>,
     local_resolver: Option<Upstreams>,
     cache: Mutex<Cache>,
     inflight: Mutex<Inflight>,
@@ -117,7 +119,7 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(config: &Config, policy: Arc<Policy>) -> Result<Arc<Pipeline>, String> {
-        let upstreams = Upstreams::from_config(&config.upstream, &config.limits)?;
+        let upstreams = Arc::new(Upstreams::from_config(&config.upstream, &config.limits)?);
         let local_resolver = config
             .local
             .resolver
@@ -144,6 +146,12 @@ impl Pipeline {
             policy,
             budget: Budget::new(config.limits.pending_bytes),
         }))
+    }
+
+    /// The upstream pool, shared with the list downloader, which resolves list hosts through
+    /// it.
+    pub fn upstreams(&self) -> &Arc<Upstreams> {
+        &self.upstreams
     }
 
     /// The budget for replies held for delivery. Queued TCP replies draw on it.
@@ -270,6 +278,7 @@ impl Pipeline {
             return Ok(Quick::NeedsUpstream);
         };
 
+        let token = hit.token;
         let remembered = hit
             .memo
             .filter(|memo| !view.paused && memo.generation == view.generation);
@@ -282,13 +291,14 @@ impl Pipeline {
             Decision::Block { ips } => self.write_blocked(&reply, query.question.qtype, ips, out),
         }
 
-        self.remember(&mut cache, &key, &view, &decision);
+        self.remember(&mut cache, &key, token, &view, &decision);
 
         Ok(Quick::Replied)
     }
 
-    /// Step 6 for a reply that just arrived from the upstream, under the policy of this
-    /// moment: whatever was decided while the query was in flight does not count.
+    /// Steps 2 and 6 for a reply that just arrived from the upstream, under the policy of
+    /// this moment: whatever was decided while the query was in flight does not count, the
+    /// question included (a rule may have been added, or a pause may have ended).
     fn deliver(
         &self,
         query: &Query<'_>,
@@ -297,13 +307,22 @@ impl Pipeline {
         out: &mut Vec<u8>,
     ) {
         let view = self.policy.view(Instant::now());
+        if let Decision::Block { ips } = view.check_request(query) {
+            self.write_blocked(reply, query.question.qtype, &ips, out);
+
+            return;
+        }
+
         let decision = view.check_response(delivery.parts());
-        self.remember(
-            &mut self.cache.lock().unwrap(),
-            &CacheKey::new(query),
-            &view,
-            &decision,
-        );
+        if let Some(token) = delivery.cached_as {
+            self.remember(
+                &mut self.cache.lock().unwrap(),
+                &CacheKey::new(query),
+                token,
+                &view,
+                &decision,
+            );
+        }
 
         match decision {
             Decision::Pass => reply.from_upstream(delivery.parts(), self.ttl_rule(0), out),
@@ -319,6 +338,7 @@ impl Pipeline {
         &self,
         cache: &mut Cache,
         key: &CacheKey<'_>,
+        token: EntryToken,
         view: &PolicyView,
         decision: &Decision,
     ) {
@@ -327,7 +347,7 @@ impl Pipeline {
                 generation: view.generation,
                 decision: decision.clone(),
             };
-            cache.set_memo(key, memo);
+            cache.set_memo(key, token, memo);
         }
     }
 
@@ -452,14 +472,17 @@ impl Pipeline {
         info.cap_soa_ttls(&mut bytes);
 
         let query = Query::parse(&request).map_err(|_| Failure::Upstream)?;
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(&CacheKey::new(&query), &bytes, &info, Instant::now());
+        let cached_as = self.cache.lock().unwrap().insert(
+            &CacheKey::new(&query),
+            &bytes,
+            &info,
+            Instant::now(),
+        );
 
         Ok(Arc::new(Delivery {
             bytes,
             info,
+            cached_as,
             _charge: charge,
         }))
     }
@@ -521,7 +544,12 @@ fn reverse_address(name: &Name) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    use hickory_proto::rr::RecordType;
+
     use super::*;
+    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse};
+    use crate::filter::engine::{CompiledList, Engine};
+    use crate::filter::parse::ListFormat;
 
     fn address_of(text: &str) -> Option<IpAddr> {
         reverse_address(&Name::from_text(text).unwrap())
@@ -641,5 +669,106 @@ mod tests {
         let config = Config::default();
 
         assert!(Pipeline::new(&config, Arc::new(Policy::new())).is_ok());
+    }
+
+    fn policy_of(rules: &str) -> Arc<Policy> {
+        let (list, _) = CompiledList::from_text(ListFormat::Adblock, rules);
+
+        Arc::new(Policy::with_engine(Arc::new(Engine::new(
+            vec![Arc::new(list)],
+            Vec::new(),
+        ))))
+    }
+
+    fn reply_with_address(spec: &QuerySpec, address: [u8; 4]) -> Vec<u8> {
+        ResponseSpec {
+            answers: vec![a(&spec.name, 300, address.into())],
+            ..ResponseSpec::default()
+        }
+        .bytes(spec)
+    }
+
+    #[tokio::test]
+    async fn a_delayed_waiter_cannot_leave_its_memo_on_a_replacement_entry() {
+        let mut config = Config::default();
+        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
+        let pipeline = Pipeline::new(&config, policy_of("||9.9.9.9^\n")).unwrap();
+        let spec = QuerySpec::new("late.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let key = CacheKey::new(&query);
+
+        let old_bytes = reply_with_address(&spec, [1, 1, 1, 1]);
+        let old_info = ResponseInfo::parse(&old_bytes).unwrap();
+        let old_token =
+            pipeline
+                .cache
+                .lock()
+                .unwrap()
+                .insert(&key, &old_bytes, &old_info, Instant::now());
+        let old_delivery = Delivery {
+            bytes: old_bytes,
+            info: old_info,
+            cached_as: old_token,
+            _charge: pipeline.budget.try_charge(1).unwrap(),
+        };
+
+        // The entry is replaced by a reply the policy blocks before the waiter runs.
+        let new_bytes = reply_with_address(&spec, [9, 9, 9, 9]);
+        let new_info = ResponseInfo::parse(&new_bytes).unwrap();
+        pipeline
+            .cache
+            .lock()
+            .unwrap()
+            .insert(&key, &new_bytes, &new_info, Instant::now())
+            .unwrap();
+
+        let reply = Reply::new(&query, pipeline.udp_size, Protocol::Udp);
+        let mut out = Vec::new();
+        pipeline.deliver(&query, &reply, &old_delivery, &mut out);
+        assert_eq!(&parse(&out).answers[0].data.to_string(), "1.1.1.1");
+
+        let quick = pipeline.answer_quickly(&request, Protocol::Udp, &mut out);
+        assert_eq!(quick, Quick::Replied);
+        assert_eq!(&parse(&out).answers[0].data.to_string(), "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_decision_with_many_ips_is_recomputed_instead_of_held_in_the_cache() {
+        let host_rules: String = (0..300)
+            .map(|index| format!("10.0.{}.{} 9.9.9.9\n", index / 256, index % 256))
+            .collect();
+        let mut config = Config::default();
+        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
+        let pipeline = Pipeline::new(&config, policy_of(&host_rules)).unwrap();
+        let spec = QuerySpec::new("late.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let bytes = reply_with_address(&spec, [9, 9, 9, 9]);
+        let info = ResponseInfo::parse(&bytes).unwrap();
+        let token = pipeline.cache.lock().unwrap().insert(
+            &CacheKey::new(&query),
+            &bytes,
+            &info,
+            Instant::now(),
+        );
+        let bytes_without_memo = pipeline.cache.lock().unwrap().bytes();
+        let delivery = Delivery {
+            bytes,
+            info,
+            cached_as: token,
+            _charge: pipeline.budget.try_charge(1).unwrap(),
+        };
+        let reply = Reply::new(&query, pipeline.udp_size, Protocol::Tcp);
+        let mut out = Vec::new();
+
+        pipeline.deliver(&query, &reply, &delivery, &mut out);
+        assert_eq!(parse(&out).answers.len(), 300);
+        assert_eq!(pipeline.cache.lock().unwrap().bytes(), bytes_without_memo);
+
+        let quick = pipeline.answer_quickly(&request, Protocol::Tcp, &mut out);
+        assert_eq!(quick, Quick::Replied);
+        assert_eq!(parse(&out).answers.len(), 300);
+        assert_eq!(pipeline.cache.lock().unwrap().bytes(), bytes_without_memo);
     }
 }

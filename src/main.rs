@@ -3,10 +3,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use picoguard::config::Config;
-use picoguard::filter::boot::engine_from_config;
+use picoguard::filter::compile::CompileWorker;
+use picoguard::filter::snapshot::SnapshotStore;
+use picoguard::lists::{Downloader, resolver_over};
 use picoguard::pipeline::Pipeline;
-use picoguard::policy::Policy;
+use picoguard::scheduler::{Scheduler, Timing};
 use picoguard::server::{self, Listeners};
+use picoguard::upstream::tls::Tls;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/picoguard/picoguard.toml";
 const USAGE: &str = "\
@@ -140,17 +143,29 @@ fn serve(config: Config) -> Result<(), String> {
         .build()
         .map_err(|error| format!("cannot start the runtime: {error}"))?;
 
-    let engine = engine_from_config(&config);
-    let policy = Arc::new(Policy::with_engine(Arc::new(engine)));
-
     runtime.block_on(async {
-        let pipeline = Pipeline::new(&config, policy)?;
+        let worker = CompileWorker::spawn()
+            .map_err(|error| format!("cannot start the compile worker: {error}"))?;
+        let store = if config.state.persist_lists {
+            SnapshotStore::open(&config.state.dir)
+                .map_err(|error| format!("cannot start the snapshot writer: {error}"))?
+        } else {
+            SnapshotStore::disabled()
+        };
+        let scheduler =
+            Scheduler::boot(&config, worker, Arc::new(store), Timing::default()).await?;
+        let pipeline = Pipeline::new(&config, scheduler.policy())?;
         let listeners = Listeners::bind(&config.server)?;
 
         for address in listeners.udp_addresses() {
             log::info!("listening on {address} (udp and tcp)");
         }
 
+        let downloader = Downloader::new(
+            resolver_over(Arc::clone(pipeline.upstreams())),
+            Arc::new(Tls::with_webpki_roots()),
+        );
+        tokio::spawn(scheduler.run(downloader));
         server::spawn(listeners, pipeline, &config);
         std::future::pending::<()>().await;
 
