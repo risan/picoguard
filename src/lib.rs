@@ -8,6 +8,7 @@ pub mod log;
 pub mod pipeline;
 pub mod policy;
 pub mod server;
+pub mod stats;
 pub mod upstream;
 
 #[cfg(test)]
