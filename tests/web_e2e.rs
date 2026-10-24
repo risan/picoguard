@@ -279,6 +279,43 @@ async fn the_page_is_served_with_protective_headers() {
 }
 
 #[tokio::test]
+async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    assert!(page.len() < 15 * 1024, "{} bytes", page.len());
+    for external in [
+        "src=", "href=", "http://", "https://", "url(", "@import", "<link",
+    ] {
+        assert!(!page.contains(external), "the page refers to {external}");
+    }
+
+    for needed in [
+        "prefers-color-scheme: dark",
+        "name=\"viewport\"",
+        "/api/status",
+        "/api/querylog",
+        "/api/pause",
+        "/api/resume",
+        "/api/lists/refresh",
+        "setInterval(update, 5000)",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+
+    for minutes in ["5", "30", "60", "1440"] {
+        assert!(
+            page.contains(&format!("data-minutes=\"{minutes}\"")),
+            "{minutes}"
+        );
+    }
+
+    // Names come from the network: the page never builds markup from them.
+    assert!(!page.contains("innerHTML") && !page.contains("insertAdjacentHTML"));
+}
+
+#[tokio::test]
 async fn an_unknown_path_is_not_found() {
     let (site, _upstream) = plain_site().await;
 

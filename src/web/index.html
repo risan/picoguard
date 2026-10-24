@@ -1,3 +1,282 @@
 <!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>picoguard</title>
-<h1>picoguard</h1>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f4f6f9; --card: #fff; --text: #1b2230; --muted: #667085; --line: #e3e7ee;
+  --accent: #2563eb; --blocked: #dc2626; --good: #16a34a; --warn: #b45309;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f131a; --card: #171d27; --text: #e5e8ee; --muted: #8b95a7; --line: #283142;
+    --accent: #6ea0ff; --blocked: #f87171; --good: #4ade80; --warn: #fbbf24;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 12px; background: var(--bg); color: var(--text);
+  font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1000px; margin: 0 auto; display: grid; gap: 12px; }
+header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+h1 { font-size: 20px; margin: 0; flex: 1; }
+h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-width: 0; }
+#state { font-size: 13px; color: var(--muted); }
+#state.bad { color: var(--blocked); }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
+.card b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+.card span { font-size: 12px; color: var(--muted); }
+.columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; font-weight: 600; color: var(--muted); }
+th, td { padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.name { word-break: break-all; }
+.scroll { overflow-x: auto; }
+.chart { display: flex; align-items: flex-end; gap: 2px; height: 90px; }
+.bar { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px;
+  display: flex; align-items: flex-end; }
+.bar i { display: block; width: 100%; background: var(--blocked); border-radius: 2px 2px 0 0; }
+.axis { display: flex; gap: 2px; font-size: 10px; color: var(--muted); }
+.axis span { flex: 1; text-align: center; overflow: hidden; }
+.pause { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.pause p { margin: 0; flex: 1 1 100%; }
+.paused { border-color: var(--warn); }
+.paused p { color: var(--warn); font-weight: 600; }
+button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--card); color: var(--text); cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.go { background: var(--accent); border-color: var(--accent); color: #fff; }
+.r-blocked_request, .r-blocked_response { color: var(--blocked); }
+.r-error { color: var(--warn); }
+.r-cached { color: var(--good); }
+.err { color: var(--warn); }
+.empty { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>picoguard</h1>
+    <span id="state">connecting</span>
+  </header>
+
+  <section id="pause">
+    <h2>Blocking</h2>
+    <div class="pause">
+      <p id="pause-text">Blocking is on.</p>
+      <button data-minutes="5">Pause 5 min</button>
+      <button data-minutes="30">30 min</button>
+      <button data-minutes="60">1 h</button>
+      <button data-minutes="1440">1 day</button>
+      <button id="resume" class="go">Resume</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Totals</h2>
+    <div class="cards" id="cards"></div>
+  </section>
+
+  <section>
+    <h2>Last 24 hours <small>(queries, blocked in red)</small></h2>
+    <div class="chart" id="chart"></div>
+    <div class="axis" id="axis"></div>
+  </section>
+
+  <div class="columns">
+    <section><h2>Top domains <small id="a-queried"></small></h2><div class="scroll" id="top-queried"></div></section>
+    <section><h2>Top blocked <small id="a-blocked"></small></h2><div class="scroll" id="top-blocked"></div></section>
+    <section><h2>Top clients <small id="a-clients"></small></h2><div class="scroll" id="top-clients"></div></section>
+  </div>
+
+  <section>
+    <h2>Recent queries</h2>
+    <div class="scroll" id="queries"></div>
+  </section>
+
+  <section>
+    <h2>Lists</h2>
+    <div class="scroll" id="lists"></div>
+    <p><button id="refresh">Refresh all lists</button> <span id="refresh-note" class="empty"></span></p>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const QTYPES = { 1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT",
+  28: "AAAA", 33: "SRV", 64: "SVCB", 65: "HTTPS", 255: "ANY" };
+const RESULTS = { pass: "upstream", cached: "cached", blocked_request: "blocked",
+  blocked_response: "blocked (answer)", error: "error" };
+let pausedUntil = null;
+
+// Names and errors come from the network: only ever set as text.
+function el(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text !== undefined && text !== null) { node.textContent = text; }
+  if (className) { node.className = className; }
+  return node;
+}
+
+function table(head, rows) {
+  const t = el("table");
+  const tr = el("tr");
+  head.forEach((h) => tr.append(el("th", h)));
+  t.append(tr);
+  rows.forEach((row) => t.append(row));
+  return t;
+}
+
+function row(cells) {
+  const tr = el("tr");
+  cells.forEach(([text, className]) => tr.append(el("td", text, className)));
+  return tr;
+}
+
+function duration(seconds) {
+  if (seconds === null || seconds === undefined) { return "never"; }
+  if (seconds < 60) { return seconds + " s"; }
+  if (seconds < 3600) { return Math.floor(seconds / 60) + " min"; }
+  if (seconds < 86400) { return Math.floor(seconds / 3600) + " h " + Math.floor(seconds % 3600 / 60) + " min"; }
+  return Math.floor(seconds / 86400) + " d " + Math.floor(seconds % 86400 / 3600) + " h";
+}
+
+async function api(path, body) {
+  const options = body === undefined ? {} : {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  };
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) { throw new Error(data.error || "HTTP " + response.status); }
+  return data;
+}
+
+function showCards(counters, percent) {
+  const items = [
+    ["Queries", counters.total], ["Blocked", percent + " %"],
+    ["Blocked by name", counters.blocked_request], ["Blocked by answer", counters.blocked_response],
+    ["Cached", counters.cached], ["Upstream", counters.upstream],
+    ["Errors", counters.errors], ["Dropped", counters.dropped],
+  ];
+  $("cards").replaceChildren(...items.map(([label, value]) => {
+    const card = el("div", undefined, "card");
+    card.append(el("b", typeof value === "number" ? value.toLocaleString() : value), el("span", label));
+    return card;
+  }));
+}
+
+function showChart(hourly) {
+  const most = Math.max(1, ...hourly.map((h) => h.total));
+  $("chart").replaceChildren(...hourly.map((h) => {
+    const hour = new Date(h.hour_start * 1000).getHours();
+    const bar = el("div", undefined, "bar");
+    bar.style.height = (h.total / most * 100) + "%";
+    bar.title = hour + ":00  " + h.total + " queries, " + h.blocked + " blocked";
+    const blocked = el("i");
+    blocked.style.height = (h.total ? h.blocked / h.total * 100 : 0) + "%";
+    bar.append(blocked);
+    return bar;
+  }));
+  $("axis").replaceChildren(...hourly.map((h, i) =>
+    el("span", i % 4 === 0 ? new Date(h.hour_start * 1000).getHours() : "")));
+}
+
+function showTop(id, noteId, top, name) {
+  $(noteId).textContent = top.approximate ? "(approximate)" : "";
+  const rows = top.entries.slice(0, 10).map((e) => {
+    const exact = e.max_error === 0;
+    const count = el("td", (exact ? "" : "~") + e.count.toLocaleString(), "num");
+    if (!exact) { count.title = "may be too high by up to " + e.max_error; }
+    const tr = el("tr");
+    tr.append(el("td", e.key, "name"), count);
+    return tr;
+  });
+  $(id).replaceChildren(rows.length ? table([name, "Queries"], rows) : el("p", "Nothing yet.", "empty"));
+}
+
+function showQueries(entries) {
+  const rows = entries.map((e) => {
+    const time = new Date(e.time * 1000).toLocaleTimeString();
+    const result = RESULTS[e.result] || e.result;
+    const ms = e.latency_us < 1000 ? "<1" : Math.round(e.latency_us / 1000);
+    return row([[time], [e.client], [e.qname, "name"], [QTYPES[e.qtype] || e.qtype],
+      [result, "r-" + e.result], [e.upstream === null ? "" : "#" + e.upstream], [ms + " ms", "num"]]);
+  });
+  $("queries").replaceChildren(rows.length
+    ? table(["Time", "Client", "Name", "Type", "Result", "Via", "Time taken"], rows)
+    : el("p", "No queries yet.", "empty"));
+}
+
+function showLists(lists) {
+  const rows = lists.map((l) => row([
+    [l.name, "name"], [l.kind], [l.format || "-"], [l.rules.toLocaleString(), "num"],
+    [duration(l.age_seconds), "num"], [l.last_error || "", "err"],
+  ]));
+  $("lists").replaceChildren(rows.length
+    ? table(["Name", "Kind", "Format", "Rules", "Checked", "Last error"], rows)
+    : el("p", "No lists configured.", "empty"));
+}
+
+function showPause(pause) {
+  pausedUntil = pause.paused ? pause.until : null;
+  $("pause").classList.toggle("paused", pause.paused);
+  tick();
+}
+
+function tick() {
+  const left = pausedUntil === null ? 0 : pausedUntil - Math.floor(Date.now() / 1000);
+  $("pause-text").textContent = left > 0
+    ? "Blocking is paused for " + duration(left) + " more."
+    : "Blocking is on.";
+}
+
+async function update() {
+  try {
+    const [status, log] = await Promise.all([api("/api/status"), api("/api/querylog?limit=50")]);
+    showCards(status.counters, status.blocked_percent);
+    showChart(status.hourly);
+    showTop("top-queried", "a-queried", status.top_queried, "Domain");
+    showTop("top-blocked", "a-blocked", status.top_blocked, "Domain");
+    showTop("top-clients", "a-clients", status.top_clients, "Client");
+    showQueries(log.entries);
+    showLists(status.lists);
+    showPause(status.pause);
+    $("state").textContent = "updated " + new Date().toLocaleTimeString();
+    $("state").className = "";
+  } catch (error) {
+    $("state").textContent = "no connection: " + error.message;
+    $("state").className = "bad";
+  }
+}
+
+async function act(path, body, note) {
+  try {
+    await api(path, body);
+    if (note) { $("refresh-note").textContent = note; }
+  } catch (error) {
+    $("state").textContent = error.message;
+    $("state").className = "bad";
+  }
+  update();
+}
+
+document.querySelectorAll("button[data-minutes]").forEach((button) =>
+  button.addEventListener("click", () =>
+    act("/api/pause", { minutes: Number(button.dataset.minutes) })));
+$("resume").addEventListener("click", () => act("/api/resume", {}));
+$("refresh").addEventListener("click", () =>
+  act("/api/lists/refresh", {}, "Refresh started; the table updates as lists finish."));
+
+update();
+setInterval(update, 5000);
+setInterval(tick, 1000);
+</script>
+</body>
+</html>
