@@ -2,6 +2,7 @@ pub mod budget;
 pub mod cache;
 pub mod config;
 pub mod dns;
+pub mod filter;
 pub mod log;
 pub mod pipeline;
 pub mod policy;

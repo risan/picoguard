@@ -1,0 +1,19 @@
+# $denyallow with a TLD wildcard (urlfilter uses the public suffix list).
+[main]
+*$denyallow=google.*|tldwild.example.*,dnstype=A
+[queries]
+google.com A
+sub.google.com A
+google.co.uk A
+www.google.co.uk A
+google.blogspot.com A
+google.example A
+google.org A
+mygoogle.com A
+google.nosuchtld A
+google.com AAAA
+tldwild.example.com A
+sub.tldwild.example.com A
+tldwild.example A
+other.com A
+other.com AAAA

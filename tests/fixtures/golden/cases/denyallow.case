@@ -1,0 +1,34 @@
+# $denyallow: domains and subdomains are excluded, IP inputs never match, TLD wildcards.
+[main]
+*$denyallow=allowed.example|allowed2.example,dnstype=A
+||ip-deny.example^$denyallow=a.example
+||1.2.3.4^$denyallow=a.example
+||1.2.3.5^
+||5.6.7.8^$dnstype=A
+||dead^$denyallow=a.example
+||beef^$denyallow=a.example
+[queries]
+allowed.example A
+sub.allowed.example A
+allowed2.example A
+x.allowed2.example A
+allowed.example AAAA
+blocked.example A
+blocked.example AAAA
+notallowed.example A
+xallowed.example A
+allowed.example.org A
+1.2.3.4 A
+1.2.3.5 A
+5.6.7.8 A
+5.6.7.8 AAAA
+9.9.9.9 A
+9.9.9.9 AAAA
+9.9.9.9 HTTPS
+2001:db8::1 A
+2001:db8::1 AAAA
+dead:beef::1 AAAA
+dead::1 AAAA
+beef::1 AAAA
+ip-deny.example A
+a.example A

@@ -1,0 +1,94 @@
+# IPv4 and IPv6 text as inputs (CNAME-less response filtering of A/AAAA/HTTPS records):
+# "^" treats ":" as a separator, "." is not one.
+[main]
+||1.2.3.4^
+|5.6.7.8^
+||dead^
+|beef^
+||2001:db8::^
+||2001:db8:2^
+||2001:db8:3::^
+||::ffff:1.2.3.4^
+||192.168.^
+|10.^
+||172.16.0.1
+@@||1.1.1.1^
+||1.1.1.1^$important
+@@||1.0.0.1^
+||1.0.0.1^
+||8.8.8.8^$dnstype=A
+||8.8.4.4^$dnstype=AAAA
+||9.9.9.9^$dnstype=HTTPS
+||[2001:db8::99]^
+/^94\.242\.247\.(2[0-9]|3[0-2]):/
+/^203\.0\.113\.[0-9]+$/
+/^fe80:/
+*.4.4.4
+||ip-name.example^
+cafe:babe::1
+7.7.7.7
+0.0.0.0 6.6.6.6
+::1 2001:db8:6::6
+[queries]
+1.2.3.4 A
+1.2.3.4 AAAA
+1.2.3.4 HTTPS
+1.2.3.4 CNAME
+1.2.3.45 A
+11.2.3.4 A
+21.2.3.4 A
+x1.2.3.4 A
+5.6.7.8 A
+5.6.7.80 A
+15.6.7.8 A
+dead:beef::1 AAAA
+dead:beef::1 HTTPS
+dead::1 AAAA
+dead AAAA
+deadbeef::1 AAAA
+xdead:beef::1 AAAA
+1dead:beef::1 AAAA
+beef::1 AAAA
+beef:dead::1 AAAA
+2001:db8::1 AAAA
+2001:db8:: AAAA
+2001:db8::2 AAAA
+2001:db8:2::1 AAAA
+2001:db8:3::1 AAAA
+2001:db8:3:: AAAA
+::ffff:1.2.3.4 AAAA
+::ffff:1.2.3.5 AAAA
+192.168.1.1 A
+192.168.0.0 A
+x192.168.1.1 A
+10.1.1.1 A
+110.1.1.1 A
+172.16.0.1 A
+172.16.0.10 A
+1.1.1.1 A
+1.1.1.1 AAAA
+1.0.0.1 A
+8.8.8.8 A
+8.8.8.8 AAAA
+8.8.4.4 A
+8.8.4.4 AAAA
+9.9.9.9 HTTPS
+9.9.9.9 A
+2001:db8::99 AAAA
+94.242.247.25 A
+94.242.247.33 A
+203.0.113.7 A
+203.0.113.7 AAAA
+fe80::1 AAAA
+fe80::1 HTTPS
+1.4.4.4 A
+4.4.4.4 A
+ip-name.example A
+cafe:babe::1 AAAA
+cafe:babe::2 AAAA
+7.7.7.7 A
+17.7.7.7 A
+6.6.6.6 A
+6.6.6.6 AAAA
+2001:db8:6::6 AAAA
+2001:db8:6::6 A

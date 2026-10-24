@@ -1,0 +1,79 @@
+# Priority: allow beats block, $important beats allow, host rules vs network rules,
+# user rules are one more list of the main engine, the allowlist engine is checked first.
+[main]
+||block-allow.example^
+@@||block-allow.example^
+||imp-block.example^$important
+@@||imp-block.example^
+@@||imp-allow.example^$important
+||imp-allow.example^$important
+@@||imp-allow2.example^$important
+||imp-allow2.example^
+||two-imp.example^$important
+@@||two-imp.example^$important
+@@||sub-allow.example^
+||x.sub-allow.example^$important
+||net-vs-host.example^
+@@||host-vs-allow.example^
+0.0.0.0 host-vs-allow.example
+0.0.0.0 net-vs-host.example
+1.2.3.4 host-only.example
+@@||allow-dnstype.example^$dnstype=A
+||allow-dnstype.example^
+0.0.0.0 allow-vs-host-dnstype.example
+@@||allow-vs-host-dnstype.example^$dnstype=AAAA
+[main]
+||user-allowed.example^
+||list-imp.example^$important
+||user-imp.example^
+||allow-engine.example^
+||allow-engine-host.example^
+0.0.0.0 allow-engine-host2.example
+||allow-engine-dt.example^
+||allow-engine-badfilter.example^
+[user]
+@@||user-allowed.example^
+@@||list-imp.example^
+||user-block.example^
+@@||user-imp.example^$important
+||user-imp.example^$important
+[allow]
+||allow-engine.example^
+allow-engine-host.example
+0.0.0.0 allow-engine-host2.example
+||allow-engine-dt.example^$dnstype=A
+||allow-engine-badfilter.example^
+||allow-engine-badfilter.example^$badfilter
+[queries]
+block-allow.example A
+sub.block-allow.example A
+imp-block.example A
+imp-allow.example A
+imp-allow2.example A
+two-imp.example A
+sub-allow.example A
+x.sub-allow.example A
+net-vs-host.example A
+net-vs-host.example AAAA
+host-vs-allow.example A
+host-only.example A
+host-only.example AAAA
+host-only.example TXT
+sub.host-only.example A
+allow-dnstype.example A
+allow-dnstype.example AAAA
+allow-vs-host-dnstype.example A
+allow-vs-host-dnstype.example AAAA
+user-allowed.example A
+list-imp.example A
+user-block.example A
+user-imp.example A
+allow-engine.example A
+allow-engine.example AAAA
+sub.allow-engine.example A
+allow-engine-host.example A
+allow-engine-host2.example A
+allow-engine-host2.example AAAA
+allow-engine-dt.example A
+allow-engine-dt.example AAAA
+allow-engine-badfilter.example A

@@ -1,0 +1,40 @@
+# Overlapping $badfilter rules. urlfilter v0.23.4 filterNegatedRules re-adds a rule when two
+# or more badfilter rules match the same name, so the badfilter stops working. picoguard
+# disables every targeted rule (plan D7); the queries in [deviations] are the expected
+# differences: query => picoguard's decision. Identical badfilters and badfilters that
+# only differ in $dnstype negate the same rule and are not a deviation.
+[main]
+||ov-a.example^
+||ov-b.example^
+||ov-c.example^
+||ov-d.example^
+||ov-e.example^
+||ov-single.example^
+[main]
+||ov-a.example^$badfilter
+||ov-a.example^$badfilter,important
+||ov-b.example^$badfilter
+ov-b.exa$badfilter
+||ov-c.example^$badfilter
+||ov-c.example^$badfilter
+||ov-d.example^$badfilter
+||ov-d.example^$badfilter,dnstype=A
+||ov-d.example^$badfilter,dnstype=AAAA
+||ov-e.example^$badfilter
+||ov-e.example^$badfilter,important
+ov-e.example$badfilter
+||ov-single.example^$badfilter
+[queries]
+ov-a.example A
+ov-b.example A
+ov-c.example A
+ov-d.example A
+ov-d.example AAAA
+ov-d.example TXT
+ov-e.example A
+ov-single.example A
+other.example A
+[deviations]
+ov-a.example A => pass -
+ov-b.example A => pass -
+ov-e.example A => pass -
