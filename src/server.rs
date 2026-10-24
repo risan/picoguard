@@ -177,7 +177,7 @@ async fn serve_udp(socket: UdpSocket, pipeline: Arc<Pipeline>, allowed: Arc<[Cid
         let request = &buffer[..length];
         match pipeline.answer_quickly(request, Protocol::Udp, &mut out) {
             Quick::Replied => {
-                let _ = socket.send_to(&out, peer).await;
+                send_now(&socket, &out, peer);
             }
 
             Quick::Dropped => {}
@@ -194,6 +194,13 @@ async fn serve_udp(socket: UdpSocket, pipeline: Arc<Pipeline>, allowed: Arc<[Cid
     }
 }
 
+/// UDP replies are never queued (D21): a socket that cannot take the datagram
+/// right now loses it, as the network may. Waiting would hold the reply, and
+/// the task holding it, outside every limit.
+fn send_now(socket: &UdpSocket, reply: &[u8], peer: SocketAddr) -> bool {
+    socket.try_send_to(reply, peer).is_ok()
+}
+
 async fn answer_udp(
     pipeline: Arc<Pipeline>,
     socket: Arc<UdpSocket>,
@@ -203,7 +210,7 @@ async fn answer_udp(
     let mut out = Vec::new();
 
     if pipeline.answer(&mut request, Protocol::Udp, &mut out).await {
-        let _ = socket.send_to(&out, peer).await;
+        send_now(&socket, &out, peer);
     }
 }
 
@@ -459,6 +466,27 @@ mod tests {
             .unwrap();
 
         assert!(error.contains("no address"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_the_socket_cannot_take_now_is_dropped_not_waited_for() {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(SocketProtocol::UDP)).unwrap();
+        socket.set_send_buffer_size(1).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let socket = UdpSocket::from_std(socket.into()).unwrap();
+        let receiver_that_never_reads = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = receiver_that_never_reads.local_addr().unwrap();
+        socket.writable().await.unwrap();
+
+        let sent: Vec<bool> = (0..100)
+            .map(|_| send_now(&socket, &[0u8; 1000], peer))
+            .collect();
+
+        assert!(sent[0], "an idle socket sends");
+        assert!(sent.contains(&false), "a full send buffer drops");
     }
 
     fn queued(frame: Vec<u8>) -> QueuedReply {
