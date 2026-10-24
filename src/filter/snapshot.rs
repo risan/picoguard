@@ -130,6 +130,7 @@ pub struct Meta {
     pub validators: Validators,
 }
 
+#[derive(Clone)]
 pub struct Snapshot {
     pub meta: Meta,
     pub list: Arc<CompiledList>,
@@ -886,8 +887,8 @@ enum WriteJob {
     Write {
         path: PathBuf,
         snapshot: Box<Snapshot>,
-        /// Sent after the writer let go of the snapshot.
-        done: oneshot::Sender<()>,
+        /// Sent after the writer let go of the snapshot, with how the write went.
+        done: oneshot::Sender<io::Result<()>>,
     },
     Barrier(oneshot::Sender<()>),
 }
@@ -940,14 +941,15 @@ impl SnapshotStore {
     }
 
     /// Writes the snapshot unless the file already holds its fingerprint, and returns when
-    /// that is done or has failed (the writer logs a failure). When this returns the writer
-    /// holds no reference to the list any more, so a caller that awaits it before it starts
-    /// the next refresh has at most the current list and the one being built in memory.
-    /// Do not cancel the future: the write goes on without the caller.
-    pub async fn save(&self, snapshot: Snapshot) {
+    /// that is done or has failed. A failure names the file; the caller decides when to try
+    /// again. When this returns the writer holds no reference to the list any more, so a
+    /// caller that awaits it before it starts the next refresh has at most the current list
+    /// and the one being built in memory. Do not cancel the future: the write goes on
+    /// without the caller. With persistence off nothing is written and this succeeds.
+    pub async fn save(&self, snapshot: Snapshot) -> io::Result<()> {
         let (Some(writer), Some(path)) = (&self.writer, self.path_for(&snapshot.meta.source))
         else {
-            return;
+            return Ok(());
         };
 
         let (done, finished) = oneshot::channel();
@@ -957,12 +959,12 @@ impl SnapshotStore {
             done,
         };
         if writer.send(job).await.is_err() {
-            log::warn!("the snapshot writer stopped");
-
-            return;
+            return Err(io::Error::other("the snapshot writer stopped"));
         }
 
-        let _ = finished.await;
+        finished
+            .await
+            .unwrap_or_else(|_| Err(io::Error::other("the snapshot writer stopped")))
     }
 
     /// Returns when everything saved so far is on disk or has failed.
@@ -991,13 +993,12 @@ fn write_loop(mut jobs: mpsc::Receiver<WriteJob>, files: &dyn Files, written: &A
                 snapshot,
                 done,
             } => {
-                let result = write_if_changed(files, written, &path, &snapshot);
+                let result = write_if_changed(files, written, &path, &snapshot).map_err(|error| {
+                    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+                });
                 drop(snapshot);
-                if let Err(error) = result {
-                    log::warn!("cannot write {}: {error}", path.display());
-                }
 
-                let _ = done.send(());
+                let _ = done.send(result);
             }
 
             WriteJob::Barrier(done) => {
@@ -1220,7 +1221,7 @@ ads.*.tracker
         assert_eq!(snapshot.list.regex_failed(), 1);
         assert_eq!(snapshot.list.hosts.len(), 3);
 
-        store.save(clone_of(&snapshot)).await;
+        store.save(clone_of(&snapshot)).await.unwrap();
         store.flush().await;
 
         let path = store.path_for(SOURCE).unwrap();
@@ -1246,7 +1247,7 @@ ads.*.tracker
         let state = TestDir::new("snap");
         let store = SnapshotStore::open(state.path()).unwrap();
         let snapshot = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
-        store.save(clone_of(&snapshot)).await;
+        store.save(clone_of(&snapshot)).await.unwrap();
         store.flush().await;
         let loaded = load(&store.path_for(SOURCE).unwrap(), &caps()).unwrap();
 
@@ -1293,7 +1294,7 @@ ads.*.tracker
         let state = TestDir::new("snap");
         let store = SnapshotStore::open(state.path()).unwrap();
         let first = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
-        store.save(clone_of(&first)).await;
+        store.save(clone_of(&first)).await.unwrap();
         store.flush().await;
         let path = store.path_for(SOURCE).unwrap();
         let written = store.bytes_written();
@@ -1303,7 +1304,7 @@ ads.*.tracker
         // The same text downloaded again, even with a new ETag.
         let mut again = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
         again.meta.validators.etag = Some("\"other\"".to_string());
-        store.save(again).await;
+        store.save(again).await.unwrap();
         store.flush().await;
 
         let after = fs::metadata(&path).unwrap();
@@ -1323,13 +1324,15 @@ ads.*.tracker
         let store = SnapshotStore::open(state.path()).unwrap();
         store
             .save(snapshot_of(&worker, "||a.example^\n", ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap();
         store.flush().await;
         let first = store.bytes_written();
 
         store
             .save(snapshot_of(&worker, "||a.example^\n||b.example^\n", ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap();
         store.flush().await;
 
         assert!(store.bytes_written() > first);
@@ -1349,7 +1352,7 @@ ads.*.tracker
         let store = SnapshotStore::open(state.path()).unwrap();
         let text = "a.example\nb.example\n";
         let adguard = snapshot_of(&worker, text, ListFormat::Auto).await;
-        store.save(clone_of(&adguard)).await;
+        store.save(clone_of(&adguard)).await.unwrap();
         store.flush().await;
         let written = store.bytes_written();
 
@@ -1357,7 +1360,7 @@ ads.*.tracker
         assert_eq!(domains.meta.content_hash, adguard.meta.content_hash);
         assert_ne!(domains.meta.fingerprint, adguard.meta.fingerprint);
         assert!(!adguard.fits(SOURCE, &options(ListFormat::Domains)));
-        store.save(domains).await;
+        store.save(domains).await.unwrap();
         store.flush().await;
 
         assert!(store.bytes_written() > written);
@@ -1375,7 +1378,8 @@ ads.*.tracker
             let store = SnapshotStore::open(state.path()).unwrap();
             store
                 .save(snapshot_of(&worker, text, ListFormat::Auto).await)
-                .await;
+                .await
+                .unwrap();
             store.flush().await;
         }
 
@@ -1390,7 +1394,7 @@ ads.*.tracker
 
         let recompiled = snapshot_of(&worker, text, ListFormat::Domains).await;
         assert_ne!(recompiled.meta.fingerprint, old.meta.fingerprint);
-        store.save(recompiled).await;
+        store.save(recompiled).await.unwrap();
         store.flush().await;
 
         assert!(store.bytes_written() > 0);
@@ -1416,7 +1420,8 @@ ads.*.tracker
 
         store
             .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap();
         store.flush().await;
 
         assert!(store.path_for(SOURCE).is_none());
@@ -1438,7 +1443,8 @@ ads.*.tracker
         let store = SnapshotStore::open(state.path()).unwrap();
         store
             .save(snapshot_of(&worker, text, ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap();
         store.flush().await;
         let path = store.path_for(SOURCE).unwrap();
 
@@ -1587,7 +1593,7 @@ ads.*.tracker
         assert_eq!(compiled.summary.counters.over_cap, 0, "{text:?}");
         assert_eq!(compiled.list.rule_count(), rules as usize, "{text:?}");
         let snapshot = Snapshot::new(&compiled, &options, SOURCE, Validators::default());
-        store.save(snapshot).await;
+        store.save(snapshot).await.unwrap();
         store.flush().await;
         let path = store.path_for(SOURCE).unwrap();
 
@@ -1715,7 +1721,7 @@ ads.*.tracker
         let store = SnapshotStore::open(state.path()).unwrap();
         let list: String = (0..2000).map(|i| format!("||host{i}.example^\n")).collect();
         let snapshot = snapshot_of(&worker, &list, ListFormat::Auto).await;
-        store.save(clone_of(&snapshot)).await;
+        store.save(clone_of(&snapshot)).await.unwrap();
         store.flush().await;
         let path = store.path_for(SOURCE).unwrap();
         let mut bytes = fs::read(&path).unwrap();
@@ -1724,7 +1730,7 @@ ads.*.tracker
         fs::write(&path, &bytes).unwrap();
         let before = store.bytes_written();
 
-        store.save(clone_of(&snapshot)).await;
+        store.save(clone_of(&snapshot)).await.unwrap();
         store.flush().await;
 
         assert!(store.bytes_written() > before);
@@ -1739,16 +1745,19 @@ ads.*.tracker
         fs::write(state.path().join("lists"), b"in the way").unwrap();
         let store = SnapshotStore::open(state.path()).unwrap();
 
-        store
+        let error = store
             .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap_err();
         store.flush().await;
+        assert!(error.to_string().contains("lists"), "{error}");
         assert_eq!(store.bytes_written(), 0);
 
         fs::remove_file(state.path().join("lists")).unwrap();
         store
             .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap();
         store.flush().await;
         assert!(store.bytes_written() > 0);
         assert!(load(&store.path_for(SOURCE).unwrap(), &caps()).is_ok());
@@ -1926,7 +1935,7 @@ ads.*.tracker
         assert!(!path.exists());
 
         files.set_gate(true);
-        saving.await.unwrap();
+        saving.await.unwrap().unwrap();
 
         assert!(path.exists());
         assert_eq!(Arc::strong_count(&probe), 1);
@@ -1958,7 +1967,7 @@ ads.*.tracker
 
                     let snapshot = snapshot_of(&worker, text, ListFormat::Auto).await;
                     earlier.push(Arc::downgrade(&snapshot.list));
-                    store.save(snapshot).await;
+                    store.save(snapshot).await.unwrap();
                 }
             }
         });
@@ -1985,7 +1994,8 @@ ads.*.tracker
 
         store
             .save(snapshot_of(&worker, "||a.example^\n", ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap();
 
         let lists = base.join("deep/er/lists");
         assert_eq!(
@@ -2005,7 +2015,8 @@ ads.*.tracker
         // The directories exist now: a new text syncs the list directory and nothing else.
         store
             .save(snapshot_of(&worker, "||b.example^\n", ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(files.calls(), [Call::Rename, Call::SyncDir(lists)]);
     }
@@ -2024,7 +2035,8 @@ ads.*.tracker
 
         store
             .save(snapshot_of(&worker, text, ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap_err();
         let left = files_in(&lists_dir(state));
 
         (store, files, left)
@@ -2102,14 +2114,16 @@ ads.*.tracker
         let worker = CompileWorker::spawn().unwrap();
         store
             .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap_err();
         assert_eq!(store.bytes_written(), size);
         assert_eq!(files_in(&lists_dir(&state)).len(), 1);
 
         files.set_faults(Faults::default());
         store
             .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
-            .await;
+            .await
+            .unwrap();
         assert_eq!(store.bytes_written(), size);
     }
 

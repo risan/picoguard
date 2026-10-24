@@ -57,6 +57,11 @@ impl Timing {
     }
 }
 
+enum Work {
+    Refresh,
+    Save,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     Blocklist,
@@ -66,6 +71,15 @@ enum Role {
 enum Source {
     Url(String),
     Path(PathBuf),
+}
+
+/// A snapshot the writer could not put on disk. The list in force is fine; only its copy on
+/// disk is behind, so it is written again, with growing waits, until that works.
+struct PendingSave {
+    snapshot: Snapshot,
+    /// Writes that failed in a row.
+    failures: u32,
+    retry_at: Instant,
 }
 
 /// The copy of a list that is in force.
@@ -85,6 +99,10 @@ struct Entry {
     interval: Duration,
     max_body_bytes: u64,
     loaded: Option<Loaded>,
+    /// What is in force but not yet on disk. A snapshot that was loaded from disk, or written
+    /// without error, is persisted whatever the next check finds; the fingerprint of
+    /// `loaded` says nothing about the disk.
+    pending_save: Option<PendingSave>,
     due: Instant,
     /// Refreshes that failed in a row.
     failures: u32,
@@ -155,16 +173,41 @@ impl Scheduler {
             .map(|loaded| &loaded.list)
     }
 
-    /// Refreshes whichever list is due next, forever. Never two at once.
+    /// Refreshes whichever list is due next and writes snapshots that failed to write, forever.
+    /// Never two at once.
     pub async fn run(mut self, downloader: Downloader) {
-        while let Some(index) = self.next_due() {
-            tokio::time::sleep_until(self.entries[index].due).await;
-            self.refresh(index, &downloader).await;
+        while let Some((index, work, at)) = self.next_work() {
+            tokio::time::sleep_until(at).await;
+
+            match work {
+                Work::Refresh => {
+                    self.refresh(index, &downloader).await;
+                }
+
+                Work::Save => {
+                    self.retry_save(index).await;
+                }
+            }
         }
     }
 
-    fn next_due(&self) -> Option<usize> {
-        (0..self.entries.len()).min_by_key(|index| self.entries[*index].due)
+    fn next_work(&self) -> Option<(usize, Work, Instant)> {
+        let refreshes = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (index, Work::Refresh, entry.due));
+        let saves = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let pending = entry.pending_save.as_ref()?;
+
+                Some((index, Work::Save, pending.retry_at))
+            });
+
+        refreshes.chain(saves).min_by_key(|(_, _, at)| *at)
     }
 
     /// Refreshes the list at `index` now. The list in force stays in force unless a new copy
@@ -176,6 +219,7 @@ impl Scheduler {
 
                 Ok(())
             }
+
             Ok(Refresh::Updated(updated)) => self.install(index, updated).await,
             Err(error) => Err(error.to_string()),
         };
@@ -299,13 +343,58 @@ impl Scheduler {
             fingerprint: compiled.fingerprint,
             validators,
         });
-        self.worker.discard(replaced);
+        let outdated = entry.pending_save.take();
+        self.worker.discard((replaced, outdated));
 
         if matches!(entry.source, Source::Url(_)) {
-            self.store.save(snapshot).await;
+            self.save(index, snapshot, 0).await;
         }
 
         Ok(())
+    }
+
+    /// Writes `snapshot`; if that fails the entry keeps it to write again later.
+    /// `failures` is how many writes of it failed before this one.
+    async fn save(&mut self, index: usize, snapshot: Snapshot, failures: u32) {
+        let result = self.store.save(snapshot.clone()).await;
+        let entry = &mut self.entries[index];
+
+        match result {
+            Ok(()) if failures > 0 => {
+                log::info!("{}: the snapshot is written now", entry.label);
+            }
+
+            Ok(()) => {}
+
+            Err(error) => {
+                if failures == 0 {
+                    log::warn!(
+                        "{}: cannot write the snapshot, will try again: {error}",
+                        entry.label
+                    );
+                } else {
+                    log::debug!("{}: cannot write the snapshot again: {error}", entry.label);
+                }
+
+                let failures = failures + 1;
+                entry.pending_save = Some(PendingSave {
+                    snapshot,
+                    failures,
+                    retry_at: Instant::now() + self.timing.retry_after(failures),
+                });
+            }
+        }
+    }
+
+    /// Writes the snapshot of the list at `index` again if an earlier write failed. A check
+    /// that finds the list unchanged never writes; this is the only way a failed write is
+    /// tried again.
+    pub async fn retry_save(&mut self, index: usize) {
+        let Some(pending) = self.entries[index].pending_save.take() else {
+            return;
+        };
+
+        self.save(index, pending.snapshot, pending.failures).await;
     }
 
     /// The lists for the next engine: the user rules first, then every list in force in
@@ -447,6 +536,7 @@ impl Entry {
             interval: timing.hour * list.refresh_hours,
             max_body_bytes: list.max_body_bytes,
             loaded: None,
+            pending_save: None,
             due: Instant::now(),
             failures: 0,
         })

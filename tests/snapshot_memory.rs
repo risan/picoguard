@@ -79,7 +79,8 @@ async fn loading_a_snapshot_costs_eight_bytes_per_plain_rule_and_no_scratch() {
             "memory",
             Validators::default(),
         ))
-        .await;
+        .await
+        .unwrap();
     store.flush().await;
     let path = store.path_for("memory").unwrap();
     drop(compiled);

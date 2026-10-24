@@ -99,7 +99,8 @@ async fn a_forged_count_reserves_nothing() {
             "https://lists.example/hostile",
             Validators::default(),
         ))
-        .await;
+        .await
+        .unwrap();
     store.flush().await;
     let path = store.path_for("https://lists.example/hostile").unwrap();
     let good = std::fs::read(&path).unwrap();

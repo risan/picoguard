@@ -779,7 +779,7 @@ async fn age_snapshot(config: &Config, version: u32) {
         snapshot.meta.max_rules,
         version,
     );
-    store.save(snapshot).await;
+    store.save(snapshot).await.unwrap();
 }
 
 /// Compiler version 2 is the one that kept `$ORIGIN .` in RPZ owners (fixed in 3). Whatever
@@ -879,4 +879,121 @@ async fn a_web_page_with_status_200_changes_nothing() {
     scheduler.refresh(0, &downloader()).await;
     assert_eq!(server.not_modified(), 1);
     assert_eq!(warnings_about("html-page"), 1, "one warning per streak");
+}
+
+/// Makes the snapshot directory impossible to create, the way a full or read-only disk
+/// would; `clear` puts the disk right again.
+struct BlockedSnapshots(PathBuf);
+
+impl BlockedSnapshots {
+    fn new(dir: &StateDir) -> BlockedSnapshots {
+        let path = dir.file("lists");
+        fs::write(&path, b"in the way").unwrap();
+
+        BlockedSnapshots(path)
+    }
+
+    fn clear(&self) {
+        fs::remove_file(&self.0).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_failed_snapshot_write_is_retried_while_the_list_stays_unchanged() {
+    capture_warnings();
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/tagged.txt", V1, Some("\"t\""));
+    server.serve("/plain.txt", V1, None);
+    let lists = vec![
+        url_list("retry-tagged", server.url("/tagged.txt")),
+        url_list("retry-plain", server.url("/plain.txt")),
+    ];
+    let config = config_of(&dir, lists);
+    let (mut scheduler, store) = boot(&config).await;
+    let disk = BlockedSnapshots::new(&dir);
+    let policy = scheduler.policy();
+    scheduler.refresh(0, &downloader()).await;
+    scheduler.refresh(1, &downloader()).await;
+
+    assert!(blocked(&policy, "ads.example."), "the list is in force");
+    assert_eq!(warnings_about("retry-tagged"), 1);
+    assert_eq!(store.bytes_written(), 0);
+
+    // A retry on a disk that is still broken fails again, quietly.
+    scheduler.retry_save(0).await;
+    assert_eq!(warnings_about("retry-tagged"), 1, "one warning per streak");
+
+    // The disk is fine now, but an unchanged list (304, or the same content again) is
+    // checked without writing anything.
+    disk.clear();
+    scheduler.refresh(0, &downloader()).await;
+    scheduler.refresh(1, &downloader()).await;
+
+    assert_eq!(server.not_modified(), 1);
+    assert_eq!(store.bytes_written(), 0);
+    assert!(dir.snapshot_files().is_empty());
+
+    scheduler.retry_save(0).await;
+    scheduler.retry_save(1).await;
+
+    assert_eq!(dir.snapshot_files().len(), 2);
+    let written = store.bytes_written();
+    assert!(written > 0);
+    scheduler.retry_save(0).await;
+    assert_eq!(
+        store.bytes_written(),
+        written,
+        "nothing is pending any more"
+    );
+
+    drop(scheduler);
+    server.stop().await;
+    let (offline, _) = boot(&config).await;
+
+    assert!(offline.list(0).is_some() && offline.list(1).is_some());
+    assert!(blocked(&offline.policy(), "ads.example."));
+}
+
+#[tokio::test]
+async fn the_loop_writes_a_failed_snapshot_by_itself() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("loop-retry", server.url("/l.txt"))]);
+    let (mut scheduler, _) = boot(&config).await;
+    let disk = BlockedSnapshots::new(&dir);
+    scheduler.refresh(0, &downloader()).await;
+    assert!(dir.snapshot_files().is_empty());
+
+    disk.clear();
+    let running = tokio::spawn(scheduler.run(downloader()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while dir.snapshot_files().is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    running.abort();
+
+    assert_eq!(dir.snapshot_files().len(), 1);
+}
+
+/// A newer copy replaces the one that could not be written; the old one is never written.
+#[tokio::test]
+async fn a_newer_list_supersedes_a_snapshot_that_was_never_written() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("superseded", server.url("/l.txt"))]);
+    let (mut scheduler, _) = boot(&config).await;
+    let disk = BlockedSnapshots::new(&dir);
+    scheduler.refresh(0, &downloader()).await;
+
+    disk.clear();
+    server.serve("/l.txt", V2, Some("\"v2\""));
+    scheduler.refresh(0, &downloader()).await;
+    drop(scheduler);
+    server.stop().await;
+    let (offline, _) = boot(&config).await;
+
+    assert!(blocked(&offline.policy(), "tracker.example."));
 }

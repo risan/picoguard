@@ -98,7 +98,8 @@ async fn loaded_snapshots_of_the_real_lists_decide_like_the_compiled_lists() {
                 &source(index),
                 Validators::default(),
             ))
-            .await;
+            .await
+            .unwrap();
         compiled.push(snapshot);
     }
 
@@ -156,7 +157,8 @@ async fn a_refresh_with_the_same_text_writes_nothing_even_after_a_restart() {
                     &source(index),
                     Validators::default(),
                 ))
-                .await;
+                .await
+                .unwrap();
         }
 
         store.flush().await;
@@ -186,7 +188,8 @@ async fn a_refresh_with_the_same_text_writes_nothing_even_after_a_restart() {
                 &source(index),
                 Validators::default(),
             ))
-            .await;
+            .await
+            .unwrap();
     }
 
     store.flush().await;
@@ -222,7 +225,8 @@ async fn a_changed_format_with_the_same_text_is_rewritten_after_a_restart() {
                 &source(0),
                 Validators::default(),
             ))
-            .await;
+            .await
+            .unwrap();
         store.flush().await;
     }
 
@@ -254,7 +258,8 @@ async fn a_changed_format_with_the_same_text_is_rewritten_after_a_restart() {
             &source(0),
             Validators::default(),
         ))
-        .await;
+        .await
+        .unwrap();
     store.flush().await;
 
     assert!(store.bytes_written() > 0);
