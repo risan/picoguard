@@ -230,8 +230,11 @@ impl LogSlot {
     fn set(&mut self, time: u64, event: &Event) {
         self.time = time;
         self.client = event.client;
+        let wire = event.qname.as_wire();
         self.qname.clear();
-        self.qname.extend_from_slice(event.qname.as_wire());
+        // Exact growth: the default doubling would let 1,000 slots hold ~2x the longest name.
+        self.qname.reserve_exact(wire.len());
+        self.qname.extend_from_slice(wire);
         self.qtype = event.qtype;
         self.result = event.result;
         self.upstream = event.upstream;

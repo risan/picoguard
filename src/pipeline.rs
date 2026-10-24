@@ -356,9 +356,11 @@ impl Pipeline {
         let Some(prepared) = self.prepare(request, protocol, client).await else {
             return false;
         };
+
         let Some(finished) = self.finish(&prepared, out).await else {
             return false;
         };
+
         self.count(&prepared, finished);
 
         true

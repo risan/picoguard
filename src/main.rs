@@ -236,6 +236,7 @@ fn run_to_shutdown(
         Ok(deadline) => *deadline,
         Err(_) => Instant::now() + SHUTDOWN_WAIT,
     };
+
     runtime.shutdown_timeout(deadline.saturating_duration_since(Instant::now()));
 
     outcome.map(|_| ())

@@ -224,6 +224,7 @@ impl ListBuilder {
 
                     None => return,
                 };
+
                 self.hosts.entries.push(HostRules::entry(hash(name), group));
             }
             Rule::Fast { kind, name } => self.fast[kind_index(kind)].push(hash(name)),

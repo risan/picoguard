@@ -43,9 +43,30 @@ const LONG_NAME_LENGTH: usize = 4 * 61 + 3 + 4;
 
 /// A name of 251 bytes, close to the DNS maximum of 253, that differs for every `number`.
 fn long_name(number: usize) -> String {
+    name_with_tld(number, "com")
+}
+
+fn name_with_tld(number: usize, tld: &str) -> String {
     let label = format!("{number:0>8}{}", "x".repeat(53));
 
-    format!("{label}.{label}.{label}.{label}.com")
+    format!("{label}.{label}.{label}.{label}.{tld}")
+}
+
+fn record(stats: &Stats, number: usize, text: &str) {
+    let name = Name::from_text(text).unwrap();
+    let result = if number.is_multiple_of(2) {
+        QueryResult::BlockedRequest
+    } else {
+        QueryResult::Pass
+    };
+    stats.record(&Event {
+        client: IpAddr::V4(Ipv4Addr::from(number as u32)),
+        qname: &name,
+        qtype: 1,
+        result,
+        upstream: Some(0),
+        latency: Duration::from_micros(500),
+    });
 }
 
 #[test]
@@ -54,23 +75,16 @@ fn full_stats_with_long_names_stay_within_half_a_megabyte() {
     let allocations_before = LIVE_ALLOCATIONS.load(Ordering::Relaxed);
     let stats = Stats::new(StatsSettings::default());
 
+    // Fill the query-log ring with slightly shorter names first: overwriting a slot with a
+    // longer name must not double the slot's buffer.
+    for number in 0..1_000 {
+        record(&stats, number, &name_with_tld(number, "c"));
+    }
+
     for number in 0..20_000 {
         let text = long_name(number);
         assert_eq!(text.len(), LONG_NAME_LENGTH);
-        let name = Name::from_text(&text).unwrap();
-        let result = if number % 2 == 0 {
-            QueryResult::BlockedRequest
-        } else {
-            QueryResult::Pass
-        };
-        stats.record(&Event {
-            client: IpAddr::V4(Ipv4Addr::from(number as u32)),
-            qname: &name,
-            qtype: 1,
-            result,
-            upstream: Some(0),
-            latency: Duration::from_micros(500),
-        });
+        record(&stats, number, &text);
     }
 
     let bytes = LIVE_BYTES.load(Ordering::Relaxed) - bytes_before;
