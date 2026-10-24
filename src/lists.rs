@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{
-    ACCEPT, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, HOST, HeaderMap, HeaderName,
-    HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, TRANSFER_ENCODING,
-    USER_AGENT,
+    ACCEPT, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, HeaderMap,
+    HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
+    TRANSFER_ENCODING, USER_AGENT,
 };
 use http::{Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty};
@@ -45,6 +45,9 @@ pub const PIECE_QUEUE: usize = 4;
 
 /// Response head and read buffer limit of the HTTP client.
 const HTTP_BUFFER_BYTES: usize = 16 * 1024;
+
+/// How much of the start of a body is looked at to tell a web page from a list.
+const SNIFF_BYTES: usize = 512;
 
 /// A validator longer than this is not worth sending back.
 const MAX_VALIDATOR_BYTES: usize = 1024;
@@ -118,6 +121,8 @@ pub enum FetchError {
     InsecureRedirect,
     BodyTooLarge,
     UnsupportedEncoding(String),
+    /// A web page (a login or error page served with status 200), not a list.
+    HtmlPage,
     Io(io::Error),
     /// The compile worker stopped listening.
     SinkClosed,
@@ -172,6 +177,10 @@ impl fmt::Display for FetchError {
 
             FetchError::UnsupportedEncoding(encoding) => {
                 write!(formatter, "unsupported content encoding {encoding:?}")
+            }
+
+            FetchError::HtmlPage => {
+                write!(formatter, "the server sent a web page, not a list")
             }
 
             FetchError::Io(error) => {
@@ -667,6 +676,10 @@ fn download(
         return Err(FetchError::UnsupportedEncoding(coding));
     }
 
+    if is_html_content_type(&head.headers) {
+        return Err(FetchError::HtmlPage);
+    }
+
     let announced = head
         .headers
         .get(CONTENT_LENGTH)
@@ -684,12 +697,41 @@ fn download(
     }))
 }
 
+fn is_html_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(CONTENT_TYPE)
+        .into_iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .map(str::trim)
+        .any(|media_type| {
+            media_type.eq_ignore_ascii_case("text/html")
+                || media_type.eq_ignore_ascii_case("application/xhtml+xml")
+        })
+}
+
+/// True when the text starts like an HTML document: `<!doctype html` or `<html`, in any
+/// case, after an optional byte order mark and white space.
+fn looks_like_html(start: &[u8]) -> bool {
+    let start = &start[..start.len().min(SNIFF_BYTES)];
+    let start = start.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(start);
+    let start = start.trim_ascii_start();
+    let starts_with = |tag: &[u8]| {
+        start
+            .get(..tag.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag))
+    };
+
+    starts_with(b"<!doctype html") || starts_with(b"<html")
+}
+
 impl Download {
     /// Reads the body and sends it as pieces followed by `End`. On an error the caller drops
     /// the sender, which tells the compile worker to throw the partial text away.
     pub async fn pump(mut self, sink: &PieceSender) -> Result<(), FetchError> {
         let mut piece = Vec::with_capacity(MAX_PIECE_BYTES);
         let mut total = 0u64;
+        let mut sniffed = false;
 
         loop {
             let frame = timeout(self.limits.idle_timeout, self.body.frame())
@@ -714,6 +756,7 @@ impl Download {
                 rest = &rest[taken..];
 
                 if piece.len() == MAX_PIECE_BYTES {
+                    reject_html_once(&piece, &mut sniffed)?;
                     let full = std::mem::replace(&mut piece, Vec::with_capacity(MAX_PIECE_BYTES));
                     send(sink, Piece::Data(full)).await?;
                 }
@@ -721,11 +764,26 @@ impl Download {
         }
 
         if !piece.is_empty() {
+            reject_html_once(&piece, &mut sniffed)?;
             send(sink, Piece::Data(piece)).await?;
         }
 
         send(sink, Piece::End).await
     }
+}
+
+/// Looks at the start of the body when its first piece is about to be sent, before the
+/// compile worker sees any of it.
+fn reject_html_once(piece: &[u8], sniffed: &mut bool) -> Result<(), FetchError> {
+    if std::mem::replace(sniffed, true) {
+        return Ok(());
+    }
+
+    if looks_like_html(piece) {
+        return Err(FetchError::HtmlPage);
+    }
+
+    Ok(())
 }
 
 async fn send(sink: &PieceSender, piece: Piece) -> Result<(), FetchError> {
@@ -1734,6 +1792,79 @@ mod tests {
         let pumped = fetch_body(&local(), &server.url("/"), &Limits::default()).await;
         assert!(pumped.result.is_ok(), "{:?}", pumped.result);
         assert_eq!(pumped.text(), b"ab");
+    }
+
+    #[tokio::test]
+    async fn a_web_page_with_status_200_is_not_a_list() {
+        for head in [
+            "Content-Type: text/html\r\nContent-Length: 6\r\n",
+            "Content-Type: Text/HTML; charset=utf-8\r\nContent-Length: 6\r\n",
+            "Content-Type: text/plain\r\nContent-Type: text/html\r\nContent-Length: 6\r\n",
+            "Content-Type: application/xhtml+xml\r\nContent-Length: 6\r\n",
+        ] {
+            let server = raw_reply(head, b"||a^\r\n").await;
+
+            let error = fetch_error(&local(), &server.url("/"), &Limits::default()).await;
+
+            assert!(matches!(error, FetchError::HtmlPage), "{head:?}: {error:?}");
+        }
+
+        let server = raw_reply(
+            "Content-Type: text/plain; charset=utf-8\r\nContent-Length: 6\r\n",
+            b"||a^\r\n",
+        )
+        .await;
+        let pumped = fetch_body(&local(), &server.url("/"), &Limits::default()).await;
+        assert!(pumped.result.is_ok(), "{:?}", pumped.result);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_starts_like_an_html_document_is_not_a_list() {
+        for body in [
+            &b"<!DOCTYPE html><html>"[..],
+            b"<!doctype HTML>\n<head>",
+            b"<html lang=en>",
+            b"  \r\n\t<HTML>",
+            b"\xEF\xBB\xBF\n<!DocType html public>",
+        ] {
+            let head = format!("Content-Length: {}\r\n", body.len());
+            let server =
+                raw_reply(Box::leak(head.into_boxed_str()), Vec::leak(body.to_vec())).await;
+
+            let error = fetch_error(&local(), &server.url("/"), &Limits::default()).await;
+
+            assert!(
+                matches!(error, FetchError::HtmlPage),
+                "{:?}: {error:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_start_of_a_body_is_sniffed_and_lists_that_mention_html_are_fine() {
+        assert!(!looks_like_html(b"! <html> in a comment\n||a^\n"));
+        assert!(!looks_like_html(b"||html.example^\n<html>"));
+        assert!(!looks_like_html(b"<!doctype\n"));
+        assert!(!looks_like_html(b""));
+
+        let mut late = vec![b' '; SNIFF_BYTES];
+        late.extend_from_slice(b"<html>");
+        assert!(!looks_like_html(&late));
+    }
+
+    #[tokio::test]
+    async fn a_web_page_in_the_second_piece_of_a_large_body_is_not_looked_for() {
+        let mut body = vec![b'\n'; MAX_PIECE_BYTES];
+        body.extend_from_slice(b"<html>");
+        let body: &'static [u8] = Vec::leak(body);
+        let head: &'static str =
+            Box::leak(format!("Content-Length: {}\r\n", body.len()).into_boxed_str());
+        let server = raw_reply(head, body).await;
+
+        let pumped = fetch_body(&local(), &server.url("/"), &Limits::default()).await;
+
+        assert!(pumped.result.is_ok(), "{:?}", pumped.result);
     }
 
     #[tokio::test]

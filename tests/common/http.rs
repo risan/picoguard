@@ -14,7 +14,11 @@ use tokio::task::JoinHandle;
 
 #[derive(Clone)]
 enum Page {
-    Text { body: String, etag: Option<String> },
+    Text {
+        body: String,
+        etag: Option<String>,
+        content_type: Option<String>,
+    },
     Status(u16),
 }
 
@@ -89,11 +93,23 @@ impl ListServer {
 
     /// Serves `body` at `path`, with an ETag when given.
     pub fn serve(&self, path: &str, body: &str, etag: Option<&str>) {
+        self.serve_typed(path, body, etag, None);
+    }
+
+    /// Like `serve`, with a `Content-Type` when given.
+    pub fn serve_typed(
+        &self,
+        path: &str,
+        body: &str,
+        etag: Option<&str>,
+        content_type: Option<&str>,
+    ) {
         self.state.pages.lock().unwrap().insert(
             path.to_string(),
             Page::Text {
                 body: body.to_string(),
                 etag: etag.map(str::to_string),
+                content_type: content_type.map(str::to_string),
             },
         );
     }
@@ -147,7 +163,11 @@ fn answer(state: &State, head: &str) -> Vec<u8> {
     let page = state.pages.lock().unwrap().get(&path).cloned();
 
     match page {
-        Some(Page::Text { body, etag }) => {
+        Some(Page::Text {
+            body,
+            etag,
+            content_type,
+        }) => {
             if etag.is_some() && etag == if_none_match {
                 state.not_modified.fetch_add(1, Ordering::SeqCst);
 
@@ -157,8 +177,11 @@ fn answer(state: &State, head: &str) -> Vec<u8> {
             let etag = etag
                 .map(|etag| format!("ETag: {etag}\r\n"))
                 .unwrap_or_default();
+            let content_type = content_type
+                .map(|content_type| format!("Content-Type: {content_type}\r\n"))
+                .unwrap_or_default();
             let mut reply = format!(
-                "HTTP/1.1 200 OK\r\nConnection: close\r\n{etag}Content-Length: {}\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n{etag}{content_type}Content-Length: {}\r\n\r\n",
                 body.len()
             )
             .into_bytes();

@@ -838,3 +838,45 @@ async fn a_snapshot_of_the_previous_compiler_is_compiled_again_whatever_its_vali
     let (offline, _) = boot(&config).await;
     assert!(blocked(&offline.policy(), "ads.example."));
 }
+
+/// A login or error page served with status 200 compiles to junk rules; it must never
+/// replace the list in force.
+#[tokio::test]
+async fn a_web_page_with_status_200_changes_nothing() {
+    capture_warnings();
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("html-page", server.url("/l.txt"))]);
+    let (mut scheduler, store) = boot(&config).await;
+    let policy = scheduler.policy();
+    scheduler.refresh(0, &downloader()).await;
+    let list = Arc::clone(scheduler.list(0).unwrap());
+    let written = store.bytes_written();
+    let generation_before = generation(&policy);
+    let snapshot_path = dir.snapshot_files().remove(0);
+    let snapshot_before = fs::read(&snapshot_path).unwrap();
+    let page = "<!DOCTYPE html>\n<html><body>\n||junk.example^\nSign in\n</body></html>\n";
+
+    for (body, content_type) in [
+        (page, Some("text/html; charset=utf-8")),
+        (page, None),
+        ("  \n<HTML><body>Sign in", Some("text/plain")),
+    ] {
+        server.serve_typed("/l.txt", body, Some("\"page\""), content_type);
+        scheduler.refresh(0, &downloader()).await;
+
+        assert!(Arc::ptr_eq(&list, scheduler.list(0).unwrap()));
+        assert!(blocked(&policy, "ads.example."));
+        assert!(!blocked(&policy, "junk.example."));
+        assert_eq!(generation(&policy), generation_before);
+        assert_eq!(store.bytes_written(), written);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_before);
+    }
+
+    // The validators of the list in force were not replaced by the page's ETag.
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    scheduler.refresh(0, &downloader()).await;
+    assert_eq!(server.not_modified(), 1);
+    assert_eq!(warnings_about("html-page"), 1, "one warning per streak");
+}
