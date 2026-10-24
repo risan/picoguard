@@ -7,9 +7,10 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::config::{Config, ListConfig};
@@ -64,9 +65,43 @@ enum Work {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Role {
+pub enum Role {
     Blocklist,
     Allowlist,
+}
+
+/// What is known about one list, for the status page.
+#[derive(Debug, Clone)]
+pub struct ListStatus {
+    pub name: String,
+    pub role: Role,
+    /// The format the copy in force was read as (`auto` resolved); `None` before any copy.
+    pub format: Option<ListFormat>,
+    pub rules: usize,
+    /// When the copy in force was loaded, downloaded or confirmed current. A snapshot read at
+    /// boot counts from the boot: it records no download time.
+    pub checked: Option<Instant>,
+    /// Why the last refresh failed; cleared by the next one that works.
+    pub last_error: Option<String>,
+}
+
+/// The scheduler seen from outside: what the lists look like, and a way to ask for a refresh.
+pub struct ListControl {
+    statuses: Mutex<Vec<ListStatus>>,
+    refresh_requested: Notify,
+}
+
+impl ListControl {
+    /// Blocklists first, then allowlists, in config order.
+    pub fn statuses(&self) -> Vec<ListStatus> {
+        self.statuses.lock().unwrap().clone()
+    }
+
+    /// Asks for every list to be refreshed now. The scheduler still does one refresh at a time,
+    /// and asks made while it is busy count as one.
+    pub fn refresh_all(&self) {
+        self.refresh_requested.notify_one();
+    }
 }
 
 enum Source {
@@ -86,6 +121,7 @@ struct PendingSave {
 /// The copy of a list that is in force.
 struct Loaded {
     list: Arc<CompiledList>,
+    format: ListFormat,
     fingerprint: u128,
     validators: Validators,
 }
@@ -107,10 +143,13 @@ struct Entry {
     due: Instant,
     /// Refreshes that failed in a row.
     failures: u32,
+    checked: Option<Instant>,
+    last_error: Option<String>,
 }
 
 pub struct Scheduler {
     policy: Arc<Policy>,
+    control: Arc<ListControl>,
     worker: CompileWorker,
     store: Arc<SnapshotStore>,
     timing: Timing,
@@ -137,6 +176,10 @@ impl Scheduler {
 
         let mut scheduler = Scheduler {
             policy: Arc::new(Policy::new()),
+            control: Arc::new(ListControl {
+                statuses: Mutex::new(Vec::new()),
+                refresh_requested: Notify::new(),
+            }),
             worker,
             store,
             timing,
@@ -147,6 +190,8 @@ impl Scheduler {
         for index in 0..scheduler.entries.len() {
             scheduler.load_at_boot(index).await;
         }
+
+        scheduler.publish_all();
 
         let (main, allow) = scheduler.lists_in_force(None);
         let engine = scheduler
@@ -164,6 +209,10 @@ impl Scheduler {
         Arc::clone(&self.policy)
     }
 
+    pub fn control(&self) -> Arc<ListControl> {
+        Arc::clone(&self.control)
+    }
+
     /// The copy of the list at `index` (counting blocklists, then allowlists, in config order)
     /// that is in force, if it has one.
     pub fn list(&self, index: usize) -> Option<&Arc<CompiledList>> {
@@ -179,6 +228,7 @@ impl Scheduler {
     /// starts after `stop`, except one last try to write the snapshots still pending.
     pub async fn run(mut self, downloader: Downloader, stop: impl Future<Output = ()>) {
         tokio::pin!(stop);
+        let control = self.control();
 
         while let Some((index, work, at)) = self.next_work() {
             tokio::select! {
@@ -186,6 +236,12 @@ impl Scheduler {
 
                 () = &mut stop => {
                     break;
+                }
+
+                () = control.refresh_requested.notified() => {
+                    self.refresh_all_now();
+
+                    continue;
                 }
 
                 () = tokio::time::sleep_until(at) => {}
@@ -204,6 +260,23 @@ impl Scheduler {
 
         for index in 0..self.entries.len() {
             self.retry_save(index).await;
+        }
+    }
+
+    fn publish_all(&self) {
+        let statuses = self.entries.iter().map(Entry::status).collect();
+        *self.control.statuses.lock().unwrap() = statuses;
+    }
+
+    fn publish(&self, index: usize) {
+        self.control.statuses.lock().unwrap()[index] = self.entries[index].status();
+    }
+
+    fn refresh_all_now(&mut self) {
+        let now = Instant::now();
+
+        for entry in &mut self.entries {
+            entry.due = now;
         }
     }
 
@@ -249,6 +322,8 @@ impl Scheduler {
 
                 entry.failures = 0;
                 entry.due = Instant::now() + jittered(entry.interval);
+                entry.checked = Some(Instant::now());
+                entry.last_error = None;
             }
 
             Err(message) => {
@@ -263,8 +338,11 @@ impl Scheduler {
 
                 entry.failures += 1;
                 entry.due = Instant::now() + self.timing.retry_after(entry.failures);
+                entry.last_error = Some(message);
             }
         }
+
+        self.publish(index);
     }
 
     async fn fetch(&self, index: usize, downloader: &Downloader) -> Result<Refresh, RefreshError> {
@@ -356,6 +434,7 @@ impl Scheduler {
         let snapshot = Snapshot::new(&compiled, &entry.options, &entry.key, validators.clone());
         let replaced = entry.loaded.replace(Loaded {
             list: new_list,
+            format: compiled.summary.format,
             fingerprint: compiled.fingerprint,
             validators,
         });
@@ -451,6 +530,7 @@ impl Scheduler {
         entry.due = match loaded {
             Some(loaded) => {
                 entry.loaded = Some(loaded);
+                entry.checked = Some(Instant::now());
 
                 // Compiled from the file or loaded from a snapshot: the first check can wait.
                 Instant::now() + self.timing.first_check.mul_f64(unit_random())
@@ -502,6 +582,7 @@ impl Scheduler {
 
         Some(Loaded {
             list: Arc::clone(&snapshot.list),
+            format: snapshot.meta.effective_format,
             fingerprint: snapshot.meta.fingerprint,
             validators: snapshot.meta.validators.clone(),
         })
@@ -513,6 +594,7 @@ impl Scheduler {
                 log::info!("{}: {} rules", entry.label, compiled.list.rule_count());
 
                 Some(Loaded {
+                    format: compiled.summary.format,
                     fingerprint: compiled.fingerprint,
                     list: compiled.list,
                     validators: Validators::default(),
@@ -529,6 +611,20 @@ impl Scheduler {
 }
 
 impl Entry {
+    fn status(&self) -> ListStatus {
+        ListStatus {
+            name: self.label.clone(),
+            role: self.role,
+            format: self.loaded.as_ref().map(|loaded| loaded.format),
+            rules: self
+                .loaded
+                .as_ref()
+                .map_or(0, |loaded| loaded.list.rule_count()),
+            checked: self.checked,
+            last_error: self.last_error.clone(),
+        }
+    }
+
     fn new(role: Role, list: &ListConfig, timing: &Timing) -> Option<Entry> {
         let (source, key) = match (&list.url, &list.path) {
             (Some(url), _) => (Source::Url(url.clone()), url.clone()),
@@ -555,6 +651,8 @@ impl Entry {
             pending_save: None,
             due: Instant::now(),
             failures: 0,
+            checked: None,
+            last_error: None,
         })
     }
 }
