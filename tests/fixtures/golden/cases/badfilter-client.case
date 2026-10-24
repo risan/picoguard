@@ -1,0 +1,33 @@
+# $badfilter and $client identity: client IPs and subnets are compared in normal form
+# (`~192.0.2.1` is `~192.0.2.1/32`, host bits of a subnet are masked), the entries are a
+# set (order does not matter), and an escaped `|` is part of one name, not a separator.
+[main]
+||bfc-ip.example^$client=~192.0.2.1
+||bfc-net.example^$client=~192.0.2.0/24
+||bfc-v6.example^$client=~2001:db8::1
+||bfc-order.example^$client=~b|~a
+||bfc-two.example^$client=~a|~b
+||bfc-esc.example^$client=~a\|b
+||bfc-name.example^$client=~Mom
+||bfc-dup.example^$client=~a|~a
+||bfc-family.example^$client=~192.0.2.1
+[main]
+||bfc-ip.example^$client=~192.0.2.1/32,badfilter
+||bfc-net.example^$client=~192.0.2.77/24,badfilter
+||bfc-v6.example^$client=~2001:0db8:0:0:0:0:0:1/128,badfilter
+||bfc-order.example^$client=~a|~b,badfilter
+||bfc-two.example^$client=~a\|b,badfilter
+||bfc-esc.example^$client=~a|~b,badfilter
+||bfc-name.example^$client=~mom,badfilter
+||bfc-dup.example^$client=~a,badfilter
+||bfc-family.example^$client=~::ffff:192.0.2.1,badfilter
+[queries]
+bfc-ip.example A
+bfc-net.example A
+bfc-v6.example A
+bfc-order.example A
+bfc-two.example A
+bfc-esc.example A
+bfc-name.example A
+bfc-dup.example A
+bfc-family.example A

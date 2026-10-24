@@ -11,7 +11,7 @@ GPL-3.0 themselves (`LICENSE-GPL-3.0`). They are **never linked into picoguard**
 | `agh-oracle/` | Go program on `urlfilter` v0.23.4. Reads rule files and `input checktype [querytype]` lines and prints `... pass -` or `... block ANSWER`. `agh-oracle sample` draws the queries of the real-list test. |
 | `agh-flow/` | Go program that runs the pinned AdGuard Home v0.107.79 linux/amd64 release against a scripted fake UDP/TCP upstream and records the full reply per query (`flow.expected`). Its decisions mode replays oracle queries against the binary. |
 | `regen.sh` | Regenerates every golden file (`oracle`, `flow` or `all`). |
-| `check-oracle.sh` | Runs every matcher case and the real lists through both `agh-oracle` and the AdGuard Home binary and compares them. |
+| `check-oracle.sh` | Builds and runs `agh-oracle` into temporary files for every matcher case and the real lists, compares them with the AdGuard Home binary, and checks that the committed `.expected` files equal that fresh output. |
 | `sample-real.sh` | Draws the sampled queries of the real-list test (run once when the list fixtures change). |
 | `split-case.sh` | Splits a `.case` file into list and query files. |
 

@@ -61,9 +61,91 @@ pub struct NetworkRule {
     pub dns_restricted: Vec<u16>,
     /// `$denyallow` domains, case as written.
     pub denyallow: Vec<String>,
-    /// Restricted `$client` and `$ctag` values, kept for the identity of the rule.
-    pub client_key: String,
-    pub ctag_key: String,
+    /// Restricted `$client` values, kept for the identity of the rule.
+    pub restricted_clients: ClientSet,
+    /// Restricted `$ctag` values (sorted), kept for the identity of the rule.
+    pub restricted_ctags: Vec<String>,
+}
+
+/// The entries of a `$client` modifier in the canonical form urlfilter compares: client IPs
+/// and subnets as masked prefixes (`192.0.2.1` is `192.0.2.1/32`), everything else as names,
+/// each part sorted and without duplicates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ClientSet {
+    pub nets: Vec<(IpAddr, u8)>,
+    pub names: Vec<String>,
+}
+
+impl ClientSet {
+    pub fn new(entries: &[String]) -> ClientSet {
+        let mut set = ClientSet::default();
+        for entry in entries {
+            match parse_client_net(entry) {
+                Some(net) => set.nets.push(net),
+                None => set.names.push(entry.clone()),
+            }
+        }
+
+        set.nets.sort();
+        set.nets.dedup();
+        set.names.sort();
+        set.names.dedup();
+
+        set
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nets.is_empty() && self.names.is_empty()
+    }
+
+    /// The entries in text form; `ClientSet::new` turns them back into the same set.
+    pub fn entries(&self) -> Vec<String> {
+        let nets = self.nets.iter().map(|(ip, bits)| format!("{ip}/{bits}"));
+
+        nets.chain(self.names.iter().cloned()).collect()
+    }
+}
+
+/// An IP address or `address/bits` as a masked prefix; `None` for any other client name.
+fn parse_client_net(entry: &str) -> Option<(IpAddr, u8)> {
+    let (address, bits) = match entry.rsplit_once('/') {
+        Some((address, bits)) => (address, Some(bits)),
+        None => (entry, None),
+    };
+    let address = match address.split_once('%') {
+        // urlfilter accepts a zone on a plain IPv6 address and drops it.
+        Some((bare, zone)) if bits.is_none() && !zone.is_empty() && bare.contains(':') => bare,
+        _ => address,
+    };
+    let ip: IpAddr = address.parse().ok()?;
+    let max_bits = if ip.is_ipv4() { 32 } else { 128 };
+    let bits = match bits {
+        None => max_bits,
+        Some(bits) => {
+            let canonical = bits == "0" || (!bits.starts_with('0') && !bits.starts_with('+'));
+
+            bits.parse::<u8>()
+                .ok()
+                .filter(|&bits| canonical && bits <= max_bits)?
+        }
+    };
+
+    Some((mask_address(ip, bits), bits))
+}
+
+fn mask_address(ip: IpAddr, bits: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(ip) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(bits)).unwrap_or(0);
+
+            IpAddr::V4(Ipv4Addr::from(u32::from(ip) & mask))
+        }
+        IpAddr::V6(ip) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(bits)).unwrap_or(0);
+
+            IpAddr::V6(Ipv6Addr::from(u128::from(ip) & mask))
+        }
+    }
 }
 
 /// What urlfilter's `negatesBadfilter` compares (it ignores `$dnstype` and `$denyallow`).
@@ -73,8 +155,8 @@ pub struct Identity {
     pub important: bool,
     pub pattern: String,
     pub restricted_types: u32,
-    pub client_key: String,
-    pub ctag_key: String,
+    pub restricted_clients: ClientSet,
+    pub restricted_ctags: Vec<String>,
 }
 
 impl NetworkRule {
@@ -88,8 +170,8 @@ impl NetworkRule {
             important: self.important,
             pattern: self.pattern.clone(),
             restricted_types: self.restricted_types,
-            client_key: self.client_key.clone(),
-            ctag_key: self.ctag_key.clone(),
+            restricted_clients: self.restricted_clients.clone(),
+            restricted_ctags: self.restricted_ctags.clone(),
         }
     }
 
@@ -224,7 +306,7 @@ impl Parser {
     /// Bytes held for an unfinished line and for format detection.
     #[cfg(test)]
     pub fn buffered_bytes(&self) -> usize {
-        self.head.len() + self.line.len()
+        self.head.len() + self.line.len() + self.rpz.buffered_bytes()
     }
 
     fn decide_format<F: FnMut(Rule<'_>)>(&mut self, sink: &mut F) {
@@ -480,6 +562,7 @@ impl Parser {
         match record {
             Record::Directive => self.counters.headers += 1,
             Record::Other => self.counters.rpz_skipped += 1,
+            Record::TooLong => self.counters.too_long += 1,
             Record::Policy {
                 name,
                 wildcard,
@@ -1237,10 +1320,10 @@ fn parse_network_rule(text: &str) -> Result<NetworkRule, Drop> {
         return Err(Drop::NotDns);
     }
 
-    let key = |clients: &Option<Clients>| {
+    let restricted = |clients: &Option<Clients>| {
         clients
             .as_ref()
-            .map(|clients| clients.restricted.join("|"))
+            .map(|clients| clients.restricted.clone())
             .unwrap_or_default()
     };
 
@@ -1250,8 +1333,8 @@ fn parse_network_rule(text: &str) -> Result<NetworkRule, Drop> {
         badfilter: options.enabled & BADFILTER != 0,
         pattern: normalized,
         restricted_types: options.restricted_types,
-        client_key: key(&options.client),
-        ctag_key: key(&options.ctag),
+        restricted_clients: ClientSet::new(&restricted(&options.client)),
+        restricted_ctags: restricted(&options.ctag),
         dns_permitted: options.dns_permitted,
         dns_restricted: options.dns_restricted,
         denyallow: options.denyallow,
@@ -1383,12 +1466,19 @@ mod tests {
                     text.push_str(&format!(" denyallow={}", rule.denyallow.join("|")));
                 }
 
-                if !rule.client_key.is_empty() {
-                    text.push_str(&format!(" client={}", rule.client_key));
+                if !rule.restricted_clients.is_empty() {
+                    let nets = rule
+                        .restricted_clients
+                        .nets
+                        .iter()
+                        .map(|(ip, bits)| format!("{ip}/{bits}"));
+                    let names = rule.restricted_clients.names.iter().cloned();
+                    let entries: Vec<String> = nets.chain(names).collect();
+                    text.push_str(&format!(" client={}", entries.join("|")));
                 }
 
-                if !rule.ctag_key.is_empty() {
-                    text.push_str(&format!(" ctag={}", rule.ctag_key));
+                if !rule.restricted_ctags.is_empty() {
+                    text.push_str(&format!(" ctag={}", rule.restricted_ctags.join("|")));
                 }
 
                 text
@@ -1671,6 +1761,55 @@ mod tests {
         }
     }
 
+    fn identity_of(rule: &str) -> Identity {
+        let mut identity = None;
+        let mut parser = Parser::new(ListFormat::Adblock, usize::MAX);
+        let mut sink = |parsed: Rule<'_>| {
+            if let Rule::Slow(rule) = parsed {
+                identity = Some(rule.identity());
+            }
+        };
+        parser.push(format!("{rule}\n").as_bytes(), &mut sink);
+        parser.finish(&mut sink);
+
+        identity.unwrap_or_else(|| panic!("{rule:?} is not a slow rule"))
+    }
+
+    #[test]
+    fn client_addresses_and_subnets_are_compared_in_normal_form() {
+        let same = |a: &str, b: &str| {
+            assert_eq!(
+                identity_of(&format!("||a.example^$client={a}")),
+                identity_of(&format!("||a.example^$client={b}")),
+                "{a} and {b}"
+            );
+        };
+        same("~192.0.2.1", "~192.0.2.1/32");
+        same("~192.0.2.0/24", "~192.0.2.77/24");
+        same("~2001:db8::1", "~2001:0DB8:0:0:0:0:0:1/128");
+        same("~fe80::1%eth0", "~fe80::1");
+        same("~b|~a", "~a|~b");
+        same("~a|~a", "~a");
+        same("~0.0.0.0/0", "~10.1.2.3/0");
+    }
+
+    #[test]
+    fn client_entries_that_differ_stay_different() {
+        let differ = |a: &str, b: &str| {
+            assert_ne!(
+                identity_of(&format!("||a.example^$client={a}")),
+                identity_of(&format!("||a.example^$client={b}")),
+                "{a} and {b}"
+            );
+        };
+        differ("~a|~b", "~a\\|b");
+        differ("~192.0.2.1", "~192.0.2.1/24");
+        differ("~192.0.2.1", "~::ffff:192.0.2.1");
+        differ("~Mom", "~mom");
+        differ("~192.0.2.1/033", "~192.0.2.1/33");
+        differ("~192.0.2.1/32", "~192.0.2.1/32|~x");
+    }
+
     #[test]
     fn client_ctag_dnsrewrite_and_respgeo() {
         assert_eq!(none("||a.example^$dnsrewrite=1.2.3.4").unsupported, 1);
@@ -1680,7 +1819,7 @@ mod tests {
         assert_eq!(none("||a.example^$client=~a|b").unsupported, 1);
         assert_eq!(
             one("||a.example^$client=~192.168.0.1|~'Mom\\'s laptop'"),
-            "slow ||a.example^ client=192.168.0.1|Mom's laptop"
+            "slow ||a.example^ client=192.168.0.1/32|Mom's laptop"
         );
         assert_eq!(
             one("||a.example^$ctag=~device_pc|~device_phone"),
@@ -1972,6 +2111,25 @@ mod tests {
         let summary = parser.finish(&mut sink);
         assert_eq!(summary.counters.too_long, 1);
         assert_eq!(count, 0);
+        assert!(peak <= MAX_LINE_BYTES, "held {peak} bytes");
+    }
+
+    #[test]
+    fn an_rpz_record_spanning_many_short_lines_stays_within_the_cap() {
+        let mut parser = Parser::new(ListFormat::Rpz, usize::MAX);
+        let mut rules = Vec::new();
+        let mut sink = |rule: Rule<'_>| rules.push(describe(&rule));
+        parser.push(b"big.example CNAME (\n", &mut sink);
+        let mut peak = 0;
+        for _ in 0..100_000 {
+            parser.push(b"  x\n", &mut sink);
+            peak = peak.max(parser.buffered_bytes());
+        }
+
+        parser.push(b")\nok.example CNAME .\n", &mut sink);
+        let summary = parser.finish(&mut sink);
+        assert_eq!(summary.counters.too_long, 1);
+        assert_eq!(rules, ["ExactBlock ok.example"]);
         assert!(peak <= MAX_LINE_BYTES, "held {peak} bytes");
     }
 

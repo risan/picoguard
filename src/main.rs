@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use picoguard::config::Config;
+use picoguard::filter::boot::engine_from_config;
 use picoguard::pipeline::Pipeline;
 use picoguard::policy::Policy;
 use picoguard::server::{self, Listeners};
@@ -139,8 +140,11 @@ fn serve(config: Config) -> Result<(), String> {
         .build()
         .map_err(|error| format!("cannot start the runtime: {error}"))?;
 
+    let engine = engine_from_config(&config);
+    let policy = Arc::new(Policy::with_engine(Arc::new(engine)));
+
     runtime.block_on(async {
-        let pipeline = Pipeline::new(&config, Arc::new(Policy::new()))?;
+        let pipeline = Pipeline::new(&config, policy)?;
         let listeners = Listeners::bind(&config.server)?;
 
         for address in listeners.udp_addresses() {

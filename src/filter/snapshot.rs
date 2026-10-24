@@ -33,10 +33,10 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128};
 
 use super::compile::{COMPILER_VERSION, CompileOptions, Compiled};
 use super::engine::{CompiledList, FAST_KINDS, HostGroup, SlowRule};
-use super::parse::{Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
+use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
 use crate::lists::Validators;
 
-pub const FILE_VERSION: u32 = 1;
+pub const FILE_VERSION: u32 = 2;
 
 const MAGIC: [u8; 8] = *b"PICOSNAP";
 const PREAMBLE_BYTES: u64 = 12;
@@ -397,9 +397,9 @@ impl<W: Write> Encoder<W> {
         self.u16s(&rule.dns_permitted)?;
         self.u16s(&rule.dns_restricted)?;
         self.texts(&rule.denyallow)?;
-        self.text(&rule.client_key)?;
+        self.texts(&rule.restricted_clients.entries())?;
 
-        self.text(&rule.ctag_key)
+        self.texts(&rule.restricted_ctags)
     }
 }
 
@@ -608,8 +608,8 @@ impl<R: Read> Decoder<R> {
             dns_permitted: self.u16s("record types")?,
             dns_restricted: self.u16s("record types")?,
             denyallow: self.texts("deny-allow names")?,
-            client_key: self.text(MAX_LINE_BYTES, "client key")?,
-            ctag_key: self.text(MAX_LINE_BYTES, "tag key")?,
+            restricted_clients: ClientSet::new(&self.texts("client entries")?),
+            restricted_ctags: self.texts("tag entries")?,
         };
 
         SlowRule::compile(rule).map_err(|()| SnapshotError::Corrupt("a rule does not compile"))

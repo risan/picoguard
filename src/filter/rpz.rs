@@ -17,7 +17,12 @@ pub enum Record {
     Directive,
     /// A record without a supported policy (SOA, NS, other CNAME targets, IP triggers, ...).
     Other,
+    /// A parenthesized record that grew past [`MAX_RECORD_BYTES`]; it was discarded.
+    TooLong,
 }
+
+/// The most text one record may accumulate; the same cap as a list line.
+pub const MAX_RECORD_BYTES: usize = super::parse::MAX_LINE_BYTES;
 
 #[derive(Debug, Default)]
 pub struct RpzReader {
@@ -25,6 +30,7 @@ pub struct RpzReader {
     last_owner: Option<String>,
     pending: String,
     pending_blank_owner: bool,
+    discarding: bool,
     depth: i32,
 }
 
@@ -47,11 +53,18 @@ impl RpzReader {
 
         let (flat, depth_change) = flatten_parentheses(&stripped);
         self.depth = (self.depth + depth_change).max(0);
-        self.pending.push(' ');
-        self.pending.push_str(&flat);
+        if !self.discarding && self.pending.len() + 1 + flat.len() > MAX_RECORD_BYTES {
+            self.discarding = true;
+            self.pending = String::new();
+        }
+
+        if !self.discarding {
+            self.pending.push(' ');
+            self.pending.push_str(&flat);
+        }
+
         if self.depth == 0 {
-            let record = std::mem::take(&mut self.pending);
-            self.record(&record, self.pending_blank_owner, out);
+            self.end_record(out);
         }
     }
 
@@ -59,9 +72,25 @@ impl RpzReader {
     pub fn finish(&mut self, out: &mut impl FnMut(Record)) {
         if self.depth > 0 {
             self.depth = 0;
-            let record = std::mem::take(&mut self.pending);
-            self.record(&record, self.pending_blank_owner, out);
+            self.end_record(out);
         }
+    }
+
+    /// Bytes held for the record in progress.
+    #[cfg(test)]
+    pub fn buffered_bytes(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn end_record(&mut self, out: &mut impl FnMut(Record)) {
+        if std::mem::take(&mut self.discarding) {
+            out(Record::TooLong);
+
+            return;
+        }
+
+        let record = std::mem::take(&mut self.pending);
+        self.record(&record, self.pending_blank_owner, out);
     }
 
     fn record(&mut self, text: &str, blank_owner: bool, out: &mut impl FnMut(Record)) {
@@ -135,12 +164,8 @@ impl RpzReader {
         let mut name = owner.to_ascii_lowercase();
         if name.ends_with('.') {
             name.pop();
-            let relative = self
-                .origin
-                .as_deref()
-                .and_then(|origin| name.strip_suffix(origin));
-            if let Some(relative) = relative {
-                name = relative.trim_end_matches('.').to_string();
+            if let Some(origin) = self.origin.as_deref() {
+                name = relative_to(&name, origin)?.to_string();
             }
         }
 
@@ -157,6 +182,16 @@ impl RpzReader {
 
         (valid && !trigger).then_some((name, wildcard))
     }
+}
+
+/// `name` without the zone `origin`, when it is the origin or ends in `.origin`.
+fn relative_to<'a>(name: &'a str, origin: &str) -> Option<&'a str> {
+    let relative = name.strip_suffix(origin)?;
+    if relative.is_empty() {
+        return Some(relative);
+    }
+
+    relative.strip_suffix('.')
 }
 
 /// Owner suffixes of the RPZ triggers that are not about the queried name.
@@ -362,6 +397,58 @@ mod tests {
         let text = "a.example A 1.2.3.4\nb.example CNAME walled.example.\n32.4.3.2.1.rpz-ip CNAME .\nns.rpz-nsdname CNAME .\nmid*.example CNAME .\n";
         let records = read(text);
         assert_eq!(records, vec![Record::Other; 5]);
+    }
+
+    #[test]
+    fn a_record_over_the_byte_cap_is_discarded_through_its_closing_parenthesis() {
+        let mut reader = RpzReader::new();
+        let mut records = Vec::new();
+        let mut out = |record| records.push(record);
+        reader.feed_line("big.example CNAME (", &mut out);
+        let mut peak = 0;
+        for _ in 0..10_000 {
+            reader.feed_line("  ads.example", &mut out);
+            peak = peak.max(reader.buffered_bytes());
+        }
+
+        reader.feed_line(")", &mut out);
+        reader.feed_line("after.example CNAME .", &mut out);
+        reader.finish(&mut out);
+        assert_eq!(
+            records,
+            [Record::TooLong, policy("after.example", false, false)]
+        );
+        assert!(peak <= MAX_RECORD_BYTES, "held {peak} bytes");
+    }
+
+    #[test]
+    fn a_record_at_the_byte_cap_is_kept() {
+        let padding = " ".repeat(MAX_RECORD_BYTES - 23);
+        let text = format!("a.example CNAME (\n{padding}\n.\n)\n");
+        assert_eq!(read(&text), [policy("a.example", false, false)]);
+    }
+
+    #[test]
+    fn an_oversized_record_left_open_is_counted_at_the_end() {
+        let mut text = String::from("big.example CNAME (\n");
+        text.push_str(&"  x\n".repeat(5_000));
+        assert_eq!(read(&text), [Record::TooLong]);
+    }
+
+    #[test]
+    fn origin_stripping_respects_label_boundaries() {
+        let text = "$ORIGIN rpz.test.\nad.notrpz.test. CNAME .\nad.rpz.test. CNAME .\nrpz.test. CNAME .\nother.example. CNAME .\n";
+        let records = read(text);
+        assert_eq!(
+            records,
+            [
+                Record::Directive,
+                Record::Other,
+                policy("ad", false, false),
+                Record::Other,
+                Record::Other,
+            ]
+        );
     }
 
     #[test]

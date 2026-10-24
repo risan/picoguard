@@ -947,6 +947,26 @@ async fn the_budget_is_released_after_delivery() {
 }
 
 #[tokio::test]
+async fn a_reply_is_charged_to_the_budget_exactly_once() {
+    let ask = Ask::new("once.example.", RecordType::A);
+    let reply_len = answer_a(&Message::from_vec(&ask.bytes()).unwrap(), 300)
+        .to_vec()
+        .unwrap()
+        .len();
+
+    for (capacity, served) in [(reply_len, true), (reply_len - 1, false)] {
+        let upstream = answering_upstream().await;
+        let mut config = config_for(&upstream);
+        config.limits.pending_bytes = capacity;
+        let server = start(config).await;
+
+        let reply = udp_exchange(server.udp, &ask.bytes(), QUIET).await;
+
+        assert_eq!(reply.is_some(), served, "budget of {capacity} bytes");
+    }
+}
+
+#[tokio::test]
 async fn tcp_connections_over_the_limit_are_closed_at_once() {
     let upstream = answering_upstream().await;
     let mut config = config_for(&upstream);

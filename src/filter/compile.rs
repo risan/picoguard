@@ -17,7 +17,7 @@ use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 
 /// Bump when parsing or compiling changes what a list means: snapshots written by an older
 /// compiler are then ignored and the lists compile again (plan D14).
-pub const COMPILER_VERSION: u32 = 1;
+pub const COMPILER_VERSION: u32 = 2;
 
 /// The per-list settings that change the compiled result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
