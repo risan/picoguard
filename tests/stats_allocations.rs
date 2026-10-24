@@ -46,7 +46,7 @@ fn names_for(queries: usize) -> Vec<String> {
 
 fn record_all(stats: &Stats, names: &[String]) {
     for (number, name) in names.iter().enumerate() {
-        let result = if (number / NAMES) % 2 == 0 {
+        let result = if (number / NAMES).is_multiple_of(2) {
             QueryResult::BlockedRequest
         } else {
             QueryResult::Pass
