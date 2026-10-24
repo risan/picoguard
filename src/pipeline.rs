@@ -109,7 +109,7 @@ pub struct Pipeline {
     blocked_hosts: Vec<Name>,
     local_domains: Vec<Name>,
     private_networks: Vec<Cidr>,
-    upstreams: Upstreams,
+    upstreams: Arc<Upstreams>,
     local_resolver: Option<Upstreams>,
     cache: Mutex<Cache>,
     inflight: Mutex<Inflight>,
@@ -119,7 +119,7 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(config: &Config, policy: Arc<Policy>) -> Result<Arc<Pipeline>, String> {
-        let upstreams = Upstreams::from_config(&config.upstream, &config.limits)?;
+        let upstreams = Arc::new(Upstreams::from_config(&config.upstream, &config.limits)?);
         let local_resolver = config
             .local
             .resolver
@@ -146,6 +146,12 @@ impl Pipeline {
             policy,
             budget: Budget::new(config.limits.pending_bytes),
         }))
+    }
+
+    /// The upstream pool, shared with the list downloader, which resolves list hosts through
+    /// it.
+    pub fn upstreams(&self) -> &Arc<Upstreams> {
+        &self.upstreams
     }
 
     /// The budget for replies held for delivery. Queued TCP replies draw on it.
