@@ -54,7 +54,9 @@ const LOAD_PEAK_LIMIT: usize = 512 * 1024;
 fn forged(good: &[u8], groups: u32, slow: u32, fix_checksum: bool) -> Vec<u8> {
     let mut bytes = good.to_vec();
     let end = bytes.len() - CHECKSUM_BYTES;
-    bytes[end - 8..end - 4].copy_from_slice(&groups.to_le_bytes());
+    // The body ends with the group count, the length of the host entries (8 bytes) and the
+    // slow rule count.
+    bytes[end - 16..end - 12].copy_from_slice(&groups.to_le_bytes());
     bytes[end - 4..end].copy_from_slice(&slow.to_le_bytes());
     if fix_checksum {
         let sum = xxh3_128(&bytes[PREAMBLE_BYTES..end]);

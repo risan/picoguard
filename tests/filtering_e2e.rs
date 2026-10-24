@@ -357,12 +357,11 @@ async fn the_answer_address_of_a_reply_is_checked_with_the_go_text_form() {
     assert_eq!(answer_addresses(&reply), ["::"]);
 }
 
-/// One name mapped to 200,000 different addresses used to cost a quadratic duplicate scan on
-/// every query. Now the collection stops one past the cap and the reply is TC (UDP) or
-/// SERVFAIL (TCP).
+/// One name mapped to the most addresses a list may have (1,024) is more than a reply gets:
+/// the collection stops one past the cap and the reply is TC (UDP) or SERVFAIL (TCP).
 #[tokio::test]
-async fn a_name_with_200_000_host_addresses_is_answered_fast_with_tc_or_servfail() {
-    const ADDRESSES: u32 = 200_000;
+async fn a_name_with_the_most_host_addresses_is_answered_fast_with_tc_or_servfail() {
+    const ADDRESSES: u32 = 1024;
     let hosts: String = (0..ADDRESSES)
         .map(|index| {
             let [a, b, c, d] = (0x0A00_0000 + index).to_be_bytes();

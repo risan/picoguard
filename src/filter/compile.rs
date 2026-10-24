@@ -11,7 +11,7 @@ use std::sync::mpsc as std_mpsc;
 use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
-use super::engine::{CompiledList, Engine, ListBuilder};
+use super::engine::{CompiledList, Engine, ListBuilder, MAX_HOST_GROUPS};
 use super::parse::{ListFormat, NetworkRule, ParseSummary, Parser, Rule};
 use super::snapshot::{self, Snapshot, SnapshotError};
 use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
@@ -19,7 +19,7 @@ use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 /// Bump on every change to compiled output (what any list text compiles to, in the parser,
 /// the compiler or the snapshot encoding), however small: snapshots written by an older
 /// compiler are then ignored and the lists compile again (plan D14).
-pub const COMPILER_VERSION: u32 = 3;
+pub const COMPILER_VERSION: u32 = 4;
 
 /// Default memory budget of the slow rules of one list. Plan section 5 leaves about 8 MB
 /// between the steady total (20 MB) and the refresh peak (28 MB). The real lists are far
@@ -53,17 +53,38 @@ const SLOW_RULE_BYTES: usize = 512;
 const TEXT_BYTE_COST: usize = 4;
 const REGEX_BYTES: usize = 24 * 1024;
 
-/// Counts the estimated memory of the slow rules of one list against a budget. Parsing and
-/// snapshot loading charge the same way, so a list that compiles also loads.
+/// What a host group (an answer IP of the host rules) costs, with its share of the lookup
+/// tables. The count of groups is capped as well, by `MAX_HOST_GROUPS`.
+pub(super) const HOST_GROUP_BYTES: usize = 64;
+
+/// Counts the estimated memory of the slow rules and host groups of one list against a
+/// budget. Parsing and snapshot loading charge the same way, so a list that compiles also
+/// loads.
 pub(super) struct SlowRuleBudget {
     left: usize,
+    host_groups: usize,
 }
 
 pub(super) struct OverBudget;
 
 impl SlowRuleBudget {
     pub(super) fn new(total: usize) -> SlowRuleBudget {
-        SlowRuleBudget { left: total }
+        SlowRuleBudget {
+            left: total,
+            host_groups: 0,
+        }
+    }
+
+    /// Takes one more host group; fails past `MAX_HOST_GROUPS` or when the budget is gone.
+    pub(super) fn charge_host_group(&mut self) -> Result<(), OverBudget> {
+        if self.host_groups >= MAX_HOST_GROUPS {
+            return Err(OverBudget);
+        }
+
+        self.left = self.left.checked_sub(HOST_GROUP_BYTES).ok_or(OverBudget)?;
+        self.host_groups += 1;
+
+        Ok(())
     }
 
     pub(super) fn charge(&mut self, rule: &NetworkRule) -> Result<(), OverBudget> {
@@ -274,6 +295,15 @@ fn compile(
 
                 return;
             }
+        }
+
+        if let Rule::Host { ip, .. } = &rule
+            && !builder.has_host_group(*ip)
+            && budget.charge_host_group().is_err()
+        {
+            over_budget.set(true);
+
+            return;
         }
 
         builder.add(rule);
@@ -532,6 +562,63 @@ mod tests {
             .await
             .unwrap();
         assert!(blocked(&next.list, "ads.example"));
+    }
+
+    fn hosts_with_answer_ips(count: usize) -> String {
+        (0..count)
+            .map(|index| format!("10.0.{}.{} host{index}.example\n", index / 256, index % 256))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_hosts_list_with_more_answer_ips_than_the_cap_fails_the_job() {
+        let worker = CompileWorker::spawn().unwrap();
+        let hosts = CompileOptions {
+            max_rules: 5000,
+            ..options(ListFormat::Hosts)
+        };
+
+        let at_the_cap =
+            compile_in_pieces(&worker, hosts, hosts_with_answer_ips(1024).as_bytes(), 4096)
+                .await
+                .unwrap();
+        let over_the_cap =
+            compile_in_pieces(&worker, hosts, hosts_with_answer_ips(1025).as_bytes(), 4096).await;
+
+        assert_eq!(at_the_cap.list.rule_count(), 1024);
+        assert_eq!(over_the_cap.err(), Some(CompileError::OverBudget));
+        let next = compile_in_pieces(&worker, options(ListFormat::Auto), LIST.as_bytes(), 100)
+            .await
+            .unwrap();
+        assert!(blocked(&next.list, "ads.example"));
+    }
+
+    #[tokio::test]
+    async fn every_host_group_is_charged_to_the_budget_of_the_list() {
+        let worker = CompileWorker::spawn().unwrap();
+        let hosts = hosts_with_answer_ips(10);
+        let with_budget = |slow_rule_budget| CompileOptions {
+            slow_rule_budget,
+            ..options(ListFormat::Hosts)
+        };
+
+        let enough = compile_in_pieces(
+            &worker,
+            with_budget(10 * HOST_GROUP_BYTES),
+            hosts.as_bytes(),
+            4096,
+        )
+        .await;
+        let too_little = compile_in_pieces(
+            &worker,
+            with_budget(10 * HOST_GROUP_BYTES - 1),
+            hosts.as_bytes(),
+            4096,
+        )
+        .await;
+
+        assert!(enough.is_ok());
+        assert_eq!(too_little.err(), Some(CompileError::OverBudget));
     }
 
     #[tokio::test]
