@@ -21,9 +21,23 @@ const MIN_MESSAGE_LEN: usize = 12;
 
 struct State {
     writer: Option<mpsc::Sender<Vec<u8>>>,
-    pending: HashMap<u16, oneshot::Sender<Vec<u8>>>,
+    pending: HashMap<u16, Pending>,
     /// Which connection the writer and pending queries belong to.
     epoch: u64,
+    next_token: u64,
+}
+
+struct Registration {
+    id: u16,
+    writer: mpsc::Sender<Vec<u8>>,
+    epoch: u64,
+    token: u64,
+}
+
+struct Pending {
+    /// Tells this registration apart from a later one that reuses the ID.
+    token: u64,
+    reply: oneshot::Sender<Vec<u8>>,
 }
 
 /// One logical connection to an upstream that is reopened by `attach`.
@@ -40,6 +54,7 @@ impl StreamClient {
                 writer: None,
                 pending: HashMap::new(),
                 epoch: 0,
+                next_token: 0,
             })),
             max_reply,
             write_timeout,
@@ -86,12 +101,15 @@ impl StreamClient {
         deadline: Instant,
     ) -> Result<Vec<u8>, UpstreamError> {
         let (reply_sender, reply) = oneshot::channel();
-        let (id, writer, epoch) = self.register(reply_sender)?;
+        let registration = self.register(reply_sender)?;
+        let id = registration.id;
         let _unregister = Unregister {
             state: &self.state,
             id,
-            epoch,
+            epoch: registration.epoch,
+            token: registration.token,
         };
+        let writer = registration.writer;
 
         request[0..2].copy_from_slice(&id.to_be_bytes());
         let mut frame = Vec::with_capacity(request.len() + 2);
@@ -120,16 +138,26 @@ impl StreamClient {
     fn register(
         &self,
         reply_sender: oneshot::Sender<Vec<u8>>,
-    ) -> Result<(u16, mpsc::Sender<Vec<u8>>, u64), UpstreamError> {
+    ) -> Result<Registration, UpstreamError> {
         let mut state = self.state.lock().unwrap();
         let writer = state.writer.clone().ok_or(UpstreamError::Closed)?;
+        let token = state.next_token;
 
         for _ in 0..ID_ATTEMPTS {
             let id = random_u64() as u16;
             if let Entry::Vacant(slot) = state.pending.entry(id) {
-                slot.insert(reply_sender);
+                slot.insert(Pending {
+                    token,
+                    reply: reply_sender,
+                });
+                state.next_token += 1;
 
-                return Ok((id, writer, state.epoch));
+                return Ok(Registration {
+                    id,
+                    writer,
+                    epoch: state.epoch,
+                    token,
+                });
             }
         }
 
@@ -141,12 +169,17 @@ struct Unregister<'a> {
     state: &'a Mutex<State>,
     id: u16,
     epoch: u64,
+    token: u64,
 }
 
 impl Drop for Unregister<'_> {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap();
-        if state.epoch == self.epoch {
+        let is_ours = state
+            .pending
+            .get(&self.id)
+            .is_some_and(|pending| pending.token == self.token);
+        if state.epoch == self.epoch && is_ours {
             state.pending.remove(&self.id);
         }
     }
@@ -160,44 +193,54 @@ struct Session {
 }
 
 impl Session {
-    async fn run<S>(self, stream: S, mut outgoing: mpsc::Receiver<Vec<u8>>)
+    /// Reads and writes independently: a write stuck on a server that is not
+    /// reading must not stop us from reading what that server sends. Whichever
+    /// side ends first ends the session.
+    async fn run<S>(self, stream: S, outgoing: mpsc::Receiver<Vec<u8>>)
     where
         S: AsyncRead + AsyncWrite,
     {
-        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (reader, writer) = tokio::io::split(stream);
+
+        tokio::select! {
+            () = self.read_frames(reader) => {}
+            () = self.write_frames(writer, outgoing) => {}
+        }
+
+        self.close();
+    }
+
+    async fn read_frames<R>(&self, mut reader: R)
+    where
+        R: AsyncRead + Unpin,
+    {
         let mut scratch = [0u8; READ_CHUNK];
         let mut buffered = Vec::new();
 
         loop {
-            tokio::select! {
-                read = reader.read(&mut scratch) => {
-                    match read {
-                        Ok(0) | Err(_) => {
-                            break;
-                        }
+            let Ok(count @ 1..) = reader.read(&mut scratch).await else {
+                return;
+            };
 
-                        Ok(count) => {
-                            buffered.extend_from_slice(&scratch[..count]);
-                            if self.dispatch_frames(&mut buffered).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                frame = outgoing.recv() => {
-                    let Some(frame) = frame else {
-                        break;
-                    };
-
-                    if write_frame(&mut writer, &frame, self.write_timeout).await.is_err() {
-                        break;
-                    }
-                }
+            buffered.extend_from_slice(&scratch[..count]);
+            if self.dispatch_frames(&mut buffered).is_err() {
+                return;
             }
         }
+    }
 
-        self.close();
+    async fn write_frames<W>(&self, mut writer: W, mut outgoing: mpsc::Receiver<Vec<u8>>)
+    where
+        W: AsyncWrite + Unpin,
+    {
+        while let Some(frame) = outgoing.recv().await {
+            if write_frame(&mut writer, &frame, self.write_timeout)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
     }
 
     /// Hands every complete frame in `buffered` to its waiting query.
@@ -232,7 +275,7 @@ impl Session {
         };
 
         if let Some(waiting) = waiting {
-            let _ = waiting.send(message.to_vec());
+            let _ = waiting.reply.send(message.to_vec());
         }
     }
 
@@ -265,6 +308,7 @@ where
 #[cfg(test)]
 mod tests {
     use tokio::io::{DuplexStream, duplex};
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::dns::test_util::QuerySpec;
@@ -465,5 +509,65 @@ mod tests {
             .unwrap();
 
         assert_eq!(&reply[12..], b"new");
+    }
+
+    #[tokio::test]
+    async fn an_id_reused_after_delivery_is_not_unregistered_by_the_old_query() {
+        let client = client();
+        let (ours, _server) = duplex(4096);
+        client.attach(ours);
+        let (old_sender, _old_reply) = oneshot::channel();
+        let old = client.register(old_sender).unwrap();
+        let (id, epoch, old_token) = (old.id, old.epoch, old.token);
+        // The reply was delivered, which removes the entry before the query's
+        // guard runs; a new query then draws the same ID.
+        client.state.lock().unwrap().pending.remove(&id);
+        let (new_sender, _new_reply) = oneshot::channel();
+        let new_token = old_token + 100;
+        client.state.lock().unwrap().pending.insert(
+            id,
+            Pending {
+                token: new_token,
+                reply: new_sender,
+            },
+        );
+
+        drop(Unregister {
+            state: &client.state,
+            id,
+            epoch,
+            token: old_token,
+        });
+
+        let state = client.state.lock().unwrap();
+        assert_eq!(
+            state.pending.get(&id).map(|pending| pending.token),
+            Some(new_token)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_write_does_not_stop_reading_the_servers_reply() {
+        let client = client();
+        let (ours, mut server) = duplex(256);
+        client.attach(ours);
+
+        // The server answers before it has read the whole query, so both
+        // directions are full at the same time: the query is larger than the
+        // pipe and so is the reply.
+        let server_task = tokio::spawn(async move {
+            let mut start = [0u8; 4];
+            server.read_exact(&mut start).await.unwrap();
+            write_reply(&mut server, [start[2], start[3]], &[7; 2000]).await;
+            let mut rest = vec![0u8; 1000 + 12 - 2];
+            server.read_exact(&mut rest).await.unwrap();
+            server
+        });
+        let mut query = vec![0u8; 12 + 1000];
+
+        let reply = client.query(&mut query, deadline()).await.unwrap();
+
+        assert_eq!(reply.len(), 12 + 2000);
+        drop(server_task.await.unwrap());
     }
 }

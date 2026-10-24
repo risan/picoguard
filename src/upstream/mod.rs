@@ -38,6 +38,9 @@ pub enum UpstreamError {
     /// The connection went away before a reply arrived.
     Closed,
     BadReply,
+    /// A DoH server answered with something other than HTTP 200.
+    HttpStatus(u16),
+    ReplyTooLarge,
 }
 
 impl fmt::Display for UpstreamError {
@@ -58,6 +61,14 @@ impl fmt::Display for UpstreamError {
             UpstreamError::BadReply => {
                 write!(formatter, "invalid reply")
             }
+
+            UpstreamError::HttpStatus(status) => {
+                write!(formatter, "HTTP status {status}")
+            }
+
+            UpstreamError::ReplyTooLarge => {
+                write!(formatter, "reply too large")
+            }
         }
     }
 }
@@ -76,8 +87,9 @@ pub(crate) fn random_u64() -> u64 {
     RandomState::new().hash_one(0u8)
 }
 
-/// True when `reply` is a response to `request`: same ID, QR set, and the same
-/// question (compared without regard to letter case).
+/// True when `reply` is a response to `request`: same ID and opcode, QR set,
+/// and the same question. The name is compared without regard to letter case,
+/// the type and class exactly.
 pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
     let (Ok(request_header), Ok(reply_header)) = (Header::parse(request), Header::parse(reply))
     else {
@@ -86,6 +98,7 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
 
     if request_header.id != reply_header.id
         || reply_header.flags & flags::QR == 0
+        || request_header.opcode() != reply_header.opcode()
         || reply_header.question_count != 1
     {
         return false;
@@ -102,8 +115,10 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
     ) else {
         return false;
     };
+    let name_len = name_end - wire::HEADER_LEN;
 
-    asked.eq_ignore_ascii_case(echoed)
+    asked[..name_len].eq_ignore_ascii_case(&echoed[..name_len])
+        && asked[name_len..] == echoed[name_len..]
 }
 
 struct TcpUpstream {
@@ -133,7 +148,9 @@ impl TcpUpstream {
     }
 
     async fn ensure_connected(&self, deadline: Instant) -> Result<(), UpstreamError> {
-        let _serialize_connects = self.connect_lock.lock().await;
+        let Ok(_serialize_connects) = timeout_at(deadline, self.connect_lock.lock()).await else {
+            return Err(UpstreamError::Timeout);
+        };
         if self.client.is_connected() {
             return Ok(());
         }
@@ -152,6 +169,7 @@ impl TcpUpstream {
 /// UDP with a fall back to TCP on the same address for truncated answers.
 struct UdpUpstream {
     server: SocketAddr,
+    max_reply: usize,
     tcp: TcpUpstream,
 }
 
@@ -165,7 +183,8 @@ impl Transport {
     async fn query(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
         match self {
             Transport::Udp(upstream) => {
-                let reply = udp::exchange(upstream.server, request, deadline).await?;
+                let reply =
+                    udp::exchange(upstream.server, request, upstream.max_reply, deadline).await?;
                 let truncated = Header::parse(&reply).is_ok_and(|header| header.truncated());
                 if truncated {
                     return upstream.tcp.query(request, deadline).await;
@@ -230,7 +249,11 @@ impl Upstream {
         };
         let _permit = acquired.map_err(|_| UpstreamError::Closed)?;
 
-        self.transport.query(request, deadline).await
+        let Ok(result) = timeout_at(deadline, self.transport.query(request, deadline)).await else {
+            return Err(UpstreamError::Timeout);
+        };
+
+        result
     }
 
     fn record_success(&self, elapsed: Duration) {
@@ -368,6 +391,7 @@ fn random_unit() -> f64 {
 fn udp_transport(server: SocketAddr, limits: &LimitsConfig, timeout: Duration) -> Transport {
     Transport::Udp(UdpUpstream {
         server,
+        max_reply: limits.upstream_reply_max,
         tcp: TcpUpstream::new(server, limits, timeout),
     })
 }
@@ -895,5 +919,129 @@ mod tests {
         assert!(!is_answer_to(&query, &wrong_id));
         assert!(!is_answer_to(&query, &other_name));
         assert!(!is_answer_to(&query, &good[..10]));
+    }
+
+    #[test]
+    fn the_question_type_and_class_must_match_exactly() {
+        let query = query_for("example.com.");
+        let name_end = wire::skip_name(&query, wire::HEADER_LEN).unwrap();
+        let good = answer(&query, ANSWER_MARKER, false);
+        // Types 65 (0x41) and 97 (0x61) differ only in an ASCII case bit.
+        let mut other_type = good.clone();
+        other_type[name_end + 1] = 33;
+        let mut other_class = good.clone();
+        other_class[name_end + 3] = 3;
+        let mut asked_65 = query.clone();
+        asked_65[name_end + 1] = 0x41;
+        let mut replied_97 = answer(&asked_65, ANSWER_MARKER, false);
+        replied_97[name_end + 1] = 0x61;
+        let mut other_opcode = good.clone();
+        other_opcode[2] |= 0x08;
+
+        assert!(!is_answer_to(&query, &other_type));
+        assert!(!is_answer_to(&query, &other_class));
+        assert!(is_answer_to(
+            &asked_65,
+            &answer(&asked_65, ANSWER_MARKER, false)
+        ));
+        assert!(!is_answer_to(&asked_65, &replied_97));
+        assert!(!is_answer_to(&query, &other_opcode));
+    }
+
+    fn small_reply_limit() -> LimitsConfig {
+        LimitsConfig {
+            upstream_reply_max: 30,
+            ..LimitsConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_udp_answer_over_the_reply_limit_is_an_error() {
+        let server = good_udp().await;
+        let config = UpstreamConfig {
+            servers: vec![udp_url(&server)],
+            timeout_ms: 1000,
+            ..UpstreamConfig::default()
+        };
+        let upstreams = Upstreams::from_config(&config, &small_reply_limit()).unwrap();
+
+        let result = upstreams.query(&mut query_for("example.com.")).await;
+
+        assert!(
+            matches!(result, Err(UpstreamError::ReplyTooLarge)),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tcp_answer_over_the_reply_limit_is_an_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_tcp(listener, Arc::new(AtomicUsize::new(0)), None));
+        let config = UpstreamConfig {
+            servers: vec![format!("tcp://{address}")],
+            timeout_ms: 1000,
+            ..UpstreamConfig::default()
+        };
+        let upstreams = Upstreams::from_config(&config, &small_reply_limit()).unwrap();
+
+        let result = upstreams.query(&mut query_for("example.com.")).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn queries_waiting_behind_a_connect_keep_their_own_deadlines() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_tcp(listener, Arc::new(AtomicUsize::new(0)), None));
+        let upstreams = Arc::new(upstreams(vec![format!("tcp://{address}")], 5000));
+        let connecting = {
+            let upstreams = Arc::clone(&upstreams);
+            tokio::spawn(async move {
+                let Transport::Tcp(tcp) = &upstreams.servers[0].transport else {
+                    unreachable!();
+                };
+                let _held = tcp.connect_lock.lock().await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        let started = Instant::now();
+
+        let impatient = {
+            let upstreams = Arc::clone(&upstreams);
+            tokio::spawn(async move {
+                upstreams.servers[0]
+                    .query(
+                        &mut query_for("a.example."),
+                        Instant::now() + Duration::from_millis(80),
+                    )
+                    .await
+            })
+        };
+        let patient = {
+            let upstreams = Arc::clone(&upstreams);
+            tokio::spawn(async move {
+                upstreams.servers[0]
+                    .query(
+                        &mut query_for("b.example."),
+                        Instant::now() + Duration::from_secs(3),
+                    )
+                    .await
+            })
+        };
+
+        let impatient = impatient.await.unwrap();
+        let impatient_took = started.elapsed();
+        let patient = patient.await.unwrap();
+
+        assert!(matches!(impatient, Err(UpstreamError::Timeout)));
+        assert!(
+            impatient_took < Duration::from_millis(250),
+            "{impatient_took:?}"
+        );
+        assert!(patient.is_ok());
+        connecting.await.unwrap();
     }
 }
