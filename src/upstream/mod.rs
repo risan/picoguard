@@ -12,7 +12,7 @@ mod test_dns;
 #[cfg(test)]
 mod test_doh;
 #[cfg(test)]
-mod test_tls;
+pub(crate) mod test_tls;
 
 use std::collections::hash_map::RandomState;
 use std::fmt;

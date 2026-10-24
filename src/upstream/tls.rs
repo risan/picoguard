@@ -23,6 +23,8 @@ use super::endpoint::Remote;
 pub enum Alpn {
     H2,
     Dot,
+    /// Plain HTTPS downloads of blocklists.
+    Http1,
 }
 
 impl Alpn {
@@ -30,6 +32,7 @@ impl Alpn {
         match self {
             Alpn::H2 => b"h2",
             Alpn::Dot => b"dot",
+            Alpn::Http1 => b"http/1.1",
         }
     }
 }
@@ -79,7 +82,7 @@ fn cpuinfo_lists_aes(cpuinfo: &str) -> bool {
 pub struct Tls {
     roots: Arc<RootCertStore>,
     has_aes: bool,
-    configs: [OnceLock<Arc<ClientConfig>>; 4],
+    configs: [OnceLock<Arc<ClientConfig>>; 6],
 }
 
 impl Tls {
@@ -100,9 +103,9 @@ impl Tls {
 
     /// The configuration for `alpn`. Without AES, `full_suites` false means
     /// ChaCha20-Poly1305 only.
-    fn config(&self, alpn: Alpn, full_suites: bool) -> Arc<ClientConfig> {
+    pub(crate) fn config(&self, alpn: Alpn, full_suites: bool) -> Arc<ClientConfig> {
         let chacha_only = !self.has_aes && !full_suites;
-        let slot = usize::from(alpn == Alpn::Dot) * 2 + usize::from(chacha_only);
+        let slot = alpn as usize * 2 + usize::from(chacha_only);
 
         Arc::clone(self.configs[slot].get_or_init(|| {
             let mut provider = ring::default_provider();
@@ -136,7 +139,7 @@ fn build_config(provider: CryptoProvider, roots: Arc<RootCertStore>) -> ClientCo
 
 /// True when the server refused the handshake because none of the offered
 /// cipher suites was acceptable to it.
-fn lacks_shared_cipher(error: &io::Error) -> bool {
+pub(crate) fn lacks_shared_cipher(error: &io::Error) -> bool {
     let alert = error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>());
