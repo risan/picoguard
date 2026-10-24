@@ -4,7 +4,6 @@
 //! software, and falls back to the full list for an upstream that has none.
 
 use std::io;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -18,6 +17,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::UpstreamError;
+use super::endpoint::Remote;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Alpn {
@@ -155,7 +155,7 @@ pub struct TlsDialer {
     tls: Arc<Tls>,
     alpn: Alpn,
     server_name: ServerName<'static>,
-    server: SocketAddr,
+    remote: Remote,
     label: String,
     needs_full_suites: AtomicBool,
 }
@@ -165,14 +165,14 @@ impl TlsDialer {
         tls: Arc<Tls>,
         alpn: Alpn,
         server_name: ServerName<'static>,
-        server: SocketAddr,
+        remote: Remote,
         label: String,
     ) -> TlsDialer {
         TlsDialer {
             tls,
             alpn,
             server_name,
-            server,
+            remote,
             label,
             needs_full_suites: AtomicBool::new(false),
         }
@@ -202,11 +202,7 @@ impl TlsDialer {
         full_suites: bool,
         deadline: Instant,
     ) -> Result<TlsStream<TcpStream>, UpstreamError> {
-        let Ok(connected) = timeout_at(deadline, TcpStream::connect(self.server)).await else {
-            return Err(UpstreamError::Timeout);
-        };
-        let tcp = connected?;
-        tcp.set_nodelay(true)?;
+        let tcp = self.remote.connect(deadline).await?;
 
         let connector = TlsConnector::from(self.tls.config(self.alpn, full_suites));
         let Ok(handshake) =
@@ -256,7 +252,13 @@ mod tests {
         let tls = Arc::new(Tls::with_roots(pki.roots(), has_aes));
         let name = ServerName::try_from("localhost").unwrap();
 
-        TlsDialer::new(tls, alpn, name, server.address, "test".to_string())
+        TlsDialer::new(
+            tls,
+            alpn,
+            name,
+            Remote::at(server.address),
+            "test".to_string(),
+        )
     }
 
     async fn negotiated(dialer: &TlsDialer) -> SupportedCipherSuite {
@@ -350,7 +352,13 @@ mod tests {
         let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
         let tls = Arc::new(Tls::with_roots(pki.roots(), false));
         let wrong_name = ServerName::try_from("other.example").unwrap();
-        let dialer = TlsDialer::new(tls, Alpn::H2, wrong_name, server.address, "test".into());
+        let dialer = TlsDialer::new(
+            tls,
+            Alpn::H2,
+            wrong_name,
+            Remote::at(server.address),
+            "test".into(),
+        );
 
         let result = dialer.connect(deadline()).await;
 
@@ -383,7 +391,13 @@ mod tests {
         let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
         let tls = Arc::new(Tls::with_roots(pki.roots(), true));
         let name = ServerName::try_from("127.0.0.1").unwrap();
-        let dialer = TlsDialer::new(tls, Alpn::H2, name, server.address, "test".into());
+        let dialer = TlsDialer::new(
+            tls,
+            Alpn::H2,
+            name,
+            Remote::at(server.address),
+            "test".into(),
+        );
 
         assert!(dialer.connect(deadline()).await.is_ok());
     }
@@ -394,7 +408,13 @@ mod tests {
         let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
         let tls = Arc::new(Tls::with_webpki_roots());
         let name = ServerName::try_from("localhost").unwrap();
-        let dialer = TlsDialer::new(tls, Alpn::H2, name, server.address, "test".into());
+        let dialer = TlsDialer::new(
+            tls,
+            Alpn::H2,
+            name,
+            Remote::at(server.address),
+            "test".into(),
+        );
 
         assert!(dialer.connect(deadline()).await.is_err());
     }

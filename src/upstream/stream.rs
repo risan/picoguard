@@ -652,6 +652,7 @@ mod tests {
         use tokio_rustls::server::TlsStream;
 
         use super::*;
+        use crate::upstream::endpoint::Remote;
         use crate::upstream::test_dns::{address_of, answer, query_for};
         use crate::upstream::test_tls::{TestPki, TlsServer};
         use crate::upstream::tls::{Alpn, Tls};
@@ -686,7 +687,13 @@ mod tests {
         ) -> StreamUpstream {
             let tls = Arc::new(Tls::with_roots(pki.roots(), true));
             let name = ServerName::try_from("localhost").unwrap();
-            let dialer = TlsDialer::new(tls, Alpn::Dot, name, address, "test".to_string());
+            let dialer = TlsDialer::new(
+                tls,
+                Alpn::Dot,
+                name,
+                Remote::at(address),
+                "test".to_string(),
+            );
 
             StreamUpstream::new(Dial::Tls(dialer), limits, Duration::from_secs(2))
         }

@@ -2,12 +2,15 @@
 //! speed, with one retry on the next best server.
 
 pub mod doh;
+pub mod endpoint;
 pub mod stream;
 pub mod tls;
 mod udp;
 
 #[cfg(test)]
 mod test_dns;
+#[cfg(test)]
+mod test_doh;
 #[cfg(test)]
 mod test_tls;
 
@@ -19,18 +22,18 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustls::pki_types::ServerName;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
 use crate::config::{LimitsConfig, UpstreamConfig};
 use crate::dns::wire::{self, Header, flags};
 
+use doh::DohUpstream;
+use endpoint::Bootstrap;
 use stream::{Dial, StreamUpstream};
 use tls::{Alpn, Tls, TlsDialer};
 
 const DEFAULT_DNS_PORT: u16 = 53;
-const DEFAULT_DOT_PORT: u16 = 853;
 const INITIAL_SRTT_MS: f64 = 100.0;
 const SRTT_WEIGHT_OF_NEW_SAMPLE: f64 = 0.3;
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
@@ -138,6 +141,7 @@ enum Transport {
     Udp(UdpUpstream),
     Tcp(StreamUpstream),
     Dot(StreamUpstream),
+    Doh(DohUpstream),
 }
 
 impl Transport {
@@ -157,6 +161,8 @@ impl Transport {
             Transport::Tcp(upstream) | Transport::Dot(upstream) => {
                 upstream.query(request, deadline).await
             }
+
+            Transport::Doh(upstream) => upstream.query(request, deadline).await,
         }
     }
 }
@@ -249,26 +255,35 @@ pub struct Upstreams {
 }
 
 impl Upstreams {
-    /// Builds the servers named in the config. `https://` still fails until
-    /// DoH is wired in.
+    /// Builds the servers named in the config.
     pub fn from_config(
         upstream: &UpstreamConfig,
         limits: &LimitsConfig,
     ) -> Result<Upstreams, String> {
-        Upstreams::with_tls(upstream, limits, Arc::new(Tls::with_webpki_roots()))
+        let bootstrap = Bootstrap::new(&upstream.bootstrap);
+
+        Upstreams::with_parts(
+            upstream,
+            limits,
+            Arc::new(Tls::with_webpki_roots()),
+            Arc::new(bootstrap),
+        )
     }
 
-    /// Like `from_config`, with the TLS settings (roots, AES policy) given.
-    pub fn with_tls(
+    /// Like `from_config`, with the TLS settings (roots, AES policy) and the
+    /// bootstrap resolver given.
+    pub fn with_parts(
         upstream: &UpstreamConfig,
         limits: &LimitsConfig,
         tls: Arc<Tls>,
+        bootstrap: Arc<Bootstrap>,
     ) -> Result<Upstreams, String> {
         let timeout = Duration::from_millis(upstream.timeout_ms);
         let context = Context {
             limits,
             timeout,
             tls: &tls,
+            bootstrap: &bootstrap,
         };
         let mut servers = Vec::new();
 
@@ -378,6 +393,7 @@ struct Context<'a> {
     limits: &'a LimitsConfig,
     timeout: Duration,
     tls: &'a Arc<Tls>,
+    bootstrap: &'a Arc<Bootstrap>,
 }
 
 fn parse_server(spec: &str, context: &Context) -> Result<Transport, String> {
@@ -402,40 +418,38 @@ fn parse_server(spec: &str, context: &Context) -> Result<Transport, String> {
     }
 
     if let Some(rest) = spec.strip_prefix("tls://") {
-        return parse_tls(spec, rest, context);
+        let target = endpoint::parse_tls(spec, rest, context.bootstrap)?;
+        let dialer = TlsDialer::new(
+            Arc::clone(context.tls),
+            Alpn::Dot,
+            target.server_name,
+            target.remote,
+            spec.to_string(),
+        );
+
+        return Ok(Transport::Dot(StreamUpstream::new(
+            Dial::Tls(dialer),
+            limits,
+            timeout,
+        )));
+    }
+
+    if let Some(rest) = spec.strip_prefix("https://") {
+        let (target, uri) = endpoint::parse_https(spec, rest, context.bootstrap)?;
+        let dialer = TlsDialer::new(
+            Arc::clone(context.tls),
+            Alpn::H2,
+            target.server_name,
+            target.remote,
+            spec.to_string(),
+        );
+
+        return Ok(Transport::Doh(DohUpstream::new(dialer, uri, limits)));
     }
 
     Err(format!(
         "upstream {spec}: encrypted upstreams are not supported yet, use udp:// or tcp://"
     ))
-}
-
-/// `tls://IP[:port][#servername]`. Without a server name the certificate must
-/// be valid for the IP.
-fn parse_tls(spec: &str, rest: &str, context: &Context) -> Result<Transport, String> {
-    let (address, name) = rest.split_once('#').unwrap_or((rest, ""));
-    let server = parse_address(spec, address, DEFAULT_DOT_PORT)?;
-    let name = if name.is_empty() {
-        server.ip().to_string()
-    } else {
-        name.to_string()
-    };
-    let server_name = ServerName::try_from(name)
-        .map_err(|_| format!("upstream {spec}: invalid server name after #"))?;
-    let dialer = TlsDialer::new(
-        Arc::clone(context.tls),
-        Alpn::Dot,
-        server_name,
-        server,
-        spec.to_string(),
-    );
-    let dial = Dial::Tls(dialer);
-
-    Ok(Transport::Dot(StreamUpstream::new(
-        dial,
-        context.limits,
-        context.timeout,
-    )))
 }
 
 fn parse_address(spec: &str, address: &str, default_port: u16) -> Result<SocketAddr, String> {
@@ -458,7 +472,11 @@ mod tests {
     use tokio::net::{TcpListener, UdpSocket};
 
     use super::*;
-    use crate::upstream::test_dns::{ANSWER_MARKER, address_of, answer, query_for};
+    use crate::upstream::test_dns::{
+        ANSWER_MARKER, FakeDns, address_of, answer, fake_dns, query_for,
+    };
+    use crate::upstream::test_doh::{doh_server, respond_with_answer};
+    use crate::upstream::test_tls::{TestPki, TlsServer};
 
     struct Fake {
         address: SocketAddr,
@@ -623,9 +641,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_truncated_udp_answer_is_fetched_again_over_tcp() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The same port number for TCP and UDP; another test may hold the UDP
+        // side of a port that was free for TCP, so draw again.
+        let (listener, udp) = loop {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            if let Ok(udp) = UdpSocket::bind(address).await {
+                break (listener, udp);
+            }
+        };
         let address = listener.local_addr().unwrap();
-        let udp = UdpSocket::bind(address).await.unwrap();
         tokio::spawn(async move {
             let mut buffer = [0u8; 2048];
             while let Ok((length, peer)) = udp.recv_from(&mut buffer).await {
@@ -857,23 +882,26 @@ mod tests {
         assert!(health.retry_at.is_none());
     }
 
-    fn context<'a>(limits: &'a LimitsConfig, tls: &'a Arc<Tls>) -> Context<'a> {
-        Context {
-            limits,
+    fn parse(spec: &str, bootstrap: &[&str]) -> Result<Transport, String> {
+        let tls = Arc::new(Tls::with_webpki_roots());
+        let limits = LimitsConfig::default();
+        let bootstrap: Vec<IpAddr> = bootstrap.iter().map(|ip| ip.parse().unwrap()).collect();
+        let bootstrap = Arc::new(Bootstrap::new(&bootstrap));
+        let context = Context {
+            limits: &limits,
             timeout: Duration::from_secs(1),
-            tls,
-        }
+            tls: &tls,
+            bootstrap: &bootstrap,
+        };
+
+        parse_server(spec, &context)
     }
 
     #[test]
     fn server_urls_parse_with_default_ports() {
-        let tls = Arc::new(Tls::with_webpki_roots());
-        let limits = LimitsConfig::default();
-        let context = context(&limits, &tls);
-
-        let udp = parse_server("udp://9.9.9.10", &context);
-        let v6 = parse_server("udp://[::1]:5353", &context);
-        let tcp = parse_server("tcp://192.168.1.1:5300", &context);
+        let udp = parse("udp://9.9.9.10", &[]);
+        let v6 = parse("udp://[::1]:5353", &[]);
+        let tcp = parse("tcp://192.168.1.1:5300", &[]);
 
         assert!(
             matches!(udp, Ok(Transport::Udp(ref u)) if u.server == "9.9.9.10:53".parse().unwrap())
@@ -887,18 +915,157 @@ mod tests {
     }
 
     #[test]
-    fn bad_and_encrypted_server_urls_are_errors() {
-        let tls = Arc::new(Tls::with_webpki_roots());
-        let limits = LimitsConfig::default();
-        let context = context(&limits, &tls);
+    fn encrypted_urls_map_to_dot_and_doh_transports() {
+        let doh_ip = parse("https://1.1.1.1/dns-query", &[]);
+        let doh_host = parse("https://dns.example/dns-query", &["9.9.9.9"]);
+        let dot_ip = parse("tls://1.1.1.1#cloudflare-dns.com", &[]);
+        let dot_host = parse("tls://dns.quad9.net", &["9.9.9.9"]);
 
-        let encrypted = parse_server("https://1.1.1.1/dns-query", &context)
-            .err()
-            .unwrap();
-        let hostname = parse_server("udp://dns.example", &context).err().unwrap();
+        assert!(matches!(doh_ip, Ok(Transport::Doh(_))));
+        assert!(matches!(doh_host, Ok(Transport::Doh(_))));
+        assert!(matches!(
+            dot_ip,
+            Ok(Transport::Dot(StreamUpstream {
+                dial: Dial::Tls(_),
+                ..
+            }))
+        ));
+        assert!(matches!(dot_host, Ok(Transport::Dot(_))));
+    }
 
-        assert!(encrypted.contains("not supported yet"), "{encrypted}");
+    #[test]
+    fn bad_server_urls_are_errors() {
+        let hostname = parse("udp://dns.example", &[]).err().unwrap();
+        let no_bootstrap = parse("https://dns.example/dns-query", &[]).err().unwrap();
+        let no_bootstrap_dot = parse("tls://dns.example", &[]).err().unwrap();
+        let bad_name = parse("tls://1.1.1.1#not a name", &[]).err().unwrap();
+
         assert!(hostname.contains("IP address"), "{hostname}");
+        assert!(
+            no_bootstrap.contains("upstream.bootstrap"),
+            "{no_bootstrap}"
+        );
+        assert!(no_bootstrap_dot.contains("upstream.bootstrap"));
+        assert!(bad_name.contains("server name"), "{bad_name}");
+    }
+
+    #[test]
+    fn the_default_config_builds_four_doh_upstreams_without_a_bootstrap() {
+        let upstreams =
+            Upstreams::from_config(&UpstreamConfig::default(), &LimitsConfig::default()).unwrap();
+
+        assert_eq!(upstreams.servers.len(), 4);
+        assert!(
+            upstreams
+                .servers
+                .iter()
+                .all(|server| matches!(server.transport, Transport::Doh(_)))
+        );
+    }
+
+    async fn dot_echo_server(pki: &TestPki) -> TlsServer {
+        let config = pki.server_config(&["dot"], rustls::crypto::ring::default_provider());
+
+        TlsServer::start(config, |mut stream| async move {
+            loop {
+                let mut length = [0u8; 2];
+                if stream.read_exact(&mut length).await.is_err() {
+                    break;
+                }
+
+                let mut query = vec![0; usize::from(u16::from_be_bytes(length))];
+                if stream.read_exact(&mut query).await.is_err() {
+                    break;
+                }
+
+                let reply = answer(&query, ANSWER_MARKER, false);
+                let mut frame = (reply.len() as u16).to_be_bytes().to_vec();
+                frame.extend_from_slice(&reply);
+                if stream.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+    }
+
+    /// Queries `spec` through a full `Upstreams`, trusting the test CA and
+    /// resolving host names through `dns`.
+    async fn query_encrypted(pki: &TestPki, dns: &FakeDns, spec: String) -> Vec<u8> {
+        let config = UpstreamConfig {
+            servers: vec![spec],
+            timeout_ms: 3000,
+            ..UpstreamConfig::default()
+        };
+        let tls = Arc::new(Tls::with_roots(pki.roots(), true));
+        let bootstrap = Arc::new(Bootstrap::at(vec![dns.address]));
+        let upstreams =
+            Upstreams::with_parts(&config, &LimitsConfig::default(), tls, bootstrap).unwrap();
+
+        upstreams
+            .query(&mut query_for("example.com."))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn doh_urls_with_an_ip_or_a_bootstrapped_host_name_answer() {
+        let pki = TestPki::new();
+        let dns = fake_dns(vec![std::net::Ipv4Addr::LOCALHOST], Vec::new()).await;
+        let server = doh_server(&pki, |_, body| respond_with_answer(body)).await;
+        let port = server.address.port();
+
+        let by_ip =
+            query_encrypted(&pki, &dns, format!("https://127.0.0.1:{port}/dns-query")).await;
+        let by_name =
+            query_encrypted(&pki, &dns, format!("https://localhost:{port}/dns-query")).await;
+
+        assert_eq!(address_of(&by_ip), ANSWER_MARKER);
+        assert_eq!(address_of(&by_name), ANSWER_MARKER);
+        assert_eq!(
+            dns.queries.load(Ordering::SeqCst),
+            2,
+            "only the host name was resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn dot_urls_with_an_ip_a_server_name_or_a_bootstrapped_host_answer() {
+        let pki = TestPki::new();
+        let dns = fake_dns(vec![std::net::Ipv4Addr::LOCALHOST], Vec::new()).await;
+        let server = dot_echo_server(&pki).await;
+        let port = server.address.port();
+
+        let by_ip = query_encrypted(&pki, &dns, format!("tls://127.0.0.1:{port}")).await;
+        let named = query_encrypted(&pki, &dns, format!("tls://127.0.0.1:{port}#localhost")).await;
+        let by_name = query_encrypted(&pki, &dns, format!("tls://localhost:{port}")).await;
+
+        assert_eq!(address_of(&by_ip), ANSWER_MARKER);
+        assert_eq!(address_of(&named), ANSWER_MARKER);
+        assert_eq!(address_of(&by_name), ANSWER_MARKER);
+        assert_eq!(dns.queries.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_certificate_for_another_name_is_refused() {
+        let pki = TestPki::new();
+        let server = dot_echo_server(&pki).await;
+        let config = UpstreamConfig {
+            servers: vec![format!(
+                "tls://127.0.0.1:{}#other.example",
+                server.address.port()
+            )],
+            timeout_ms: 1000,
+            ..UpstreamConfig::default()
+        };
+        let tls = Arc::new(Tls::with_roots(pki.roots(), true));
+        let bootstrap = Arc::new(Bootstrap::at(Vec::new()));
+        let upstreams =
+            Upstreams::with_parts(&config, &LimitsConfig::default(), tls, bootstrap).unwrap();
+
+        let result = upstreams.query(&mut query_for("example.com.")).await;
+
+        assert!(result.is_err());
     }
 
     #[test]

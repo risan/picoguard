@@ -18,7 +18,7 @@ use super::tls::TlsDialer;
 use super::{UpstreamError, is_answer_to};
 use crate::config::LimitsConfig;
 
-const DNS_MESSAGE: &str = "application/dns-message";
+pub(super) const DNS_MESSAGE: &str = "application/dns-message";
 
 type Sender = http2::SendRequest<Full<Bytes>>;
 
@@ -248,124 +248,29 @@ fn from_hyper(error: hyper::Error) -> UpstreamError {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
     use std::net::SocketAddr;
-    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use http::request::Parts;
-    use http_body_util::combinators::BoxBody;
-    use hyper::body::{Frame, SizeHint};
-    use hyper::service::service_fn;
-    use rustls::crypto::ring;
     use rustls::pki_types::ServerName;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::upstream::endpoint::Remote;
     use crate::upstream::test_dns::{ANSWER_MARKER, address_of, answer, query_for};
+    use crate::upstream::test_doh::{
+        Reaction, Unannounced, dns_message, doh_config, doh_server, respond_with_answer, serve_doh,
+    };
     use crate::upstream::test_tls::{TestPki, TlsServer};
     use crate::upstream::tls::{Alpn, Tls};
-
-    type ReplyBody = BoxBody<Bytes, Infallible>;
-    type ServerStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
-    type Handled = Pin<Box<dyn Future<Output = ()> + Send>>;
-
-    /// What a test server does with one request.
-    struct Reaction {
-        delay: Duration,
-        response: Response<ReplyBody>,
-    }
-
-    fn dns_message(bytes: Vec<u8>) -> Response<ReplyBody> {
-        Response::builder()
-            .header(CONTENT_TYPE, DNS_MESSAGE)
-            .body(Full::new(Bytes::from(bytes)).boxed())
-            .unwrap()
-    }
-
-    fn respond_with_answer(body: &[u8]) -> Reaction {
-        Reaction {
-            delay: Duration::ZERO,
-            response: dns_message(answer(body, ANSWER_MARKER, false)),
-        }
-    }
-
-    /// A chunked body of `chunks` times 16 KiB that announces no length.
-    struct Unannounced {
-        chunks: usize,
-    }
-
-    impl Body for Unannounced {
-        type Data = Bytes;
-        type Error = Infallible;
-
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-            if self.chunks == 0 {
-                return Poll::Ready(None);
-            }
-
-            self.chunks -= 1;
-
-            Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![0u8; 16 * 1024])))))
-        }
-
-        fn size_hint(&self) -> SizeHint {
-            SizeHint::default()
-        }
-    }
-
-    fn doh_config(pki: &TestPki) -> rustls::ServerConfig {
-        pki.server_config(&["h2"], ring::default_provider())
-    }
-
-    async fn doh_server(
-        pki: &TestPki,
-        behavior: impl Fn(&Parts, &[u8]) -> Reaction + Send + Sync + 'static,
-    ) -> TlsServer {
-        let behavior = Arc::new(behavior);
-
-        TlsServer::start(doh_config(pki), serve_doh(behavior)).await
-    }
-
-    fn serve_doh<B>(behavior: Arc<B>) -> impl Fn(ServerStream) -> Handled + Send + Sync + 'static
-    where
-        B: Fn(&Parts, &[u8]) -> Reaction + Send + Sync + 'static,
-    {
-        move |stream| {
-            let behavior = Arc::clone(&behavior);
-
-            Box::pin(async move {
-                let service = service_fn(move |request: Request<Incoming>| {
-                    let behavior = Arc::clone(&behavior);
-
-                    async move {
-                        let (parts, body) = request.into_parts();
-                        let body = body.collect().await.unwrap().to_bytes();
-                        let reaction = behavior(&parts, &body);
-                        tokio::time::sleep(reaction.delay).await;
-
-                        Ok::<_, Infallible>(reaction.response)
-                    }
-                });
-
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await;
-            })
-        }
-    }
 
     fn upstream_for(pki: &TestPki, address: SocketAddr, limits: &LimitsConfig) -> DohUpstream {
         let tls = Arc::new(Tls::with_roots(pki.roots(), true));
         let name = ServerName::try_from("localhost").unwrap();
-        let dialer = TlsDialer::new(tls, Alpn::H2, name, address, "test".to_string());
+        let dialer = TlsDialer::new(tls, Alpn::H2, name, Remote::at(address), "test".to_string());
         let uri: Uri = "https://localhost/dns-query".parse().unwrap();
 
         DohUpstream::new(dialer, uri, limits)
