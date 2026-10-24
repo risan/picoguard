@@ -300,12 +300,25 @@ impl<'a> Iterator for Labels<'a> {
     }
 }
 
-/// Reads the name at `start`, following compression pointers. Returns the
-/// lowercased name and the offset just after it in the original position.
-pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
-    let mut name = Name::empty();
+/// A name reached through at most this many compression pointers is accepted;
+/// real messages use one or two.
+const MAX_NAME_POINTERS: usize = 128;
+
+/// The one walker over names, for decompression, skipping and validation.
+/// Follows compression pointers, which must point strictly backward and at
+/// most `MAX_NAME_POINTERS` times, and fails when the expanded name passes
+/// 255 bytes, so no input can make it loop. Calls `on_label` for every label
+/// of the expanded name. Returns the offset after the name as written at
+/// `start`, where the next field begins.
+fn walk_name<F>(msg: &[u8], start: usize, mut on_label: F) -> Result<usize, WireError>
+where
+    F: FnMut(&[u8]) -> Result<(), WireError>,
+{
     let mut position = start;
-    let mut end = None;
+    let mut span_end = None;
+    let mut pointers = 0;
+    // The terminating zero label.
+    let mut expanded_len = 1;
 
     loop {
         let first = *msg.get(position).ok_or(WireError::Truncated)?;
@@ -314,28 +327,30 @@ pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
             0x00 => {
                 let length = usize::from(first);
                 if length == 0 {
-                    name.push_terminator();
+                    return Ok(span_end.unwrap_or(position + 1));
+                }
 
-                    return Ok((name, end.unwrap_or(position + 1)));
+                expanded_len += 1 + length;
+                if expanded_len > MAX_NAME_LEN {
+                    return Err(WireError::BadName);
                 }
 
                 let label = msg
                     .get(position + 1..position + 1 + length)
                     .ok_or(WireError::Truncated)?;
-                name.push_label(label)?;
+                on_label(label)?;
                 position += 1 + length;
             }
 
             0xC0 => {
                 let second = *msg.get(position + 1).ok_or(WireError::Truncated)?;
                 let target = (usize::from(first & 0x3F) << 8) | usize::from(second);
-                if end.is_none() {
-                    end = Some(position + 2);
+                if span_end.is_none() {
+                    span_end = Some(position + 2);
                 }
 
-                // Only backward pointers: cycles then need label bytes, which
-                // the 255-byte name limit stops.
-                if target >= position {
+                pointers += 1;
+                if target >= position || pointers > MAX_NAME_POINTERS {
                     return Err(WireError::BadName);
                 }
 
@@ -349,35 +364,20 @@ pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
     }
 }
 
-/// Returns the offset just after the name at `start` without decompressing it.
+/// Reads the name at `start`, following compression pointers. Returns the
+/// lowercased name and the offset just after it in the original position.
+pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
+    let mut name = Name::empty();
+    let end = walk_name(msg, start, |label| name.push_label(label))?;
+    name.push_terminator();
+
+    Ok((name, end))
+}
+
+/// Returns the offset just after the name at `start`. The name is walked
+/// without being kept, so a bad pointer is an error here too.
 pub fn skip_name(msg: &[u8], start: usize) -> Result<usize, WireError> {
-    let mut position = start;
-
-    loop {
-        let first = *msg.get(position).ok_or(WireError::Truncated)?;
-
-        match first & 0xC0 {
-            0x00 => {
-                if first == 0 {
-                    return Ok(position + 1);
-                }
-
-                position += 1 + usize::from(first);
-            }
-
-            0xC0 => {
-                if position + 2 > msg.len() {
-                    return Err(WireError::Truncated);
-                }
-
-                return Ok(position + 2);
-            }
-
-            _ => {
-                return Err(WireError::BadName);
-            }
-        }
-    }
+    walk_name(msg, start, |_| Ok(()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -967,6 +967,152 @@ mod tests {
         let result = read_name(&msg, 2);
 
         assert_eq!(result, Err(WireError::BadName));
+    }
+
+    fn pointer_to(target: usize) -> [u8; 2] {
+        [0xC0 | (target >> 8) as u8, target as u8]
+    }
+
+    /// A response with the given question name and one record per `(owner,
+    /// rtype, rdata)`; every record is class IN with TTL 60.
+    fn response_of(question_name: &[u8], records: &[(&[u8], u16, &[u8])]) -> Vec<u8> {
+        let mut bytes = vec![
+            0x12,
+            0x34,
+            0x81,
+            0x80,
+            0,
+            1,
+            0,
+            records.len() as u8,
+            0,
+            0,
+            0,
+            0,
+        ];
+        bytes.extend_from_slice(question_name);
+        bytes.extend_from_slice(&[0, 1, 0, 1]);
+
+        for (owner, rtype, rdata) in records {
+            bytes.extend_from_slice(owner);
+            bytes.extend_from_slice(&rtype.to_be_bytes());
+            bytes.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+            bytes.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(rdata);
+        }
+
+        bytes
+    }
+
+    const EXAMPLE_COM: &[u8] = b"\x07example\x03com\x00";
+    const A_RDATA: &[u8] = &[192, 0, 2, 1];
+
+    fn owner_offset(question_name: &[u8]) -> usize {
+        HEADER_LEN + question_name.len() + 4
+    }
+
+    #[test]
+    fn a_response_with_a_good_compressed_owner_name_parses() {
+        let owner = pointer_to(HEADER_LEN);
+
+        let info = ResponseInfo::parse(&response_of(EXAMPLE_COM, &[(&owner, 1, A_RDATA)])).unwrap();
+
+        assert_eq!(info.ttl_offsets.len(), 1);
+    }
+
+    #[test]
+    fn response_owner_names_with_bad_pointers_are_rejected_not_skipped() {
+        let at = owner_offset(EXAMPLE_COM);
+        let with_owner = |owner: &[u8]| response_of(EXAMPLE_COM, &[(owner, 1, A_RDATA)]);
+        let cases = [
+            ("pointer to itself", with_owner(&pointer_to(at))),
+            ("pointer forward", with_owner(&pointer_to(at + 2))),
+            ("pointer past the message", with_owner(&pointer_to(9000))),
+            (
+                "label, then a pointer back to the label",
+                with_owner(&[1, b'a', pointer_to(at)[0], pointer_to(at)[1]]),
+            ),
+            ("reserved label type", with_owner(&[0x40, 0])),
+        ];
+
+        for (label, bytes) in cases {
+            assert!(ResponseInfo::parse(&bytes).is_err(), "{label}");
+        }
+    }
+
+    #[test]
+    fn an_owner_name_that_expands_past_255_bytes_is_rejected() {
+        let mut long_question = Vec::new();
+        for _ in 0..4 {
+            long_question.push(50);
+            long_question.extend_from_slice(&[b'a'; 50]);
+        }
+        long_question.push(0);
+        let mut owner = vec![60];
+        owner.extend_from_slice(&[b'b'; 60]);
+        owner.extend_from_slice(&pointer_to(HEADER_LEN));
+
+        let bytes = response_of(&long_question, &[(&owner, 1, A_RDATA)]);
+
+        assert_eq!(ResponseInfo::parse(&bytes), Err(WireError::BadName));
+    }
+
+    #[test]
+    fn a_chain_of_pointers_beyond_the_limit_is_rejected() {
+        // Record 1 carries 200 pointers, each aimed at the one before it, in
+        // opaque rdata. Record 2's owner points at the last of them.
+        let rdata_start = owner_offset(EXAMPLE_COM) + 2 + 2 + 2 + 4 + 2;
+        let mut chain = vec![0u8];
+        let mut previous = rdata_start;
+        for _ in 0..200 {
+            let this = rdata_start + chain.len();
+            chain.extend_from_slice(&pointer_to(previous));
+            previous = this;
+        }
+        let owner = pointer_to(HEADER_LEN);
+        let last_hop = pointer_to(previous);
+
+        let bytes = response_of(
+            EXAMPLE_COM,
+            &[(&owner, 99, &chain), (&last_hop, 1, A_RDATA)],
+        );
+
+        assert_eq!(ResponseInfo::parse(&bytes), Err(WireError::BadName));
+        assert_eq!(
+            skip_name(&bytes, rdata_start + chain.len() - 2),
+            Err(WireError::BadName)
+        );
+    }
+
+    #[test]
+    fn bad_pointers_in_soa_names_and_the_question_are_rejected() {
+        let owner = pointer_to(HEADER_LEN);
+        let rdata_start = owner_offset(EXAMPLE_COM) + 2 + 2 + 2 + 4 + 2;
+        let soa_with_mname = |mname: [u8; 2]| {
+            let mut rdata = mname.to_vec();
+            rdata.extend_from_slice(&pointer_to(HEADER_LEN));
+            rdata.extend_from_slice(&[0; 20]);
+            let mut bytes = response_of(EXAMPLE_COM, &[(&owner, rtype::SOA, &rdata)]);
+            // Move the record from the answer to the authority section.
+            bytes[6..10].copy_from_slice(&[0, 0, 0, 1]);
+
+            bytes
+        };
+
+        assert!(ResponseInfo::parse(&soa_with_mname(pointer_to(HEADER_LEN))).is_ok());
+        assert_eq!(
+            ResponseInfo::parse(&soa_with_mname(pointer_to(rdata_start))),
+            Err(WireError::BadName)
+        );
+        assert_eq!(
+            ResponseInfo::parse(&soa_with_mname(pointer_to(rdata_start + 8))),
+            Err(WireError::BadName)
+        );
+        let forward_question = response_of(&pointer_to(HEADER_LEN + 2), &[]);
+        assert_eq!(
+            ResponseInfo::parse(&forward_question),
+            Err(WireError::BadName)
+        );
     }
 
     #[test]
