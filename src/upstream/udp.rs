@@ -1,3 +1,4 @@
+use std::io;
 use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
@@ -20,19 +21,33 @@ pub async fn exchange(
     } else {
         ([0u16; 8], 0).into()
     };
+
     let socket = UdpSocket::bind(local).await?;
     socket.connect(server).await?;
 
     request[0..2].copy_from_slice(&(random_u64() as u16).to_be_bytes());
     socket.send(request).await?;
 
-    let mut buffer = receive_buffer(max_reply);
     loop {
-        buffer.clear();
-        let Ok(received) = timeout_at(deadline, socket.recv_buf(&mut buffer)).await else {
+        let Ok(readable) = timeout_at(deadline, socket.readable()).await else {
             return Err(UpstreamError::Timeout);
         };
-        received?;
+
+        readable?;
+
+        // Allocated only now: a query waiting for its reply holds no buffer.
+        let mut buffer = receive_buffer(max_reply);
+        match socket.try_recv_buf(&mut buffer) {
+            Ok(_) => {}
+
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                continue;
+            }
+
+            Err(error) => {
+                return Err(error.into());
+            }
+        }
 
         if !is_answer_to(request, &buffer) {
             continue;
