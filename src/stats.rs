@@ -348,6 +348,7 @@ impl Stats {
                 ..Hour::default()
             };
         }
+
         hour.total += 1;
         if blocked {
             hour.blocked += 1;
@@ -358,6 +359,7 @@ impl Stats {
         if blocked {
             inner.blocked.record(|key| key == qname, || qname.clone());
         }
+
         let client = event.client;
         inner.clients.record(|key| *key == client, || client);
 
@@ -511,6 +513,7 @@ mod tests {
                 record(&stats, "example.com", result);
             }
         }
+
         stats.record_dropped();
         stats.record_dropped();
 
@@ -569,6 +572,7 @@ mod tests {
             query.client = client(last);
             stats.record(&query);
         }
+
         let clients = stats.snapshot().top_clients;
 
         assert_eq!(clients[0].key, client(7));
@@ -582,6 +586,7 @@ mod tests {
         for name in ["a", "a", "a", "b", "c"] {
             top.record(|key| **key == *name, || name.into());
         }
+
         let entries = top.top();
 
         assert_eq!(entries.len(), 2);
@@ -639,6 +644,7 @@ mod tests {
             *truth.entry(name).or_default() += 1;
             record(&stats, name, QueryResult::Pass);
         }
+
         let reported = stats.snapshot().top_queried;
 
         let mut ranked: Vec<(&str, u64)> =
@@ -697,6 +703,7 @@ mod tests {
             wire.push(60);
             wire.extend_from_slice(&[0xff; 60]);
         }
+
         wire.push(0);
         wire[181] = last;
 
@@ -847,6 +854,7 @@ mod tests {
         for _ in 0..4 {
             record(&stats, "a.example", QueryResult::BlockedRequest);
         }
+
         time.store(MIDNIGHT + 27 * HOUR, Ordering::Relaxed);
         record(&stats, "b.example", QueryResult::Pass);
         let hourly = stats.snapshot().hourly;

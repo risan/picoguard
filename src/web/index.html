@@ -51,6 +51,8 @@ button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid
   background: var(--card); color: var(--text); cursor: pointer; }
 button:hover { border-color: var(--accent); }
 button.go { background: var(--accent); border-color: var(--accent); color: #fff; }
+#resume { display: none; }
+.paused #resume { display: inline-block; }
 .r-blocked_request, .r-blocked_response { color: var(--blocked); }
 .r-error { color: var(--warn); }
 .r-cached { color: var(--good); }
@@ -118,8 +120,15 @@ let pausedUntil = null;
 // Names and errors come from the network: only ever set as text.
 function el(tag, text, className) {
   const node = document.createElement(tag);
-  if (text !== undefined && text !== null) { node.textContent = text; }
-  if (className) { node.className = className; }
+
+  if (text !== undefined && text !== null) {
+    node.textContent = text;
+  }
+
+  if (className) {
+    node.className = className;
+  }
+
   return node;
 }
 
@@ -129,20 +138,34 @@ function table(head, rows) {
   head.forEach((h) => tr.append(el("th", h)));
   t.append(tr);
   rows.forEach((row) => t.append(row));
+
   return t;
 }
 
 function row(cells) {
   const tr = el("tr");
   cells.forEach(([text, className]) => tr.append(el("td", text, className)));
+
   return tr;
 }
 
 function duration(seconds) {
-  if (seconds === null || seconds === undefined) { return "never"; }
-  if (seconds < 60) { return seconds + " s"; }
-  if (seconds < 3600) { return Math.floor(seconds / 60) + " min"; }
-  if (seconds < 86400) { return Math.floor(seconds / 3600) + " h " + Math.floor(seconds % 3600 / 60) + " min"; }
+  if (seconds === null || seconds === undefined) {
+    return "never";
+  }
+
+  if (seconds < 60) {
+    return seconds + " s";
+  }
+
+  if (seconds < 3600) {
+    return Math.floor(seconds / 60) + " min";
+  }
+
+  if (seconds < 86400) {
+    return Math.floor(seconds / 3600) + " h " + Math.floor(seconds % 3600 / 60) + " min";
+  }
+
   return Math.floor(seconds / 86400) + " d " + Math.floor(seconds % 86400 / 3600) + " h";
 }
 
@@ -154,7 +177,11 @@ async function api(path, body) {
   };
   const response = await fetch(path, options);
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) { throw new Error(data.error || "HTTP " + response.status); }
+
+  if (!response.ok) {
+    throw new Error(data.error || "HTTP " + response.status);
+  }
+
   return data;
 }
 
@@ -168,6 +195,7 @@ function showCards(counters, percent) {
   $("cards").replaceChildren(...items.map(([label, value]) => {
     const card = el("div", undefined, "card");
     card.append(el("b", typeof value === "number" ? value.toLocaleString() : value), el("span", label));
+
     return card;
   }));
 }
@@ -182,20 +210,32 @@ function showChart(hourly) {
     const blocked = el("i");
     blocked.style.height = (h.total ? h.blocked / h.total * 100 : 0) + "%";
     bar.append(blocked);
+
     return bar;
   }));
   $("axis").replaceChildren(...hourly.map((h, i) =>
     el("span", i % 4 === 0 ? new Date(h.hour_start * 1000).getHours() : "")));
 }
 
+// A name that took over another one's slot inherited that count. If it was seen only once
+// for sure (count - max_error is 1), the entry says nothing yet and is left out.
+function worthShowing(entry) {
+  return entry.max_error === 0 || entry.count - entry.max_error > 1;
+}
+
 function showTop(id, noteId, top, name) {
   $(noteId).textContent = top.approximate ? "(approximate)" : "";
-  const rows = top.entries.slice(0, 10).map((e) => {
+  const rows = top.entries.filter(worthShowing).slice(0, 10).map((e) => {
     const exact = e.max_error === 0;
     const count = el("td", (exact ? "" : "~") + e.count.toLocaleString(), "num");
-    if (!exact) { count.title = "may be too high by up to " + e.max_error; }
+
+    if (!exact) {
+      count.title = "may be too high by up to " + e.max_error;
+    }
+
     const tr = el("tr");
     tr.append(el("td", e.key, "name"), count);
+
     return tr;
   });
   $(id).replaceChildren(rows.length ? table([name, "Queries"], rows) : el("p", "Nothing yet.", "empty"));
@@ -206,6 +246,7 @@ function showQueries(entries) {
     const time = new Date(e.time * 1000).toLocaleTimeString();
     const result = RESULTS[e.result] || e.result;
     const ms = e.latency_us < 1000 ? "<1" : Math.round(e.latency_us / 1000);
+
     return row([[time], [e.client], [e.qname, "name"], [QTYPES[e.qtype] || e.qtype],
       [result, "r-" + e.result], [e.upstream === null ? "" : "#" + e.upstream], [ms + " ms", "num"]]);
   });
@@ -259,11 +300,15 @@ async function update() {
 async function act(path, body, note) {
   try {
     await api(path, body);
-    if (note) { $("refresh-note").textContent = note; }
+
+    if (note) {
+      $("refresh-note").textContent = note;
+    }
   } catch (error) {
     $("state").textContent = error.message;
     $("state").className = "bad";
   }
+
   update();
 }
 

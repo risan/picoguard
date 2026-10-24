@@ -169,6 +169,7 @@ async fn serve_connection(stream: TcpStream, web: Arc<Web>, _slot: OwnedSemaphor
 
         async move { Ok::<_, Infallible>(web.respond(request).await) }
     });
+
     let connection = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(HEAD_TIMEOUT)
@@ -334,6 +335,7 @@ impl Web {
             Some(colon) => authority.split_at(colon),
             None => (authority, ""),
         };
+
         let is_known_name = host.parse::<Ipv4Addr>().is_ok()
             || self
                 .hostnames
@@ -347,6 +349,7 @@ impl Web {
         let Some(expected) = &self.credentials else {
             return Ok(());
         };
+
         let sent = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -469,6 +472,7 @@ impl Web {
                 until: None,
             };
         };
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -504,6 +508,7 @@ fn check_origin(headers: &HeaderMap, host: &str) -> Result<(), Rejection> {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return Ok(());
     };
+
     let is_own_origin = origin
         .to_str()
         .ok()
@@ -544,6 +549,7 @@ async fn read_body(headers: &HeaderMap, body: Incoming) -> Result<Bytes, Rejecti
             "the body is limited to 1 KiB",
         )
     };
+
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())

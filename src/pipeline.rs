@@ -56,7 +56,6 @@ enum Route {
     Local,
 }
 
-/// Who asked and since when, for the statistics.
 #[derive(Clone, Copy)]
 struct Asker {
     client: IpAddr,
@@ -77,9 +76,7 @@ impl Asker {
 enum Settled {
     /// The configuration decides this one, whatever the policy.
     Static(QueryResult),
-    /// The policy blocked the question.
     Blocked(QueryResult),
-    /// The cache had the reply.
     Cached(QueryResult),
 }
 
@@ -91,7 +88,6 @@ impl Settled {
     }
 }
 
-/// How a query ended, for the statistics.
 #[derive(Debug, Clone, Copy)]
 struct Counted {
     result: QueryResult,
@@ -112,7 +108,6 @@ impl Counted {
 #[must_use]
 pub struct Finished(Option<Counted>);
 
-/// Where the bytes of a delivery came from.
 #[derive(Debug, Clone, Copy)]
 enum Source {
     Cache,
