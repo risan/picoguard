@@ -55,7 +55,9 @@ servers = [
 
 # Blocklists. format is "auto" (default), "adblock", "hosts", "domains",
 # "wildcard", "dnsmasq" or "rpz". A list has either url or path. Per list:
-# refresh_hours = 24, max_rules = 3000000, max_body_bytes = 67108864.
+# refresh_hours = 24, max_rules = 3000000, max_body_bytes = 67108864,
+# slow_rule_budget = 8388608 (estimated bytes for rules that are not plain
+# domains; a list over it is not used).
 [[lists]]
 name = "hagezi-pro"
 url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"
@@ -108,7 +110,12 @@ format = "adblock"
 # Set both to require basic auth.
 # user = "admin"
 # password = "change-me"
+
+# [stats]
+# Entries of the query log and of each top list on the status page. Both are
+# allocated in full.
 # query_log_entries = 1000
+# top_k = 50
 
 # [state]
 # dir = "/var/lib/picoguard"
