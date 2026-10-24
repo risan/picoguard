@@ -3,7 +3,7 @@
 //! wire, as the RFC asks for cache friendliness, and restored in the reply.
 
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http::header::{ACCEPT, CONTENT_TYPE};
@@ -15,7 +15,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::time::{Instant, timeout_at};
 
 use super::tls::TlsDialer;
-use super::{UpstreamError, is_answer_to};
+use super::{Charged, UpstreamError, is_answer_to};
+use crate::budget::Budget;
 use crate::config::LimitsConfig;
 
 pub(super) const DNS_MESSAGE: &str = "application/dns-message";
@@ -66,15 +67,29 @@ impl DohUpstream {
         }
     }
 
+    #[cfg(test)]
+    async fn query(&self, request: &[u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
+        let unlimited = Budget::new(usize::MAX);
+
+        Ok(self.query_charged(request, &unlimited, deadline).await?.0)
+    }
+
     /// Sends `request` with ID 0 and returns the reply carrying the ID that
-    /// `request` has.
-    pub async fn query(&self, request: &[u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
+    /// `request` has. The bytes of the reply are charged to `budget` while
+    /// they are read, so partial bodies count too, and the charge goes to
+    /// the caller with the reply.
+    pub async fn query_charged(
+        &self,
+        request: &[u8],
+        budget: &Arc<Budget>,
+        deadline: Instant,
+    ) -> Result<Charged, UpstreamError> {
         let mut body = request.to_vec();
         body[0..2].fill(0);
         let body = Bytes::from(body);
 
         let mut connection = self.connection(deadline).await?;
-        let mut result = self.post(&connection, body.clone(), deadline).await;
+        let mut result = self.post(&connection, body.clone(), budget, deadline).await;
 
         // A reused connection may have been closed by the server since its
         // last use, which only shows when a request goes out on it.
@@ -82,14 +97,14 @@ impl DohUpstream {
         if connection_failed && !connection.fresh {
             self.discard(connection.generation);
             connection = self.connection(deadline).await?;
-            result = self.post(&connection, body, deadline).await;
+            result = self.post(&connection, body, budget, deadline).await;
         }
 
         if let Err(UpstreamError::Timeout | UpstreamError::Closed | UpstreamError::Io(_)) = result {
             self.discard(connection.generation);
         }
 
-        let mut reply = result?;
+        let (mut reply, charge) = result?;
         let Some(id) = reply.get_mut(0..2) else {
             return Err(UpstreamError::BadReply);
         };
@@ -99,15 +114,16 @@ impl DohUpstream {
             return Err(UpstreamError::BadReply);
         }
 
-        Ok(reply)
+        Ok((reply, charge))
     }
 
     async fn post(
         &self,
         connection: &Connection,
         body: Bytes,
+        budget: &Arc<Budget>,
         deadline: Instant,
-    ) -> Result<Vec<u8>, UpstreamError> {
+    ) -> Result<Charged, UpstreamError> {
         let request = Request::post(self.uri.clone())
             .header(CONTENT_TYPE, DNS_MESSAGE)
             .header(ACCEPT, DNS_MESSAGE)
@@ -118,7 +134,7 @@ impl DohUpstream {
         let exchange = async {
             let response = sender.send_request(request).await.map_err(from_hyper)?;
 
-            self.read_reply(response).await
+            self.read_reply(response, budget).await
         };
 
         let Ok(result) = timeout_at(deadline, exchange).await else {
@@ -128,7 +144,11 @@ impl DohUpstream {
         result
     }
 
-    async fn read_reply(&self, response: Response<Incoming>) -> Result<Vec<u8>, UpstreamError> {
+    async fn read_reply(
+        &self,
+        response: Response<Incoming>,
+        budget: &Arc<Budget>,
+    ) -> Result<Charged, UpstreamError> {
         if response.status() != StatusCode::OK {
             return Err(UpstreamError::HttpStatus(response.status().as_u16()));
         }
@@ -149,6 +169,11 @@ impl DohUpstream {
             return Err(UpstreamError::ReplyTooLarge);
         }
 
+        // The charge comes first and is released by dropping it, which also
+        // covers a request that is cancelled in the middle of the body.
+        let mut charge = budget
+            .try_charge(announced as usize)
+            .ok_or(UpstreamError::BudgetExhausted)?;
         let mut reply = Vec::with_capacity(announced as usize);
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(from_hyper)?;
@@ -156,14 +181,19 @@ impl DohUpstream {
                 continue;
             };
 
-            if reply.len() + data.len() > self.max_reply {
+            let length = reply.len() + data.len();
+            if length > self.max_reply {
                 return Err(UpstreamError::ReplyTooLarge);
+            }
+
+            if length > charge.bytes() && !charge.grow(length - charge.bytes()) {
+                return Err(UpstreamError::BudgetExhausted);
             }
 
             reply.extend_from_slice(&data);
         }
 
-        Ok(reply)
+        Ok((reply, charge))
     }
 
     async fn connection(&self, deadline: Instant) -> Result<Connection, UpstreamError> {
@@ -262,7 +292,8 @@ mod tests {
     use crate::upstream::endpoint::Remote;
     use crate::upstream::test_dns::{ANSWER_MARKER, address_of, answer, query_for};
     use crate::upstream::test_doh::{
-        Reaction, Unannounced, dns_message, doh_config, doh_server, respond_with_answer, serve_doh,
+        Reaction, Release, Unannounced, dns_message, doh_config, doh_server, gated_response,
+        respond_with_answer, serve_doh,
     };
     use crate::upstream::test_tls::{TestPki, TlsServer};
     use crate::upstream::tls::{Alpn, Tls};
@@ -593,6 +624,196 @@ mod tests {
 
         assert!(matches!(first, Err(UpstreamError::BadReply)));
         assert!(matches!(second, Err(UpstreamError::BadReply)));
+    }
+
+    /// A server whose replies are `size` bytes long, announced in full, of
+    /// which only the first `first` bytes are sent until the returned
+    /// releases are used.
+    async fn server_with_stalled_replies(
+        pki: &TestPki,
+        size: usize,
+        first: usize,
+    ) -> (TlsServer, Arc<Mutex<Vec<Release>>>) {
+        let stalled = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&stalled);
+        let server = doh_server(pki, move |_, body| {
+            let mut message = answer(body, ANSWER_MARKER, false);
+            message.resize(size, 0);
+            let (response, release) = gated_response(message, first);
+            recorder.lock().unwrap().push(release);
+
+            Reaction {
+                delay: Duration::ZERO,
+                response,
+            }
+        })
+        .await;
+
+        (server, stalled)
+    }
+
+    async fn until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if condition() {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        panic!("the condition did not become true");
+    }
+
+    #[tokio::test]
+    async fn partial_bodies_in_flight_never_hold_more_than_the_budget() {
+        let pki = TestPki::new();
+        let (server, stalled) = server_with_stalled_replies(&pki, 30_000, 10_000).await;
+        let upstream = Arc::new(upstream(&pki, &server));
+        let budget = Budget::new(100_000);
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (upstream, budget) = (Arc::clone(&upstream), Arc::clone(&budget));
+            tasks.push(tokio::spawn(async move {
+                upstream
+                    .query_charged(&query_for("example.com."), &budget, deadline())
+                    .await
+            }));
+        }
+
+        until(|| tasks.iter().filter(|task| task.is_finished()).count() == 5).await;
+
+        assert_eq!(budget.used(), 90_000, "three announced replies fit");
+        let mut refused = 0;
+        let mut waiting = Vec::new();
+        for task in tasks {
+            if task.is_finished() {
+                let result = task.await.unwrap();
+                assert!(
+                    matches!(result, Err(UpstreamError::BudgetExhausted)),
+                    "{result:?}"
+                );
+                refused += 1;
+            } else {
+                waiting.push(task);
+            }
+        }
+        assert_eq!(refused, 5);
+
+        until(|| stalled.lock().unwrap().len() == 8).await;
+        for release in stalled.lock().unwrap().drain(..) {
+            release.send_rest();
+        }
+        let mut held = Vec::new();
+        for task in waiting {
+            let (reply, charge) = task.await.unwrap().unwrap();
+            assert_eq!(reply.len(), 30_000);
+            assert_eq!(charge.bytes(), 30_000);
+            held.push(charge);
+        }
+        assert_eq!(budget.used(), 90_000, "the charges went to the callers");
+
+        drop(held);
+
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_in_the_middle_of_a_body_frees_the_charge() {
+        let pki = TestPki::new();
+        let (server, _stalled) = server_with_stalled_replies(&pki, 30_000, 10_000).await;
+        let upstream = upstream(&pki, &server);
+        let budget = Budget::new(100_000);
+
+        let result = upstream
+            .query_charged(
+                &query_for("example.com."),
+                &budget,
+                Instant::now() + Duration::from_millis(300),
+            )
+            .await;
+
+        assert!(matches!(result, Err(UpstreamError::Timeout)), "{result:?}");
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_query_in_the_middle_of_a_body_frees_the_charge() {
+        let pki = TestPki::new();
+        let (server, stalled) = server_with_stalled_replies(&pki, 30_000, 10_000).await;
+        let upstream = Arc::new(upstream(&pki, &server));
+        let budget = Budget::new(100_000);
+        let (task_upstream, task_budget) = (Arc::clone(&upstream), Arc::clone(&budget));
+        let task = tokio::spawn(async move {
+            task_upstream
+                .query_charged(&query_for("example.com."), &task_budget, deadline())
+                .await
+        });
+        until(|| budget.used() == 30_000 && stalled.lock().unwrap().len() == 1).await;
+
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_body_without_a_length_is_charged_as_it_arrives() {
+        let pki = TestPki::new();
+        let server = doh_server(&pki, |_, _| Reaction {
+            delay: Duration::ZERO,
+            response: Response::builder()
+                .header(CONTENT_TYPE, DNS_MESSAGE)
+                .body(Unannounced { chunks: 3 }.boxed())
+                .unwrap(),
+        })
+        .await;
+        let upstream = upstream(&pki, &server);
+        let budget = Budget::new(40_000);
+
+        let result = upstream
+            .query_charged(&query_for("example.com."), &budget, deadline())
+            .await;
+
+        assert!(
+            matches!(result, Err(UpstreamError::BudgetExhausted)),
+            "{result:?}"
+        );
+        assert_eq!(budget.used(), 0, "the failed reply gave everything back");
+    }
+
+    #[tokio::test]
+    async fn a_failed_reply_gives_its_bytes_back() {
+        let pki = TestPki::new();
+        let server = doh_server(&pki, |_, _| Reaction {
+            delay: Duration::ZERO,
+            response: dns_message(vec![7; 500]),
+        })
+        .await;
+        let budget = Budget::new(100_000);
+
+        let result = upstream(&pki, &server)
+            .query_charged(&query_for("example.com."), &budget, deadline())
+            .await;
+
+        assert!(matches!(result, Err(UpstreamError::BadReply)));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_does_not_fit_is_refused_before_it_is_read() {
+        let pki = TestPki::new();
+        let (server, _stalled) = server_with_stalled_replies(&pki, 30_000, 10_000).await;
+        let budget = Budget::new(20_000);
+
+        let result = upstream(&pki, &server)
+            .query_charged(&query_for("example.com."), &budget, deadline())
+            .await;
+
+        assert!(
+            matches!(result, Err(UpstreamError::BudgetExhausted)),
+            "{result:?}"
+        );
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]

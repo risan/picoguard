@@ -48,6 +48,30 @@ pub struct Charge {
     bytes: usize,
 }
 
+impl Charge {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Reserves `more` bytes on top of this charge, or returns false and
+    /// changes nothing when that would pass the capacity.
+    pub fn grow(&mut self, more: usize) -> bool {
+        let grown = self
+            .budget
+            .used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(more)
+                    .filter(|total| *total <= self.budget.capacity)
+            })
+            .is_ok();
+        if grown {
+            self.bytes += more;
+        }
+
+        grown
+    }
+}
+
 impl std::fmt::Debug for Budget {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "Budget({}/{})", self.used(), self.capacity)
@@ -99,5 +123,24 @@ mod tests {
         assert!(budget.try_charge(usize::MAX).is_none());
 
         assert_eq!(budget.used(), 8);
+    }
+
+    #[test]
+    fn a_charge_grows_within_the_capacity_and_gives_back_all_it_holds() {
+        let budget = Budget::new(100);
+        let mut charge = budget.try_charge(30).unwrap();
+
+        assert!(charge.grow(50));
+        assert_eq!(charge.bytes(), 80);
+        assert_eq!(budget.used(), 80);
+        assert!(!charge.grow(21));
+        assert_eq!(charge.bytes(), 80);
+        assert_eq!(budget.used(), 80);
+        assert!(!charge.grow(usize::MAX));
+        assert!(charge.grow(20));
+
+        drop(charge);
+
+        assert_eq!(budget.used(), 0);
     }
 }
