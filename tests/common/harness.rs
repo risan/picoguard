@@ -106,6 +106,7 @@ pub fn engine_of(main: &[&str], allow: &[&str]) -> Arc<Engine> {
 pub struct Running {
     pub udp: SocketAddr,
     pub policy: Arc<Policy>,
+    pub pipeline: Arc<Pipeline>,
 }
 
 pub fn config_for(upstream: &FakeUpstream) -> Config {
@@ -126,9 +127,13 @@ pub async fn start_with_policy(config: &Config, policy: Arc<Policy>) -> Running 
     let pipeline = Pipeline::new(config, Arc::clone(&policy)).unwrap();
     let listeners = Listeners::bind(&config.server).unwrap();
     let udp = listeners.udp_addresses()[0];
-    server::spawn(listeners, pipeline, config);
+    server::spawn(listeners, Arc::clone(&pipeline), config);
 
-    Running { udp, policy }
+    Running {
+        udp,
+        policy,
+        pipeline,
+    }
 }
 
 /// Sends one UDP query (RD set, no EDNS) and returns the reply.

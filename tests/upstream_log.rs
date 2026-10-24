@@ -69,7 +69,16 @@ async fn an_upstream_that_fails_by_turns_logs_one_warning() {
     for index in 0..40 {
         let mut out = Vec::new();
         let request = query_for(&format!("name{index}.example."));
-        assert!(pipeline.answer(request, Protocol::Udp, &mut out).await);
+        assert!(
+            pipeline
+                .answer(
+                    request,
+                    Protocol::Udp,
+                    "127.0.0.1".parse().unwrap(),
+                    &mut out
+                )
+                .await
+        );
 
         if out[3] & 0x0F == 2 {
             failures += 1;

@@ -2,7 +2,7 @@
 //! the connection limits of D21.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -175,7 +175,7 @@ async fn serve_udp(socket: UdpSocket, pipeline: Arc<Pipeline>, allowed: Arc<[Cid
         }
 
         let request = &buffer[..length];
-        match pipeline.answer_quickly(request, Protocol::Udp, &mut out) {
+        match pipeline.answer_quickly(request, Protocol::Udp, peer.ip(), &mut out) {
             Quick::Replied => {
                 send_now(&socket, &out, peer);
             }
@@ -209,7 +209,10 @@ async fn answer_udp(
 ) {
     let mut out = Vec::new();
 
-    if pipeline.answer(request, Protocol::Udp, &mut out).await {
+    if pipeline
+        .answer(request, Protocol::Udp, peer.ip(), &mut out)
+        .await
+    {
         send_now(&socket, &out, peer);
     }
 }
@@ -239,6 +242,7 @@ async fn serve_tcp(
 
         tokio::spawn(serve_connection(
             stream,
+            peer.ip(),
             Arc::clone(&pipeline),
             Arc::clone(&settings),
             slot,
@@ -257,6 +261,7 @@ struct QueuedReply {
 
 async fn serve_connection(
     stream: TcpStream,
+    client: IpAddr,
     pipeline: Arc<Pipeline>,
     settings: Arc<TcpSettings>,
     connection_slot: OwnedSemaphorePermit,
@@ -296,6 +301,7 @@ async fn serve_connection(
         tokio::spawn(answer_tcp(
             Arc::clone(&pipeline),
             request,
+            client,
             slot,
             queue.clone(),
             Arc::clone(&queue_budget),
@@ -329,11 +335,12 @@ where
 async fn answer_tcp(
     pipeline: Arc<Pipeline>,
     request: Vec<u8>,
+    client: IpAddr,
     slot: OwnedSemaphorePermit,
     queue: mpsc::UnboundedSender<QueuedReply>,
     queue_budget: Arc<Budget>,
 ) {
-    let Some(prepared) = pipeline.prepare(request, Protocol::Tcp).await else {
+    let Some(prepared) = pipeline.prepare(request, Protocol::Tcp, client).await else {
         return;
     };
 
@@ -419,6 +426,8 @@ mod tests {
     use crate::filter::parse::ListFormat;
     use crate::policy::Policy;
     use crate::upstream::test_dns::{FakeDns, fake_dns, query_for};
+
+    const CLIENT: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 10));
 
     fn ipv6_available() -> bool {
         std::net::UdpSocket::bind("[::1]:0").is_ok()
@@ -639,7 +648,9 @@ mod tests {
         let (queue, replies) = mpsc::unbounded_channel();
         queue.send(fixed(vec![0; 1000])).unwrap();
         for name in ["ads.example.", "fine.example."] {
-            let prepared = pipeline.prepare(query_for(name), Protocol::Tcp).await;
+            let prepared = pipeline
+                .prepare(query_for(name), Protocol::Tcp, CLIENT)
+                .await;
             queue.send(queued(prepared.unwrap())).unwrap();
         }
 
@@ -660,14 +671,14 @@ mod tests {
         let mut out = Vec::new();
         assert!(
             pipeline
-                .answer(query_for("ads.example."), Protocol::Tcp, &mut out)
+                .answer(query_for("ads.example."), Protocol::Tcp, CLIENT, &mut out)
                 .await
         );
         assert_eq!(first_address(&out), "1.2.3.4");
         let (queue, replies) = mpsc::unbounded_channel();
         queue.send(fixed(vec![0; 1000])).unwrap();
         let prepared = pipeline
-            .prepare(query_for("ads.example."), Protocol::Tcp)
+            .prepare(query_for("ads.example."), Protocol::Tcp, CLIENT)
             .await;
         queue.send(queued(prepared.unwrap())).unwrap();
 
@@ -686,7 +697,7 @@ mod tests {
         let (queue, replies) = mpsc::unbounded_channel();
         queue.send(fixed(vec![0; 1000])).unwrap();
         let prepared = pipeline
-            .prepare(query_for("ads.example."), Protocol::Tcp)
+            .prepare(query_for("ads.example."), Protocol::Tcp, CLIENT)
             .await;
         queue.send(queued(prepared.unwrap())).unwrap();
         drop(queue);
