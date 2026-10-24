@@ -12,7 +12,7 @@ use rustls::crypto::ring::{self, cipher_suite};
 use rustls::pki_types::ServerName;
 use rustls::{AlertDescription, ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
@@ -23,6 +23,8 @@ use super::endpoint::Remote;
 pub enum Alpn {
     H2,
     Dot,
+    /// Plain HTTPS downloads of blocklists.
+    Http1,
 }
 
 impl Alpn {
@@ -30,6 +32,7 @@ impl Alpn {
         match self {
             Alpn::H2 => b"h2",
             Alpn::Dot => b"dot",
+            Alpn::Http1 => b"http/1.1",
         }
     }
 }
@@ -79,7 +82,7 @@ fn cpuinfo_lists_aes(cpuinfo: &str) -> bool {
 pub struct Tls {
     roots: Arc<RootCertStore>,
     has_aes: bool,
-    configs: [OnceLock<Arc<ClientConfig>>; 4],
+    configs: [OnceLock<Arc<ClientConfig>>; 6],
 }
 
 impl Tls {
@@ -100,9 +103,9 @@ impl Tls {
 
     /// The configuration for `alpn`. Without AES, `full_suites` false means
     /// ChaCha20-Poly1305 only.
-    fn config(&self, alpn: Alpn, full_suites: bool) -> Arc<ClientConfig> {
+    pub(crate) fn config(&self, alpn: Alpn, full_suites: bool) -> Arc<ClientConfig> {
         let chacha_only = !self.has_aes && !full_suites;
-        let slot = usize::from(alpn == Alpn::Dot) * 2 + usize::from(chacha_only);
+        let slot = alpn as usize * 2 + usize::from(chacha_only);
 
         Arc::clone(self.configs[slot].get_or_init(|| {
             let mut provider = ring::default_provider();
@@ -136,7 +139,7 @@ fn build_config(provider: CryptoProvider, roots: Arc<RootCertStore>) -> ClientCo
 
 /// True when the server refused the handshake because none of the offered
 /// cipher suites was acceptable to it.
-fn lacks_shared_cipher(error: &io::Error) -> bool {
+pub(crate) fn lacks_shared_cipher(error: &io::Error) -> bool {
     let alert = error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>());
@@ -202,16 +205,28 @@ impl TlsDialer {
         full_suites: bool,
         deadline: Instant,
     ) -> Result<TlsStream<TcpStream>, UpstreamError> {
-        let tcp = self.remote.connect(deadline).await?;
+        self.remote
+            .connect_with(deadline, |tcp| self.negotiate(full_suites, tcp))
+            .await
+    }
 
+    async fn negotiate(
+        &self,
+        full_suites: bool,
+        tcp: TcpStream,
+    ) -> Result<TlsStream<TcpStream>, UpstreamError> {
         let connector = TlsConnector::from(self.tls.config(self.alpn, full_suites));
-        let Ok(handshake) =
-            timeout_at(deadline, connector.connect(self.server_name.clone(), tcp)).await
-        else {
-            return Err(UpstreamError::Timeout);
-        };
+        let stream = connector.connect(self.server_name.clone(), tcp).await?;
+        let negotiated = stream.get_ref().1.alpn_protocol();
+        if self.alpn == Alpn::H2 && negotiated != Some(self.alpn.protocol()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the server did not negotiate HTTP/2 (ALPN h2)",
+            )
+            .into());
+        }
 
-        Ok(handshake?)
+        Ok(stream)
     }
 
     #[cfg(test)]
@@ -222,13 +237,17 @@ impl TlsDialer {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
     use rustls::SupportedCipherSuite;
     use rustls::crypto::ring::cipher_suite;
     use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::upstream::endpoint::{Bootstrap, parse_tls};
+    use crate::upstream::test_dns::{FakeDns, fake_dns};
     use crate::upstream::test_tls::{TestPki, TlsServer};
 
     const AES_256: SupportedCipherSuite = cipher_suite::TLS13_AES_256_GCM_SHA384;
@@ -383,6 +402,144 @@ mod tests {
 
         assert_eq!(h2.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
         assert_eq!(dot.get_ref().1.alpn_protocol(), Some(&b"dot"[..]));
+    }
+
+    /// A dialer for the host name `dns.example`, which `dns` resolves, on the
+    /// port of `server`. The certificate is checked against `localhost`.
+    fn named_dialer(pki: &TestPki, server: &TlsServer, dns: &FakeDns) -> TlsDialer {
+        let bootstrap = Arc::new(Bootstrap::at(vec![dns.address]));
+        let spec = format!("dns.example:{}#localhost", server.address.port());
+        let target = parse_tls("u", &spec, &bootstrap).unwrap();
+        let tls = Arc::new(Tls::with_roots(pki.roots(), true));
+
+        TlsDialer::new(
+            tls,
+            Alpn::H2,
+            target.server_name,
+            target.remote,
+            "test".to_string(),
+        )
+    }
+
+    /// Accepts TCP connections on `address` and never answers: an address
+    /// that is up but cannot do TLS.
+    async fn silent_listener(address: SocketAddr) -> TcpListener {
+        TcpListener::bind(address).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cached_address_that_accepts_tcp_but_fails_tls_is_forgotten() {
+        let pki = TestPki::new();
+        let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
+        let old_address = SocketAddr::new("127.0.0.2".parse().unwrap(), server.address.port());
+        let _silent = silent_listener(old_address).await;
+        let dns = fake_dns(vec![Ipv4Addr::new(127, 0, 0, 2)], Vec::new()).await;
+        let dialer = named_dialer(&pki, &server, &dns);
+
+        let stuck = dialer
+            .connect(Instant::now() + Duration::from_millis(300))
+            .await;
+        dns.set_v4(vec![Ipv4Addr::LOCALHOST]);
+        let recovered = dialer.connect(deadline()).await;
+
+        assert!(matches!(stuck, Err(UpstreamError::Timeout)), "{stuck:?}");
+        assert!(recovered.is_ok(), "{recovered:?}");
+    }
+
+    #[tokio::test]
+    async fn a_cached_address_with_a_bad_certificate_is_forgotten() {
+        let pki = TestPki::new();
+        let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
+        let other_pki = TestPki::new();
+        let old_server = TlsServer::start_on(
+            TcpListener::bind(("127.0.0.2", server.address.port()))
+                .await
+                .unwrap(),
+            other_pki.server_config(&["h2"], ring::default_provider()),
+            |_| async {},
+        );
+        let dns = fake_dns(vec![Ipv4Addr::new(127, 0, 0, 2)], Vec::new()).await;
+        let dialer = named_dialer(&pki, &server, &dns);
+
+        let untrusted = dialer.connect(deadline()).await;
+        dns.set_v4(vec![Ipv4Addr::LOCALHOST]);
+        let recovered = dialer.connect(deadline()).await;
+
+        assert!(matches!(untrusted, Err(UpstreamError::Io(_))));
+        assert!(recovered.is_ok(), "{recovered:?}");
+        drop(old_server);
+    }
+
+    #[tokio::test]
+    async fn a_second_address_is_tried_when_the_first_never_answers_the_handshake() {
+        let pki = TestPki::new();
+        let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
+        let blackholed = SocketAddr::new("127.0.0.2".parse().unwrap(), server.address.port());
+        let _silent = silent_listener(blackholed).await;
+        let dns = fake_dns(
+            vec![Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::LOCALHOST],
+            Vec::new(),
+        )
+        .await;
+        let dialer = named_dialer(&pki, &server, &dns);
+        let started = Instant::now();
+
+        let connected = dialer.connect(started + Duration::from_secs(4)).await;
+
+        assert!(connected.is_ok(), "{connected:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn the_address_that_worked_is_tried_first_next_time() {
+        let pki = TestPki::new();
+        let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
+        let blackholed = SocketAddr::new("127.0.0.2".parse().unwrap(), server.address.port());
+        let _silent = silent_listener(blackholed).await;
+        let dns = fake_dns(
+            vec![Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::LOCALHOST],
+            Vec::new(),
+        )
+        .await;
+        let dialer = named_dialer(&pki, &server, &dns);
+        dialer
+            .connect(Instant::now() + Duration::from_secs(4))
+            .await
+            .unwrap();
+        let started = Instant::now();
+
+        dialer
+            .connect(Instant::now() + Duration::from_secs(4))
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(dns.queries.load(Ordering::SeqCst), 2, "resolved once");
+    }
+
+    #[tokio::test]
+    async fn an_h2_dialer_rejects_a_server_that_negotiates_no_protocol() {
+        let pki = TestPki::new();
+        let server = idle_server(&pki, &[], ring::default_provider()).await;
+
+        let result = dialer(&pki, true, Alpn::H2, &server)
+            .connect(deadline())
+            .await;
+
+        assert!(matches!(result, Err(UpstreamError::Io(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_dot_dialer_accepts_a_server_that_negotiates_no_protocol() {
+        let pki = TestPki::new();
+        let server = idle_server(&pki, &[], ring::default_provider()).await;
+
+        let stream = dialer(&pki, true, Alpn::Dot, &server)
+            .connect(deadline())
+            .await
+            .unwrap();
+
+        assert_eq!(stream.get_ref().1.alpn_protocol(), None);
     }
 
     #[tokio::test]

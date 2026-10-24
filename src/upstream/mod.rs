@@ -12,7 +12,7 @@ mod test_dns;
 #[cfg(test)]
 mod test_doh;
 #[cfg(test)]
-mod test_tls;
+pub(crate) mod test_tls;
 
 use std::collections::hash_map::RandomState;
 use std::fmt;
@@ -25,6 +25,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
+use crate::budget::{Budget, Charge};
 use crate::config::{LimitsConfig, UpstreamConfig};
 use crate::dns::wire::{self, Header, flags};
 
@@ -49,6 +50,8 @@ pub enum UpstreamError {
     /// A DoH server answered with something other than HTTP 200.
     HttpStatus(u16),
     ReplyTooLarge,
+    /// The global budget for reply bytes has no room for this reply.
+    BudgetExhausted,
 }
 
 impl fmt::Display for UpstreamError {
@@ -76,6 +79,10 @@ impl fmt::Display for UpstreamError {
 
             UpstreamError::ReplyTooLarge => {
                 write!(formatter, "reply too large")
+            }
+
+            UpstreamError::BudgetExhausted => {
+                write!(formatter, "no room in the pending-bytes budget")
             }
         }
     }
@@ -115,6 +122,7 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
     let Ok(name_end) = wire::skip_name(request, wire::HEADER_LEN) else {
         return false;
     };
+
     let question_end = name_end + 4;
 
     let (Some(asked), Some(echoed)) = (
@@ -123,11 +131,16 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
     ) else {
         return false;
     };
+
     let name_len = name_end - wire::HEADER_LEN;
 
     asked[..name_len].eq_ignore_ascii_case(&echoed[..name_len])
         && asked[name_len..] == echoed[name_len..]
 }
+
+/// A reply together with the claim on the pending-bytes budget that pays for
+/// holding it. Dropping the charge gives the bytes back.
+pub type Charged = (Vec<u8>, Charge);
 
 /// UDP with a fall back to TCP on the same address for truncated answers.
 struct UdpUpstream {
@@ -145,25 +158,38 @@ enum Transport {
 }
 
 impl Transport {
-    async fn query(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
-        match self {
+    async fn query(
+        &self,
+        request: &mut [u8],
+        budget: &Arc<Budget>,
+        deadline: Instant,
+    ) -> Result<Charged, UpstreamError> {
+        let reply = match self {
             Transport::Udp(upstream) => {
                 let reply =
                     udp::exchange(upstream.server, request, upstream.max_reply, deadline).await?;
                 let truncated = Header::parse(&reply).is_ok_and(|header| header.truncated());
                 if truncated {
-                    return upstream.tcp.query(request, deadline).await;
+                    upstream.tcp.query(request, deadline).await?
+                } else {
+                    reply
                 }
-
-                Ok(reply)
             }
 
             Transport::Tcp(upstream) | Transport::Dot(upstream) => {
-                upstream.query(request, deadline).await
+                upstream.query(request, deadline).await?
             }
 
-            Transport::Doh(upstream) => upstream.query(request, deadline).await,
-        }
+            Transport::Doh(upstream) => {
+                return upstream.query_charged(request, budget, deadline).await;
+            }
+        };
+
+        let charge = budget
+            .try_charge(reply.len())
+            .ok_or(UpstreamError::BudgetExhausted)?;
+
+        Ok((reply, charge))
     }
 }
 
@@ -195,14 +221,22 @@ impl Upstream {
         }
     }
 
-    async fn query(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
+    async fn query(
+        &self,
+        request: &mut [u8],
+        budget: &Arc<Budget>,
+        deadline: Instant,
+    ) -> Result<Charged, UpstreamError> {
         let started = Instant::now();
-        let result = self.send(request, deadline).await;
+        let result = self.send(request, budget, deadline).await;
 
         match &result {
             Ok(_) => {
                 self.record_success(started.elapsed());
             }
+
+            // Our own limit says nothing about the server.
+            Err(UpstreamError::BudgetExhausted) => {}
 
             Err(error) => {
                 self.record_failure(error);
@@ -212,13 +246,21 @@ impl Upstream {
         result
     }
 
-    async fn send(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
+    async fn send(
+        &self,
+        request: &mut [u8],
+        budget: &Arc<Budget>,
+        deadline: Instant,
+    ) -> Result<Charged, UpstreamError> {
         let Ok(acquired) = timeout_at(deadline, self.limiter.acquire()).await else {
             return Err(UpstreamError::Timeout);
         };
+
         let _permit = acquired.map_err(|_| UpstreamError::Closed)?;
 
-        let Ok(result) = timeout_at(deadline, self.transport.query(request, deadline)).await else {
+        let Ok(result) =
+            timeout_at(deadline, self.transport.query(request, budget, deadline)).await
+        else {
             return Err(UpstreamError::Timeout);
         };
 
@@ -310,24 +352,46 @@ impl Upstreams {
         }
     }
 
+    /// Like `query_charged`, without a limit on the bytes held.
+    pub async fn query(&self, request: &mut [u8]) -> Result<Vec<u8>, UpstreamError> {
+        let unlimited = Budget::new(usize::MAX);
+
+        Ok(self.query_charged(request, &unlimited).await?.0)
+    }
+
     /// Sends `request` to the best server and, if that fails, once more to the
     /// next best. The ID in `request` is replaced. The first try gets half of
-    /// the timeout so the second still has time.
-    pub async fn query(&self, request: &mut [u8]) -> Result<Vec<u8>, UpstreamError> {
+    /// the timeout so the second still has time. The reply comes with its
+    /// charge on `budget`, taken while it was received, so that no reply
+    /// bytes are held without being counted. A reply that does not fit
+    /// the budget is `BudgetExhausted`, which is not retried.
+    pub async fn query_charged(
+        &self,
+        request: &mut [u8],
+        budget: &Arc<Budget>,
+    ) -> Result<Charged, UpstreamError> {
         let started = Instant::now();
         let first = self.pick(None, random_unit());
 
         let first_attempt = self.servers[first]
-            .query(request, started + self.timeout / 2)
+            .query(request, budget, started + self.timeout / 2)
             .await;
-        if let Ok(reply) = first_attempt {
-            return Ok(reply);
+        match first_attempt {
+            Ok(reply) => {
+                return Ok(reply);
+            }
+
+            Err(UpstreamError::BudgetExhausted) => {
+                return Err(UpstreamError::BudgetExhausted);
+            }
+
+            Err(_) => {}
         }
 
         let second = self.pick(Some(first), random_unit());
 
         self.servers[second]
-            .query(request, started + self.timeout)
+            .query(request, budget, started + self.timeout)
             .await
     }
 
@@ -499,6 +563,7 @@ mod tests {
                 let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
                     break;
                 };
+
                 counter.fetch_add(1, Ordering::SeqCst);
                 let replies = behavior(&buffer[..length]);
                 let socket = Arc::clone(&socket);
@@ -624,6 +689,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_transport_hands_the_reply_over_with_its_charge() {
+        let udp = good_udp().await;
+        let upstreams = upstreams(vec![udp_url(&udp)], 1000);
+        let budget = Budget::new(10_000);
+
+        let (reply, charge) = upstreams
+            .query_charged(&mut query_for("example.com."), &budget)
+            .await
+            .unwrap();
+
+        assert_eq!(charge.bytes(), reply.len());
+        assert_eq!(budget.used(), reply.len());
+
+        drop(charge);
+
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_does_not_fit_the_budget_is_neither_retried_nor_blamed_on_the_server() {
+        let udp = good_udp().await;
+        let upstreams = upstreams(vec![udp_url(&udp)], 1000);
+        let budget = Budget::new(10);
+
+        let result = upstreams
+            .query_charged(&mut query_for("example.com."), &budget)
+            .await;
+
+        assert!(
+            matches!(result, Err(UpstreamError::BudgetExhausted)),
+            "{result:?}"
+        );
+        assert_eq!(udp.received.load(Ordering::SeqCst), 1);
+        assert_eq!(upstreams.servers[0].health.lock().unwrap().failures, 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
     async fn a_failed_server_is_skipped_while_it_backs_off() {
         let dead = dead_udp().await;
         let good = good_udp().await;
@@ -650,6 +753,7 @@ mod tests {
                 break (listener, udp);
             }
         };
+
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buffer = [0u8; 2048];
@@ -677,6 +781,7 @@ mod tests {
             let Ok((mut connection, _)) = listener.accept().await else {
                 break;
             };
+
             accepted.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let mut served = 0;
@@ -753,6 +858,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             listener.local_addr().unwrap()
         };
+
         let upstreams = upstreams(vec![format!("tcp://{free_port}")], 300);
 
         let result = upstreams.query(&mut query_for("example.com.")).await;
@@ -798,6 +904,7 @@ mod tests {
                 upstreams.query(&mut query_for("example.com.")).await
             }));
         }
+
         for task in tasks {
             task.await.unwrap().unwrap();
         }
@@ -872,6 +979,7 @@ mod tests {
         for _ in 0..20 {
             server.record_failure(&UpstreamError::Timeout);
         }
+
         let capped = server.health.lock().unwrap().retry_at.unwrap();
 
         assert!(second > first + Duration::from_millis(500));
@@ -1081,6 +1189,7 @@ mod tests {
             reply[13..20].make_ascii_lowercase();
             reply
         };
+
         let other_name = answer(&query_for("other.com."), ANSWER_MARKER, false);
 
         assert!(is_answer_to(&query, &good));
@@ -1172,10 +1281,12 @@ mod tests {
                 let Transport::Tcp(tcp) = &upstreams.servers[0].transport else {
                     unreachable!();
                 };
+
                 let _held = tcp.connect_lock.lock().await;
                 tokio::time::sleep(Duration::from_millis(300)).await;
             })
         };
+
         tokio::task::yield_now().await;
         let started = Instant::now();
 
@@ -1185,17 +1296,20 @@ mod tests {
                 upstreams.servers[0]
                     .query(
                         &mut query_for("a.example."),
+                        &Budget::new(usize::MAX),
                         Instant::now() + Duration::from_millis(80),
                     )
                     .await
             })
         };
+
         let patient = {
             let upstreams = Arc::clone(&upstreams);
             tokio::spawn(async move {
                 upstreams.servers[0]
                     .query(
                         &mut query_for("b.example."),
+                        &Budget::new(usize::MAX),
                         Instant::now() + Duration::from_secs(3),
                     )
                     .await

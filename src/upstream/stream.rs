@@ -68,6 +68,7 @@ impl StreamUpstream {
         let Ok(_serialize_connects) = timeout_at(deadline, self.connect_lock.lock()).await else {
             return Err(UpstreamError::Timeout);
         };
+
         if self.client.is_connected() {
             return Ok(());
         }
@@ -77,6 +78,7 @@ impl StreamUpstream {
                 let Ok(connected) = timeout_at(deadline, TcpStream::connect(server)).await else {
                     return Err(UpstreamError::Timeout);
                 };
+
                 let stream = connected?;
                 stream.set_nodelay(true)?;
                 self.client.attach(stream);
@@ -470,6 +472,7 @@ mod tests {
             let client = Arc::clone(&client);
             tokio::spawn(async move { client.query(&mut request("a.example."), deadline()).await })
         };
+
         tokio::task::yield_now().await;
         let second = {
             let client = Arc::clone(&client);
@@ -501,6 +504,7 @@ mod tests {
                 server.write_all(&[byte]).await.unwrap();
                 tokio::task::yield_now().await;
             }
+
             server
         });
 
@@ -752,6 +756,7 @@ mod tests {
                     async move { upstream.query(&mut query_for("a.example."), later()).await },
                 )
             };
+
             tokio::time::sleep(Duration::from_millis(50)).await;
             let second = {
                 let upstream = Arc::clone(&upstream);
@@ -800,6 +805,7 @@ mod tests {
                         let Some(query) = read_query(&mut stream).await else {
                             return;
                         };
+
                         reply_to(&mut stream, &query).await;
                         counter.fetch_add(1, Ordering::SeqCst);
                     }
@@ -834,6 +840,7 @@ mod tests {
                     reply_to(&mut stream, &query).await;
                 }
             };
+
             let server = TlsServer::start(dot_server_config(&pki), echo).await;
             let upstream = upstream(&pki, &server);
             upstream

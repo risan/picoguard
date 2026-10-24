@@ -62,6 +62,7 @@ impl TestPki {
             let address: IpAddr = address.parse().unwrap();
             params.subject_alt_names.push(SanType::IpAddress(address));
         }
+
         let certificate = params.signed_by(&key, &self.authority).unwrap();
 
         let chain: Vec<CertificateDer<'static>> = vec![certificate.der().clone()];
@@ -121,6 +122,7 @@ impl TlsServer {
                 let Ok((tcp, _)) = listener.accept().await else {
                     break;
                 };
+
                 accepted.fetch_add(1, Ordering::SeqCst);
                 let acceptor = acceptor.clone();
                 let handler = Arc::clone(&handler);
@@ -130,6 +132,7 @@ impl TlsServer {
                     let Ok(stream) = acceptor.accept(tcp).await else {
                         return;
                     };
+
                     counter.fetch_add(1, Ordering::SeqCst);
                     handler(stream).await;
                 });
