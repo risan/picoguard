@@ -144,6 +144,15 @@ impl TlsServer {
         }
     }
 
+    /// Closes the listener and every connection, then returns the address so a
+    /// new server can bind it again.
+    pub async fn stop(mut self) -> SocketAddr {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+
+        self.address
+    }
+
     /// Waits until `count` handshakes have completed on the server side, which
     /// can lag behind the client by a moment.
     pub async fn wait_for_handshakes(&self, count: usize) {

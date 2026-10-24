@@ -1,10 +1,13 @@
 //! Forwarding to upstream resolvers: one transport per server, picked by
 //! speed, with one retry on the next best server.
 
+pub mod doh;
 pub mod stream;
 pub mod tls;
 mod udp;
 
+#[cfg(test)]
+mod test_dns;
 #[cfg(test)]
 mod test_tls;
 
@@ -432,38 +435,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use hickory_proto::rr::RecordType;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
 
     use super::*;
-    use crate::dns::test_util::QuerySpec;
-    use crate::dns::wire::rtype;
-
-    const ANSWER_MARKER: [u8; 4] = [192, 0, 2, 1];
-
-    fn query_for(name: &str) -> Vec<u8> {
-        QuerySpec::new(name, RecordType::A).bytes()
-    }
-
-    /// A reply to `request` with one A record, optionally with TC set.
-    fn answer(request: &[u8], address: [u8; 4], truncated: bool) -> Vec<u8> {
-        let question_end = wire::skip_name(request, wire::HEADER_LEN).unwrap() + 4;
-        let mut reply = request[..question_end].to_vec();
-        let reply_flags = 0x8180u16 | if truncated { flags::TC } else { 0 };
-        reply[2..4].copy_from_slice(&reply_flags.to_be_bytes());
-        reply[6..12].copy_from_slice(&[0, 1, 0, 0, 0, 0]);
-        reply.extend_from_slice(&[0xC0, 0x0C]);
-        reply.extend_from_slice(&rtype::A.to_be_bytes());
-        reply.extend_from_slice(&[0, 1, 0, 0, 0, 60, 0, 4]);
-        reply.extend_from_slice(&address);
-
-        reply
-    }
-
-    fn address_of(reply: &[u8]) -> [u8; 4] {
-        reply[reply.len() - 4..].try_into().unwrap()
-    }
+    use crate::upstream::test_dns::{ANSWER_MARKER, address_of, answer, query_for};
 
     struct Fake {
         address: SocketAddr,
