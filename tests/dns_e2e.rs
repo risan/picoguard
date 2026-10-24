@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
-use hickory_proto::rr::rdata::{A, TXT};
+use hickory_proto::rr::rdata::{A, SOA, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use picoguard::config::Config;
 use picoguard::pipeline::Pipeline;
@@ -87,6 +87,26 @@ fn answer_a(query: &Message, ttl: u32) -> Message {
         ttl,
         RData::A(A(ANSWER)),
     ));
+
+    reply
+}
+
+/// NXDOMAIN with a SOA whose TTL is 900 and whose MINIMUM is 45, so RFC 2308
+/// says the answer is good for 45 seconds.
+fn nxdomain_with_soa(query: &Message) -> Message {
+    let mut reply = answer_a(query, 0);
+    reply.answers.clear();
+    reply.metadata.response_code = ResponseCode::NXDomain;
+    let soa = SOA::new(
+        name("ns.example."),
+        name("hostmaster.example."),
+        1,
+        3600,
+        600,
+        86400,
+        45,
+    );
+    reply.add_authority(Record::from_rdata(name("example."), 900, RData::SOA(soa)));
 
     reply
 }
@@ -337,6 +357,22 @@ async fn repeated_queries_come_from_the_cache_with_an_aged_ttl() {
     assert_eq!(first.answers[0].ttl, 300);
     assert_eq!(second.answers[0].ttl, 300);
     assert_eq!(third.answers[0].ttl, 299);
+    assert_eq!(upstream.count(), 1);
+}
+
+#[tokio::test]
+async fn a_cached_negative_reply_shows_the_effective_soa_ttl_and_ages_it() {
+    let upstream = fake_upstream(|query| vec![(Duration::ZERO, nxdomain_with_soa(query))]).await;
+    let server = start(config_for(&upstream)).await;
+    let ask = Ask::new("gone.example.", RecordType::A);
+
+    let fresh = udp_ask(&server, &ask).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let cached = udp_ask(&server, &ask).await.unwrap();
+
+    assert_eq!(fresh.authorities[0].ttl, 45);
+    assert_eq!(cached.authorities[0].ttl, 44);
+    assert_eq!(cached.metadata.response_code, ResponseCode::NXDomain);
     assert_eq!(upstream.count(), 1);
 }
 

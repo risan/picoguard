@@ -751,6 +751,13 @@ pub struct ResponseInfo {
     /// NXDOMAIN, or NOERROR where the name at the end of the answer's CNAME
     /// chain (the queried name when there is no chain) has no data.
     pub is_negative: bool,
+    soas: Vec<AuthoritySoa>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthoritySoa {
+    ttl_offset: u16,
+    minimum: u32,
 }
 
 impl ResponseInfo {
@@ -767,6 +774,7 @@ impl ResponseInfo {
             min_ttl: None,
             negative_ttl: None,
             is_negative: false,
+            soas: Vec::new(),
         };
 
         for record in Records::new(msg)? {
@@ -794,12 +802,39 @@ impl ResponseInfo {
             {
                 let ttl = record.ttl.min(minimum);
                 info.negative_ttl = Some(info.negative_ttl.map_or(ttl, |min| min.min(ttl)));
+                info.soas.push(AuthoritySoa {
+                    ttl_offset: offset(record.ttl_offset)?,
+                    minimum,
+                });
             }
         }
 
         info.is_negative = is_negative(msg, &header)?;
 
         Ok(info)
+    }
+}
+
+impl ResponseInfo {
+    /// RFC 2308 section 5: in a negative reply the TTL of the SOA is the smaller
+    /// of its own TTL and its MINIMUM. Writing that into `msg` as the reply
+    /// arrives makes the SOA TTL clients see age together with the lifetime
+    /// the cache gives the reply. `msg` must be the bytes this was parsed from.
+    pub fn cap_soa_ttls(&mut self, msg: &mut [u8]) {
+        if !self.is_negative {
+            return;
+        }
+
+        for soa in &self.soas {
+            let at = usize::from(soa.ttl_offset);
+            let Ok(ttl) = read_u32(msg, at) else {
+                continue;
+            };
+            let capped = ttl.min(soa.minimum);
+
+            msg[at..at + 4].copy_from_slice(&capped.to_be_bytes());
+            self.min_ttl = Some(self.min_ttl.map_or(capped, |min| min.min(capped)));
+        }
     }
 }
 
@@ -1505,6 +1540,40 @@ mod tests {
         .bytes(&QuerySpec::new("h0.example.com.", RecordType::A));
 
         assert!(!ResponseInfo::parse(&bytes).unwrap().is_negative);
+    }
+
+    #[test]
+    fn a_negative_reply_gets_its_soa_ttl_capped_by_the_minimum() {
+        let query = QuerySpec::new("nx.example.com.", RecordType::A);
+        let reply = |ttl, minimum, rcode| {
+            ResponseSpec {
+                authorities: vec![soa("example.com.", ttl, minimum)],
+                rcode,
+                ..ResponseSpec::default()
+            }
+            .bytes(&query)
+        };
+        let soa_ttl = |bytes: &[u8], info: &ResponseInfo| ttl_at(bytes, info.ttl_offsets[0]);
+
+        let mut nxdomain = reply(900, 45, rcode::NXDOMAIN);
+        let mut info = ResponseInfo::parse(&nxdomain).unwrap();
+        info.cap_soa_ttls(&mut nxdomain);
+        let mut already_lower = reply(30, 45, rcode::NXDOMAIN);
+        let mut lower_info = ResponseInfo::parse(&already_lower).unwrap();
+        lower_info.cap_soa_ttls(&mut already_lower);
+        let mut positive = ResponseSpec {
+            answers: vec![a("nx.example.com.", 300, [192, 0, 2, 1].into())],
+            authorities: vec![soa("example.com.", 900, 45)],
+            ..ResponseSpec::default()
+        }
+        .bytes(&query);
+        let mut positive_info = ResponseInfo::parse(&positive).unwrap();
+        positive_info.cap_soa_ttls(&mut positive);
+
+        assert_eq!(soa_ttl(&nxdomain, &info), 45);
+        assert_eq!(info.min_ttl, Some(45));
+        assert_eq!(soa_ttl(&already_lower, &lower_info), 30);
+        assert_eq!(ttl_at(&positive, positive_info.ttl_offsets[1]), 900);
     }
 
     #[test]

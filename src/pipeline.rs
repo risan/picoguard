@@ -363,12 +363,13 @@ impl Pipeline {
         } else {
             &self.upstreams
         };
-        let bytes = upstreams.query(&mut request).await.map_err(|error| {
+        let mut bytes = upstreams.query(&mut request).await.map_err(|error| {
             log::debug!("upstream query failed: {error}");
 
             Failure::Upstream
         })?;
-        let info = ResponseInfo::parse(&bytes).map_err(|_| Failure::Upstream)?;
+        let mut info = ResponseInfo::parse(&bytes).map_err(|_| Failure::Upstream)?;
+        info.cap_soa_ttls(&mut bytes);
         let charge = self
             .budget
             .try_charge(bytes.len())
