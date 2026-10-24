@@ -1,6 +1,7 @@
 //! Where an encrypted upstream lives: the `https://` and `tls://` URL forms,
 //! and how a host name in them is turned into addresses (bootstrap).
 
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -94,6 +95,7 @@ async fn lookup(
     let Ok(reply) = udp::exchange(server, &mut query, BOOTSTRAP_REPLY_MAX, deadline).await else {
         return Vec::new();
     };
+
     let Ok(records) = Records::new(&reply) else {
         return Vec::new();
     };
@@ -133,25 +135,54 @@ impl Remote {
         }
     }
 
-    pub async fn connect(&self, deadline: Instant) -> Result<TcpStream, UpstreamError> {
+    /// Connects to the addresses in turn, runs `attempt` on the first
+    /// connection that opens, and returns its result. An attempt that fails
+    /// or runs out of time moves on to the next address, so `attempt` should
+    /// include everything that can make an address unusable (the TLS
+    /// handshake). Each address but the last gets half of the time left. When
+    /// every address fails, the resolved addresses are forgotten and the next
+    /// call resolves the name again.
+    pub async fn connect_with<T, F, Fut>(
+        &self,
+        deadline: Instant,
+        mut attempt: F,
+    ) -> Result<T, UpstreamError>
+    where
+        F: FnMut(TcpStream) -> Fut,
+        Fut: Future<Output = Result<T, UpstreamError>>,
+    {
+        let addresses = self.addresses(deadline).await?;
         let mut last_error = UpstreamError::Timeout;
 
-        for ip in self.addresses(deadline).await? {
-            let Ok(connected) = timeout_at(deadline, TcpStream::connect((ip, self.port))).await
-            else {
-                last_error = UpstreamError::Timeout;
-                break;
+        for (index, ip) in addresses.iter().enumerate() {
+            let attempt_deadline = if index + 1 == addresses.len() {
+                deadline
+            } else {
+                let now = Instant::now();
+
+                now + deadline.saturating_duration_since(now) / 2
             };
 
-            match connected {
-                Ok(stream) => {
-                    stream.set_nodelay(true)?;
+            let connecting = async {
+                let stream = TcpStream::connect((*ip, self.port)).await?;
+                stream.set_nodelay(true)?;
 
-                    return Ok(stream);
+                attempt(stream).await
+            };
+
+            match timeout_at(attempt_deadline, connecting).await {
+                Ok(Ok(connected)) => {
+                    self.prefer(*ip);
+
+                    return Ok(connected);
                 }
 
-                Err(error) => {
-                    last_error = error.into();
+                Ok(Err(error)) => {
+                    last_error = error;
+                }
+
+                Err(_) => {
+                    last_error = UpstreamError::Timeout;
                 }
             }
         }
@@ -159,6 +190,14 @@ impl Remote {
         self.resolved.lock().unwrap().clear();
 
         Err(last_error)
+    }
+
+    /// Makes `ip` the first address to try next time.
+    fn prefer(&self, ip: IpAddr) {
+        let mut resolved = self.resolved.lock().unwrap();
+        if let Some(position) = resolved.iter().position(|address| *address == ip) {
+            resolved.swap(0, position);
+        }
     }
 
     async fn addresses(&self, deadline: Instant) -> Result<Vec<IpAddr>, UpstreamError> {
@@ -196,6 +235,7 @@ pub fn parse_https(
         Some(slash) => (&rest[..slash], &rest[slash..]),
         None => (rest, ""),
     };
+
     let path = if path.is_empty() || path == "/" {
         DEFAULT_DOH_PATH
     } else {
@@ -307,6 +347,10 @@ mod tests {
 
     fn later() -> Instant {
         Instant::now() + Duration::from_secs(3)
+    }
+
+    async fn accept(stream: TcpStream) -> Result<TcpStream, UpstreamError> {
+        Ok(stream)
     }
 
     fn bootstrap_at(servers: &[&FakeDns]) -> Arc<Bootstrap> {
@@ -421,6 +465,7 @@ mod tests {
             assert!(https.contains("SPEC"), "{rest}: {https}");
             assert!(tls.contains("SPEC"), "{rest}: {tls}");
         }
+
         let name = parse_tls("SPEC", "1.1.1.1#bad name", &some_bootstrap())
             .err()
             .unwrap();
@@ -482,8 +527,8 @@ mod tests {
         let target =
             parse_tls("u", &format!("dns.example:{port}"), &bootstrap_at(&[&dns])).unwrap();
 
-        target.remote.connect(later()).await.unwrap();
-        target.remote.connect(later()).await.unwrap();
+        target.remote.connect_with(later(), accept).await.unwrap();
+        target.remote.connect_with(later(), accept).await.unwrap();
 
         assert_eq!(dns.queries.load(Ordering::SeqCst), 2, "one A and one AAAA");
     }
@@ -494,6 +539,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             listener.local_addr().unwrap().port()
         };
+
         let dns = fake_dns(vec![Ipv4Addr::LOCALHOST], Vec::new()).await;
         let target = parse_tls(
             "u",
@@ -502,10 +548,10 @@ mod tests {
         )
         .unwrap();
 
-        let refused = target.remote.connect(later()).await;
+        let refused = target.remote.connect_with(later(), accept).await;
         assert!(matches!(refused, Err(UpstreamError::Io(_))));
         let listener = TcpListener::bind(("127.0.0.1", free_port)).await.unwrap();
-        let connected = target.remote.connect(later()).await;
+        let connected = target.remote.connect_with(later(), accept).await;
 
         assert!(connected.is_ok());
         assert_eq!(dns.queries.load(Ordering::SeqCst), 4, "resolved twice");
@@ -517,6 +563,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote = Remote::at(listener.local_addr().unwrap());
 
-        assert!(remote.connect(later()).await.is_ok());
+        assert!(remote.connect_with(later(), accept).await.is_ok());
     }
 }

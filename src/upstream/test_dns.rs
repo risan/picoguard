@@ -1,8 +1,8 @@
 //! DNS messages for the upstream tests.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use hickory_proto::rr::RecordType;
 use tokio::net::UdpSocket;
@@ -40,6 +40,14 @@ pub fn address_of(reply: &[u8]) -> [u8; 4] {
 pub struct FakeDns {
     pub address: SocketAddr,
     pub queries: Arc<AtomicUsize>,
+    v4: Arc<Mutex<Vec<Ipv4Addr>>>,
+}
+
+impl FakeDns {
+    /// From now on the server answers A queries with `addresses`.
+    pub fn set_v4(&self, addresses: Vec<Ipv4Addr>) {
+        *self.v4.lock().unwrap() = addresses;
+    }
 }
 
 pub async fn fake_dns(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>) -> FakeDns {
@@ -47,6 +55,8 @@ pub async fn fake_dns(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>) -> FakeDns {
     let address = socket.local_addr().unwrap();
     let queries = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&queries);
+    let v4 = Arc::new(Mutex::new(v4));
+    let served_v4 = Arc::clone(&v4);
 
     tokio::spawn(async move {
         let mut buffer = [0u8; 512];
@@ -56,7 +66,12 @@ pub async fn fake_dns(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>) -> FakeDns {
             let question_end = wire::skip_name(query, wire::HEADER_LEN).unwrap() + 4;
             let asked = u16::from_be_bytes([query[question_end - 4], query[question_end - 3]]);
             let rdata: Vec<Vec<u8>> = if asked == rtype::A {
-                v4.iter().map(|ip| ip.octets().to_vec()).collect()
+                served_v4
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|ip| ip.octets().to_vec())
+                    .collect()
             } else {
                 v6.iter().map(|ip| ip.octets().to_vec()).collect()
             };
@@ -71,9 +86,14 @@ pub async fn fake_dns(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>) -> FakeDns {
                 reply.extend_from_slice(&(data.len() as u16).to_be_bytes());
                 reply.extend_from_slice(&data);
             }
+
             let _ = socket.send_to(&reply, peer).await;
         }
     });
 
-    FakeDns { address, queries }
+    FakeDns {
+        address,
+        queries,
+        v4,
+    }
 }
