@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
@@ -204,6 +205,38 @@ impl ListBuilder {
             sort_dedup(&mut self.fast[sub]);
         }
     }
+}
+
+/// Membership in a sorted array of distinct xxh3 hashes. The hashes are uniformly spread, so
+/// the position of `needle` can be estimated from its value: a few probes find it where a
+/// binary search needs log2(n) probes that miss the CPU cache. Anything unexpected (a
+/// skewed array) falls back to the binary search after a few rounds.
+fn contains_hash(sorted: &[u64], needle: u64) -> bool {
+    const ROUNDS: usize = 6;
+
+    const LINEAR_TAIL: usize = 8;
+
+    let (mut low, mut high) = (0, sorted.len());
+    for _ in 0..ROUNDS {
+        if high - low <= LINEAR_TAIL {
+            return sorted[low..high].contains(&needle);
+        }
+
+        let (first, last) = (sorted[low], sorted[high - 1]);
+        if needle < first || needle > last {
+            return false;
+        }
+
+        let share = (needle - first) as f64 / (last - first) as f64;
+        let at = low + (share * (high - low - 1) as f64) as usize;
+        match sorted[at].cmp(&needle) {
+            Ordering::Equal => return true,
+            Ordering::Less => low = at + 1,
+            Ordering::Greater => high = at,
+        }
+    }
+
+    sorted[low..high].binary_search(&needle).is_ok()
 }
 
 fn sort_dedup(hashes: &mut Vec<u64>) {
@@ -473,6 +506,77 @@ fn icann_suffix(domain: &str) -> Option<&str> {
     }
 }
 
+// ---- Slow-rule index ----
+
+/// How many leading bytes of a shortcut key the index.
+const KEY_BYTES: usize = 4;
+
+/// Finds the slow rules whose shortcut can occur in a URL, like urlfilter's shortcut table:
+/// a rule is filed under the first [`KEY_BYTES`] bytes of its shortcut, and a check looks up
+/// every window of that length in the URL. Rules with a shorter shortcut are always tried.
+#[derive(Default)]
+struct SlowIndex {
+    /// `(key, list, rule)` sorted by key.
+    keyed: Vec<(u32, u32, u32)>,
+    always: Vec<(u32, u32)>,
+}
+
+fn key_of(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+impl SlowIndex {
+    fn new(lists: &[Arc<CompiledList>]) -> SlowIndex {
+        let mut index = SlowIndex::default();
+        for (list_at, list) in lists.iter().enumerate() {
+            for (rule_at, slow) in list.slow.iter().enumerate() {
+                let (list_at, rule_at) = (list_at as u32, rule_at as u32);
+                let shortcut = slow.matcher.shortcut().as_bytes();
+                if shortcut.len() < KEY_BYTES {
+                    index.always.push((list_at, rule_at));
+                } else {
+                    index.keyed.push((key_of(shortcut), list_at, rule_at));
+                }
+            }
+        }
+
+        index.keyed.sort_unstable();
+        index.keyed.shrink_to_fit();
+        index.always.shrink_to_fit();
+
+        index
+    }
+
+    /// Calls `f` for every slow rule whose shortcut starts with some window of `url`, and for
+    /// the rules without a usable shortcut. A rule may be offered more than once.
+    fn for_each_candidate<'a>(
+        &self,
+        lists: &'a [Arc<CompiledList>],
+        url: &str,
+        f: &mut dyn FnMut(&'a SlowRule),
+    ) {
+        for &(list, rule) in &self.always {
+            f(&lists[list as usize].slow[rule as usize]);
+        }
+
+        if self.keyed.is_empty() {
+            return;
+        }
+
+        for window in url.as_bytes().windows(KEY_BYTES) {
+            let key = key_of(window);
+            let first = self.keyed.partition_point(|entry| entry.0 < key);
+            for &(found, list, rule) in &self.keyed[first..] {
+                if found != key {
+                    break;
+                }
+
+                f(&lists[list as usize].slow[rule as usize]);
+            }
+        }
+    }
+}
+
 // ---- Rule sets ----
 
 /// The rules of one urlfilter `DNSEngine`: a set of lists and the `$badfilter` index
@@ -481,6 +585,7 @@ struct RuleSet {
     lists: Vec<Arc<CompiledList>>,
     has_fast: [bool; FAST_KINDS],
     has_slow: bool,
+    slow_index: SlowIndex,
     /// Hash of a plain rule's name, per array, that an unconditional badfilter disables.
     disabled_fast: [HashSet<u64>; FAST_KINDS],
     conditional_fast: [HashMap<u64, Vec<Condition>>; FAST_KINDS],
@@ -493,6 +598,7 @@ impl RuleSet {
         let mut set = RuleSet {
             has_fast: std::array::from_fn(|kind| lists.iter().any(|l| !l.fast[kind].is_empty())),
             has_slow: lists.iter().any(|list| !list.slow.is_empty()),
+            slow_index: SlowIndex::new(&lists),
             lists,
             disabled_fast: Default::default(),
             conditional_fast: Default::default(),
@@ -543,7 +649,7 @@ impl RuleSet {
         let present = self
             .lists
             .iter()
-            .any(|list| list.fast[kind].binary_search(&name).is_ok());
+            .any(|list| contains_hash(&list.fast[kind], name));
         if !present || self.disabled_fast[kind].contains(&name) {
             return false;
         }
@@ -612,8 +718,8 @@ impl RuleSet {
         }
 
         let url = format!("http://{}", query.host);
-        for list in &self.lists {
-            for slow in &list.slow {
+        self.slow_index
+            .for_each_candidate(&self.lists, &url, &mut |slow| {
                 let rule = &slow.rule;
                 let allowed = conditions_hold(
                     &rule.dns_permitted,
@@ -626,7 +732,7 @@ impl RuleSet {
                     || !slow.matcher.is_match(query.host, &url)
                     || self.slow_disabled(slow, query)
                 {
-                    continue;
+                    return;
                 }
 
                 note(match (rule.whitelist, rule.important) {
@@ -635,8 +741,7 @@ impl RuleSet {
                     (true, false) => Class::Allow,
                     (false, false) => Class::Block,
                 });
-            }
-        }
+            });
 
         best.get()
     }
@@ -649,7 +754,7 @@ impl RuleSet {
         let mut v6 = Vec::new();
         for list in &self.lists {
             for group in &list.hosts {
-                if group.names.binary_search(&name).is_err() {
+                if !contains_hash(&group.names, name) {
                     continue;
                 }
 
@@ -1015,5 +1120,104 @@ mod tests {
         let engine = adblock("||a.example^$client=~192.168.0.1\n||b.example^$client=192.168.0.1\n");
         assert!(blocked(&engine, "a.example", TYPE_A));
         assert!(!blocked(&engine, "b.example", TYPE_A));
+    }
+
+    fn candidates(engine: &Engine, host: &str) -> usize {
+        let mut count = 0;
+        let url = format!("http://{host}");
+        engine
+            .main
+            .slow_index
+            .for_each_candidate(&engine.main.lists, &url, &mut |_| count += 1);
+
+        count
+    }
+
+    #[test]
+    fn a_check_looks_only_at_slow_rules_whose_shortcut_can_occur() {
+        let mut rules = String::new();
+        for number in 0..500 {
+            rules.push_str(&format!("||t{number:04}.example^$important\n"));
+        }
+
+        rules.push_str("/^sh[a-z]rt/\n*$denyallow=ok.example\n");
+        let engine = adblock(&rules);
+        assert_eq!(engine.main.lists[0].slow_rule_count(), 502);
+        // The regex has a one-letter shortcut and the `*` rule none: both are always tried.
+        assert_eq!(candidates(&engine, "clean.example"), 2);
+        assert!(candidates(&engine, "t0123.example") <= 12);
+        assert!(candidates(&engine, "sub.t0499.example") <= 12);
+        assert!(blocked(&engine, "t0123.example", TYPE_A));
+        assert!(blocked(&engine, "sub.t0499.example", TYPE_A));
+        assert!(blocked(&engine, "short.example", TYPE_A));
+        assert!(!blocked(&engine, "t0500.ok.example", TYPE_A));
+    }
+
+    #[test]
+    fn indexed_slow_rules_decide_like_a_scan_of_every_rule() {
+        let rules = "||ads.\n.banner.\n/tr[a-z]{2}k/\n||x.example^$dnstype=A\n@@||good.ads.example^$important\n|lone\n*.cdn.\nping^\n";
+        let engine = adblock(rules);
+        let list = &engine.main.lists[0];
+        for host in [
+            "ads.example",
+            "good.ads.example",
+            "a.banner.net",
+            "track.example",
+            "x.example",
+            "lone.example",
+            "a.lone.example",
+            "img.cdn.example",
+            "ping.example",
+            "pingpong.example",
+            "clean.example",
+        ] {
+            let query = Query {
+                host,
+                record_type: TYPE_A,
+                is_ip: false,
+            };
+            let url = format!("http://{host}");
+            let scanned = list
+                .slow
+                .iter()
+                .any(|slow| !slow.rule.whitelist && slow.matcher.is_match(host, &url));
+            let important_allow = list.slow.iter().any(|slow| {
+                slow.rule.whitelist && slow.rule.important && slow.matcher.is_match(host, &url)
+            });
+            let expected = scanned && !important_allow;
+            let decided = !matches!(
+                engine.main.class(&query),
+                None | Some(Class::Allow | Class::ImportantAllow)
+            );
+            assert_eq!(decided, expected, "{host}");
+        }
+    }
+
+    #[test]
+    fn hash_membership_agrees_with_binary_search_on_any_distribution() {
+        let uniform: Vec<u64> = (0..5000u64)
+            .map(|n| xxh3_64(&n.to_le_bytes()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let clustered: Vec<u64> = (0..5000u64)
+            .map(|n| if n < 4990 { n * 3 } else { u64::MAX - n })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for sorted in [uniform, clustered, vec![], vec![7], vec![7, 9]] {
+            let mut needles: Vec<u64> = sorted
+                .iter()
+                .flat_map(|&n| [n, n.wrapping_add(1), n.wrapping_sub(1)])
+                .collect();
+            needles.extend([0, 1, u64::MAX, u64::MAX - 1]);
+            for needle in needles {
+                assert_eq!(
+                    contains_hash(&sorted, needle),
+                    sorted.binary_search(&needle).is_ok(),
+                    "{needle}"
+                );
+            }
+        }
     }
 }

@@ -98,6 +98,12 @@ impl Matcher {
         })
     }
 
+    /// The lowercase text a URL must contain for the rule to match; empty when the rule has
+    /// no usable shortcut.
+    pub fn shortcut(&self) -> &str {
+        &self.shortcut
+    }
+
     /// `host` is the lowercase input; `url` is `http://` followed by `host`.
     pub fn is_match(&self, host: &str, url: &str) -> bool {
         if !self.shortcut.is_empty() && !url.contains(&self.shortcut) {
