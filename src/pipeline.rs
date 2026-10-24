@@ -665,8 +665,8 @@ mod tests {
         assert!(Pipeline::new(&config, Arc::new(Policy::new())).is_ok());
     }
 
-    fn blocking_policy() -> Arc<Policy> {
-        let (list, _) = CompiledList::from_text(ListFormat::Adblock, "||9.9.9.9^\n");
+    fn policy_of(rules: &str) -> Arc<Policy> {
+        let (list, _) = CompiledList::from_text(ListFormat::Adblock, rules);
 
         Arc::new(Policy::with_engine(Arc::new(Engine::new(
             vec![Arc::new(list)],
@@ -686,7 +686,7 @@ mod tests {
     async fn a_delayed_waiter_cannot_leave_its_memo_on_a_replacement_entry() {
         let mut config = Config::default();
         config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
-        let pipeline = Pipeline::new(&config, blocking_policy()).unwrap();
+        let pipeline = Pipeline::new(&config, policy_of("||9.9.9.9^\n")).unwrap();
         let spec = QuerySpec::new("late.example.", RecordType::A);
         let request = spec.bytes();
         let query = Query::parse(&request).unwrap();
@@ -725,5 +725,44 @@ mod tests {
         let quick = pipeline.answer_quickly(&request, Protocol::Udp, &mut out);
         assert_eq!(quick, Quick::Replied);
         assert_eq!(&parse(&out).answers[0].data.to_string(), "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_decision_with_many_ips_is_recomputed_instead_of_held_in_the_cache() {
+        let host_rules: String = (0..300)
+            .map(|index| format!("10.0.{}.{} 9.9.9.9\n", index / 256, index % 256))
+            .collect();
+        let mut config = Config::default();
+        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
+        let pipeline = Pipeline::new(&config, policy_of(&host_rules)).unwrap();
+        let spec = QuerySpec::new("late.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let bytes = reply_with_address(&spec, [9, 9, 9, 9]);
+        let info = ResponseInfo::parse(&bytes).unwrap();
+        let token = pipeline.cache.lock().unwrap().insert(
+            &CacheKey::new(&query),
+            &bytes,
+            &info,
+            Instant::now(),
+        );
+        let bytes_without_memo = pipeline.cache.lock().unwrap().bytes();
+        let delivery = Delivery {
+            bytes,
+            info,
+            cached_as: token,
+            _charge: pipeline.budget.try_charge(1).unwrap(),
+        };
+        let reply = Reply::new(&query, pipeline.udp_size, Protocol::Tcp);
+        let mut out = Vec::new();
+
+        pipeline.deliver(&query, &reply, &delivery, &mut out);
+        assert_eq!(parse(&out).answers.len(), 300);
+        assert_eq!(pipeline.cache.lock().unwrap().bytes(), bytes_without_memo);
+
+        let quick = pipeline.answer_quickly(&request, Protocol::Tcp, &mut out);
+        assert_eq!(quick, Quick::Replied);
+        assert_eq!(parse(&out).answers.len(), 300);
+        assert_eq!(pipeline.cache.lock().unwrap().bytes(), bytes_without_memo);
     }
 }
