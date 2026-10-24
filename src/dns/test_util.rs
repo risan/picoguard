@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::svcb::{IpHint, SVCB, SvcParamKey, SvcParamValue};
-use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, SOA};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, SOA, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
 pub fn name(text: &str) -> Name {
@@ -127,4 +127,11 @@ impl ResponseSpec {
 
 pub fn parse(bytes: &[u8]) -> Message {
     Message::from_vec(bytes).unwrap()
+}
+
+/// A TXT record whose rdata is about `size` bytes.
+pub fn txt(owner: &str, ttl: u32, size: usize) -> Record {
+    let strings: Vec<String> = (0..size / 256).map(|_| "x".repeat(255)).collect();
+
+    Record::from_rdata(name(owner), ttl, RData::TXT(TXT::new(strings)))
 }
