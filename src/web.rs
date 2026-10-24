@@ -22,6 +22,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use ring::hmac;
+use ring::rand::SystemRandom;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -57,7 +59,7 @@ pub struct Web {
     allow_from: Vec<Cidr>,
     hostnames: Vec<String>,
     /// The `Authorization` credentials a client must send; `None` when no password is set.
-    credentials: Option<String>,
+    credentials: Option<Credentials>,
     query_log_entries: usize,
 }
 
@@ -67,14 +69,16 @@ impl Web {
         stats: Arc<Stats>,
         policy: Arc<Policy>,
         lists: Arc<ListControl>,
-    ) -> Web {
+    ) -> Result<Web, String> {
         let web = &config.web;
         let credentials = match (&web.user, &web.password) {
-            (Some(user), Some(password)) => Some(base64(format!("{user}:{password}").as_bytes())),
+            (Some(user), Some(password)) => Some(Credentials::new(&base64(
+                format!("{user}:{password}").as_bytes(),
+            ))?),
             _ => None,
         };
 
-        Web {
+        Ok(Web {
             stats,
             policy,
             lists,
@@ -82,7 +86,7 @@ impl Web {
             hostnames: web.hostnames.clone(),
             credentials,
             query_log_entries: config.stats.query_log_entries,
-        }
+        })
     }
 }
 
@@ -165,6 +169,7 @@ async fn serve_connection(stream: TcpStream, web: Arc<Web>, _slot: OwnedSemaphor
 
         async move { Ok::<_, Infallible>(web.respond(request).await) }
     });
+
     let connection = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(HEAD_TIMEOUT)
@@ -330,6 +335,7 @@ impl Web {
             Some(colon) => authority.split_at(colon),
             None => (authority, ""),
         };
+
         let is_known_name = host.parse::<Ipv4Addr>().is_ok()
             || self
                 .hostnames
@@ -343,6 +349,7 @@ impl Web {
         let Some(expected) = &self.credentials else {
             return Ok(());
         };
+
         let sent = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -350,7 +357,7 @@ impl Web {
             .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
             .map(|(_, credentials)| credentials.trim());
 
-        if sent.is_some_and(|sent| same_secret(sent.as_bytes(), expected.as_bytes())) {
+        if sent.is_some_and(|sent| expected.accepts(sent)) {
             return Ok(());
         }
 
@@ -465,6 +472,7 @@ impl Web {
                 until: None,
             };
         };
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -500,6 +508,7 @@ fn check_origin(headers: &HeaderMap, host: &str) -> Result<(), Rejection> {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return Ok(());
     };
+
     let is_own_origin = origin
         .to_str()
         .ok()
@@ -540,6 +549,7 @@ async fn read_body(headers: &HeaderMap, body: Incoming) -> Result<Bytes, Rejecti
             "the body is limited to 1 KiB",
         )
     };
+
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
@@ -565,18 +575,26 @@ fn method_not_allowed(allowed: &'static str) -> Rejection {
         .with_header(header::ALLOW, allowed)
 }
 
-/// Compares without stopping at the first difference, and without revealing the length of
-/// the expected value by timing.
-fn same_secret(sent: &[u8], expected: &[u8]) -> bool {
-    let mut difference = sent.len() ^ expected.len();
+/// The expected `Authorization` credentials, kept as an HMAC-SHA256 tag under a key drawn at
+/// startup. Tags have one size, so neither what is stored nor the comparison depends on the
+/// length of the secret, and `hmac::verify` does not stop at the first difference.
+struct Credentials {
+    key: hmac::Key,
+    tag: hmac::Tag,
+}
 
-    for index in 0..sent.len().max(expected.len()) {
-        let sent_byte = sent.get(index).copied().unwrap_or(0);
-        let expected_byte = expected.get(index).copied().unwrap_or(0);
-        difference |= usize::from(sent_byte ^ expected_byte);
+impl Credentials {
+    fn new(credentials: &str) -> Result<Credentials, String> {
+        let key = hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new())
+            .map_err(|_| "cannot draw a random key for the web credentials".to_string())?;
+        let tag = hmac::sign(&key, credentials.as_bytes());
+
+        Ok(Credentials { key, tag })
     }
 
-    difference == 0
+    fn accepts(&self, sent: &str) -> bool {
+        hmac::verify(&self.key, sent.as_bytes(), self.tag.as_ref()).is_ok()
+    }
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -739,6 +757,7 @@ mod tests {
             policy,
             lists,
         )
+        .unwrap()
     }
 
     #[test]
@@ -843,13 +862,26 @@ mod tests {
     }
 
     #[test]
-    fn secrets_are_equal_only_when_every_byte_is() {
-        assert!(same_secret(b"abc", b"abc"));
-        assert!(same_secret(b"", b""));
-        assert!(!same_secret(b"abc", b"abd"));
-        assert!(!same_secret(b"abc", b"abcd"));
-        assert!(!same_secret(b"abcd", b"abc"));
-        assert!(!same_secret(b"", b"a"));
+    fn credentials_are_accepted_only_when_every_byte_is_equal() {
+        let credentials = Credentials::new("abc").unwrap();
+
+        assert!(credentials.accepts("abc"));
+        assert!(!credentials.accepts("abd"));
+        assert!(!credentials.accepts("abcd"));
+        assert!(!credentials.accepts("ab"));
+        assert!(!credentials.accepts(""));
+        assert!(Credentials::new("").unwrap().accepts(""));
+    }
+
+    #[test]
+    fn what_is_kept_of_the_credentials_has_the_same_size_whatever_their_length() {
+        let short = Credentials::new("a").unwrap();
+        let long = Credentials::new(&"a".repeat(5000)).unwrap();
+
+        assert_eq!(short.tag.as_ref().len(), long.tag.as_ref().len());
+        assert_eq!(std::mem::size_of_val(&short), std::mem::size_of_val(&long));
+        assert!(!short.accepts(&"a".repeat(5000)));
+        assert!(long.accepts(&"a".repeat(5000)));
     }
 
     #[test]

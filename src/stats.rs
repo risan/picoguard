@@ -8,11 +8,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::dns::wire::{Name, read_name};
+
 pub const DEFAULT_TOP_K: usize = 50;
 pub const DEFAULT_QUERY_LOG_ENTRIES: usize = 1_000;
 pub const HOURS: usize = 24;
 
 const SECONDS_PER_HOUR: u64 = 3_600;
+/// Longest name text shown; a name with many escapes is cut and marked.
+const SHOWN_NAME_BYTES: usize = 256;
+const CUT_MARK: char = '\u{2026}';
 
 /// Seconds since the Unix epoch.
 pub type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
@@ -45,11 +50,11 @@ pub enum QueryResult {
     Error,
 }
 
-/// One answered query. `qname` is the name as the filter saw it (lowercase,
-/// no trailing dot): it is the key of the top-k lists.
+/// One answered query. `qname` is the name as the filter saw it (lowercase): it is the
+/// identity of the top-k entries.
 pub struct Event<'a> {
     pub client: IpAddr,
-    pub qname: &'a str,
+    pub qname: &'a Name,
     pub qtype: u16,
     pub result: QueryResult,
     /// Position of the upstream that answered or failed, if one was asked.
@@ -83,6 +88,16 @@ pub struct TopEntry<K> {
     pub key: K,
     pub count: u64,
     pub max_error: u64,
+}
+
+impl<K> TopEntry<K> {
+    fn with_key<T>(self, key: impl FnOnce(K) -> T) -> TopEntry<T> {
+        TopEntry {
+            key: key(self.key),
+            count: self.count,
+            max_error: self.max_error,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -184,9 +199,62 @@ struct Hour {
     blocked: u64,
 }
 
+/// A slot of the query log ring. Its name text is reused for every entry the slot holds.
+struct LogSlot {
+    time: u64,
+    client: IpAddr,
+    /// The name in wire format.
+    qname: Vec<u8>,
+    qtype: u16,
+    result: QueryResult,
+    upstream: Option<u8>,
+    latency_us: u32,
+}
+
+impl LogSlot {
+    fn new(time: u64, event: &Event) -> LogSlot {
+        let mut slot = LogSlot {
+            time,
+            client: event.client,
+            qname: Vec::new(),
+            qtype: event.qtype,
+            result: event.result,
+            upstream: event.upstream,
+            latency_us: 0,
+        };
+        slot.set(time, event);
+
+        slot
+    }
+
+    fn set(&mut self, time: u64, event: &Event) {
+        self.time = time;
+        self.client = event.client;
+        self.qname.clear();
+        self.qname.extend_from_slice(event.qname.as_wire());
+        self.qtype = event.qtype;
+        self.result = event.result;
+        self.upstream = event.upstream;
+        self.latency_us = u32::try_from(event.latency.as_micros()).unwrap_or(u32::MAX);
+    }
+
+    fn entry(&self) -> QueryLogEntry {
+        QueryLogEntry {
+            time: self.time,
+            client: self.client,
+            qname: read_name(&self.qname, 0)
+                .map_or_else(|_| Box::from(""), |(name, _)| shown(&name)),
+            qtype: self.qtype,
+            result: self.result,
+            upstream: self.upstream,
+            latency_us: self.latency_us,
+        }
+    }
+}
+
 struct QueryLog {
     capacity: usize,
-    entries: Vec<QueryLogEntry>,
+    slots: Vec<LogSlot>,
     /// Once the ring is full, the slot of the oldest entry and the next to overwrite.
     oldest: usize,
 }
@@ -195,29 +263,29 @@ impl QueryLog {
     fn new(capacity: usize) -> QueryLog {
         QueryLog {
             capacity,
-            entries: Vec::with_capacity(capacity),
+            slots: Vec::with_capacity(capacity),
             oldest: 0,
         }
     }
 
-    fn push(&mut self, entry: QueryLogEntry) {
+    fn push(&mut self, time: u64, event: &Event) {
         if self.capacity == 0 {
             return;
         }
 
-        if self.entries.len() < self.capacity {
-            self.entries.push(entry);
+        if self.slots.len() < self.capacity {
+            self.slots.push(LogSlot::new(time, event));
         } else {
-            self.entries[self.oldest] = entry;
+            self.slots[self.oldest].set(time, event);
             self.oldest = (self.oldest + 1) % self.capacity;
         }
     }
 
     fn newest_first(&self, limit: usize) -> Vec<QueryLogEntry> {
-        let length = self.entries.len();
+        let length = self.slots.len();
 
         (0..length.min(limit))
-            .map(|age| self.entries[(self.oldest + length - 1 - age) % length].clone())
+            .map(|age| self.slots[(self.oldest + length - 1 - age) % length].entry())
             .collect()
     }
 }
@@ -225,8 +293,8 @@ impl QueryLog {
 struct Inner {
     counters: Counters,
     hours: [Hour; HOURS],
-    queried: TopK<Box<str>>,
-    blocked: TopK<Box<str>>,
+    queried: TopK<Name>,
+    blocked: TopK<Name>,
     clients: TopK<IpAddr>,
     log: QueryLog,
 }
@@ -280,28 +348,22 @@ impl Stats {
                 ..Hour::default()
             };
         }
+
         hour.total += 1;
         if blocked {
             hour.blocked += 1;
         }
 
         let qname = event.qname;
-        inner.queried.record(|key| **key == *qname, || qname.into());
+        inner.queried.record(|key| key == qname, || qname.clone());
         if blocked {
-            inner.blocked.record(|key| **key == *qname, || qname.into());
+            inner.blocked.record(|key| key == qname, || qname.clone());
         }
+
         let client = event.client;
         inner.clients.record(|key| *key == client, || client);
 
-        inner.log.push(QueryLogEntry {
-            time: now,
-            client,
-            qname: qname.into(),
-            qtype: event.qtype,
-            result: event.result,
-            upstream: event.upstream,
-            latency_us: u32::try_from(event.latency.as_micros()).unwrap_or(u32::MAX),
-        });
+        inner.log.push(now, event);
     }
 
     /// A query shed before it was read, so there is no name to log.
@@ -335,8 +397,8 @@ impl Stats {
         StatsSnapshot {
             counters: inner.counters,
             hourly,
-            top_queried: inner.queried.top(),
-            top_blocked: inner.blocked.top(),
+            top_queried: shown_top(&inner.queried),
+            top_blocked: shown_top(&inner.blocked),
             top_clients: inner.clients.top(),
         }
     }
@@ -345,6 +407,26 @@ impl Stats {
     pub fn query_log(&self, limit: usize) -> Vec<QueryLogEntry> {
         self.inner.lock().unwrap().log.newest_first(limit)
     }
+}
+
+fn shown_top(top: &TopK<Name>) -> Vec<TopEntry<Box<str>>> {
+    top.top()
+        .into_iter()
+        .map(|entry| entry.with_key(|name| shown(&name)))
+        .collect()
+}
+
+/// The text of a name for people: escaped, and cut with a mark when it is long.
+fn shown(name: &Name) -> Box<str> {
+    let mut text = name.to_string();
+
+    if text.len() > SHOWN_NAME_BYTES {
+        // The text of a name is ASCII, so a cut never splits a character.
+        text.truncate(SHOWN_NAME_BYTES);
+        text.push(CUT_MARK);
+    }
+
+    text.into()
 }
 
 fn unix_seconds() -> u64 {
@@ -370,7 +452,11 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(192, 168, 1, last))
     }
 
-    fn event(qname: &str, result: QueryResult) -> Event<'_> {
+    fn name(text: &str) -> Name {
+        Name::from_text(text).unwrap()
+    }
+
+    fn event(qname: &Name, result: QueryResult) -> Event<'_> {
         Event {
             client: client(2),
             qname,
@@ -379,6 +465,10 @@ mod tests {
             upstream: None,
             latency: Duration::from_micros(100),
         }
+    }
+
+    fn record(stats: &Stats, qname: &str, result: QueryResult) {
+        stats.record(&event(&name(qname), result));
     }
 
     fn stats_at(settings: StatsSettings, start: u64) -> (Stats, Arc<AtomicU64>) {
@@ -420,9 +510,10 @@ mod tests {
         ];
         for (result, times) in results {
             for _ in 0..times {
-                stats.record(&event("example.com", result));
+                record(&stats, "example.com", result);
             }
         }
+
         stats.record_dropped();
         stats.record_dropped();
 
@@ -456,10 +547,10 @@ mod tests {
     fn blocked_domains_list_only_blocked_results() {
         let (stats, _) = stats_at(StatsSettings::default(), MIDNIGHT);
 
-        stats.record(&event("ads.example", QueryResult::BlockedRequest));
-        stats.record(&event("ads.example", QueryResult::BlockedResponse));
-        stats.record(&event("tracker.example", QueryResult::BlockedRequest));
-        stats.record(&event("fine.example", QueryResult::Pass));
+        record(&stats, "ads.example", QueryResult::BlockedRequest);
+        record(&stats, "ads.example", QueryResult::BlockedResponse);
+        record(&stats, "tracker.example", QueryResult::BlockedRequest);
+        record(&stats, "fine.example", QueryResult::Pass);
         let snapshot = stats.snapshot();
 
         let blocked: Vec<(&str, u64)> = snapshot
@@ -476,10 +567,12 @@ mod tests {
         let (stats, _) = stats_at(StatsSettings::default(), MIDNIGHT);
 
         for last in [7, 7, 7, 9] {
-            let mut query = event("example.com", QueryResult::Pass);
+            let qname = name("example.com");
+            let mut query = event(&qname, QueryResult::Pass);
             query.client = client(last);
             stats.record(&query);
         }
+
         let clients = stats.snapshot().top_clients;
 
         assert_eq!(clients[0].key, client(7));
@@ -493,6 +586,7 @@ mod tests {
         for name in ["a", "a", "a", "b", "c"] {
             top.record(|key| **key == *name, || name.into());
         }
+
         let entries = top.top();
 
         assert_eq!(entries.len(), 2);
@@ -506,7 +600,7 @@ mod tests {
     fn zero_sizes_keep_nothing_and_do_not_fail() {
         let (stats, _) = stats_at(small(0, 0), MIDNIGHT);
 
-        stats.record(&event("example.com", QueryResult::Pass));
+        record(&stats, "example.com", QueryResult::Pass);
         let snapshot = stats.snapshot();
 
         assert_eq!(snapshot.counters.total, 1);
@@ -548,8 +642,9 @@ mod tests {
         for rank in skewed_stream(names.len(), LENGTH) {
             let name = names[rank].as_str();
             *truth.entry(name).or_default() += 1;
-            stats.record(&event(name, QueryResult::Pass));
+            record(&stats, name, QueryResult::Pass);
         }
+
         let reported = stats.snapshot().top_queried;
 
         let mut ranked: Vec<(&str, u64)> =
@@ -600,12 +695,57 @@ mod tests {
             .collect()
     }
 
+    /// Three labels of 60 bytes that print as `\255` each: 720 characters of text. Names for
+    /// different `last` bytes share their first 716.
+    fn escaped_name(last: u8) -> Name {
+        let mut wire = Vec::new();
+        for _ in 0..3 {
+            wire.push(60);
+            wire.extend_from_slice(&[0xff; 60]);
+        }
+
+        wire.push(0);
+        wire[181] = last;
+
+        read_name(&wire, 0).unwrap().0
+    }
+
+    #[test]
+    fn a_short_name_is_shown_whole_in_lowercase() {
+        assert_eq!(&*shown(&name("Www.Example.COM.")), "www.example.com");
+    }
+
+    #[test]
+    fn a_long_name_is_shown_cut_and_marked() {
+        let text = shown(&escaped_name(1));
+
+        assert!(text.starts_with("\\255\\255"));
+        assert!(text.ends_with(CUT_MARK));
+        assert_eq!(text.len(), SHOWN_NAME_BYTES + CUT_MARK.len_utf8());
+    }
+
+    #[test]
+    fn names_that_look_alike_once_cut_are_separate_entries_and_log_lines() {
+        let (stats, _) = stats_at(small(5, 5), MIDNIGHT);
+        let (first, second) = (escaped_name(1), escaped_name(2));
+
+        for qname in [&first, &second, &first] {
+            stats.record(&event(qname, QueryResult::BlockedRequest));
+        }
+
+        let counts = |top: Vec<TopEntry<Box<str>>>| top.iter().map(|e| e.count).collect::<Vec<_>>();
+        let snapshot = stats.snapshot();
+        assert_eq!(counts(snapshot.top_queried), [2, 1]);
+        assert_eq!(counts(snapshot.top_blocked), [2, 1]);
+        assert_eq!(logged_names(&stats, 3)[0], *shown(&first));
+    }
+
     #[test]
     fn query_log_lists_newest_first_until_full() {
         let (stats, _) = stats_at(small(5, 3), MIDNIGHT);
 
-        stats.record(&event("one.example", QueryResult::Pass));
-        stats.record(&event("two.example", QueryResult::Pass));
+        record(&stats, "one.example", QueryResult::Pass);
+        record(&stats, "two.example", QueryResult::Pass);
 
         assert_eq!(logged_names(&stats, 10), ["two.example", "one.example"]);
     }
@@ -615,7 +755,7 @@ mod tests {
         let (stats, _) = stats_at(small(5, 3), MIDNIGHT);
 
         for number in 1..=7 {
-            stats.record(&event(&format!("q{number}.example"), QueryResult::Pass));
+            record(&stats, &format!("q{number}.example"), QueryResult::Pass);
         }
 
         assert_eq!(
@@ -632,7 +772,7 @@ mod tests {
 
         stats.record(&Event {
             client: client(77),
-            qname: "example.com",
+            qname: &name("example.com"),
             qtype: 28,
             result: QueryResult::Error,
             upstream: Some(1),
@@ -656,7 +796,8 @@ mod tests {
     #[test]
     fn a_huge_latency_is_capped() {
         let (stats, _) = stats_at(small(5, 3), MIDNIGHT);
-        let mut query = event("example.com", QueryResult::Pass);
+        let qname = name("example.com");
+        let mut query = event(&qname, QueryResult::Pass);
         query.latency = Duration::from_secs(10_000);
 
         stats.record(&query);
@@ -677,10 +818,10 @@ mod tests {
     fn hourly_buckets_roll_over_at_midnight() {
         let (stats, time) = stats_at(StatsSettings::default(), MIDNIGHT - HOUR / 2);
 
-        stats.record(&event("a.example", QueryResult::Pass));
-        stats.record(&event("b.example", QueryResult::BlockedRequest));
+        record(&stats, "a.example", QueryResult::Pass);
+        record(&stats, "b.example", QueryResult::BlockedRequest);
         time.store(MIDNIGHT + HOUR / 6, Ordering::Relaxed);
-        stats.record(&event("c.example", QueryResult::Pass));
+        record(&stats, "c.example", QueryResult::Pass);
         let hourly = stats.snapshot().hourly;
 
         assert_eq!(hourly.len(), 24);
@@ -695,10 +836,10 @@ mod tests {
     fn skipped_hours_read_as_empty() {
         let (stats, time) = stats_at(StatsSettings::default(), MIDNIGHT + 10 * HOUR);
 
-        stats.record(&event("a.example", QueryResult::Pass));
+        record(&stats, "a.example", QueryResult::Pass);
         time.store(MIDNIGHT + 15 * HOUR + 5, Ordering::Relaxed);
-        stats.record(&event("b.example", QueryResult::Pass));
-        stats.record(&event("b.example", QueryResult::Pass));
+        record(&stats, "b.example", QueryResult::Pass);
+        record(&stats, "b.example", QueryResult::Pass);
 
         let mut expected = vec![0; 24];
         expected[23] = 2;
@@ -711,10 +852,11 @@ mod tests {
         let (stats, time) = stats_at(StatsSettings::default(), MIDNIGHT + 3 * HOUR);
 
         for _ in 0..4 {
-            stats.record(&event("a.example", QueryResult::BlockedRequest));
+            record(&stats, "a.example", QueryResult::BlockedRequest);
         }
+
         time.store(MIDNIGHT + 27 * HOUR, Ordering::Relaxed);
-        stats.record(&event("b.example", QueryResult::Pass));
+        record(&stats, "b.example", QueryResult::Pass);
         let hourly = stats.snapshot().hourly;
 
         assert_eq!((hourly[23].total, hourly[23].blocked), (1, 0));
@@ -725,7 +867,7 @@ mod tests {
     fn reading_after_a_quiet_day_shows_nothing_but_keeps_the_counters() {
         let (stats, time) = stats_at(StatsSettings::default(), MIDNIGHT);
 
-        stats.record(&event("a.example", QueryResult::Pass));
+        record(&stats, "a.example", QueryResult::Pass);
         time.store(MIDNIGHT + 2 * 86_400, Ordering::Relaxed);
 
         assert_eq!(totals(&stats), vec![0; 24]);
@@ -738,7 +880,7 @@ mod tests {
 
         for hour in 0..30 {
             time.store(MIDNIGHT + hour * HOUR, Ordering::Relaxed);
-            stats.record(&event("a.example", QueryResult::Pass));
+            record(&stats, "a.example", QueryResult::Pass);
         }
 
         assert_eq!(totals(&stats), vec![1; 24]);

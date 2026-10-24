@@ -9,18 +9,18 @@
 //! 7. cache insert and the client reply.
 
 use std::collections::HashMap;
-use std::fmt::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
+use tokio::time::timeout;
 
 use crate::budget::{Budget, Charge};
 use crate::cache::{Cache, CacheKey, EntryToken, Memo};
 use crate::config::{Cidr, Config, is_allowed};
 use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
-use crate::dns::wire::{Name, Query, QueryError, ResponseInfo, rcode, rtype};
+use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, rcode, rtype};
 use crate::filter::engine::{BlockedAnswer, Decision, blocked_answer};
 use crate::policy::{Policy, PolicyView};
 use crate::stats::{Event, QueryResult, Stats, StatsSettings};
@@ -38,8 +38,6 @@ const PRIVATE_NETWORKS: [&str; 7] = [
 ];
 const IPV4_REVERSE_LABELS: usize = 6;
 const IPV6_REVERSE_LABELS: usize = 34;
-/// Longest name text the statistics see; a name with many escapes is cut.
-const STATS_NAME_BYTES: usize = 256;
 
 /// What the steps that need no waiting settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +56,6 @@ enum Route {
     Local,
 }
 
-/// Who asked and since when, for the statistics.
 #[derive(Clone, Copy)]
 struct Asker {
     client: IpAddr,
@@ -74,37 +71,56 @@ impl Asker {
     }
 }
 
-/// A name as text in a fixed buffer, so recording a query allocates nothing.
-struct NameText {
-    bytes: [u8; STATS_NAME_BYTES],
-    len: usize,
+/// What answered a query without waiting, and how it counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// The configuration decides this one, whatever the policy.
+    Static(QueryResult),
+    Blocked(QueryResult),
+    Cached(QueryResult),
 }
 
-impl NameText {
-    fn of(name: &Name) -> NameText {
-        let mut text = NameText {
-            bytes: [0; STATS_NAME_BYTES],
-            len: 0,
-        };
-        let _ = write!(text, "{name}");
-
-        text
-    }
-
-    fn as_str(&self) -> &str {
-        // The text of a name is ASCII, so a cut never splits a character.
-        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or_default()
+impl Settled {
+    fn result(self) -> QueryResult {
+        match self {
+            Settled::Static(result) | Settled::Blocked(result) | Settled::Cached(result) => result,
+        }
     }
 }
 
-impl fmt::Write for NameText {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        let room = STATS_NAME_BYTES - self.len;
-        let kept = text.len().min(room);
-        self.bytes[self.len..self.len + kept].copy_from_slice(&text.as_bytes()[..kept]);
-        self.len += kept;
+#[derive(Debug, Clone, Copy)]
+struct Counted {
+    result: QueryResult,
+    server: Option<u8>,
+}
 
-        Ok(())
+impl Counted {
+    fn of(result: QueryResult) -> Counted {
+        Counted {
+            result,
+            server: None,
+        }
+    }
+}
+
+/// What is left to do once `Pipeline::finish` has built a reply: count the query with
+/// `Pipeline::count`, after the reply has been chosen for good.
+#[must_use]
+pub struct Finished(Option<Counted>);
+
+#[derive(Debug, Clone, Copy)]
+enum Source {
+    Cache,
+    /// The upstream that gave the reply. `None` for the local resolver.
+    Upstream(Option<u8>),
+}
+
+impl Source {
+    fn server(self) -> Option<u8> {
+        match self {
+            Source::Cache => None,
+            Source::Upstream(server) => server,
+        }
     }
 }
 
@@ -120,12 +136,39 @@ struct Delivery {
     info: ResponseInfo,
     /// The cache entry made from these bytes, if they were cached.
     cached_as: Option<EntryToken>,
-    /// The upstream that gave the reply. `None` for the local resolver.
-    server: Option<u8>,
+    /// How old the bytes were when they were received: a cache hit has been cached for a while.
+    age_secs_when_received: u32,
+    received: Instant,
+    source: Source,
     _charge: Charge,
 }
 
 impl Delivery {
+    fn new(
+        bytes: Vec<u8>,
+        info: ResponseInfo,
+        cached_as: Option<EntryToken>,
+        age_secs_when_received: u32,
+        source: Source,
+        charge: Charge,
+    ) -> Delivery {
+        Delivery {
+            bytes,
+            info,
+            cached_as,
+            age_secs_when_received,
+            received: Instant::now(),
+            source,
+            _charge: charge,
+        }
+    }
+
+    fn age_secs(&self) -> u32 {
+        let waited = u32::try_from(self.received.elapsed().as_secs()).unwrap_or(u32::MAX);
+
+        self.age_secs_when_received.saturating_add(waited)
+    }
+
     fn parts(&self) -> ReplyParts<'_> {
         ReplyParts {
             bytes: &self.bytes,
@@ -143,12 +186,20 @@ pub struct Prepared(Inner);
 enum Inner {
     /// A reply no policy can change: an error, or the answer to a malformed query.
     Final(Vec<u8>),
-    /// The compact query, and the upstream reply it waited for (`None`: the cache answers).
+    /// The compact query, and the upstream reply it waited for or the cache hit it was
+    /// answered from. `None`: a static answer, or a block; `finish` asks again if the block
+    /// has ended by then.
     Undecided {
         request: Vec<u8>,
         protocol: Protocol,
         asker: Asker,
         delivery: Option<Arc<Delivery>>,
+    },
+    /// The compact query of a question that got no answer; `finish` writes the SERVFAIL.
+    Failed {
+        request: Vec<u8>,
+        protocol: Protocol,
+        asker: Asker,
     },
 }
 
@@ -156,6 +207,17 @@ impl Prepared {
     #[cfg(test)]
     pub(crate) fn fixed(reply: Vec<u8>) -> Prepared {
         Prepared(Inner::Final(reply))
+    }
+
+    /// The compact query and the asker of a reply that is not final yet.
+    fn asked(&self) -> Option<(&[u8], &Asker)> {
+        match &self.0 {
+            Inner::Final(_) => None,
+
+            Inner::Undecided { request, asker, .. } | Inner::Failed { request, asker, .. } => {
+                Some((request, asker))
+            }
+        }
     }
 
     /// What the queued reply holds until it is written, for the byte limit of a queue. The
@@ -170,6 +232,8 @@ impl Prepared {
                 Some(delivery) => delivery.bytes.len(),
                 None => request.len(),
             },
+
+            Inner::Failed { request, .. } => request.len(),
         }
     }
 }
@@ -193,6 +257,7 @@ impl Drop for WaitingClient {
 
 pub struct Pipeline {
     udp_size: u16,
+    resume_limit: Duration,
     refuse_any: bool,
     cache_min_ttl: u32,
     cache_max_ttl: u32,
@@ -221,6 +286,7 @@ impl Pipeline {
 
         Ok(Arc::new(Pipeline {
             udp_size: config.server.udp_size,
+            resume_limit: Duration::from_millis(config.upstream.timeout_ms),
             refuse_any: config.refuse_any,
             cache_min_ttl: config.cache.min_ttl,
             cache_max_ttl: config.cache.max_ttl,
@@ -271,20 +337,10 @@ impl Pipeline {
         client: IpAddr,
         out: &mut Vec<u8>,
     ) -> Quick {
-        self.quickly(request, protocol, Some(&Asker::new(client)), out)
-    }
-
-    /// `answer_quickly`, recording the query only when `asker` is given: a reply that waits
-    /// for its decision is recorded when it is decided.
-    fn quickly(
-        &self,
-        request: &[u8],
-        protocol: Protocol,
-        asker: Option<&Asker>,
-        out: &mut Vec<u8>,
-    ) -> Quick {
-        self.try_answer_quickly(request, protocol, asker, out)
-            .unwrap_or_else(|quick| quick)
+        match self.settle(request, protocol, Some(&Asker::new(client)), out) {
+            Ok(_) => Quick::Replied,
+            Err(quick) => quick,
+        }
     }
 
     /// The whole pipeline for one request. Returns false when there is
@@ -297,10 +353,15 @@ impl Pipeline {
         client: IpAddr,
         out: &mut Vec<u8>,
     ) -> bool {
-        match self.prepare(request, protocol, client).await {
-            Some(prepared) => self.finish(&prepared, out),
-            None => false,
-        }
+        let Some(prepared) = self.prepare(request, protocol, client).await else {
+            return false;
+        };
+        let Some(finished) = self.finish(&prepared, out).await else {
+            return false;
+        };
+        self.count(&prepared, finished);
+
+        true
     }
 
     /// Steps 1 to 5: everything up to the decision. A stream reply may wait in a queue
@@ -318,8 +379,8 @@ impl Pipeline {
     ) -> Option<Prepared> {
         let asker = Asker::new(client);
         let mut out = Vec::new();
-        let quick = self.quickly(&request, protocol, None, &mut out);
-        if quick == Quick::Dropped {
+        let settled = self.settle(&request, protocol, None, &mut out);
+        if settled == Err(Quick::Dropped) {
             return None;
         }
 
@@ -329,18 +390,38 @@ impl Pipeline {
         };
         let compact = build::compact_query(&parsed);
         drop(request);
-        if quick == Quick::Replied {
-            return Some(Prepared(Inner::Undecided {
-                request: compact,
-                protocol,
-                asker,
-                delivery: None,
-            }));
+        match settled {
+            Ok(Settled::Cached(_)) => {
+                // The entry may be gone before the reply is written, so the reply keeps its
+                // own copy of the bytes, charged like an upstream reply.
+                let query = Query::parse(&compact).ok()?;
+                let Some(delivery) = self.hold_cache_hit(&query) else {
+                    return self.shed(compact, protocol, asker);
+                };
+
+                return Some(Prepared(Inner::Undecided {
+                    request: compact,
+                    protocol,
+                    asker,
+                    delivery: Some(delivery),
+                }));
+            }
+
+            Ok(Settled::Static(_) | Settled::Blocked(_)) => {
+                return Some(Prepared(Inner::Undecided {
+                    request: compact,
+                    protocol,
+                    asker,
+                    delivery: None,
+                }));
+            }
+
+            Err(_) => {}
         }
 
         let query = Query::parse(&compact).ok()?;
         let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
-            return self.overloaded(&query, protocol, &asker, out);
+            return self.shed(compact, protocol, asker);
         };
 
         match receiver.await {
@@ -351,57 +432,108 @@ impl Pipeline {
                 delivery: Some(delivery),
             })),
 
-            Ok(Err(Failure::Overloaded)) => self.overloaded(&query, protocol, &asker, out),
+            Ok(Err(Failure::Overloaded)) => self.shed(compact, protocol, asker),
 
-            _ => {
-                Reply::new(&query, self.udp_size, protocol).error(rcode::SERVFAIL, &mut out);
-                self.record(&asker, &query, QueryResult::Error, None);
-
-                Some(Prepared(Inner::Final(out)))
-            }
+            _ => Some(Prepared(Inner::Failed {
+                request: compact,
+                protocol,
+                asker,
+            })),
         }
     }
 
-    /// Steps 2 and 6 under the policy of this moment, and the reply in `out`. Returns false
-    /// when there is nothing to send.
-    pub fn finish(&self, prepared: &Prepared, out: &mut Vec<u8>) -> bool {
+    /// Steps 2 and 6 under the policy of this moment, and the reply in `out`. A question that
+    /// was blocked when it was prepared and is not any more is resolved now (steps 4 and 5),
+    /// for at most the upstream timeout. Returns `None` when there is nothing to send.
+    ///
+    /// The query is not counted yet: the caller may still replace the reply (see `count`).
+    pub async fn finish(
+        self: &Arc<Pipeline>,
+        prepared: &Prepared,
+        out: &mut Vec<u8>,
+    ) -> Option<Finished> {
         match &prepared.0 {
             Inner::Final(bytes) => {
                 out.clear();
                 out.extend_from_slice(bytes);
 
-                true
+                Some(Finished(None))
             }
 
             Inner::Undecided {
                 request,
                 protocol,
-                asker,
                 delivery: Some(delivery),
+                ..
             } => {
-                let Ok(query) = Query::parse(request) else {
-                    return false;
-                };
+                let query = Query::parse(request).ok()?;
                 let reply = Reply::new(&query, self.udp_size, *protocol);
-                self.deliver(&query, &reply, delivery, asker, out);
 
-                true
+                Some(Finished(Some(self.deliver(&query, &reply, delivery, out))))
             }
 
-            // The cache entry may be gone by now; then there is no answer to give.
             Inner::Undecided {
                 request,
                 protocol,
-                asker,
                 delivery: None,
-            } => {
-                self.quickly(request, *protocol, Some(asker), out) == Quick::Replied
-                    || self.servfail(request, *protocol, asker, out)
+                ..
+            } => match self.settle(request, *protocol, None, out) {
+                Ok(settled) => Some(Finished(Some(Counted::of(settled.result())))),
+                Err(Quick::Replied) => Some(Finished(None)),
+                Err(Quick::Dropped) => None,
+                Err(Quick::NeedsUpstream) => self.resume(request, *protocol, out).await,
+            },
+
+            Inner::Failed {
+                request, protocol, ..
+            } => self
+                .servfail(request, *protocol, out)
+                .then_some(Finished(Some(Counted::of(QueryResult::Error)))),
+        }
+    }
+
+    /// Records the query in the statistics, with the result `finish` found. Called once the
+    /// reply is final: after it has been queued, framed and charged, or when a UDP reply is
+    /// ready. A reply replaced by a SERVFAIL on the way is counted by `failure_of` instead.
+    pub fn count(&self, prepared: &Prepared, finished: Finished) {
+        let (Some(counted), Some((request, asker))) = (finished.0, prepared.asked()) else {
+            return;
+        };
+
+        if let Ok(query) = Query::parse(request) {
+            self.record(asker, &query, counted.result, counted.server);
+        }
+    }
+
+    async fn resume(
+        self: &Arc<Pipeline>,
+        request: &[u8],
+        protocol: Protocol,
+        out: &mut Vec<u8>,
+    ) -> Option<Finished> {
+        let query = Query::parse(request).ok()?;
+        let reply = Reply::new(&query, self.udp_size, protocol);
+        let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
+            return self.shed_now(&reply, protocol, out);
+        };
+
+        match timeout(self.resume_limit, receiver).await {
+            Ok(Ok(Ok(delivery))) => {
+                Some(Finished(Some(self.deliver(&query, &reply, &delivery, out))))
+            }
+
+            Ok(Ok(Err(Failure::Overloaded))) => self.shed_now(&reply, protocol, out),
+
+            _ => {
+                reply.error(rcode::SERVFAIL, out);
+
+                Some(Finished(Some(Counted::of(QueryResult::Error))))
             }
         }
     }
 
-    /// A SERVFAIL in place of `prepared`, for a reply that cannot be queued or written.
+    /// A SERVFAIL in place of `prepared`, for a reply that cannot be queued or written. A
+    /// query that was not answered yet is counted here, as the error it ends in.
     pub fn failure_of(&self, prepared: &Prepared) -> Option<Prepared> {
         let mut out = Vec::new();
 
@@ -412,17 +544,22 @@ impl Pipeline {
 
             Inner::Undecided {
                 request, protocol, ..
+            }
+            | Inner::Failed {
+                request, protocol, ..
             } => {
-                if !self.write_servfail(request, *protocol, &mut out) {
+                if !self.servfail(request, *protocol, &mut out) {
                     return None;
                 }
+
+                self.count(prepared, Finished(Some(Counted::of(QueryResult::Error))));
             }
         }
 
         Some(Prepared(Inner::Final(out)))
     }
 
-    fn write_servfail(&self, request: &[u8], protocol: Protocol, out: &mut Vec<u8>) -> bool {
+    fn servfail(&self, request: &[u8], protocol: Protocol, out: &mut Vec<u8>) -> bool {
         let Ok(query) = Query::parse(request) else {
             return false;
         };
@@ -432,27 +569,10 @@ impl Pipeline {
         true
     }
 
-    /// A SERVFAIL for a query that was expected to have an answer.
-    fn servfail(
-        &self,
-        request: &[u8],
-        protocol: Protocol,
-        asker: &Asker,
-        out: &mut Vec<u8>,
-    ) -> bool {
-        if let Ok(query) = Query::parse(request) {
-            self.record(asker, &query, QueryResult::Error, None);
-        }
-
-        self.write_servfail(request, protocol, out)
-    }
-
     fn record(&self, asker: &Asker, query: &Query<'_>, result: QueryResult, server: Option<u8>) {
-        let name = NameText::of(&query.question.name);
-
         self.stats.record(&Event {
             client: asker.client,
-            qname: name.as_str(),
+            qname: &query.question.name,
             qtype: query.question.qtype,
             result,
             upstream: server,
@@ -460,13 +580,16 @@ impl Pipeline {
         });
     }
 
-    fn try_answer_quickly(
+    /// Steps 1 to 3 and 6. `Err` says what is left to do: nothing (`Replied` is a
+    /// header-only answer to a malformed query), or the upstream. The query is recorded
+    /// when `asker` is given.
+    fn settle(
         &self,
         request: &[u8],
         protocol: Protocol,
         asker: Option<&Asker>,
         out: &mut Vec<u8>,
-    ) -> Result<Quick, Quick> {
+    ) -> Result<Settled, Quick> {
         let query = Query::parse(request).map_err(|error| {
             if let QueryError::Reject { header, rcode } = error {
                 build::header_only(&header, rcode, out);
@@ -482,42 +605,43 @@ impl Pipeline {
             if let Some(asker) = asker {
                 self.record(asker, &query, result, None);
             }
+
+            result
         };
 
         if self.blocked_hosts.contains(name) {
             reply.error(rcode::REFUSED, out);
-            record(QueryResult::BlockedRequest);
 
-            return Ok(Quick::Replied);
+            return Ok(Settled::Static(record(QueryResult::BlockedRequest)));
         }
 
         if self.refuse_any && query.question.qtype == rtype::ANY {
             reply.error(rcode::NOTIMP, out);
-            record(QueryResult::BlockedRequest);
 
-            return Ok(Quick::Replied);
+            return Ok(Settled::Static(record(QueryResult::BlockedRequest)));
         }
 
         if self.route_of(name) == Route::Local && self.local_resolver.is_none() {
             reply.error(rcode::NXDOMAIN, out);
-            record(QueryResult::Error);
 
-            return Ok(Quick::Replied);
+            return Ok(Settled::Static(record(QueryResult::Error)));
         }
 
         let now = Instant::now();
-        let view = self.policy.view(now);
+        let view = self.policy.view(self.policy.now());
         if let Decision::Block { ips } = view.check_request(&query) {
             self.write_blocked(&reply, query.question.qtype, &ips, out);
-            record(QueryResult::BlockedRequest);
 
-            return Ok(Quick::Replied);
+            return Ok(Settled::Blocked(record(counted_as(
+                out,
+                QueryResult::BlockedRequest,
+            ))));
         }
 
         let key = CacheKey::new(&query);
         let mut cache = self.cache.lock().unwrap();
         let Some(hit) = cache.get(&key, now) else {
-            return Ok(Quick::NeedsUpstream);
+            return Err(Quick::NeedsUpstream);
         };
 
         let token = hit.token;
@@ -528,21 +652,42 @@ impl Pipeline {
             Some(memo) => memo.decision,
             None => view.check_response(hit.parts),
         };
-        match &decision {
+        let result = match &decision {
             Decision::Pass => {
                 reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs), out);
-                record(QueryResult::Cached);
+
+                QueryResult::Cached
             }
 
             Decision::Block { ips } => {
                 self.write_blocked(&reply, query.question.qtype, ips, out);
-                record(QueryResult::BlockedResponse);
+
+                QueryResult::BlockedResponse
             }
-        }
+        };
 
         self.remember(&mut cache, &key, token, &view, &decision);
 
-        Ok(Quick::Replied)
+        Ok(Settled::Cached(record(counted_as(out, result))))
+    }
+
+    /// A copy of the cached reply to `query`, charged to the pending-bytes budget. `None`
+    /// when there is no such entry or the budget cannot hold the copy.
+    fn hold_cache_hit(&self, query: &Query<'_>) -> Option<Arc<Delivery>> {
+        let mut cache = self.cache.lock().unwrap();
+        let hit = cache.get(&CacheKey::new(query), Instant::now())?;
+        let charge = self.budget.try_charge(hit.parts.bytes.len())?;
+        let bytes = hit.parts.bytes.to_vec();
+        let info = ResponseInfo::parse(&bytes).ok()?;
+
+        Some(Arc::new(Delivery::new(
+            bytes,
+            info,
+            Some(hit.token),
+            hit.age_secs,
+            Source::Cache,
+            charge,
+        )))
     }
 
     /// Steps 2 and 6 for a reply that just arrived from the upstream, under the policy of
@@ -553,15 +698,13 @@ impl Pipeline {
         query: &Query<'_>,
         reply: &Reply<'_, '_>,
         delivery: &Delivery,
-        asker: &Asker,
         out: &mut Vec<u8>,
-    ) {
-        let view = self.policy.view(Instant::now());
+    ) -> Counted {
+        let view = self.policy.view(self.policy.now());
         if let Decision::Block { ips } = view.check_request(query) {
             self.write_blocked(reply, query.question.qtype, &ips, out);
-            self.record(asker, query, QueryResult::BlockedRequest, None);
 
-            return;
+            return Counted::of(counted_as(out, QueryResult::BlockedRequest));
         }
 
         let decision = view.check_response(delivery.parts());
@@ -575,16 +718,26 @@ impl Pipeline {
             );
         }
 
-        match decision {
+        let result = match decision {
             Decision::Pass => {
-                reply.from_upstream(delivery.parts(), self.ttl_rule(0), out);
-                self.record(asker, query, QueryResult::Pass, delivery.server);
+                reply.from_upstream(delivery.parts(), self.ttl_rule(delivery.age_secs()), out);
+
+                match delivery.source {
+                    Source::Cache => QueryResult::Cached,
+                    Source::Upstream(_) => QueryResult::Pass,
+                }
             }
 
             Decision::Block { ips } => {
                 self.write_blocked(reply, query.question.qtype, &ips, out);
-                self.record(asker, query, QueryResult::BlockedResponse, delivery.server);
+
+                QueryResult::BlockedResponse
             }
+        };
+
+        Counted {
+            result: counted_as(out, result),
+            server: delivery.source.server(),
         }
     }
 
@@ -625,24 +778,43 @@ impl Pipeline {
         }
     }
 
-    /// What a query gets when a limit is reached: UDP is dropped, TCP is answered SERVFAIL.
-    fn overloaded(
-        &self,
-        query: &Query<'_>,
-        protocol: Protocol,
-        asker: &Asker,
-        mut out: Vec<u8>,
-    ) -> Option<Prepared> {
-        if protocol == Protocol::Udp {
-            self.stats.record_dropped();
-
+    /// A query that reaches a limit: UDP is dropped, TCP is answered SERVFAIL.
+    fn shed(&self, request: Vec<u8>, protocol: Protocol, asker: Asker) -> Option<Prepared> {
+        if self.drops(protocol) {
             return None;
         }
 
-        Reply::new(query, self.udp_size, protocol).error(rcode::SERVFAIL, &mut out);
-        self.record(asker, query, QueryResult::Error, None);
+        Some(Prepared(Inner::Failed {
+            request,
+            protocol,
+            asker,
+        }))
+    }
 
-        Some(Prepared(Inner::Final(out)))
+    /// `shed` for a query being finished, whose reply goes to `out`.
+    fn shed_now(
+        &self,
+        reply: &Reply<'_, '_>,
+        protocol: Protocol,
+        out: &mut Vec<u8>,
+    ) -> Option<Finished> {
+        if self.drops(protocol) {
+            return None;
+        }
+
+        reply.error(rcode::SERVFAIL, out);
+
+        Some(Finished(Some(Counted::of(QueryResult::Error))))
+    }
+
+    fn drops(&self, protocol: Protocol) -> bool {
+        if protocol != Protocol::Udp {
+            return false;
+        }
+
+        self.stats.record_dropped();
+
+        true
     }
 
     fn route_of(&self, name: &Name) -> Route {
@@ -750,17 +922,25 @@ impl Pipeline {
             Instant::now(),
         );
 
-        Ok(Arc::new(Delivery {
-            bytes,
-            info,
-            cached_as,
-            server: if route == Route::Default {
-                u8::try_from(server).ok()
-            } else {
-                None
-            },
-            _charge: charge,
-        }))
+        let source = Source::Upstream(if route == Route::Default {
+            u8::try_from(server).ok()
+        } else {
+            None
+        });
+
+        Ok(Arc::new(Delivery::new(
+            bytes, info, cached_as, 0, source, charge,
+        )))
+    }
+}
+
+/// A SERVFAIL is an error, whatever built it: the upstream, a rebuild that failed, or a
+/// blocked answer too big for the stream.
+fn counted_as(reply: &[u8], result: QueryResult) -> QueryResult {
+    if Header::parse(reply).is_ok_and(|header| header.rcode() == rcode::SERVFAIL) {
+        QueryResult::Error
+    } else {
+        result
     }
 }
 
@@ -831,23 +1011,6 @@ mod tests {
 
     fn address_of(text: &str) -> Option<IpAddr> {
         reverse_address(&Name::from_text(text).unwrap())
-    }
-
-    #[test]
-    fn a_name_text_for_the_statistics_is_cut_when_escapes_make_it_long() {
-        let short = NameText::of(&Name::from_text("Www.Example.COM.").unwrap());
-        let mut wire = Vec::new();
-        for _ in 0..3 {
-            wire.push(60);
-            wire.extend_from_slice(&[0xff; 60]);
-        }
-        wire.push(0);
-        let (name, _) = crate::dns::wire::read_name(&wire, 0).unwrap();
-        let long = NameText::of(&name);
-
-        assert_eq!(short.as_str(), "www.example.com");
-        assert_eq!(long.as_str().len(), STATS_NAME_BYTES);
-        assert!(long.as_str().starts_with("\\255\\255"));
     }
 
     #[test]
@@ -1001,13 +1164,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(&key, &old_bytes, &old_info, Instant::now());
-        let old_delivery = Delivery {
-            bytes: old_bytes,
-            info: old_info,
-            cached_as: old_token,
-            server: None,
-            _charge: pipeline.budget.try_charge(1).unwrap(),
-        };
+        let old_delivery = Delivery::new(
+            old_bytes,
+            old_info,
+            old_token,
+            0,
+            Source::Upstream(None),
+            pipeline.budget.try_charge(1).unwrap(),
+        );
 
         // The entry is replaced by a reply the policy blocks before the waiter runs.
         let new_bytes = reply_with_address(&spec, [9, 9, 9, 9]);
@@ -1021,7 +1185,7 @@ mod tests {
 
         let reply = Reply::new(&query, pipeline.udp_size, Protocol::Udp);
         let mut out = Vec::new();
-        pipeline.deliver(&query, &reply, &old_delivery, &Asker::new(CLIENT), &mut out);
+        pipeline.deliver(&query, &reply, &old_delivery, &mut out);
         assert_eq!(&parse(&out).answers[0].data.to_string(), "1.1.1.1");
 
         let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut out);
@@ -1049,17 +1213,18 @@ mod tests {
             Instant::now(),
         );
         let bytes_without_memo = pipeline.cache.lock().unwrap().bytes();
-        let delivery = Delivery {
+        let delivery = Delivery::new(
             bytes,
             info,
-            cached_as: token,
-            server: None,
-            _charge: pipeline.budget.try_charge(1).unwrap(),
-        };
+            token,
+            0,
+            Source::Upstream(None),
+            pipeline.budget.try_charge(1).unwrap(),
+        );
         let reply = Reply::new(&query, pipeline.udp_size, Protocol::Tcp);
         let mut out = Vec::new();
 
-        pipeline.deliver(&query, &reply, &delivery, &Asker::new(CLIENT), &mut out);
+        pipeline.deliver(&query, &reply, &delivery, &mut out);
         assert_eq!(parse(&out).answers.len(), 200);
         assert_eq!(pipeline.cache.lock().unwrap().bytes(), bytes_without_memo);
 

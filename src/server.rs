@@ -376,19 +376,24 @@ fn frame_of(message: &[u8]) -> Option<Vec<u8>> {
 
 /// The frame to write for `prepared`, decided now, with its charge on the pending-bytes
 /// budget. A reply that cannot be framed or does not fit is replaced by a SERVFAIL, which is
-/// not charged.
-fn frame_for(pipeline: &Pipeline, prepared: &Prepared) -> Option<(Vec<u8>, Option<Charge>)> {
+/// not charged. The query is counted with the reply that is chosen.
+async fn frame_for(
+    pipeline: &Arc<Pipeline>,
+    prepared: &Prepared,
+) -> Option<(Vec<u8>, Option<Charge>)> {
     let mut out = Vec::new();
 
-    if pipeline.finish(prepared, &mut out)
+    if let Some(finished) = pipeline.finish(prepared, &mut out).await
         && let Some(frame) = frame_of(&out)
         && let Some(charge) = pipeline.budget().try_charge(frame.len())
     {
+        pipeline.count(prepared, finished);
+
         return Some((frame, Some(charge)));
     }
 
     let failure = pipeline.failure_of(prepared)?;
-    pipeline.finish(&failure, &mut out);
+    let _ = pipeline.finish(&failure, &mut out).await;
 
     Some((frame_of(&out)?, None))
 }
@@ -400,12 +405,12 @@ async fn write_replies<W>(
     mut writer: W,
     mut replies: mpsc::UnboundedReceiver<QueuedReply>,
     write_timeout: Duration,
-    pipeline: &Pipeline,
+    pipeline: &Arc<Pipeline>,
 ) where
     W: AsyncWrite + Unpin,
 {
     while let Some(reply) = replies.recv().await {
-        let Some((frame, _charge)) = frame_for(pipeline, &reply.prepared) else {
+        let Some((frame, _charge)) = frame_for(pipeline, &reply.prepared).await else {
             continue;
         };
         let written = timeout(write_timeout, writer.write_all(&frame)).await;
@@ -418,6 +423,7 @@ async fn write_replies<W>(
 
 #[cfg(test)]
 mod tests {
+    use hickory_proto::op::ResponseCode;
     use tokio::io::duplex;
 
     use super::*;
@@ -585,7 +591,7 @@ mod tests {
     /// Writes `replies` to a peer that starts reading only when this is awaited, so the
     /// writer is stuck on the first frame until then, and returns the messages it got.
     async fn written_to_a_slow_peer(
-        pipeline: &Pipeline,
+        pipeline: &Arc<Pipeline>,
         replies: mpsc::UnboundedReceiver<QueuedReply>,
     ) -> Vec<Vec<u8>> {
         let (writer, mut peer) = duplex(8);
@@ -689,11 +695,35 @@ mod tests {
         assert_eq!(first_address(&messages[1]), "0.0.0.0");
     }
 
+    /// A clock that only moves when `advance` says so.
+    #[derive(Clone)]
+    struct ManualClock(Arc<std::sync::Mutex<std::time::Instant>>);
+
+    impl ManualClock {
+        fn new() -> ManualClock {
+            ManualClock(Arc::new(std::sync::Mutex::new(std::time::Instant::now())))
+        }
+
+        fn policy(&self, engine: Arc<Engine>) -> Arc<Policy> {
+            let clock = self.clone();
+
+            Arc::new(Policy::with_clock(
+                engine,
+                Arc::new(move || *clock.0.lock().unwrap()),
+            ))
+        }
+
+        fn advance(&self, by: Duration) {
+            *self.0.lock().unwrap() += by;
+        }
+    }
+
     #[tokio::test]
     async fn a_queued_reply_is_filtered_again_when_a_pause_ends_while_it_waits() {
-        let policy = Arc::new(Policy::with_engine(blocking("||ads.example^\n")));
+        let clock = ManualClock::new();
+        let policy = clock.policy(blocking("||ads.example^\n"));
         let (pipeline, _upstream) = pipeline_over(&policy).await;
-        policy.pause(Duration::from_millis(300), std::time::Instant::now());
+        policy.pause(Duration::from_secs(300), policy.now());
         let (queue, replies) = mpsc::unbounded_channel();
         queue.send(fixed(vec![0; 1000])).unwrap();
         let prepared = pipeline
@@ -702,17 +732,192 @@ mod tests {
         queue.send(queued(prepared.unwrap())).unwrap();
         drop(queue);
         assert!(
-            policy.view(std::time::Instant::now()).paused,
+            policy.view(policy.now()).paused,
             "the reply must have arrived during the pause"
         );
 
-        while policy.view(std::time::Instant::now()).paused {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
+        clock.advance(Duration::from_secs(300));
+        assert!(!policy.view(policy.now()).paused);
         let messages = written_to_a_slow_peer(&pipeline, replies).await;
 
         assert_eq!(first_address(&messages[1]), "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn a_pause_lasts_until_the_clock_reaches_its_deadline() {
+        let clock = ManualClock::new();
+        let policy = clock.policy(blocking("||ads.example^\n"));
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
+        policy.pause(Duration::from_secs(60), policy.now());
+        let answer_of = || async {
+            let mut out = Vec::new();
+            pipeline
+                .answer(query_for("ads.example."), Protocol::Tcp, CLIENT, &mut out)
+                .await;
+
+            first_address(&out)
+        };
+
+        assert_eq!(answer_of().await, "1.2.3.4");
+        clock.advance(Duration::from_secs(59));
+        assert_eq!(answer_of().await, "1.2.3.4");
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(answer_of().await, "0.0.0.0");
+    }
+
+    fn asked(upstream: &FakeDns) -> usize {
+        upstream.queries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_queued_cache_hit_is_answered_after_its_entry_is_evicted() {
+        let policy = Arc::new(Policy::new());
+        let upstream = fake_dns(vec!["1.2.3.4".parse().unwrap()], Vec::new()).await;
+        let mut config = Config::default();
+        config.upstream.servers = vec![format!("udp://{}", upstream.address)];
+        config.cache.max_entries = 1;
+        let pipeline = Pipeline::new(&config, Arc::clone(&policy)).unwrap();
+        let mut out = Vec::new();
+        pipeline
+            .answer(query_for("kept.example."), Protocol::Tcp, CLIENT, &mut out)
+            .await;
+        let (queue, replies) = mpsc::unbounded_channel();
+        queue.send(fixed(vec![0; 1000])).unwrap();
+        let prepared = pipeline
+            .prepare(query_for("kept.example."), Protocol::Tcp, CLIENT)
+            .await;
+        queue.send(queued(prepared.unwrap())).unwrap();
+
+        // Another question takes the only cache slot while the writer is stuck.
+        pipeline
+            .answer(query_for("other.example."), Protocol::Tcp, CLIENT, &mut out)
+            .await;
+        drop(queue);
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
+
+        assert_eq!(first_address(&messages[1]), "1.2.3.4");
+        assert_eq!(asked(&upstream), 2, "the held answer needs no new query");
+    }
+
+    #[tokio::test]
+    async fn a_queued_reply_blocked_at_preparation_is_resolved_when_the_block_ends() {
+        let policy = Arc::new(Policy::with_engine(blocking("||ads.example^\n")));
+        let (pipeline, upstream) = pipeline_over(&policy).await;
+        let (queue, replies) = mpsc::unbounded_channel();
+        queue.send(fixed(vec![0; 1000])).unwrap();
+        let prepared = pipeline
+            .prepare(query_for("ads.example."), Protocol::Tcp, CLIENT)
+            .await;
+        queue.send(queued(prepared.unwrap())).unwrap();
+        assert_eq!(asked(&upstream), 0, "a blocked question is not asked");
+
+        policy.swap_engine(blocking("||other.example^\n"));
+        drop(queue);
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
+
+        assert_eq!(first_address(&messages[1]), "1.2.3.4");
+        assert_eq!(asked(&upstream), 1);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_reply_is_checked_against_the_policy_of_the_moment() {
+        let policy = Arc::new(Policy::with_engine(blocking("||ads.example^\n")));
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
+        let (queue, replies) = mpsc::unbounded_channel();
+        queue.send(fixed(vec![0; 1000])).unwrap();
+        let prepared = pipeline
+            .prepare(query_for("ads.example."), Protocol::Tcp, CLIENT)
+            .await;
+        queue.send(queued(prepared.unwrap())).unwrap();
+
+        policy.swap_engine(blocking("||1.2.3.4^\n"));
+        drop(queue);
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
+
+        assert_eq!(first_address(&messages[1]), "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_query_that_gets_no_answer_ends_in_servfail_within_the_upstream_timeout() {
+        let policy = Arc::new(Policy::with_engine(blocking("||ads.example^\n")));
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut config = Config::default();
+        config.upstream.servers = vec![format!("udp://{}", silent.local_addr().unwrap())];
+        config.upstream.timeout_ms = 200;
+        let pipeline = Pipeline::new(&config, Arc::clone(&policy)).unwrap();
+        let (queue, replies) = mpsc::unbounded_channel();
+        let prepared = pipeline
+            .prepare(query_for("ads.example."), Protocol::Tcp, CLIENT)
+            .await;
+        queue.send(queued(prepared.unwrap())).unwrap();
+        policy.swap_engine(blocking("||other.example^\n"));
+        drop(queue);
+        let started = std::time::Instant::now();
+
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
+
+        assert_eq!(
+            parse(&messages[0]).metadata.response_code,
+            ResponseCode::ServFail
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    fn counters_of(pipeline: &Pipeline) -> crate::stats::Counters {
+        pipeline.stats().snapshot().counters
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_connection_queue_cannot_hold_is_counted_once_as_an_error() {
+        let policy = Arc::new(Policy::new());
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
+        let (queue, replies) = mpsc::unbounded_channel();
+        let slot = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+
+        answer_tcp(
+            Arc::clone(&pipeline),
+            query_for("full.example."),
+            CLIENT,
+            slot,
+            queue,
+            Budget::new(1),
+        )
+        .await;
+        let messages = written_to_a_slow_peer(&pipeline, replies).await;
+
+        assert_eq!(
+            parse(&messages[0]).metadata.response_code,
+            ResponseCode::ServFail
+        );
+        let counters = counters_of(&pipeline);
+        assert_eq!((counters.total, counters.errors), (1, 1));
+        assert_eq!(counters.upstream, 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_whose_frame_does_not_fit_the_budget_is_counted_as_the_servfail_it_became() {
+        let policy = Arc::new(Policy::new());
+        let (pipeline, _upstream) = pipeline_over(&policy).await;
+        let prepared = pipeline
+            .prepare(query_for("tight.example."), Protocol::Tcp, CLIENT)
+            .await
+            .unwrap();
+        let capacity = Config::default().limits.pending_bytes;
+        let _all_but_one_byte = pipeline
+            .budget()
+            .try_charge(capacity - pipeline.budget().used() - 1)
+            .unwrap();
+
+        let (frame, charge) = frame_for(&pipeline, &prepared).await.unwrap();
+
+        assert!(charge.is_none(), "a SERVFAIL is not charged");
+        assert_eq!(
+            parse(&frame[2..]).metadata.response_code,
+            ResponseCode::ServFail
+        );
+        let counters = counters_of(&pipeline);
+        assert_eq!((counters.total, counters.errors), (1, 1));
+        assert_eq!(counters.upstream, 0);
     }
 
     #[tokio::test]

@@ -180,6 +180,9 @@ impl Transport {
                     udp::exchange(upstream.server, request, upstream.max_reply, deadline).await?;
                 let truncated = Header::parse(&reply).is_ok_and(|header| header.truncated());
                 if truncated {
+                    // Uncharged bytes must not outlive the wait for the TCP answer.
+                    drop(reply);
+
                     return upstream.tcp.query_charged(request, budget, deadline).await;
                 }
 

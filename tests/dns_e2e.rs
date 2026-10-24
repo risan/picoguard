@@ -472,9 +472,15 @@ async fn a_big_answer_is_truncated_over_udp_and_complete_over_tcp() {
 
 #[tokio::test]
 async fn a_tcp_upstream_answer_truncated_over_udp_is_fetched_over_tcp() {
-    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tcp, udp) = loop {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        // The UDP port of the same number may belong to a test running beside this one.
+        if let Ok(udp) = UdpSocket::bind(tcp.local_addr().unwrap()).await {
+            break (tcp, udp);
+        }
+    };
     let address = tcp.local_addr().unwrap();
-    let udp = UdpSocket::bind(address).await.unwrap();
     let tcp_queries = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&tcp_queries);
     tokio::spawn(async move {

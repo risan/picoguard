@@ -237,7 +237,8 @@ async fn site(config: Config) -> Site {
         Arc::clone(dns.pipeline.stats()),
         Arc::clone(&policy),
         Arc::clone(&control),
-    );
+    )
+    .unwrap();
     web::spawn(listeners, Arc::new(web_state));
 
     Site {
@@ -313,6 +314,17 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
 
     // Names come from the network: the page never builds markup from them.
     assert!(!page.contains("innerHTML") && !page.contains("insertAdjacentHTML"));
+}
+
+/// No browser here: the button is hidden by a style rule, so the rule is what is checked.
+#[tokio::test]
+async fn the_resume_button_is_shown_only_while_blocking_is_paused() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    assert!(page.contains("#resume { display: none; }"));
+    assert!(page.contains(".paused #resume { display: inline-block; }"));
 }
 
 #[tokio::test]

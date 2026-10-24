@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use picoguard::dns::wire::Name;
 use picoguard::stats::{Event, QueryResult, Stats, StatsSettings};
 
 const BUDGET_BYTES: usize = 512 * 1024;
@@ -54,8 +55,9 @@ fn full_stats_with_long_names_stay_within_half_a_megabyte() {
     let stats = Stats::new(StatsSettings::default());
 
     for number in 0..20_000 {
-        let name = long_name(number);
-        assert_eq!(name.len(), LONG_NAME_LENGTH);
+        let text = long_name(number);
+        assert_eq!(text.len(), LONG_NAME_LENGTH);
+        let name = Name::from_text(&text).unwrap();
         let result = if number % 2 == 0 {
             QueryResult::BlockedRequest
         } else {
