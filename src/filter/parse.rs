@@ -224,7 +224,7 @@ impl Parser {
     /// Bytes held for an unfinished line and for format detection.
     #[cfg(test)]
     pub fn buffered_bytes(&self) -> usize {
-        self.head.len() + self.line.len()
+        self.head.len() + self.line.len() + self.rpz.buffered_bytes()
     }
 
     fn decide_format<F: FnMut(Rule<'_>)>(&mut self, sink: &mut F) {
@@ -480,6 +480,7 @@ impl Parser {
         match record {
             Record::Directive => self.counters.headers += 1,
             Record::Other => self.counters.rpz_skipped += 1,
+            Record::TooLong => self.counters.too_long += 1,
             Record::Policy {
                 name,
                 wildcard,
@@ -1972,6 +1973,25 @@ mod tests {
         let summary = parser.finish(&mut sink);
         assert_eq!(summary.counters.too_long, 1);
         assert_eq!(count, 0);
+        assert!(peak <= MAX_LINE_BYTES, "held {peak} bytes");
+    }
+
+    #[test]
+    fn an_rpz_record_spanning_many_short_lines_stays_within_the_cap() {
+        let mut parser = Parser::new(ListFormat::Rpz, usize::MAX);
+        let mut rules = Vec::new();
+        let mut sink = |rule: Rule<'_>| rules.push(describe(&rule));
+        parser.push(b"big.example CNAME (\n", &mut sink);
+        let mut peak = 0;
+        for _ in 0..100_000 {
+            parser.push(b"  x\n", &mut sink);
+            peak = peak.max(parser.buffered_bytes());
+        }
+
+        parser.push(b")\nok.example CNAME .\n", &mut sink);
+        let summary = parser.finish(&mut sink);
+        assert_eq!(summary.counters.too_long, 1);
+        assert_eq!(rules, ["ExactBlock ok.example"]);
         assert!(peak <= MAX_LINE_BYTES, "held {peak} bytes");
     }
 
