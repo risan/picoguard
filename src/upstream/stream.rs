@@ -1,23 +1,96 @@
 //! DNS over a byte stream (RFC 7766 framing): a 2-byte length before every
 //! message, many queries in flight on one connection, replies matched by ID.
-//! Plain TCP uses it now; DoT reuses it over TLS.
+//! Plain TCP and DoT (the same framing over TLS) both use it.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 
-use super::{UpstreamError, random_u64};
+use super::tls::TlsDialer;
+use super::{UpstreamError, is_answer_to, random_u64};
+use crate::config::LimitsConfig;
 
 const READ_CHUNK: usize = 4096;
 const OUTGOING_QUEUE: usize = 32;
 const ID_ATTEMPTS: usize = 16;
 const MIN_MESSAGE_LEN: usize = 12;
+
+/// How a stream upstream opens its connection.
+pub(super) enum Dial {
+    Plain(SocketAddr),
+    Tls(TlsDialer),
+}
+
+/// Plain TCP or DoT: one connection with pipelined queries, reopened when needed.
+pub(super) struct StreamUpstream {
+    pub(super) dial: Dial,
+    client: StreamClient,
+    pub(super) connect_lock: tokio::sync::Mutex<()>,
+}
+
+impl StreamUpstream {
+    pub(super) fn new(dial: Dial, limits: &LimitsConfig, timeout: Duration) -> StreamUpstream {
+        StreamUpstream {
+            dial,
+            client: StreamClient::new(limits.upstream_reply_max, timeout),
+            connect_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub(super) async fn query(
+        &self,
+        request: &mut [u8],
+        deadline: Instant,
+    ) -> Result<Vec<u8>, UpstreamError> {
+        self.ensure_connected(deadline).await?;
+
+        let reply = self.client.query(request, deadline).await?;
+        if !is_answer_to(request, &reply) {
+            return Err(UpstreamError::BadReply);
+        }
+
+        Ok(reply)
+    }
+
+    async fn ensure_connected(&self, deadline: Instant) -> Result<(), UpstreamError> {
+        if self.client.is_connected() {
+            return Ok(());
+        }
+
+        let Ok(_serialize_connects) = timeout_at(deadline, self.connect_lock.lock()).await else {
+            return Err(UpstreamError::Timeout);
+        };
+        if self.client.is_connected() {
+            return Ok(());
+        }
+
+        match &self.dial {
+            Dial::Plain(server) => {
+                let Ok(connected) = timeout_at(deadline, TcpStream::connect(server)).await else {
+                    return Err(UpstreamError::Timeout);
+                };
+                let stream = connected?;
+                stream.set_nodelay(true)?;
+                self.client.attach(stream);
+            }
+
+            Dial::Tls(dialer) => {
+                let stream = dialer.connect(deadline).await?;
+                self.client.attach(stream);
+            }
+        }
+
+        Ok(())
+    }
+}
 
 struct State {
     writer: Option<mpsc::Sender<Vec<u8>>>,
@@ -569,5 +642,229 @@ mod tests {
 
         assert_eq!(reply.len(), 12 + 2000);
         drop(server_task.await.unwrap());
+    }
+
+    mod dot {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use rustls::crypto::ring;
+        use rustls::pki_types::ServerName;
+        use tokio_rustls::server::TlsStream;
+
+        use super::*;
+        use crate::upstream::test_dns::{address_of, answer, query_for};
+        use crate::upstream::test_tls::{TestPki, TlsServer};
+        use crate::upstream::tls::{Alpn, Tls};
+
+        async fn read_query(stream: &mut TlsStream<TcpStream>) -> Option<Vec<u8>> {
+            let mut length = [0u8; 2];
+            stream.read_exact(&mut length).await.ok()?;
+            let mut query = vec![0; usize::from(u16::from_be_bytes(length))];
+            stream.read_exact(&mut query).await.ok()?;
+
+            Some(query)
+        }
+
+        /// Answers `query` with an A record whose address is four times the
+        /// first letter of the queried name.
+        async fn reply_to(stream: &mut TlsStream<TcpStream>, query: &[u8]) {
+            let letter = query[13];
+            let reply = answer(query, [letter; 4], false);
+            let mut frame = (reply.len() as u16).to_be_bytes().to_vec();
+            frame.extend_from_slice(&reply);
+            stream.write_all(&frame).await.unwrap();
+        }
+
+        fn dot_server_config(pki: &TestPki) -> rustls::ServerConfig {
+            pki.server_config(&["dot"], ring::default_provider())
+        }
+
+        fn upstream_for(
+            pki: &TestPki,
+            address: SocketAddr,
+            limits: &LimitsConfig,
+        ) -> StreamUpstream {
+            let tls = Arc::new(Tls::with_roots(pki.roots(), true));
+            let name = ServerName::try_from("localhost").unwrap();
+            let dialer = TlsDialer::new(tls, Alpn::Dot, name, address, "test".to_string());
+
+            StreamUpstream::new(Dial::Tls(dialer), limits, Duration::from_secs(2))
+        }
+
+        fn upstream(pki: &TestPki, server: &TlsServer) -> StreamUpstream {
+            upstream_for(pki, server.address, &LimitsConfig::default())
+        }
+
+        fn later() -> Instant {
+            Instant::now() + Duration::from_secs(3)
+        }
+
+        #[tokio::test]
+        async fn a_query_is_answered_over_tls_with_the_dot_protocol() {
+            let pki = TestPki::new();
+            let protocol = Arc::new(Mutex::new(None));
+            let seen = Arc::clone(&protocol);
+            let server = TlsServer::start(dot_server_config(&pki), move |mut stream| {
+                let seen = Arc::clone(&seen);
+
+                async move {
+                    *seen.lock().unwrap() = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+                    while let Some(query) = read_query(&mut stream).await {
+                        reply_to(&mut stream, &query).await;
+                    }
+                }
+            })
+            .await;
+            let upstream = upstream(&pki, &server);
+
+            let reply = upstream
+                .query(&mut query_for("a.example."), later())
+                .await
+                .unwrap();
+
+            assert_eq!(address_of(&reply), [b'a'; 4]);
+            assert_eq!(protocol.lock().unwrap().as_deref(), Some(&b"dot"[..]));
+        }
+
+        #[tokio::test]
+        async fn pipelined_queries_get_their_own_answers_when_replies_arrive_out_of_order() {
+            let pki = TestPki::new();
+            let server = TlsServer::start(dot_server_config(&pki), |mut stream| async move {
+                let first = read_query(&mut stream).await.unwrap();
+                let second = read_query(&mut stream).await.unwrap();
+                reply_to(&mut stream, &second).await;
+                reply_to(&mut stream, &first).await;
+                let _ = read_query(&mut stream).await;
+            })
+            .await;
+            let upstream = Arc::new(upstream(&pki, &server));
+
+            let first = {
+                let upstream = Arc::clone(&upstream);
+                tokio::spawn(
+                    async move { upstream.query(&mut query_for("a.example."), later()).await },
+                )
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let second = {
+                let upstream = Arc::clone(&upstream);
+                tokio::spawn(
+                    async move { upstream.query(&mut query_for("b.example."), later()).await },
+                )
+            };
+
+            assert_eq!(address_of(&first.await.unwrap().unwrap()), [b'a'; 4]);
+            assert_eq!(address_of(&second.await.unwrap().unwrap()), [b'b'; 4]);
+            assert_eq!(server.handshakes.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn one_connection_serves_many_queries() {
+            let pki = TestPki::new();
+            let server = TlsServer::start(dot_server_config(&pki), |mut stream| async move {
+                while let Some(query) = read_query(&mut stream).await {
+                    reply_to(&mut stream, &query).await;
+                }
+            })
+            .await;
+            let upstream = upstream(&pki, &server);
+
+            for _ in 0..20 {
+                upstream
+                    .query(&mut query_for("a.example."), later())
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn the_connection_is_reopened_after_the_server_closes_it() {
+            let pki = TestPki::new();
+            let served = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&served);
+            let server = TlsServer::start(dot_server_config(&pki), move |mut stream| {
+                let counter = Arc::clone(&counter);
+
+                async move {
+                    // Two queries per connection, then close.
+                    for _ in 0..2 {
+                        let Some(query) = read_query(&mut stream).await else {
+                            return;
+                        };
+                        reply_to(&mut stream, &query).await;
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+            .await;
+            let upstream = upstream(&pki, &server);
+
+            for _ in 0..6 {
+                let mut attempts = 0;
+                loop {
+                    attempts += 1;
+                    let result = upstream.query(&mut query_for("a.example."), later()).await;
+                    if result.is_ok() || attempts == 2 {
+                        assert!(result.is_ok(), "{result:?}");
+                        break;
+                    }
+
+                    // A query sent into a connection that is just closing fails once.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+
+            assert!(server.handshakes.load(Ordering::SeqCst) >= 3);
+        }
+
+        #[tokio::test]
+        async fn the_connection_is_reopened_after_the_server_restarts() {
+            let pki = TestPki::new();
+            let echo = |mut stream: TlsStream<TcpStream>| async move {
+                while let Some(query) = read_query(&mut stream).await {
+                    reply_to(&mut stream, &query).await;
+                }
+            };
+            let server = TlsServer::start(dot_server_config(&pki), echo).await;
+            let upstream = upstream(&pki, &server);
+            upstream
+                .query(&mut query_for("a.example."), later())
+                .await
+                .unwrap();
+
+            let address = server.stop().await;
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let restarted = TlsServer::start_on(listener, dot_server_config(&pki), echo);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let reply = upstream.query(&mut query_for("a.example."), later()).await;
+
+            assert_eq!(address_of(&reply.unwrap()), [b'a'; 4]);
+            restarted.wait_for_handshakes(1).await;
+            assert_eq!(restarted.handshakes.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn a_reply_over_the_configured_limit_is_an_error() {
+            let pki = TestPki::new();
+            let server = TlsServer::start(dot_server_config(&pki), |mut stream| async move {
+                while let Some(query) = read_query(&mut stream).await {
+                    reply_to(&mut stream, &query).await;
+                }
+            })
+            .await;
+            let limits = LimitsConfig {
+                upstream_reply_max: 30,
+                ..LimitsConfig::default()
+            };
+
+            let result = upstream_for(&pki, server.address, &limits)
+                .query(&mut query_for("a.example."), later())
+                .await;
+
+            assert!(result.is_err());
+        }
     }
 }

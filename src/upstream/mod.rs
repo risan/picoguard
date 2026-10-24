@@ -16,19 +16,21 @@ use std::fmt;
 use std::hash::BuildHasher;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::net::TcpStream;
+use rustls::pki_types::ServerName;
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 
 use crate::config::{LimitsConfig, UpstreamConfig};
 use crate::dns::wire::{self, Header, flags};
 
-use stream::StreamClient;
+use stream::{Dial, StreamUpstream};
+use tls::{Alpn, Tls, TlsDialer};
 
 const DEFAULT_DNS_PORT: u16 = 53;
+const DEFAULT_DOT_PORT: u16 = 853;
 const INITIAL_SRTT_MS: f64 = 100.0;
 const SRTT_WEIGHT_OF_NEW_SAMPLE: f64 = 0.3;
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
@@ -124,62 +126,18 @@ pub(crate) fn is_answer_to(request: &[u8], reply: &[u8]) -> bool {
         && asked[name_len..] == echoed[name_len..]
 }
 
-struct TcpUpstream {
-    server: SocketAddr,
-    client: StreamClient,
-    connect_lock: tokio::sync::Mutex<()>,
-}
-
-impl TcpUpstream {
-    fn new(server: SocketAddr, limits: &LimitsConfig, timeout: Duration) -> TcpUpstream {
-        TcpUpstream {
-            server,
-            client: StreamClient::new(limits.upstream_reply_max, timeout),
-            connect_lock: tokio::sync::Mutex::new(()),
-        }
-    }
-
-    async fn query(&self, request: &mut [u8], deadline: Instant) -> Result<Vec<u8>, UpstreamError> {
-        self.ensure_connected(deadline).await?;
-
-        let reply = self.client.query(request, deadline).await?;
-        if !is_answer_to(request, &reply) {
-            return Err(UpstreamError::BadReply);
-        }
-
-        Ok(reply)
-    }
-
-    async fn ensure_connected(&self, deadline: Instant) -> Result<(), UpstreamError> {
-        let Ok(_serialize_connects) = timeout_at(deadline, self.connect_lock.lock()).await else {
-            return Err(UpstreamError::Timeout);
-        };
-        if self.client.is_connected() {
-            return Ok(());
-        }
-
-        let Ok(connected) = timeout_at(deadline, TcpStream::connect(self.server)).await else {
-            return Err(UpstreamError::Timeout);
-        };
-        let stream = connected?;
-        stream.set_nodelay(true)?;
-        self.client.attach(stream);
-
-        Ok(())
-    }
-}
-
 /// UDP with a fall back to TCP on the same address for truncated answers.
 struct UdpUpstream {
     server: SocketAddr,
     max_reply: usize,
-    tcp: TcpUpstream,
+    tcp: StreamUpstream,
 }
 
-/// How to reach one upstream server. DoH and DoT join in a later phase.
+/// How to reach one upstream server.
 enum Transport {
     Udp(UdpUpstream),
-    Tcp(TcpUpstream),
+    Tcp(StreamUpstream),
+    Dot(StreamUpstream),
 }
 
 impl Transport {
@@ -196,7 +154,9 @@ impl Transport {
                 Ok(reply)
             }
 
-            Transport::Tcp(upstream) => upstream.query(request, deadline).await,
+            Transport::Tcp(upstream) | Transport::Dot(upstream) => {
+                upstream.query(request, deadline).await
+            }
         }
     }
 }
@@ -289,17 +249,31 @@ pub struct Upstreams {
 }
 
 impl Upstreams {
-    /// Builds the servers named in the config. Only `udp://` and `tcp://` work
-    /// until the encrypted transports exist.
+    /// Builds the servers named in the config. `https://` still fails until
+    /// DoH is wired in.
     pub fn from_config(
         upstream: &UpstreamConfig,
         limits: &LimitsConfig,
     ) -> Result<Upstreams, String> {
+        Upstreams::with_tls(upstream, limits, Arc::new(Tls::with_webpki_roots()))
+    }
+
+    /// Like `from_config`, with the TLS settings (roots, AES policy) given.
+    pub fn with_tls(
+        upstream: &UpstreamConfig,
+        limits: &LimitsConfig,
+        tls: Arc<Tls>,
+    ) -> Result<Upstreams, String> {
         let timeout = Duration::from_millis(upstream.timeout_ms);
+        let context = Context {
+            limits,
+            timeout,
+            tls: &tls,
+        };
         let mut servers = Vec::new();
 
         for spec in &upstream.servers {
-            let transport = parse_server(spec, limits, timeout)?;
+            let transport = parse_server(spec, &context)?;
             servers.push(Upstream::new(spec.clone(), transport, limits));
         }
 
@@ -395,23 +369,40 @@ fn udp_transport(server: SocketAddr, limits: &LimitsConfig, timeout: Duration) -
     Transport::Udp(UdpUpstream {
         server,
         max_reply: limits.upstream_reply_max,
-        tcp: TcpUpstream::new(server, limits, timeout),
+        tcp: StreamUpstream::new(Dial::Plain(server), limits, timeout),
     })
 }
 
-fn parse_server(spec: &str, limits: &LimitsConfig, timeout: Duration) -> Result<Transport, String> {
+/// What building a transport from a server URL needs besides the URL.
+struct Context<'a> {
+    limits: &'a LimitsConfig,
+    timeout: Duration,
+    tls: &'a Arc<Tls>,
+}
+
+fn parse_server(spec: &str, context: &Context) -> Result<Transport, String> {
+    let (limits, timeout) = (context.limits, context.timeout);
+
     if let Some(address) = spec.strip_prefix("udp://") {
         return Ok(udp_transport(
-            parse_address(spec, address)?,
+            parse_address(spec, address, DEFAULT_DNS_PORT)?,
             limits,
             timeout,
         ));
     }
 
     if let Some(address) = spec.strip_prefix("tcp://") {
-        let server = parse_address(spec, address)?;
+        let server = parse_address(spec, address, DEFAULT_DNS_PORT)?;
 
-        return Ok(Transport::Tcp(TcpUpstream::new(server, limits, timeout)));
+        return Ok(Transport::Tcp(StreamUpstream::new(
+            Dial::Plain(server),
+            limits,
+            timeout,
+        )));
+    }
+
+    if let Some(rest) = spec.strip_prefix("tls://") {
+        return parse_tls(spec, rest, context);
     }
 
     Err(format!(
@@ -419,14 +410,42 @@ fn parse_server(spec: &str, limits: &LimitsConfig, timeout: Duration) -> Result<
     ))
 }
 
-fn parse_address(spec: &str, address: &str) -> Result<SocketAddr, String> {
+/// `tls://IP[:port][#servername]`. Without a server name the certificate must
+/// be valid for the IP.
+fn parse_tls(spec: &str, rest: &str, context: &Context) -> Result<Transport, String> {
+    let (address, name) = rest.split_once('#').unwrap_or((rest, ""));
+    let server = parse_address(spec, address, DEFAULT_DOT_PORT)?;
+    let name = if name.is_empty() {
+        server.ip().to_string()
+    } else {
+        name.to_string()
+    };
+    let server_name = ServerName::try_from(name)
+        .map_err(|_| format!("upstream {spec}: invalid server name after #"))?;
+    let dialer = TlsDialer::new(
+        Arc::clone(context.tls),
+        Alpn::Dot,
+        server_name,
+        server,
+        spec.to_string(),
+    );
+    let dial = Dial::Tls(dialer);
+
+    Ok(Transport::Dot(StreamUpstream::new(
+        dial,
+        context.limits,
+        context.timeout,
+    )))
+}
+
+fn parse_address(spec: &str, address: &str, default_port: u16) -> Result<SocketAddr, String> {
     if let Ok(server) = address.parse::<SocketAddr>() {
         return Ok(server);
     }
 
     address
         .parse::<IpAddr>()
-        .map(|ip| SocketAddr::new(ip, DEFAULT_DNS_PORT))
+        .map(|ip| SocketAddr::new(ip, default_port))
         .map_err(|_| format!("upstream {spec}: expected an IP address and optional port"))
 }
 
@@ -838,14 +857,23 @@ mod tests {
         assert!(health.retry_at.is_none());
     }
 
+    fn context<'a>(limits: &'a LimitsConfig, tls: &'a Arc<Tls>) -> Context<'a> {
+        Context {
+            limits,
+            timeout: Duration::from_secs(1),
+            tls,
+        }
+    }
+
     #[test]
     fn server_urls_parse_with_default_ports() {
+        let tls = Arc::new(Tls::with_webpki_roots());
         let limits = LimitsConfig::default();
-        let timeout = Duration::from_secs(1);
+        let context = context(&limits, &tls);
 
-        let udp = parse_server("udp://9.9.9.10", &limits, timeout);
-        let v6 = parse_server("udp://[::1]:5353", &limits, timeout);
-        let tcp = parse_server("tcp://192.168.1.1:5300", &limits, timeout);
+        let udp = parse_server("udp://9.9.9.10", &context);
+        let v6 = parse_server("udp://[::1]:5353", &context);
+        let tcp = parse_server("tcp://192.168.1.1:5300", &context);
 
         assert!(
             matches!(udp, Ok(Transport::Udp(ref u)) if u.server == "9.9.9.10:53".parse().unwrap())
@@ -854,21 +882,20 @@ mod tests {
             matches!(v6, Ok(Transport::Udp(ref u)) if u.server == "[::1]:5353".parse().unwrap())
         );
         assert!(
-            matches!(tcp, Ok(Transport::Tcp(ref t)) if t.server == "192.168.1.1:5300".parse().unwrap())
+            matches!(tcp, Ok(Transport::Tcp(ref t)) if matches!(t.dial, Dial::Plain(server) if server == "192.168.1.1:5300".parse().unwrap()))
         );
     }
 
     #[test]
     fn bad_and_encrypted_server_urls_are_errors() {
+        let tls = Arc::new(Tls::with_webpki_roots());
         let limits = LimitsConfig::default();
-        let timeout = Duration::from_secs(1);
+        let context = context(&limits, &tls);
 
-        let encrypted = parse_server("https://1.1.1.1/dns-query", &limits, timeout)
+        let encrypted = parse_server("https://1.1.1.1/dns-query", &context)
             .err()
             .unwrap();
-        let hostname = parse_server("udp://dns.example", &limits, timeout)
-            .err()
-            .unwrap();
+        let hostname = parse_server("udp://dns.example", &context).err().unwrap();
 
         assert!(encrypted.contains("not supported yet"), "{encrypted}");
         assert!(hostname.contains("IP address"), "{hostname}");
