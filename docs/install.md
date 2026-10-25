@@ -78,15 +78,24 @@ Run these steps as root (`sudo -i`) on the device.
 
 ### Download and check the binary
 
-Open the picoguard release page and copy the address of the download folder. Release files are
-named `picoguard-<target>`, and `SHA256SUMS` lists their checksums. Replace `TARGET` with the
-name from the first table (for example `aarch64-unknown-linux-musl`) and `RELEASE_URL` with the
-release folder address:
+Release files are named `picoguard-<target>`, and `SHA256SUMS` lists their checksums. Replace
+`TARGET` with the name from the first table (for example `aarch64-unknown-linux-musl`).
+
+The repository is private for now, so a plain download needs a login. Use the GitHub CLI
+(`gh auth login` once), on the board or on another computer:
 
 ```sh
 cd /tmp
-wget "$RELEASE_URL/picoguard-TARGET"
-wget "$RELEASE_URL/SHA256SUMS"
+gh release download v0.1.0 -R risan/picoguard -p "picoguard-TARGET" -p SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+When the repository is public, `wget` works without a login:
+
+```sh
+cd /tmp
+wget "https://github.com/risan/picoguard/releases/download/v0.1.0/picoguard-TARGET"
+wget "https://github.com/risan/picoguard/releases/download/v0.1.0/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
