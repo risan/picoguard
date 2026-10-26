@@ -20,10 +20,12 @@ check_embedded scripts/install.sh OPENRC_SCRIPT dist/picoguard.openrc
 
 dash -n scripts/install.sh
 bash -n scripts/proxmox-lxc.sh
+scripts/test-release.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
     shellcheck -s sh scripts/install.sh
-    shellcheck -s bash scripts/proxmox-lxc.sh scripts/build-release.sh scripts/check.sh
+    shellcheck -s bash scripts/proxmox-lxc.sh scripts/build-release.sh scripts/check.sh \
+        scripts/release-preflight.sh scripts/test-release.sh
 fi
 
 cargo fmt --check
