@@ -314,7 +314,12 @@ impl Updates {
         *self.latest.lock().unwrap() = latest;
     }
 
-    fn shown_version(&self) -> Option<String> {
+    pub fn build(&self) -> Build {
+        self.build
+    }
+
+    /// The newest version the check knows of, `X.Y.Z`.
+    pub fn latest_version(&self) -> Option<String> {
         self.latest
             .lock()
             .unwrap()
@@ -467,7 +472,7 @@ impl Checker {
 
 /// What the check says while it leaves the shown result as it is.
 fn current_outcome(updates: &Updates) -> Outcome {
-    match updates.shown_version() {
+    match updates.latest_version() {
         Some(version) => Outcome::Newer(version),
         None => Outcome::UpToDate,
     }
