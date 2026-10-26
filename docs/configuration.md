@@ -82,7 +82,7 @@ lists are used.
 | `path` | none | Local file. Read at start and again every `refresh_hours`. |
 | `format` | `"auto"` | `auto`, `adblock`, `hosts`, `domains`, `wildcard`, `dnsmasq` or `rpz`. |
 | `refresh_hours` | `24` | How often to download again. |
-| `max_rules` | `3000000` | A list with more rules is not used. |
+| `max_rules` | `3000000` | A list with more rules is not used: the refresh fails, the status page shows the error and the last good copy stays. |
 | `max_body_bytes` | `67108864` (64 MiB) | A larger download is stopped and not used. |
 | `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A regex is charged the memory it really holds (about 8 KB for `/track[0-9]+/`, close to 1 MB for `/(\pL\|\pN){1,50}x/`), a wildcard rule 64 bytes for each of its parts. A list over it is not used. |
 

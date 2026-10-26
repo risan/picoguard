@@ -19,7 +19,7 @@ use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 /// Bump on every change to compiled output (what any list text compiles to, in the parser,
 /// the compiler or the snapshot encoding), however small: snapshots written by an older
 /// compiler are then ignored and the lists compile again (plan D14).
-pub const COMPILER_VERSION: u32 = 6;
+pub const COMPILER_VERSION: u32 = 7;
 
 /// Default memory budget of the slow rules of one list. Plan section 5 leaves about 8 MB
 /// between the steady total (20 MB) and the refresh peak (28 MB). The real lists are far
@@ -127,6 +127,9 @@ pub enum CompileError {
     WorkerStopped,
     /// The slow rules of the list cost more than `CompileOptions::slow_rule_budget`.
     OverBudget,
+    /// The list has more rules than `CompileOptions::max_rules`. A cut-off copy would drop
+    /// rules the list had before, so the list is refused instead.
+    OverRuleCap,
 }
 
 /// A compile job that is waiting for text. Send the pieces, then `Piece::End`, then await
@@ -334,6 +337,10 @@ fn compile(
     let summary = parser.finish(&mut sink);
     if over_budget.get() {
         return Err(CompileError::OverBudget);
+    }
+
+    if summary.counters.over_cap > 0 {
+        return Err(CompileError::OverRuleCap);
     }
 
     let content_hash = hasher.digest128();
@@ -553,6 +560,28 @@ mod tests {
             slow_rule_cost_of(&format!("|r1{}\n", "*^".repeat(2020)))
                 >= 4040 * crate::filter::pattern::GLOB_TOKEN_BYTES
         );
+    }
+
+    #[tokio::test]
+    async fn a_list_over_the_rule_cap_fails_the_job_instead_of_losing_its_last_rules() {
+        let worker = CompileWorker::spawn().unwrap();
+        let capped = CompileOptions {
+            max_rules: 2,
+            ..options(ListFormat::Adblock)
+        };
+        let text = b"||ads.example^\n||tracker.example^\n||malware.example^\n";
+
+        let at_the_cap = compile_in_pieces(&worker, capped, &text[..text.len() - 24], 64)
+            .await
+            .unwrap();
+        let over_the_cap = compile_in_pieces(&worker, capped, text, 64).await;
+
+        assert_eq!(at_the_cap.list.rule_count(), 2);
+        assert_eq!(over_the_cap.err(), Some(CompileError::OverRuleCap));
+        let next = compile_in_pieces(&worker, options(ListFormat::Auto), LIST.as_bytes(), 100)
+            .await
+            .unwrap();
+        assert!(blocked(&next.list, "ads.example"));
     }
 
     #[tokio::test]

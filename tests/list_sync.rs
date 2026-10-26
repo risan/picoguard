@@ -437,6 +437,42 @@ async fn a_hosts_list_with_too_many_answer_ips_keeps_the_last_good_list() {
 }
 
 #[tokio::test]
+async fn a_refresh_over_max_rules_keeps_the_last_good_list_and_shows_the_error() {
+    capture_warnings();
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve(
+        "/l.txt",
+        "||ads.example^\n||malware.example^\n",
+        Some("\"v1\""),
+    );
+    let list = ListConfig {
+        max_rules: 2,
+        ..url_list("capped", server.url("/l.txt"))
+    };
+    let config = config_of(&dir, vec![list]);
+    let (mut scheduler, _) = boot(&config).await;
+    scheduler.refresh(0, &downloader()).await;
+    let policy = scheduler.policy();
+    let in_force = Arc::clone(scheduler.list(0).unwrap());
+    let generation_before = generation(&policy);
+    assert!(blocked(&policy, "malware.example."));
+
+    server.serve(
+        "/l.txt",
+        "||ads.example^\n||tracker.example^\n||malware.example^\n",
+        Some("\"v2\""),
+    );
+    scheduler.refresh(0, &downloader()).await;
+
+    assert!(Arc::ptr_eq(&in_force, scheduler.list(0).unwrap()));
+    assert!(blocked(&policy, "malware.example."));
+    assert!(!blocked(&policy, "tracker.example."));
+    assert_eq!(generation(&policy), generation_before);
+    assert_eq!(warnings_about("capped"), 1);
+}
+
+#[tokio::test]
 async fn a_success_ends_a_failure_streak_and_the_next_failure_warns_again() {
     capture_warnings();
     let dir = StateDir::new();
@@ -636,7 +672,8 @@ async fn local_files_rules_and_allowlists_make_one_engine() {
 }
 
 #[tokio::test]
-async fn unreadable_files_are_skipped_and_the_format_and_cap_are_honoured() {
+async fn unreadable_files_are_skipped_and_the_format_is_honoured_and_a_list_over_its_cap_is_refused()
+ {
     let dir = StateDir::new();
     fs::write(dir.file("ok.txt"), "||ok.example^\n").unwrap();
     fs::write(
@@ -662,9 +699,10 @@ async fn unreadable_files_are_skipped_and_the_format_and_cap_are_honoured() {
     let policy = scheduler.policy();
 
     assert!(blocked(&policy, "ok.example."));
-    assert!(blocked(&policy, "a.example."));
+    assert!(!blocked(&policy, "a.example."));
     assert!(!blocked(&policy, "b.example."));
     assert!(scheduler.list(0).is_none());
+    assert!(scheduler.list(2).is_none());
 
     // The missing file appears later and is picked up by its refresh.
     fs::write(dir.file("missing.txt"), "||late.example^\n").unwrap();
