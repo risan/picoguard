@@ -2,10 +2,11 @@
 //! delivery rebuilds the reply and takes the filter decision under the policy
 //! of that moment.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::net::IpAddr;
 use std::time::Instant;
 
-use lru::LruCache;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::CacheConfig;
@@ -13,8 +14,8 @@ use crate::dns::build::ReplyParts;
 use crate::dns::wire::{HEADER_LEN, Name, Query, ResponseInfo, flags, rcode};
 use crate::filter::engine::Decision;
 
-/// Struct, LRU node, hash slot and allocator overhead of one entry, counted
-/// against `max_bytes` on top of the payload.
+/// Slot, hash-table entry and allocator overhead of one entry, counted against `max_bytes` on
+/// top of the payload.
 const ENTRY_OVERHEAD: usize = 160;
 const FLAG_RD: u8 = 1;
 const FLAG_DO: u8 = 2;
@@ -106,10 +107,15 @@ pub struct Memo {
     pub decision: Decision,
 }
 
+/// One cached reply. The TTL offsets and the reply bytes share the single allocation `data`,
+/// held as `u16`s so the offsets can be borrowed as they are: first the offsets, then the
+/// reply bytes padded to an even length. An entry lives long, so keeping it to one allocation
+/// stops it from fragmenting the allocator next to the short-lived buffers of every miss.
 struct Entry {
     token: EntryToken,
-    bytes: Box<[u8]>,
-    ttl_offsets: Box<[u16]>,
+    hash: u64,
+    data: Box<[u16]>,
+    reply_len: u32,
     opt_start: Option<u16>,
     request_flags: u8,
     inserted: Instant,
@@ -117,9 +123,71 @@ struct Entry {
     memo: Option<Memo>,
 }
 
+struct NewEntry<'a> {
+    token: EntryToken,
+    key: &'a CacheKey<'a>,
+    reply: &'a [u8],
+    ttl_offsets: &'a [u16],
+    opt_start: Option<u16>,
+    inserted: Instant,
+    lifetime_secs: u32,
+}
+
 impl Entry {
+    /// Copies the reply with its question name replaced by the key's lowercase form.
+    fn new(new: NewEntry<'_>) -> Entry {
+        let NewEntry {
+            token,
+            key,
+            reply,
+            ttl_offsets,
+            opt_start,
+            inserted,
+            lifetime_secs,
+        } = new;
+
+        let mut data = vec![0u16; ttl_offsets.len() + reply.len().div_ceil(2)].into_boxed_slice();
+        data[..ttl_offsets.len()].copy_from_slice(ttl_offsets);
+
+        let stored: &mut [u8] = bytemuck::cast_slice_mut(&mut data[ttl_offsets.len()..]);
+        stored[..reply.len()].copy_from_slice(reply);
+
+        let name = key.name.as_wire();
+        stored[HEADER_LEN..HEADER_LEN + name.len()].copy_from_slice(name);
+
+        Entry {
+            token,
+            hash: key.hash,
+            data,
+            reply_len: u32::try_from(reply.len()).expect("a reply is at most 64 KiB"),
+            opt_start,
+            request_flags: key.request_flags,
+            inserted,
+            lifetime_secs,
+            memo: None,
+        }
+    }
+
+    fn reply_len(&self) -> usize {
+        self.reply_len as usize
+    }
+
+    fn ttl_count(&self) -> usize {
+        self.data.len() - self.reply_len().div_ceil(2)
+    }
+
+    fn ttl_offsets(&self) -> &[u16] {
+        &self.data[..self.ttl_count()]
+    }
+
+    fn bytes(&self) -> &[u8] {
+        let padded: &[u8] = bytemuck::cast_slice(&self.data[self.ttl_count()..]);
+
+        &padded[..self.reply_len()]
+    }
+
     fn cost(&self) -> usize {
-        cost_of(self.bytes.len(), self.ttl_offsets.len()) + self.memo.as_ref().map_or(0, memo_cost)
+        cost_of(self.reply_len(), self.ttl_count()) + self.memo.as_ref().map_or(0, memo_cost)
     }
 
     fn age_secs(&self, now: Instant) -> u32 {
@@ -129,7 +197,7 @@ impl Entry {
     }
 
     fn matches(&self, key: &CacheKey<'_>) -> bool {
-        self.request_flags == key.request_flags && key.question_matches(&self.bytes)
+        self.request_flags == key.request_flags && key.question_matches(self.bytes())
     }
 }
 
@@ -161,8 +229,45 @@ pub struct Hit<'a> {
     pub memo: Option<Memo>,
 }
 
+/// Marks "no slot" in the links of the recency list and in the free list.
+const NONE: u32 = u32::MAX;
+
+/// The cache key is already an xxh3 hash, so the table uses it as it is.
+#[derive(Default)]
+struct HashIsKey(u64);
+
+impl Hasher for HashIsKey {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+/// A place in the slab: the entry, if any, and its neighbours in the recency list. A free slot
+/// chains to the next free one through `older`.
+struct Slot {
+    newer: u32,
+    older: u32,
+    entry: Option<Entry>,
+}
+
+/// Entries live in a slab and are linked by index, most recently used first, so a cached reply
+/// costs its one allocation and a slot in a contiguous `Vec`, with no list node of its own.
 pub struct Cache {
-    entries: LruCache<u64, Entry>,
+    slots: Vec<Slot>,
+    index: HashMap<u64, u32, BuildHasherDefault<HashIsKey>>,
+    newest: u32,
+    oldest: u32,
+    free: u32,
     next_token: u64,
     bytes: usize,
     max_entries: usize,
@@ -175,7 +280,11 @@ pub struct Cache {
 impl Cache {
     pub fn new(config: &CacheConfig) -> Cache {
         Cache {
-            entries: LruCache::unbounded(),
+            slots: Vec::new(),
+            index: HashMap::default(),
+            newest: NONE,
+            oldest: NONE,
+            free: NONE,
             next_token: 0,
             bytes: 0,
             max_entries: config.max_entries,
@@ -187,11 +296,11 @@ impl Cache {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.index.is_empty()
     }
 
     /// Bytes counted against `max_bytes`.
@@ -202,34 +311,27 @@ impl Cache {
     /// Returns a live entry for `key` and marks it recently used. An expired
     /// entry is removed.
     pub fn get(&mut self, key: &CacheKey<'_>, now: Instant) -> Option<Hit<'_>> {
-        let (matches, expired) = self
-            .entries
-            .peek(&key.hash)
-            .map(|entry| {
-                (
-                    entry.matches(key),
-                    entry.age_secs(now) >= entry.lifetime_secs,
-                )
-            })
-            .unwrap_or_default();
-
-        if !matches {
+        let slot = *self.index.get(&key.hash)?;
+        let entry = self.entry(slot);
+        if !entry.matches(key) {
             return None;
         }
 
-        if expired {
+        if entry.age_secs(now) >= entry.lifetime_secs {
             self.remove(key.hash);
 
             return None;
         }
 
-        let entry = self.entries.get(&key.hash)?;
+        self.move_to_front(slot);
+
+        let entry = self.entry(slot);
 
         Some(Hit {
             token: entry.token,
             parts: ReplyParts {
-                bytes: &entry.bytes,
-                ttl_offsets: &entry.ttl_offsets,
+                bytes: entry.bytes(),
+                ttl_offsets: entry.ttl_offsets(),
                 opt_start: entry.opt_start,
             },
             age_secs: entry.age_secs(now),
@@ -259,35 +361,32 @@ impl Cache {
             return None;
         }
 
-        let mut bytes = reply.to_vec();
-        bytes[HEADER_LEN..HEADER_LEN + name_len].copy_from_slice(key.name.as_wire());
-        if !key.question_matches(&bytes) {
+        let token = EntryToken(self.next_token);
+        let entry = Entry::new(NewEntry {
+            token,
+            key,
+            reply,
+            ttl_offsets: &info.ttl_offsets,
+            opt_start: info.opt_start,
+            inserted: now,
+            lifetime_secs,
+        });
+        if !key.question_matches(entry.bytes()) {
             return None;
         }
 
+        self.next_token += 1;
         self.remove(key.hash);
-        while self.entries.len() >= self.max_entries || self.bytes + cost > self.max_bytes {
-            let Some((_, evicted)) = self.entries.pop_lru() else {
+        while self.len() >= self.max_entries || self.bytes + cost > self.max_bytes {
+            if !self.evict_oldest() {
                 break;
-            };
-
-            self.bytes -= evicted.cost();
+            }
         }
 
-        let token = EntryToken(self.next_token);
-        self.next_token += 1;
-        let entry = Entry {
-            token,
-            bytes: bytes.into_boxed_slice(),
-            ttl_offsets: info.ttl_offsets.clone().into_boxed_slice(),
-            opt_start: info.opt_start,
-            request_flags: key.request_flags,
-            inserted: now,
-            lifetime_secs,
-            memo: None,
-        };
         self.bytes += entry.cost();
-        self.entries.put(key.hash, entry);
+        let slot = self.place(entry);
+        self.index.insert(key.hash, slot);
+        self.link_at_front(slot);
 
         Some(token)
     }
@@ -296,10 +395,11 @@ impl Cache {
     /// there: an entry replaced since has other bytes. The memo's heap counts against
     /// `max_bytes`; a decision with many IPs is not kept and clears the earlier memo.
     pub fn set_memo(&mut self, key: &CacheKey<'_>, token: EntryToken, memo: Memo) {
-        let Some(entry) = self.entries.peek_mut(&key.hash) else {
+        let Some(&slot) = self.index.get(&key.hash) else {
             return;
         };
 
+        let entry = self.entry_mut(slot);
         if entry.token != token || !entry.matches(key) {
             return;
         }
@@ -310,18 +410,112 @@ impl Cache {
         self.bytes = self.bytes - cost_before + cost_after;
 
         while self.bytes > self.max_bytes {
-            let Some((_, evicted)) = self.entries.pop_lru() else {
+            if !self.evict_oldest() {
                 break;
-            };
-
-            self.bytes -= evicted.cost();
+            }
         }
     }
 
-    fn remove(&mut self, hash: u64) {
-        if let Some(entry) = self.entries.pop(&hash) {
-            self.bytes -= entry.cost();
+    fn entry(&self, slot: u32) -> &Entry {
+        self.slots[slot as usize]
+            .entry
+            .as_ref()
+            .expect("an indexed slot holds an entry")
+    }
+
+    fn entry_mut(&mut self, slot: u32) -> &mut Entry {
+        self.slots[slot as usize]
+            .entry
+            .as_mut()
+            .expect("an indexed slot holds an entry")
+    }
+
+    /// Puts `entry` in a free slot, or in a new one at the end of the slab.
+    fn place(&mut self, entry: Entry) -> u32 {
+        if self.free == NONE {
+            let slot = u32::try_from(self.slots.len()).expect("fewer than 2^32 cache slots");
+            self.slots.push(Slot {
+                newer: NONE,
+                older: NONE,
+                entry: Some(entry),
+            });
+
+            return slot;
         }
+
+        let slot = self.free;
+        let place = &mut self.slots[slot as usize];
+        self.free = place.older;
+        place.entry = Some(entry);
+
+        slot
+    }
+
+    fn link_at_front(&mut self, slot: u32) {
+        let previous_newest = self.newest;
+        let place = &mut self.slots[slot as usize];
+        place.newer = NONE;
+        place.older = previous_newest;
+
+        if previous_newest == NONE {
+            self.oldest = slot;
+        } else {
+            self.slots[previous_newest as usize].newer = slot;
+        }
+
+        self.newest = slot;
+    }
+
+    fn unlink(&mut self, slot: u32) {
+        let place = &self.slots[slot as usize];
+        let (newer, older) = (place.newer, place.older);
+
+        if newer == NONE {
+            self.newest = older;
+        } else {
+            self.slots[newer as usize].older = older;
+        }
+
+        if older == NONE {
+            self.oldest = newer;
+        } else {
+            self.slots[older as usize].newer = newer;
+        }
+    }
+
+    fn move_to_front(&mut self, slot: u32) {
+        if self.newest == slot {
+            return;
+        }
+
+        self.unlink(slot);
+        self.link_at_front(slot);
+    }
+
+    fn remove(&mut self, hash: u64) {
+        let Some(slot) = self.index.remove(&hash) else {
+            return;
+        };
+
+        self.unlink(slot);
+
+        let place = &mut self.slots[slot as usize];
+        let entry = place.entry.take().expect("an indexed slot holds an entry");
+        place.older = self.free;
+        self.free = slot;
+        self.bytes -= entry.cost();
+    }
+
+    /// Drops the least recently used entry; false when the cache is empty.
+    fn evict_oldest(&mut self) -> bool {
+        if self.oldest == NONE {
+            return false;
+        }
+
+        let hash = self.entry(self.oldest).hash;
+        self.remove(hash);
+
+        true
     }
 
     /// How long a reply may be served, or `None` if it must not be cached:
@@ -782,6 +976,95 @@ mod tests {
         );
         for kept in [0, 2, 3] {
             assert!(age_of_hit(&mut cache, &fixtures[kept], start).is_some());
+        }
+    }
+
+    #[test]
+    fn replies_of_odd_and_even_length_come_back_byte_for_byte_with_their_offsets() {
+        let mut cache = Cache::new(&config());
+        let start = Instant::now();
+        let fixture = Fixture::new("example.com.");
+        let build = |records: usize| {
+            ResponseSpec {
+                answers: (0..records)
+                    .map(|index| a("example.com.", 60, [192, 0, 2, index as u8].into()))
+                    .collect(),
+                edns: Some(1232),
+                ..ResponseSpec::default()
+            }
+            .bytes(&fixture.spec)
+        };
+
+        for records in 1..5 {
+            let reply = build(records);
+            let info = ResponseInfo::parse(&reply).unwrap();
+            assert!(insert(&mut cache, &fixture, &reply, start));
+
+            let query = fixture.query();
+            let hit = cache.get(&CacheKey::new(&query), start).unwrap();
+
+            assert_eq!(hit.parts.bytes, &reply[..]);
+            assert_eq!(hit.parts.ttl_offsets, &info.ttl_offsets[..]);
+            assert_eq!(hit.parts.opt_start, info.opt_start);
+            assert_eq!(info.ttl_offsets.len(), records);
+        }
+    }
+
+    #[test]
+    fn evicted_slots_are_reused_so_the_slab_stays_at_the_entry_limit() {
+        let mut cache = Cache::new(&CacheConfig {
+            max_entries: 3,
+            ..config()
+        });
+        let start = Instant::now();
+
+        for index in 0..100 {
+            let fixture = Fixture::new(&format!("n{index}.example."));
+            insert(&mut cache, &fixture, &fixture.positive(60), start);
+        }
+
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.slots.len(), 3);
+    }
+
+    #[test]
+    fn recency_follows_a_simple_model_through_inserts_and_gets() {
+        const CAPACITY: usize = 4;
+        let mut cache = Cache::new(&CacheConfig {
+            max_entries: CAPACITY,
+            ..config()
+        });
+        let start = Instant::now();
+        let fixtures: Vec<Fixture> = (0..9)
+            .map(|index| Fixture::new(&format!("m{index}.example.")))
+            .collect();
+        let mut model: Vec<usize> = Vec::new();
+        let mut seed = 12345u64;
+
+        for step in 0..2000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let id = (seed >> 33) as usize % fixtures.len();
+            let fixture = &fixtures[id];
+
+            if (seed >> 20) & 1 == 0 {
+                insert(&mut cache, fixture, &fixture.positive(60), start);
+                model.retain(|&kept| kept != id);
+                model.insert(0, id);
+                model.truncate(CAPACITY);
+            } else {
+                let found = age_of_hit(&mut cache, fixture, start).is_some();
+
+                assert_eq!(found, model.contains(&id), "step {step}, name {id}");
+
+                if found {
+                    model.retain(|&kept| kept != id);
+                    model.insert(0, id);
+                }
+            }
+
+            assert_eq!(cache.len(), model.len(), "step {step}");
         }
     }
 

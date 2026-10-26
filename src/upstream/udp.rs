@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io;
 use std::net::SocketAddr;
 
@@ -5,6 +6,12 @@ use tokio::net::UdpSocket;
 use tokio::time::{Instant, timeout_at};
 
 use super::{UpstreamError, is_answer_to, random_u64};
+
+thread_local! {
+    // Every query on the runtime thread receives into this one buffer, so no reply maps and
+    // unmaps a fresh 64 KiB block. Only the pages a datagram actually fills become resident.
+    static RECEIVE_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Sends `request` from a fresh socket (so every query has its own source
 /// port) and returns the first datagram that answers it. Datagrams with a
@@ -35,13 +42,30 @@ pub async fn exchange(
 
         readable?;
 
-        // Allocated only now: a query waiting for its reply holds no buffer.
-        let mut buffer = receive_buffer(max_reply);
-        match socket.try_recv_buf(&mut buffer) {
+        if let Some(reply) = receive_answer(&socket, request, max_reply)? {
+            return Ok(reply);
+        }
+    }
+}
+
+/// Reads one datagram if there is one. `None` means nothing to read yet, or a datagram that
+/// does not answer `request`.
+fn receive_answer(
+    socket: &UdpSocket,
+    request: &[u8],
+    max_reply: usize,
+) -> Result<Option<Vec<u8>>, UpstreamError> {
+    RECEIVE_BUFFER.with_borrow_mut(|buffer| {
+        // Room for one byte more than `max_reply`, so a datagram over the cap is seen as
+        // such instead of arriving cut to the buffer size.
+        buffer.clear();
+        buffer.reserve(max_reply + 1);
+
+        match socket.try_recv_buf(buffer) {
             Ok(_) => {}
 
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                continue;
+                return Ok(None);
             }
 
             Err(error) => {
@@ -49,24 +73,16 @@ pub async fn exchange(
             }
         }
 
-        if !is_answer_to(request, &buffer) {
-            continue;
+        if !is_answer_to(request, buffer) {
+            return Ok(None);
         }
 
         if buffer.len() > max_reply {
             return Err(UpstreamError::ReplyTooLarge);
         }
 
-        buffer.shrink_to_fit();
-
-        return Ok(buffer);
-    }
-}
-
-/// Room for one byte more than `max_reply`, so a datagram over the cap is
-/// seen as such instead of arriving cut to the buffer size.
-fn receive_buffer(max_reply: usize) -> Vec<u8> {
-    Vec::with_capacity(max_reply + 1)
+        Ok(Some(buffer.clone()))
+    })
 }
 
 #[cfg(test)]
@@ -102,11 +118,40 @@ mod tests {
         Instant::now() + Duration::from_secs(2)
     }
 
-    #[test]
-    fn the_receive_buffer_holds_the_largest_allowed_reply_and_one_byte_more() {
-        assert!(receive_buffer(LIMIT).capacity() > LIMIT);
-        assert!(receive_buffer(5000).capacity() > 5000);
-        assert!(receive_buffer(100).capacity() > 100);
+    fn receive_buffer_address_and_capacity() -> (usize, usize) {
+        RECEIVE_BUFFER.with_borrow(|buffer| (buffer.as_ptr() as usize, buffer.capacity()))
+    }
+
+    #[tokio::test]
+    async fn queries_share_one_receive_buffer_that_holds_the_cap_and_one_byte_more() {
+        let server = server_replying_with(DATAGRAM).await;
+
+        exchange(server, &mut query_for("example.com."), LIMIT, soon())
+            .await
+            .unwrap();
+        let (address, capacity) = receive_buffer_address_and_capacity();
+        exchange(server, &mut query_for("example.org."), LIMIT, soon())
+            .await
+            .unwrap();
+
+        assert!(capacity > LIMIT);
+        assert_eq!(receive_buffer_address_and_capacity(), (address, capacity));
+    }
+
+    #[tokio::test]
+    async fn a_returned_reply_owns_exactly_its_bytes_and_survives_the_next_query() {
+        let server = server_replying_with(DATAGRAM).await;
+
+        let first = exchange(server, &mut query_for("example.com."), LIMIT, soon())
+            .await
+            .unwrap();
+        let copy = first.clone();
+        exchange(server, &mut query_for("other.example."), LIMIT, soon())
+            .await
+            .unwrap();
+
+        assert_eq!(first.capacity(), first.len());
+        assert_eq!(first, copy);
     }
 
     #[tokio::test]
