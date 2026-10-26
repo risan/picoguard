@@ -557,6 +557,13 @@ gather_files() {
 
     if [ -f "$SCRIPT_DIR/install.sh" ]; then
         INSTALLER_PATH=$SCRIPT_DIR/install.sh
+
+        # Release files downloaded together carry a manifest that lists install.sh; a
+        # checkout of the repository has none, and its install.sh is the user's own file.
+        if [ -f "$SCRIPT_DIR/SHA256SUMS" ] && awk '{ n = $2; sub(/^\*/, "", n); if (n == "install.sh") { found = 1 } } END { exit !found }' "$SCRIPT_DIR/SHA256SUMS"; then
+            verify_checksum "$INSTALLER_PATH" "$SCRIPT_DIR/SHA256SUMS" install.sh
+            say "install.sh: checksum OK"
+        fi
     else
         fetch install.sh
         INSTALLER_PATH=$TMP/install.sh
