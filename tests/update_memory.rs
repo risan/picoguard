@@ -20,6 +20,7 @@ const FIXTURE: &str = include_str!("fixtures/github/release-latest.json");
 const PEAK_BUDGET_BYTES: usize = 512 * 1024;
 const KEPT_BUDGET_BYTES: usize = 4 * 1024;
 const FAILURE_BUDGET_BYTES: usize = 1024;
+const MANY_WORDS_PEAK_BUDGET_BYTES: usize = 1024 * 1024;
 const JSON: Option<&str> = Some("application/json");
 
 struct CountingAllocator;
@@ -165,5 +166,29 @@ fn a_failed_check_after_a_good_one_keeps_nothing_more() {
         assert_ne!(outcome, Outcome::Newer("99.0.0".to_string()));
         assert_eq!(updates.view().latest.as_deref(), Some("99.0.0"));
         assert!(kept < FAILURE_BUDGET_BYTES, "kept {kept} bytes");
+    });
+}
+
+#[test]
+fn a_near_limit_answer_of_one_letter_words_stays_within_a_megabyte() {
+    in_runtime(async {
+        let notes = "a ".repeat(100_000);
+        let answer = serde_json::json!({ "tag_name": "v99.0.0", "body": notes }).to_string();
+        let server = ListServer::start().await;
+        server.serve_typed("/latest", &answer, None, JSON);
+        let url = server.url("/latest");
+        warm_up(&url).await;
+        let updates = Updates::new(Build::current());
+        let mut checker = checker(&url);
+        let before = start_measuring();
+
+        let (outcome, _) = checker.check(&updates).await;
+        settle().await;
+
+        let peak = peak_since(before);
+        println!("update check (100000 one-letter words): peak {peak} bytes");
+
+        assert_eq!(outcome, Outcome::Newer("99.0.0".to_string()));
+        assert!(peak < MANY_WORDS_PEAK_BUDGET_BYTES, "peak {peak} bytes");
     });
 }

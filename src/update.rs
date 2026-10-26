@@ -154,14 +154,22 @@ pub fn is_newer(latest: Version, running: Version) -> bool {
 /// The release notes as one line of plain text: no URL, white space squeezed, at most
 /// `SUMMARY_CHARS` characters.
 pub fn summarize(notes: &str) -> String {
-    let words: Vec<&str> = notes
+    // One character more than the summary holds shows that the text was cut.
+    let mut line: String = notes
         .split_whitespace()
         .filter(|word| !word.contains("://"))
+        .flat_map(|word| std::iter::once(' ').chain(word.chars()))
+        .skip(1)
+        .take(SUMMARY_CHARS + 1)
         .collect();
-    let line = words.join(" ");
 
     match line.char_indices().nth(SUMMARY_CHARS) {
-        Some((end, _)) => format!("{}…", &line[..end]),
+        Some((end, _)) => {
+            line.truncate(end);
+            line.push('…');
+
+            line
+        }
         None => line,
     }
 }
@@ -615,6 +623,9 @@ mod tests {
 
         let wide = "é".repeat(300);
         assert_eq!(summarize(&wide), format!("{}…", "é".repeat(200)));
+
+        let many_words = "a ".repeat(100_000);
+        assert_eq!(summarize(&many_words), format!("{}…", "a ".repeat(100)));
     }
 
     #[test]
