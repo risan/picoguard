@@ -68,7 +68,14 @@ const CANARY_NAMES: [&str; 3] = [
 /// Estimated bytes of a compiled slow rule without its matcher: measured at 430 to 800
 /// bytes for a glob rule. The matcher is charged as it reports (`Matcher::cost_bytes`).
 const SLOW_RULE_BYTES: usize = 512;
-const TEXT_BYTE_COST: usize = 4;
+pub(super) const TEXT_BYTE_COST: usize = 4;
+
+/// What each name of a modifier (`$denyallow`, `$client`, `$ctag`) costs besides its text.
+pub(super) const NAME_OVERHEAD_BYTES: usize = 24;
+
+/// The longest text of a `$client` address or subnet (`ffff:...:ffff/128`), which the
+/// snapshot keeps as text.
+const NET_TEXT_BYTES: usize = 43;
 
 /// What a host group (an answer IP of the host rules) costs, with its share of the lookup
 /// tables. The count of groups is capped as well, by `MAX_HOST_GROUPS`.
@@ -104,6 +111,11 @@ impl SlowRuleBudget {
         Ok(())
     }
 
+    /// What is left to charge.
+    pub(super) fn remaining(&self) -> usize {
+        self.left
+    }
+
     pub(super) fn charge(&mut self, slow: &SlowRule) -> Result<(), OverBudget> {
         let cost = slow_rule_cost(slow);
         self.left = self.left.checked_sub(cost).ok_or(OverBudget)?;
@@ -115,13 +127,13 @@ impl SlowRuleBudget {
 pub(super) fn slow_rule_cost(slow: &SlowRule) -> usize {
     let rule = &slow.rule;
     let text = rule.pattern.len()
-        + 24 * rule.restricted_clients.nets.len()
+        + (NET_TEXT_BYTES + NAME_OVERHEAD_BYTES) * rule.restricted_clients.nets.len()
         + rule
             .denyallow
             .iter()
             .chain(&rule.restricted_clients.names)
             .chain(&rule.restricted_ctags)
-            .map(|name| name.len() + 24)
+            .map(|name| name.len() + NAME_OVERHEAD_BYTES)
             .sum::<usize>()
         + 2 * (rule.dns_permitted.len() + rule.dns_restricted.len());
 

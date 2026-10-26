@@ -33,8 +33,10 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128};
 
-use super::compile::{COMPILER_VERSION, CompileOptions, Compiled, SlowRuleBudget};
-use super::engine::{CompiledList, FAST_KINDS, HostRules, SlowRule};
+use super::compile::{
+    COMPILER_VERSION, CompileOptions, Compiled, NAME_OVERHEAD_BYTES, SlowRuleBudget, TEXT_BYTE_COST,
+};
+use super::engine::{CompiledList, FAST_KINDS, HostRules, MAX_HOST_GROUPS, SlowRule};
 use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
 use crate::lists::Validators;
 
@@ -115,6 +117,30 @@ impl From<io::Error> for SnapshotError {
 
         SnapshotError::Io(error)
     }
+}
+
+/// The most bytes a snapshot of a list under `options` can take: no valid file is larger, so
+/// a larger one is refused before a byte of it is read. The parts are the fixed fields (a
+/// source, two validators and one invalid line, each up to `MAX_TEXT_BYTES`), 8 bytes for
+/// each rule the cap allows, the host groups, and half the slow-rule budget (a slow rule is
+/// charged 512 bytes and 4 per text byte, and takes less than half of that in the file).
+pub fn max_file_bytes(options: &CompileOptions) -> u64 {
+    const FIXED_BYTES: u64 = 4 * (MAX_TEXT_BYTES as u64 + 5) + 1024;
+    const HOST_GROUP_FILE_BYTES: u64 = 4 + 64;
+
+    let parts = [
+        PREAMBLE_BYTES,
+        CHECKSUM_BYTES,
+        FIXED_BYTES,
+        u64::from(options.max_rules).saturating_mul(8),
+        (MAX_HOST_GROUPS as u64).saturating_mul(HOST_GROUP_FILE_BYTES),
+        (options.slow_rule_budget as u64) / 2,
+    ];
+
+    parts
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .unwrap_or(u64::MAX)
 }
 
 /// What a snapshot is keyed by, and what the next request needs.
@@ -480,6 +506,9 @@ struct Decoder<R: Read> {
     /// Rules (plain, host names and slow rules) the list may still hold under its cap.
     rules_left: u64,
     slow_budget: SlowRuleBudget,
+    /// What the modifier names of the rule being decoded may still cost: each name is
+    /// charged before it is allocated, as `slow_rule_cost` charges it afterwards.
+    name_allowance: usize,
 }
 
 impl<R: Read> Decoder<R> {
@@ -531,6 +560,17 @@ impl<R: Read> Decoder<R> {
 
     fn text(&mut self, limit: usize, what: &'static str) -> Result<String, SnapshotError> {
         let length = self.u32()? as usize;
+
+        self.text_of(length, limit, what)
+    }
+
+    /// The text of a length that has been read already.
+    fn text_of(
+        &mut self,
+        length: usize,
+        limit: usize,
+        what: &'static str,
+    ) -> Result<String, SnapshotError> {
         if length > limit {
             return Err(SnapshotError::TooLarge(what));
         }
@@ -568,11 +608,25 @@ impl<R: Read> Decoder<R> {
         (0..count).map(|_| self.u16()).collect()
     }
 
-    fn texts(&mut self, what: &'static str) -> Result<Vec<String>, SnapshotError> {
+    /// Names of a modifier. Each is charged to `name_allowance` from its length, before the
+    /// text is read.
+    fn names(&mut self, what: &'static str) -> Result<Vec<String>, SnapshotError> {
         let count = self.small_count(what)?;
-        (0..count)
-            .map(|_| self.text(MAX_LINE_BYTES, what))
-            .collect()
+        let mut names = Vec::new();
+        for _ in 0..count {
+            let length = self.u32()? as usize;
+            let cost = length
+                .checked_add(NAME_OVERHEAD_BYTES)
+                .and_then(|bytes| bytes.checked_mul(TEXT_BYTE_COST))
+                .ok_or(SnapshotError::TooLarge(what))?;
+            self.name_allowance = self
+                .name_allowance
+                .checked_sub(cost)
+                .ok_or(SnapshotError::TooLarge(what))?;
+            names.push(self.text_of(length, MAX_LINE_BYTES, what)?);
+        }
+
+        Ok(names)
     }
 
     /// Takes `count` rules from the budget of the list's cap.
@@ -634,6 +688,7 @@ impl<R: Read> Decoder<R> {
     }
 
     fn rule(&mut self) -> Result<SlowRule, SnapshotError> {
+        self.name_allowance = self.slow_budget.remaining();
         let flags = self.u8()?;
         let restricted_types = self.u32()?;
         let rule = NetworkRule {
@@ -644,9 +699,9 @@ impl<R: Read> Decoder<R> {
             pattern: self.text(MAX_LINE_BYTES, "rule pattern")?,
             dns_permitted: self.u16s("record types")?,
             dns_restricted: self.u16s("record types")?,
-            denyallow: self.texts("deny-allow names")?,
-            restricted_clients: ClientSet::new(&self.texts("client entries")?),
-            restricted_ctags: self.texts("tag entries")?,
+            denyallow: self.names("deny-allow names")?,
+            restricted_clients: ClientSet::new(&self.names("client entries")?),
+            restricted_ctags: self.names("tag entries")?,
         };
 
         self.charge(1, "slow rules")?;
@@ -706,6 +761,10 @@ fn check_preamble(file: &mut File) -> Result<u64, SnapshotError> {
 /// is ever acted on.
 pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotError> {
     let mut file = File::open(path)?;
+    if file.metadata()?.len() > max_file_bytes(options) {
+        return Err(SnapshotError::TooLarge("snapshot file"));
+    }
+
     let body_bytes = check_preamble(&mut file)?;
     if !body_checksum_matches(&mut file, body_bytes)? {
         return Err(SnapshotError::BadChecksum);
@@ -718,6 +777,7 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         max_rules: u64::from(options.max_rules),
         rules_left: u64::from(options.max_rules),
         slow_budget: SlowRuleBudget::new(options.slow_rule_budget),
+        name_allowance: 0,
     };
     let stored_fingerprint = decoder.u128()?;
     let content_hash = decoder.u128()?;
@@ -1734,6 +1794,49 @@ ads.*.tracker
                 "{groups}/{slow}: {error:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_file_over_the_largest_possible_snapshot_is_refused_before_it_is_read() {
+        let state = TestDir::new("snap");
+        let path = state.path().join("sparse.pgs");
+        let options = capped(10);
+        let limit = max_file_bytes(&options);
+        let sparse = |length: u64| {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&MAGIC).unwrap();
+            file.write_all(&FILE_VERSION.to_le_bytes()).unwrap();
+            file.set_len(length).unwrap();
+        };
+
+        sparse(limit + 1);
+        let started = std::time::Instant::now();
+        let over = load(&path, &options).err().expect("refused");
+        sparse(1 << 40);
+        let huge = load(&path, &options).err().expect("refused");
+
+        assert!(matches!(over, SnapshotError::TooLarge(_)), "{over:?}");
+        assert!(matches!(huge, SnapshotError::TooLarge(_)), "{huge:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        sparse(limit);
+        let at_the_limit = load(&path, &options).err().expect("refused");
+        assert!(matches!(at_the_limit, SnapshotError::BadChecksum));
+    }
+
+    #[tokio::test]
+    async fn the_largest_possible_snapshot_is_never_smaller_than_a_real_one() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let store = SnapshotStore::open(state.path()).unwrap();
+        let snapshot = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
+        store.save(clone_of(&snapshot)).await.unwrap();
+        store.flush().await;
+        let path = store.path_for(SOURCE).unwrap();
+
+        let size = fs::metadata(&path).unwrap().len();
+
+        assert!(size <= max_file_bytes(&options(ListFormat::Auto)));
+        assert!(load(&path, &options(ListFormat::Auto)).is_ok());
     }
 
     #[tokio::test]
