@@ -246,7 +246,7 @@ The repository is private for now, so a plain download needs a login. Use the Gi
 
 ```sh
 cd /tmp
-gh release download v0.1.0 -R risan/picoguard -p "picoguard-TARGET" -p SHA256SUMS
+gh release download v0.2.0 -R risan/picoguard -p "picoguard-TARGET" -p SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
@@ -254,8 +254,8 @@ When the repository is public, `wget` works without a login:
 
 ```sh
 cd /tmp
-wget "https://github.com/risan/picoguard/releases/download/v0.1.0/picoguard-TARGET"
-wget "https://github.com/risan/picoguard/releases/download/v0.1.0/SHA256SUMS"
+wget "https://github.com/risan/picoguard/releases/download/v0.2.0/picoguard-TARGET"
+wget "https://github.com/risan/picoguard/releases/download/v0.2.0/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
