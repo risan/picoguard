@@ -122,8 +122,8 @@ install -m 0644 picoguard.service /etc/systemd/system/picoguard.service
 picoguard --check -c /etc/picoguard/picoguard.toml
 ```
 
-The last command must print `OK`. The default config blocks ads, trackers and malware with HaGeZi
-Pro and HaGeZi Threat Intelligence mini, and forwards to Cloudflare and Quad9 over DoH. To change
+The last command must print `OK`. The default config blocks ads, trackers and malware with the
+AdGuard DNS filter, HaGeZi Pro and HaGeZi Threat Intelligence mini, and forwards to Cloudflare and Quad9 over DoH. To change
 anything, read [configuration.md](configuration.md).
 
 If your router is at `192.168.1.1`, open the config and uncomment the `[local]` section with

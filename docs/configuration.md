@@ -71,9 +71,9 @@ router. Without it, such queries get NXDOMAIN.
 ## `[[lists]]` and `[[allowlists]]`
 
 Blocklists are `[[lists]]` tables. Allowlists (names that are never blocked) are
-`[[allowlists]]` with the same keys. If the file has no `[[lists]]` at all, picoguard uses
-HaGeZi Pro and HaGeZi Threat Intelligence mini. As soon as you write one `[[lists]]`, only your
-lists are used.
+`[[allowlists]]` with the same keys. If the file has no `[[lists]]` at all, picoguard uses the
+AdGuard DNS filter, HaGeZi Pro and HaGeZi Threat Intelligence mini. As soon as you write one
+`[[lists]]`, only your lists are used.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -237,8 +237,8 @@ The table is a plan from the formula above. It has not been measured on a board 
 
 | Board RAM | Lists | Rules | Cache | Expected RSS |
 |---|---|---|---|---|
-| 256 MB | The default: HaGeZi Pro and HaGeZi TIF mini | at most about 260k | 10,000 entries (default) | about 12 to 15 MB |
-| 256 MB, more blocking | Default plus AdGuard DNS filter | about 450k | 10,000 entries | about 16 MB (measured) |
+| 256 MB | The default: AdGuard DNS filter, HaGeZi Pro and HaGeZi TIF mini | about 450k | 10,000 entries (default) | about 11 MB idle, 19 MB after 49,000 queries (measured on x86_64) |
+| 256 MB, lighter | HaGeZi Pro and HaGeZi TIF mini only | at most about 260k | 10,000 entries | about 12 to 15 MB |
 | 512 MB | Above plus a larger HaGeZi list (for example Pro++) | up to about 1 million | `max_entries = 30000`, `max_bytes = 12582912` | about 25 to 35 MB |
 | 1 GB or more | Any mix, for example several regional lists | up to about 3 million (raise `max_rules` for a list over 1.5 million) | `max_entries = 100000`, `max_bytes = 41943040` | about 60 to 90 MB |
 

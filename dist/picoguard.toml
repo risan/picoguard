@@ -60,6 +60,11 @@ servers = [
 # domains; a list over it is not used), allow_redirects = false (a downloaded
 # hosts line with a real address blocks like 0.0.0.0; true answers with it).
 [[lists]]
+name = "adguard-dns"
+url = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"
+format = "adblock"
+
+[[lists]]
 name = "hagezi-pro"
 url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"
 format = "adblock"

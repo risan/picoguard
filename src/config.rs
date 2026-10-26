@@ -194,6 +194,10 @@ impl Default for Config {
             local: LocalConfig::default(),
             lists: vec![
                 ListConfig::adblock(
+                    "adguard-dns",
+                    "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
+                ),
+                ListConfig::adblock(
                     "hagezi-pro",
                     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt",
                 ),
@@ -823,6 +827,7 @@ mod tests {
         assert_eq!(
             urls,
             [
+                Some("https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"),
                 Some(
                     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"
                 ),
