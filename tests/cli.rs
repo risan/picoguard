@@ -62,6 +62,16 @@ fn check_rejects_an_unknown_key() {
 }
 
 #[test]
+fn check_rejects_an_unknown_update_key() {
+    let path = write_config("unknown-update-key.toml", "[update]\nbogus = 1\n");
+
+    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("bogus"));
+}
+
+#[test]
 fn check_rejects_an_upstream_that_cannot_be_built() {
     let path = write_config(
         "check-bad-upstream.toml",
@@ -142,6 +152,7 @@ fn stderr_of_a_run_with_the_status_page(name: &str, credentials: &str) -> String
         format!(
             "lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
              [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
+             [update]\ncheck = false\n\
              [web]\nbind = [\"127.0.0.1\"]\nport = {web_port}\n{credentials}"
         )
     });

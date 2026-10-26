@@ -181,6 +181,7 @@ pub struct Config {
     pub web: WebConfig,
     pub stats: StatsConfig,
     pub state: StateConfig,
+    pub update: UpdateConfig,
     pub log: LogConfig,
     pub blocked_ttl: u32,
     pub blocked_hosts: Vec<String>,
@@ -214,6 +215,7 @@ impl Default for Config {
             web: WebConfig::default(),
             stats: StatsConfig::default(),
             state: StateConfig::default(),
+            update: UpdateConfig::default(),
             log: LogConfig::default(),
             blocked_ttl: 10,
             blocked_hosts: ["version.bind", "id.server", "hostname.bind"]
@@ -706,6 +708,18 @@ impl StateConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        UpdateConfig { check: true }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -1036,6 +1050,25 @@ mod tests {
         let message = error_of("[cache]\nmax_entires = 5");
 
         assert!(message.contains("max_entires"), "{message}");
+    }
+
+    #[test]
+    fn update_check_is_on_by_default() {
+        assert!(Config::parse("").unwrap().update.check);
+    }
+
+    #[test]
+    fn update_check_can_be_turned_off() {
+        let config = Config::parse("[update]\ncheck = false").unwrap();
+
+        assert!(!config.update.check);
+    }
+
+    #[test]
+    fn an_unknown_update_key_is_rejected() {
+        let message = error_of("[update]\nbogus = 1");
+
+        assert!(message.contains("bogus"), "{message}");
     }
 
     #[test]
