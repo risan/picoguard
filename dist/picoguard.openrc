@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+
+description="picoguard DNS ad and malware blocker"
+
+command=/usr/local/bin/picoguard
+command_args="-c /etc/picoguard/picoguard.toml"
+# A system user that install.sh creates with adduser -S. State goes to
+# /var/lib/picoguard (state.dir).
+command_user=picoguard:picoguard
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+# Port 53 and nothing else that needs root.
+capabilities="^cap_net_bind_service"
+
+# Log lines (level warn by default) go to syslog when a logger runs.
+error_logger="logger -t picoguard -p daemon.warning"
+
+depend() {
+    need net
+    use logger
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --owner picoguard:picoguard --mode 0750 /var/lib/picoguard
+}

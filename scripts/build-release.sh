@@ -25,13 +25,15 @@ if [ "$armv7_size" -gt "$armv7_size_limit" ]; then
     exit 1
 fi
 
-# Release assets: one file per target named picoguard-<target>, plus SHA256SUMS,
-# as docs/install.md expects.
+# Release assets: one file per target named picoguard-<target>, the two install
+# scripts, and SHA256SUMS over all of them, as docs/install.md expects.
 mkdir -p dist/release
-rm -f dist/release/picoguard-* dist/release/SHA256SUMS
+rm -f dist/release/picoguard-* dist/release/install.sh dist/release/proxmox-lxc.sh dist/release/SHA256SUMS
 for target in "${targets[@]}"; do
     cp "dist/bin/$target/picoguard" "dist/release/picoguard-$target"
 done
 
-(cd dist/release && sha256sum picoguard-* > SHA256SUMS)
+cp scripts/install.sh scripts/proxmox-lxc.sh dist/release/
+
+(cd dist/release && sha256sum picoguard-* install.sh proxmox-lxc.sh > SHA256SUMS)
 echo "release assets: dist/release/"

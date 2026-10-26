@@ -1,0 +1,7 @@
+target/
+dist/bin
+dist/release
+bench/out
+.works
+.claude
+.git
