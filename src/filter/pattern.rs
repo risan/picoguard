@@ -11,17 +11,13 @@
 
 use std::fmt;
 
-use regex::{Regex, RegexBuilder};
+use regex_automata::meta::{self, Regex};
+use regex_automata::nfa::thompson::WhichCaptures;
+use regex_automata::util::syntax;
 
-/// Compiled regexes may not grow beyond this many bytes.
+/// Compiled regexes may not grow beyond this many bytes. The slow-rule budget charges what
+/// each regex really holds, so this only bounds one regex and the time to compile it.
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
-
-/// What a regex is charged in the slow-rule budget: measured at 3 to 20 KiB for the regexes
-/// of real lists (a Unicode class such as `\p{L}` is the expensive one).
-const REGEX_COST_BYTES: usize = 24 * 1024;
-
-/// The lazy DFA cache of one regex.
-const REGEX_DFA_LIMIT: usize = 1 << 17;
 
 /// Go's `regexp` rejects repetition counts above this.
 const MAX_REPEAT: u32 = 1000;
@@ -45,7 +41,8 @@ enum Subject {
 enum Body {
     Any,
     Glob(Glob),
-    Regex(Regex),
+    /// With the bytes it is charged: what it holds and what one search cache holds.
+    Regex(Regex, usize),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,7 +87,9 @@ impl Matcher {
             if inner == ".*" {
                 Body::Any
             } else {
-                Body::Regex(compile_regex(inner)?)
+                let (regex, cost) = compile_regex(inner)?;
+
+                Body::Regex(regex, cost)
             }
         } else {
             Body::Glob(Glob::parse(pattern))
@@ -109,7 +108,7 @@ impl Matcher {
         match &self.body {
             Body::Any => 0,
             Body::Glob(glob) => glob.cost_bytes(),
-            Body::Regex(_) => REGEX_COST_BYTES,
+            Body::Regex(_, cost) => *cost,
         }
     }
 
@@ -133,7 +132,7 @@ impl Matcher {
         match &self.body {
             Body::Any => true,
             Body::Glob(glob) => glob.is_match(subject.as_bytes()),
-            Body::Regex(regex) => regex.is_match(subject),
+            Body::Regex(regex, _) => regex.is_match(subject),
         }
     }
 }
@@ -150,15 +149,24 @@ fn uses_url(pattern: &str) -> bool {
         || (pattern.len() >= 4 && pattern.starts_with('/') && pattern.ends_with('.'))
 }
 
-fn compile_regex(source: &str) -> Result<Regex, PatternError> {
+/// The regex and its cost: the memory it holds plus one search cache (the pool of the regex
+/// makes one per thread that searches; the DNS thread and the compile worker are the only
+/// ones). The engines of the `regex` crate that grow their caches while they search, the
+/// lazy DFA among them, are not built in, so both numbers are fixed once compiled.
+fn compile_regex(source: &str) -> Result<(Regex, usize), PatternError> {
     let translated = translate_go_regex(source)?;
+    let regex = meta::Builder::new()
+        .configure(
+            meta::Config::new()
+                .nfa_size_limit(Some(REGEX_SIZE_LIMIT))
+                .which_captures(WhichCaptures::None),
+        )
+        .syntax(syntax::Config::new().case_insensitive(true))
+        .build(&translated)
+        .map_err(|error| PatternError::Regex(error.to_string()))?;
+    let cost = regex.memory_usage() + regex.create_cache().memory_usage();
 
-    RegexBuilder::new(&translated)
-        .case_insensitive(true)
-        .size_limit(REGEX_SIZE_LIMIT)
-        .dfa_size_limit(REGEX_DFA_LIMIT)
-        .build()
-        .map_err(|error| PatternError::Regex(error.to_string()))
+    Ok((regex, cost))
 }
 
 // ---- Glob patterns ----
@@ -991,6 +999,15 @@ mod tests {
 
         assert_eq!(cost("a*****b"), cost("a*b"));
         assert!(cost("a*^*^b") > cost("a*b"));
+    }
+
+    #[test]
+    fn a_regex_is_charged_the_memory_it_holds() {
+        let cost = |pattern: &str| Matcher::compile(pattern).unwrap().cost_bytes();
+
+        assert!(cost("/track[0-9]+/") < 24 * 1024);
+        assert!(cost("/(\\pL|\\pN){1,50}x/") > 512 * 1024);
+        assert!(cost("/(\\pL|\\pN){1,50}x/") > 5 * cost("/(\\pL|\\pN){1,5}x/"));
     }
 
     #[test]

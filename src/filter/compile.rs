@@ -19,7 +19,7 @@ use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 /// Bump on every change to compiled output (what any list text compiles to, in the parser,
 /// the compiler or the snapshot encoding), however small: snapshots written by an older
 /// compiler are then ignored and the lists compile again (plan D14).
-pub const COMPILER_VERSION: u32 = 5;
+pub const COMPILER_VERSION: u32 = 6;
 
 /// Default memory budget of the slow rules of one list. Plan section 5 leaves about 8 MB
 /// between the steady total (20 MB) and the refresh peak (28 MB). The real lists are far
@@ -651,6 +651,26 @@ mod tests {
     async fn many_regexes_fail_the_job_within_the_default_budget() {
         let worker = CompileWorker::spawn().unwrap();
         let text: String = (0..2000).map(|i| format!("/track{i}[0-9]+/\n")).collect();
+
+        let result = compile_in_pieces(
+            &worker,
+            options(ListFormat::Adblock),
+            text.as_bytes(),
+            64 * 1024,
+        )
+        .await;
+
+        assert_eq!(result.err(), Some(CompileError::OverBudget));
+    }
+
+    #[tokio::test]
+    async fn heavy_regexes_are_charged_what_they_hold_not_a_flat_amount() {
+        let worker = CompileWorker::spawn().unwrap();
+        // Each one compiles to about 1 MiB, so 320 of them held 330 MB under a flat charge
+        // of 24 KiB each (8 MiB in all).
+        let text: String = (0..320)
+            .map(|i| format!("/(\\pL|\\pN){{1,50}}x{i}/\n"))
+            .collect();
 
         let result = compile_in_pieces(
             &worker,
