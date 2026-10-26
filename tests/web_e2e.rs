@@ -7,10 +7,12 @@ mod common;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::harness::{Running, answering_upstream, ask, config_for, start_with_policy};
 use common::http::ListServer;
+use common::release::{Files, TARGET, scratch, test_key};
 use hickory_proto::rr::RecordType;
 use picoguard::config::{Config, ListConfig, ListFormat};
 use picoguard::filter::compile::CompileWorker;
@@ -18,6 +20,7 @@ use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::Downloader;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Scheduler, Timing};
+use picoguard::stage::{StageSetup, StageTiming, Stager};
 use picoguard::update::{self, Build, CheckTiming, Latest, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
@@ -172,6 +175,9 @@ struct Site {
     dns: Running,
     policy: Arc<Policy>,
     updates: Arc<Updates>,
+    /// The fake of the release downloads the stager reads.
+    release: ListServer,
+    stager: Arc<Stager>,
     /// Sends the administrator's credentials with every request that has none of its own.
     signs_in: bool,
 }
@@ -237,7 +243,66 @@ fn day_long_timing() -> Timing {
     }
 }
 
+/// What the stager of a site is built for.
+#[derive(Clone, Copy)]
+struct SiteKind {
+    build: Build,
+    /// Whether the installer directory exists.
+    installer: bool,
+}
+
+static SITES: AtomicUsize = AtomicUsize::new(0);
+
+const OFFERED: &str = "9.9.9";
+
+fn offered() -> Latest {
+    Latest {
+        version: OFFERED.to_string(),
+        notes: String::new(),
+    }
+}
+
+fn release_binary() -> Vec<u8> {
+    (0..30_000u32)
+        .map(|index| (index * 7 % 251) as u8)
+        .collect()
+}
+
+fn serve_release(server: &ListServer, files: &Files) {
+    let base = format!("/download/v{OFFERED}");
+    server.serve_bytes(&format!("{base}/SHA256SUMS"), files.sums.clone());
+    server.serve_bytes(&format!("{base}/SHA256SUMS.sig"), files.signature.clone());
+    server.serve_bytes(&format!("{base}/picoguard-{TARGET}"), files.binary.clone());
+}
+
 async fn site(config: Config) -> Site {
+    site_with(
+        config,
+        SiteKind {
+            build: Build::current(),
+            installer: true,
+        },
+    )
+    .await
+}
+
+/// A release build with an installer and a newer version known: the button is offered
+/// whenever a password is set.
+async fn full_site(config: Config) -> Site {
+    let site = site_with(
+        config,
+        SiteKind {
+            build: Build::Release,
+            installer: true,
+        },
+    )
+    .await;
+    site.updates.show(Some(offered()));
+
+    site
+}
+
+async fn site_with(config: Config, kind: SiteKind) -> Site {
     let scheduler = Scheduler::boot(
         &config,
         CompileWorker::spawn().unwrap(),
@@ -253,13 +318,39 @@ async fn site(config: Config) -> Site {
     let dns = start_with_policy(&config, Arc::clone(&policy)).await;
     let listeners = WebListeners::bind(&config.web).unwrap();
     let address = listeners.addresses()[0];
-    let updates = Arc::new(Updates::new(Build::current()));
+    let updates = Arc::new(Updates::new(kind.build));
+    let root = scratch(&format!("web-e2e-{}", SITES.fetch_add(1, Ordering::SeqCst)));
+    std::fs::create_dir(root.join("state")).unwrap();
+    if kind.installer {
+        std::fs::create_dir(root.join("installer")).unwrap();
+    }
+
+    let release = ListServer::start().await;
+    serve_release(&release, &Files::good(OFFERED, &release_binary()));
+    let stager = Stager::new(
+        StageSetup {
+            target: Some(TARGET),
+            base_url: release.url("/download"),
+            state_dir: root.join("state"),
+            installer_dir: root.join("installer"),
+            key: test_key(),
+            max_binary_bytes: 1024 * 1024,
+            timing: StageTiming {
+                poll: Duration::from_millis(20),
+                wait: Duration::from_secs(5),
+            },
+        },
+        Arc::clone(&updates),
+        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Arc::new(Tls::with_webpki_roots()),
+    );
     let web_state = Web::new(
         &config,
         Arc::clone(dns.pipeline.stats()),
         Arc::clone(&policy),
         Arc::clone(&control),
         Arc::clone(&updates),
+        Arc::clone(&stager),
     )
     .unwrap();
     web::spawn(listeners, Arc::new(web_state));
@@ -269,6 +360,8 @@ async fn site(config: Config) -> Site {
         dns,
         policy,
         updates,
+        release,
+        stager,
         signs_in: config.web.password.is_some(),
     }
 }
@@ -665,6 +758,8 @@ async fn wait_for_requests(server: &ListServer, count: usize) {
     panic!("{} of {count} requests", server.requests());
 }
 
+const UPDATE_BODY: &str = "{\"version\": \"9.9.9\"}";
+
 fn rejected_mutations() -> Vec<(&'static str, Request, u16)> {
     let big = format!("{{\"minutes\": 5, \"padding\": \"{}\"}}", "x".repeat(1100));
     let chunked_big = format!("{:x}\r\n{}\r\n0\r\n\r\n", big.len(), big);
@@ -751,6 +846,54 @@ fn rejected_mutations() -> Vec<(&'static str, Request, u16)> {
             },
             405,
         ),
+        (
+            "an update from another origin",
+            post("/api/update", UPDATE_BODY).header("Origin", "http://evil.example"),
+            403,
+        ),
+        (
+            "an update from a null origin",
+            post("/api/update", UPDATE_BODY).header("Origin", "null"),
+            403,
+        ),
+        (
+            "an update for a name that is not configured",
+            post("/api/update", UPDATE_BODY).header("Host", "evil.example"),
+            403,
+        ),
+        (
+            "an update as plain text",
+            post("/api/update", UPDATE_BODY).header("Content-Type", "text/plain"),
+            415,
+        ),
+        (
+            "an update without a content type",
+            Request {
+                headers: Vec::new(),
+                ..post("/api/update", UPDATE_BODY)
+            },
+            415,
+        ),
+        (
+            "an update body over 1 KiB",
+            post(
+                "/api/update",
+                &format!(
+                    "{{\"version\": \"9.9.9\", \"padding\": \"{}\"}}",
+                    "x".repeat(1100)
+                ),
+            ),
+            413,
+        ),
+        ("a get of update", get("/api/update"), 405),
+        (
+            "a put of update",
+            Request {
+                method: "PUT",
+                ..post("/api/update", UPDATE_BODY)
+            },
+            405,
+        ),
         ("a post of a read", post("/api/status", "{}"), 405),
         ("a post of the page", post("/", "{}"), 405),
     ]
@@ -767,7 +910,14 @@ async fn assert_mutations_are_rejected(site: &Site, credentials: Option<&str>) {
 
         assert_eq!(reply.status, status, "{what}");
         assert!(!site.is_paused(), "{what} paused blocking");
+        assert_nothing_was_started(site, what);
     }
+}
+
+/// A rejected request never reaches the release fake and never starts an update.
+fn assert_nothing_was_started(site: &Site, what: &str) {
+    assert_eq!(site.release.requests(), 0, "{what} reached the release");
+    assert!(site.stager.view().is_none(), "{what} started an update");
 }
 
 async fn open_site() -> (Site, common::harness::FakeUpstream) {
@@ -897,6 +1047,7 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
         ("pause", post("/api/pause", "{\"minutes\": 5}")),
         ("resume", post("/api/resume", "")),
         ("refresh", post("/api/lists/refresh", "")),
+        ("update", post("/api/update", UPDATE_BODY)),
         ("a get of pause", get("/api/pause")),
     ] {
         let reply = site.send(request).await;
@@ -933,7 +1084,10 @@ async fn the_page_asks_for_the_log_only_when_the_status_is_not_limited() {
 
 #[tokio::test]
 async fn unsafe_mutations_are_rejected_without_a_password() {
-    let (site, _upstream) = open_site().await;
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    let site = full_site(config).await;
 
     for (what, request, _) in rejected_mutations() {
         let target = request.path.clone();
@@ -947,6 +1101,7 @@ async fn unsafe_mutations_are_rejected_without_a_password() {
         };
         assert_eq!(reply.status, expected, "{what}");
         assert!(!site.is_paused(), "{what} paused blocking");
+        assert_nothing_was_started(&site, what);
     }
 }
 
@@ -955,7 +1110,7 @@ async fn unsafe_mutations_are_rejected_with_a_password_and_valid_credentials() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
     let mut config = local_config(&upstream);
     with_credentials(&mut config);
-    let site = site(config).await;
+    let site = full_site(config).await;
 
     assert_mutations_are_rejected(&site, Some(ADMIN)).await;
 }
@@ -983,6 +1138,7 @@ async fn the_page_and_every_endpoint_need_the_password_when_one_is_set() {
         ("/api/pause", "{\"minutes\": 5}"),
         ("/api/resume", ""),
         ("/api/lists/refresh", ""),
+        ("/api/update", UPDATE_BODY),
     ];
 
     let sign_in_attempts = [
@@ -1136,7 +1292,9 @@ async fn a_peer_outside_allow_from_gets_nothing_from_reads_or_changes() {
     );
     assert!(site.is_ignored(post("/api/resume", "")).await);
     assert!(site.is_ignored(post("/api/lists/refresh", "")).await);
+    assert!(site.is_ignored(post("/api/update", UPDATE_BODY)).await);
     assert!(!site.is_paused());
+    assert_nothing_was_started(&site, "a peer outside allow_from");
 }
 
 #[tokio::test]
@@ -1160,7 +1318,9 @@ async fn an_ipv6_peer_outside_allow_from_gets_nothing_and_one_inside_is_served()
             .is_ignored(post("/api/pause", "{\"minutes\": 5}"))
             .await
     );
+    assert!(outside.is_ignored(post("/api/update", UPDATE_BODY)).await);
     assert!(!outside.is_paused());
+    assert_nothing_was_started(&outside, "an IPv6 peer outside allow_from");
 
     config.web.allow_from = vec!["::1/128".parse().unwrap()];
     let inside = site(config).await;
@@ -1169,4 +1329,273 @@ async fn an_ipv6_peer_outside_allow_from_gets_nothing_and_one_inside_is_served()
     assert_eq!(reply.status, 200);
     let paused = inside.send(post("/api/pause", "{\"minutes\": 5}")).await;
     assert_eq!(paused.status, 200);
+}
+
+async fn status_of(site: &Site) -> Value {
+    site.send(get("/api/status")).await.json()["update"].clone()
+}
+
+async fn until_status(site: &Site, what: &str, mut done: impl FnMut(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        let update = status_of(site).await;
+
+        if done(&update) {
+            return update;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {update}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn update_site(kind: SiteKind) -> (Site, common::harness::FakeUpstream) {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let site = site_with(local_config(&upstream), kind).await;
+    site.updates.show(Some(offered()));
+
+    (site, upstream)
+}
+
+const RELEASE: SiteKind = SiteKind {
+    build: Build::Release,
+    installer: true,
+};
+
+#[tokio::test]
+async fn the_update_route_answers_400_409_and_202() {
+    let (site, _upstream) = update_site(RELEASE).await;
+
+    for (what, body) in [
+        ("an empty object", "{}"),
+        ("a number", "{\"version\": 3}"),
+        ("an array", "[\"9.9.9\"]"),
+        ("an unknown field", "{\"version\": \"9.9.9\", \"x\": 1}"),
+        (
+            "a repeated field",
+            "{\"version\": \"9.9.9\", \"version\": \"9.9.9\"}",
+        ),
+        ("an empty version", "{\"version\": \"\"}"),
+        ("a v prefix", "{\"version\": \"v9.9.9\"}"),
+        ("two numbers", "{\"version\": \"9.9\"}"),
+        ("a pre-release", "{\"version\": \"9.9.9-rc.1\"}"),
+        ("not JSON", "9.9.9"),
+    ] {
+        let reply = site.send(post("/api/update", body)).await;
+
+        assert_eq!(reply.status, 400, "{what}");
+        assert!(reply.json()["error"].as_str().unwrap().starts_with("send "));
+        assert_nothing_was_started(&site, what);
+    }
+
+    let wrong = site
+        .send(post("/api/update", "{\"version\": \"9.9.8\"}"))
+        .await;
+    assert_eq!(wrong.status, 409);
+    assert_eq!(wrong.json()["error"], "that is not the newest release");
+    assert_nothing_was_started(&site, "another version");
+
+    let started = site.send(post("/api/update", UPDATE_BODY)).await;
+    assert_eq!(started.status, 202);
+    assert_eq!(started.json(), serde_json::json!({"install": "started"}));
+
+    let again = site.send(post("/api/update", UPDATE_BODY)).await;
+    assert_eq!(again.status, 409);
+    assert_eq!(again.json()["error"], "an update is already in progress");
+}
+
+#[tokio::test]
+async fn an_update_that_cannot_be_installed_from_the_page_answers_409() {
+    for (what, kind) in [
+        (
+            "a source build",
+            SiteKind {
+                build: Build::Source,
+                installer: true,
+            },
+        ),
+        (
+            "a Docker build",
+            SiteKind {
+                build: Build::Docker,
+                installer: true,
+            },
+        ),
+        (
+            "no installer",
+            SiteKind {
+                build: Build::Release,
+                installer: false,
+            },
+        ),
+    ] {
+        let (site, _upstream) = update_site(kind).await;
+
+        let reply = site.send(post("/api/update", UPDATE_BODY)).await;
+
+        assert_eq!(reply.status, 409, "{what}");
+        assert_eq!(
+            reply.json()["error"],
+            "this build is updated with the command shown",
+            "{what}"
+        );
+        assert_nothing_was_started(&site, what);
+    }
+
+    let (site, _upstream) = update_site(RELEASE).await;
+    site.updates.show(None);
+
+    let reply = site.send(post("/api/update", UPDATE_BODY)).await;
+
+    assert_eq!(reply.status, 409);
+    assert_eq!(reply.json()["error"], "that is not the newest release");
+    assert_nothing_was_started(&site, "no newer version");
+}
+
+#[tokio::test]
+async fn can_install_follows_every_condition() {
+    let (full, _upstream) = update_site(RELEASE).await;
+    assert_eq!(status_of(&full).await["can_install"], true);
+
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    let open = site_with(config, RELEASE).await;
+    open.updates.show(Some(offered()));
+    assert_eq!(status_of(&open).await["can_install"], false);
+
+    for (what, kind) in [
+        (
+            "a source build",
+            SiteKind {
+                build: Build::Source,
+                installer: true,
+            },
+        ),
+        (
+            "no installer",
+            SiteKind {
+                build: Build::Release,
+                installer: false,
+            },
+        ),
+    ] {
+        let (site, _upstream) = update_site(kind).await;
+
+        assert_eq!(status_of(&site).await["can_install"], false, "{what}");
+    }
+
+    let (site, _upstream) = update_site(RELEASE).await;
+    site.updates.show(None);
+    assert_eq!(status_of(&site).await["can_install"], false);
+
+    site.updates.show(Some(offered()));
+    assert_eq!(status_of(&site).await["can_install"], true);
+    assert_eq!(
+        site.send(post("/api/update", UPDATE_BODY)).await.status,
+        202
+    );
+    let update = until_status(&site, "waiting", |update| {
+        update["install"]["state"] == "waiting"
+    })
+    .await;
+
+    assert_eq!(update["can_install"], false);
+}
+
+#[tokio::test]
+async fn progress_is_shown_with_and_without_a_password() {
+    let big: Vec<u8> = (0..300_000u32).map(|index| (index % 253) as u8).collect();
+    let files = Files::good(OFFERED, &big);
+
+    let (site, _upstream) = update_site(RELEASE).await;
+    site.release.serve_slowly(
+        &format!("/download/v{OFFERED}/picoguard-{TARGET}"),
+        big.clone(),
+        16 * 1024,
+        Duration::from_millis(25),
+    );
+    serve_release_small_files(&site.release, &files);
+
+    assert_eq!(
+        site.send(post("/api/update", UPDATE_BODY)).await.status,
+        202
+    );
+    let mut sizes = Vec::new();
+    let mut early = false;
+    let update = until_status(&site, "waiting", |update| {
+        match update["install"]["state"].as_str() {
+            Some("checking") => early = true,
+            Some("downloading") => {
+                early = true;
+                sizes.push(update["install"]["bytes"].as_u64().unwrap());
+            }
+            _ => {}
+        }
+
+        update["install"]["state"] == "waiting"
+    })
+    .await;
+
+    assert!(early, "neither checking nor downloading was seen");
+    assert!(
+        sizes.windows(2).any(|pair| pair[1] > pair[0]),
+        "the bytes did not grow: {sizes:?}"
+    );
+    assert_eq!(update["install"]["version"], OFFERED);
+
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    let open = site_with(config, RELEASE).await;
+    open.updates.show(Some(offered()));
+    open.stager.start(OFFERED).unwrap();
+
+    let update = until_status(&open, "waiting", |update| {
+        update["install"]["state"] == "waiting"
+    })
+    .await;
+
+    assert_eq!(update["can_install"], false);
+    assert_eq!(update["install"]["version"], OFFERED);
+}
+
+fn serve_release_small_files(server: &ListServer, files: &Files) {
+    let base = format!("/download/v{OFFERED}");
+    server.serve_bytes(&format!("{base}/SHA256SUMS"), files.sums.clone());
+    server.serve_bytes(&format!("{base}/SHA256SUMS.sig"), files.signature.clone());
+}
+
+#[tokio::test]
+async fn a_hanging_download_holds_up_neither_dns_nor_the_page() {
+    let (site, _upstream) = update_site(RELEASE).await;
+    site.release.serve_slowly(
+        &format!("/download/v{OFFERED}/picoguard-{TARGET}"),
+        release_binary(),
+        1024,
+        Duration::from_secs(30),
+    );
+
+    assert_eq!(
+        site.send(post("/api/update", UPDATE_BODY)).await.status,
+        202
+    );
+    until_status(&site, "downloading", |update| {
+        update["install"]["state"] == "downloading"
+    })
+    .await;
+
+    let answers = async {
+        ask(&site.dns, "ok.example.", RecordType::A).await;
+        site.send(get("/api/status")).await
+    };
+    let status = tokio::time::timeout(Duration::from_secs(2), answers)
+        .await
+        .expect("DNS and the page answer while the download hangs");
+
+    assert_eq!(status.status, 200);
 }

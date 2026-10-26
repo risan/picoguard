@@ -266,6 +266,7 @@ fn serve(config: Config) -> Result<(), String> {
                 scheduler.policy(),
                 scheduler.control(),
                 Arc::clone(&updates),
+                Arc::clone(&stager),
             )?;
             web::spawn(status_page, Arc::new(web));
         }

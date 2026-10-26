@@ -1,4 +1,4 @@
-//! The status page and its JSON API (plan D16). One HTML page, five reads and three
+//! The status page and its JSON API (plan D16). One HTML page, five reads and four
 //! mutations. A web page on another device of the LAN must not be able to pause blocking, so
 //! every request passes the access policy before it reaches a handler:
 //!
@@ -35,8 +35,9 @@ use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
 use crate::policy::Policy;
 use crate::scheduler::{ListControl, ListStatus, Role};
 use crate::server::bind_tcp;
+use crate::stage::{Refused, Stager};
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, Stats, TopEntry};
-use crate::update::{UpdateView, Updates};
+use crate::update::{Tag, UpdateView, Updates, parse_tag};
 
 const PAGE: &str = include_str!("web/index.html");
 
@@ -61,6 +62,7 @@ pub struct Web {
     policy: Arc<Policy>,
     lists: Arc<ListControl>,
     updates: Arc<Updates>,
+    stager: Arc<Stager>,
     allow_from: Vec<Cidr>,
     hostnames: Vec<String>,
     /// The `Authorization` credentials a client must send; `None` when no password is set.
@@ -75,6 +77,7 @@ impl Web {
         policy: Arc<Policy>,
         lists: Arc<ListControl>,
         updates: Arc<Updates>,
+        stager: Arc<Stager>,
     ) -> Result<Web, String> {
         let web = &config.web;
         let credentials = match (&web.user, &web.password) {
@@ -95,6 +98,7 @@ impl Web {
             policy,
             lists,
             updates,
+            stager,
             allow_from: web.allow_from.clone(),
             hostnames: web.hostnames.clone(),
             credentials,
@@ -209,6 +213,7 @@ enum Change {
     Pause,
     Resume,
     RefreshLists,
+    Install,
 }
 
 enum Route {
@@ -226,6 +231,7 @@ impl Route {
             "/api/pause" => Some(Route::Change(Change::Pause)),
             "/api/resume" => Some(Route::Change(Change::Resume)),
             "/api/lists/refresh" => Some(Route::Change(Change::RefreshLists)),
+            "/api/update" => Some(Route::Change(Change::Install)),
             _ => None,
         }
     }
@@ -406,7 +412,7 @@ impl Web {
                     StatusCode::OK,
                     &StatusView {
                         version: env!("CARGO_PKG_VERSION"),
-                        update: self.updates.view(),
+                        update: self.update_view(),
                         counters: &snapshot.counters,
                         blocked_percent: blocked_percent(&snapshot.counters),
                         hourly: &snapshot.hourly,
@@ -476,7 +482,40 @@ impl Web {
                     },
                 ))
             }
+
+            Change::Install => {
+                let version = install_version(body).ok_or_else(|| {
+                    Rejection::new(StatusCode::BAD_REQUEST, "send {\"version\": \"X.Y.Z\"}")
+                })?;
+
+                self.stager.start(&version).map_err(|refused| {
+                    Rejection::new(
+                        StatusCode::CONFLICT,
+                        match refused {
+                            Refused::CannotInstall => {
+                                "this build is updated with the command shown"
+                            }
+                            Refused::InProgress => "an update is already in progress",
+                            Refused::NotNewest => "that is not the newest release",
+                        },
+                    )
+                })?;
+
+                Ok(json(
+                    StatusCode::ACCEPTED,
+                    &InstallStarted { install: "started" },
+                ))
+            }
         }
+    }
+
+    /// The button is offered only to a signed-in user: the route needs the password too.
+    fn update_view(&self) -> UpdateView {
+        let mut view = self.updates.view();
+        view.can_install = self.credentials.is_some() && self.stager.can_install();
+        view.install = self.stager.view();
+
+        view
     }
 
     fn query_log_limit(&self, query: Option<&str>) -> Result<usize, Rejection> {
@@ -682,6 +721,32 @@ struct PauseRequest {
     minutes: u32,
 }
 
+/// The version to install: `{"version": "X.Y.Z"}` and nothing else. A JSON array would also
+/// fill the struct, so the first byte must open an object.
+fn install_version(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct InstallRequest {
+        version: String,
+    }
+
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+
+    let request: InstallRequest = serde_json::from_slice(body).ok()?;
+
+    match parse_tag(&request.version) {
+        Tag::Release(_) if !request.version.starts_with('v') => Some(request.version),
+        Tag::Release(_) | Tag::Suffixed | Tag::Invalid => None,
+    }
+}
+
+#[derive(Serialize)]
+struct InstallStarted {
+    install: &'static str,
+}
+
 #[derive(Serialize)]
 struct PauseView {
     paused: bool,
@@ -780,21 +845,41 @@ fn blocked_percent(counters: &Counters) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::stage::{StageSetup, StageTiming};
     use crate::update::Build;
+    use crate::upstream::tls::Tls;
 
     fn web_with_names(names: &[&str]) -> Web {
         let mut config = Config::default();
         config.web.hostnames = names.iter().map(|name| name.to_string()).collect();
         let policy = Arc::new(Policy::new());
         let lists = Arc::new(ListControl::default());
+        let updates = Arc::new(Updates::new(Build::current()));
+        let stager = Stager::new(
+            StageSetup {
+                target: None,
+                base_url: String::new(),
+                state_dir: PathBuf::from("/nonexistent"),
+                installer_dir: PathBuf::from("/nonexistent"),
+                key: [0; 32],
+                max_binary_bytes: 0,
+                timing: StageTiming::default(),
+            },
+            Arc::clone(&updates),
+            Arc::new(|_| Box::pin(async { Err(std::io::Error::other("no DNS in this test")) })),
+            Arc::new(Tls::with_webpki_roots()),
+        );
 
         Web::new(
             &config,
             Arc::new(Stats::new(Default::default())),
             policy,
             lists,
-            Arc::new(Updates::new(Build::current())),
+            updates,
+            stager,
         )
         .unwrap()
     }

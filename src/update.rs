@@ -17,6 +17,7 @@ use crate::lists::{
     Downloader, Fetch, FetchError, Limits, PIECE_QUEUE, Piece, Resolver, Validators,
 };
 use crate::scheduler::{jittered, unit_random};
+use crate::stage::InstallView;
 use crate::upstream::tls::Tls;
 
 pub const RELEASES_URL: &str = "https://api.github.com/repos/risan/picoguard/releases/latest";
@@ -275,6 +276,11 @@ pub struct UpdateView {
     pub notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub how: Option<&'static str>,
+    /// Whether this request may install from the page. `Updates` cannot tell: the status page
+    /// fills it in from the password and the stager.
+    pub can_install: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install: Option<InstallView>,
 }
 
 /// The result of the check, shared with the status page.
@@ -299,6 +305,8 @@ impl Updates {
                 latest: None,
                 notes: None,
                 how: None,
+                can_install: false,
+                install: None,
             };
         };
 
@@ -307,6 +315,8 @@ impl Updates {
             latest: Some(latest.version),
             notes: Some(latest.notes).filter(|notes| !notes.is_empty()),
             how: Some(self.build.how()),
+            can_install: false,
+            install: None,
         }
     }
 

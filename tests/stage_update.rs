@@ -767,3 +767,58 @@ async fn a_fifo_request_does_not_block_the_start() {
     assert_eq!(stager.view(), None);
     assert!(names(&restart.update_dir()).is_empty());
 }
+
+/// A runtime that is stopped while an update runs or waits must not wait for it.
+fn assert_shutdown_is_quick(name: &str, poll: Duration, until_state: &str, trickle: bool) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let state = until_state.to_string();
+
+    runtime.block_on(async {
+        let files = release_files();
+        let root = scratch(&format!("stage-update-{name}"));
+        fs::create_dir(root.join("state")).unwrap();
+        fs::create_dir(root.join("installer")).unwrap();
+        let server = ListServer::start().await;
+        serve(&server, &files);
+
+        if trickle {
+            server.serve_slowly(
+                &binary_path(),
+                files.binary.clone(),
+                1024,
+                Duration::from_millis(200),
+            );
+        }
+
+        let mut setup = setup(&server, &root);
+        setup.timing.poll = poll;
+        let stager = stager_from(setup, updates_with(VERSION));
+        stager.start(VERSION).unwrap();
+
+        view_is(&stager, &state).await;
+        std::mem::forget(server);
+    });
+
+    let started = Instant::now();
+    runtime.shutdown_timeout(Duration::from_secs(5));
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{name}: stopping took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn stopping_never_waits_for_an_update() {
+    assert_shutdown_is_quick(
+        "stop-downloading",
+        Duration::from_millis(20),
+        "downloading",
+        true,
+    );
+    assert_shutdown_is_quick("stop-waiting", Duration::from_secs(3), "waiting", false);
+}
