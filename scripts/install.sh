@@ -16,6 +16,13 @@ SYSTEMD_MEMORY_DROPIN=$SYSTEMD_UNIT_DIR/memory.conf
 # First line of a drop-in that install.sh wrote. Any other memory.conf is the user's.
 MEMORY_DROPIN_MARKER='# Written by install.sh for the xlarge lists.'
 OPENRC_SCRIPT=/etc/init.d/picoguard
+UPDATE_HELPER_DIR=/usr/local/lib/picoguard
+UPDATE_HELPER=$UPDATE_HELPER_DIR/update
+UPDATE_COMMON=$UPDATE_HELPER_DIR/common.sh
+UPDATE_DIR=/var/lib/picoguard-update
+SYSTEMD_UPDATE_PATH=/etc/systemd/system/picoguard-update.path
+SYSTEMD_UPDATE_SERVICE=/etc/systemd/system/picoguard-update.service
+OPENRC_UPDATE_SCRIPT=/etc/init.d/picoguard-update
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/picoguard.conf
 RESOLV_SAVED_LINK=$CONFIG_DIR/resolv.conf.original-link
 RESOLV_SAVED_COPY=$CONFIG_DIR/resolv.conf.original
@@ -23,6 +30,10 @@ OLD_STATE_DIR=/var/lib/private/picoguard
 SERVICE_USER=picoguard
 HAGEZI=https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock
 ADGUARD_DNS_FILTER=https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+
+# How long to wait for an update that is being installed, and then for the one this run stopped.
+LOCK_WAIT=${PICOGUARD_LOCK_WAIT:-300}
+STOPPED_WAIT=150
 
 BINARY_FILE=
 VERSION=latest
@@ -514,14 +525,6 @@ is_ipv4() {
     printf '%s\n' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 }
 
-is_port() {
-    case $1 in
-        ''|*[!0-9]*) return 1 ;;
-    esac
-
-    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
-}
-
 upstream_label() {
     case $1 in
         cloudflare-quad9) say "Cloudflare and Quad9 over DoH" ;;
@@ -958,47 +961,6 @@ secure_config_files() {
     done
 }
 
-# Where to ask picoguard: the port and an address of [server] bind that this machine can reach.
-read_dns_target() {
-    port=$(awk '/^\[/ { in_server = ($0 == "[server]") } in_server && $1 == "port" { print $3; exit }' "$CHECK_PATH")
-
-    if is_port "$port"; then
-        DNS_PORT=$port
-    fi
-
-    # The array may span several lines and use either TOML string quote. Comments are cut off first.
-    addresses=$(awk '
-        /^\[/ { in_server = ($0 == "[server]"); collecting = 0 }
-        in_server && ($0 ~ /^[ \t]*bind[ \t]*=/ || collecting) {
-            sub(/#.*/, "")
-            print
-            collecting = ($0 !~ /\]/)
-        }' "$CHECK_PATH" | grep -o "[\"'][^\"']*[\"']" | tr -d "\"'" || true)
-
-    has_ipv4_loopback=0
-    has_ipv6_loopback=0
-    first_address=
-
-    for address in $addresses; do
-        if [ -z "$first_address" ]; then
-            first_address=$address
-        fi
-
-        case $address in
-            0.0.0.0|127.*) has_ipv4_loopback=1 ;;
-            ::|::1) has_ipv6_loopback=1 ;;
-        esac
-    done
-
-    if [ "$has_ipv4_loopback" = 1 ]; then
-        DNS_HOST=127.0.0.1
-    elif [ "$has_ipv6_loopback" = 1 ]; then
-        DNS_HOST=::1
-    elif [ -n "$first_address" ]; then
-        DNS_HOST=$first_address
-    fi
-}
-
 # Prints "name pid" for each listener on the DNS port, one per line (pid is - when unknown).
 port_53_owners() {
     if command -v ss >/dev/null 2>&1; then
@@ -1159,6 +1121,84 @@ ensure_port_53_free() {
     fi
 }
 
+# The installer sources the same text from /usr/local/lib/picoguard/common.sh.
+common_text() {
+    cat <<'COMMON'
+# shellcheck disable=SC2034,SC2154 # DNS_HOST, DNS_PORT, CHECK_PATH and INIT belong to the script that sources this
+# Shared by install.sh and the update installer (dist/picoguard-update.sh): the DNS address
+# of a config and the picoguard service. install.sh holds this text too, and scripts/check.sh
+# fails when the two differ.
+
+is_port() {
+    case $1 in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# Where to ask picoguard: the port and an address of [server] bind that this machine can reach.
+read_dns_target() {
+    port=$(awk '/^\[/ { in_server = ($0 == "[server]") } in_server && $1 == "port" { print $3; exit }' "$CHECK_PATH")
+
+    if is_port "$port"; then
+        DNS_PORT=$port
+    fi
+
+    # The array may span several lines and use either TOML string quote. Comments are cut off first.
+    addresses=$(awk '
+        /^\[/ { in_server = ($0 == "[server]"); collecting = 0 }
+        in_server && ($0 ~ /^[ \t]*bind[ \t]*=/ || collecting) {
+            sub(/#.*/, "")
+            print
+            collecting = ($0 !~ /\]/)
+        }' "$CHECK_PATH" | grep -o "[\"'][^\"']*[\"']" | tr -d "\"'" || true)
+
+    has_ipv4_loopback=0
+    has_ipv6_loopback=0
+    first_address=
+
+    for address in $addresses; do
+        if [ -z "$first_address" ]; then
+            first_address=$address
+        fi
+
+        case $address in
+            0.0.0.0|127.*) has_ipv4_loopback=1 ;;
+            ::|::1) has_ipv6_loopback=1 ;;
+        esac
+    done
+
+    if [ "$has_ipv4_loopback" = 1 ]; then
+        DNS_HOST=127.0.0.1
+    elif [ "$has_ipv6_loopback" = 1 ]; then
+        DNS_HOST=::1
+    elif [ -n "$first_address" ]; then
+        DNS_HOST=$first_address
+    fi
+}
+
+service_active() {
+    case $INIT in
+        systemd) systemctl is-active --quiet picoguard ;;
+        openrc) rc-service picoguard status >/dev/null 2>&1 ;;
+    esac
+}
+
+# Closing fd 9 keeps a lock the caller holds there (install.sh and the update installer take
+# one) from being inherited by the service: OpenRC's supervise-daemon keeps its inherited
+# descriptors for as long as it lives, which would hold the lock until a reboot.
+restart_service() {
+    case $INIT in
+        systemd) systemctl restart picoguard 9>&- ;;
+        openrc) rc-service picoguard restart 9>&- ;;
+    esac
+}
+COMMON
+}
+
+eval "$(common_text)"
+
 systemd_unit_text() {
     cat <<'SYSTEMD_UNIT'
 [Unit]
@@ -1256,6 +1296,477 @@ start_pre() {
 OPENRC_SCRIPT
 }
 
+update_helper_text() {
+    cat <<'UPDATE_HELPER'
+#!/bin/sh
+# The root installer of picoguard updates. The status page stages an update under
+# /var/lib/picoguard/update, which the picoguard user owns, so nothing in it is trusted: the
+# installed picoguard copies it and checks it again (`verify-update`), and only that copy is
+# installed. Then it restarts picoguard, asks it for example.com, and puts the previous
+# binary back when there is no answer.
+#
+#   update run systemd     one pass (the oneshot of picoguard-update.service)
+#   update watch openrc    a pass at start and then whenever a request waits, polled every
+#                          POLL seconds (the service picoguard-update, under supervise-daemon)
+#
+# install.sh writes this file to /usr/local/lib/picoguard/update; scripts/check.sh keeps its
+# copy in install.sh equal to dist/picoguard-update.sh.
+
+set -eu
+umask 077
+
+B=/usr/local/bin/picoguard
+STAGED_DIR=/var/lib/picoguard/update
+REQUEST=$STAGED_DIR/request
+I=/var/lib/picoguard-update
+LIB_DIR=/usr/local/lib/picoguard
+VERIFY_WAIT=120
+CHECK_WAIT=30
+DNS_WAIT=30
+POLL=5
+TICK=/run/picoguard-update.tick
+
+# What common.sh reads and sets.
+CHECK_PATH=/etc/picoguard/picoguard.toml
+DNS_HOST=127.0.0.1
+DNS_PORT=53
+INIT=
+
+# The request being answered, and why the last DNS check failed.
+ID=
+VERSION=
+DNS_FAILURE=
+
+# Whether the last read of the request ended with "no verify-update": a watcher logs that once.
+CANNOT_VERIFY=0
+
+# shellcheck disable=SC1091 # checked on its own, as dist/picoguard-common.sh
+. "$LIB_DIR/common.sh"
+
+log() {
+    printf 'picoguard update: %s\n' "$*" >&2
+
+    # supervise-daemon discards stderr. Its logger option would keep a `logger` process
+    # beside the watcher for as long as it runs, one process more than an idle watcher may be.
+    if [ "$INIT" = openrc ]; then
+        logger -t picoguard-update -p daemon.warning "$*" || true
+    fi
+}
+
+# `timeout` ends with 124 (GNU) or 143 (BusyBox, which kills with SIGTERM) when time ran out.
+ran_out() {
+    [ "$1" = 124 ] || [ "$1" = 143 ]
+}
+
+# The id and version of a request as `verify-update` prints it, as "ID VERSION"; fails for
+# anything but exactly those two lines.
+parse_request() {
+    id=$(printf '%s\n' "$1" | sed -n 's/^id=\([0-9a-f]\{16\}\)$/\1/p')
+    version=$(printf '%s\n' "$1" | sed -n 's/^version=\([0-9]\{1,\}\.[0-9]\{1,\}\.[0-9]\{1,\}\)$/\1/p')
+
+    if [ -z "$id" ] || [ -z "$version" ] || [ "$(printf '%s\n' "$1" | wc -l)" != 2 ]; then
+        return 1
+    fi
+
+    printf '%s %s\n' "$id" "$version"
+}
+
+# Prints "ID VERSION" of the request that is waiting. Exit 1: there is none, or it is not
+# whole; exit 2: the installed picoguard has no `verify-update`.
+#
+# `verify-update` is given `$I`, which exists, so it refuses and touches nothing. But it reads
+# the request first, without following links and for at most 256 bytes, and prints it when it
+# is valid.
+read_request() {
+    if [ ! -f "$REQUEST" ] || [ -L "$REQUEST" ]; then
+        return 1
+    fi
+
+    status=0
+    out=$(timeout 5 "$B" verify-update "$STAGED_DIR" "$I" 2>/dev/null) || status=$?
+
+    case $status in
+        1) ;;
+        2) return 2 ;;
+        *) return 1 ;;
+    esac
+
+    parse_request "$out"
+}
+
+# write_record [swap]: the record of the pass in progress, durable before it replaces the
+# last one. A record with `swap=1` is the only sign that the new binary may be at $B.
+write_record() {
+    {
+        printf 'id=%s\nversion=%s\n' "$ID" "$VERSION"
+
+        if [ "${1:-}" = swap ]; then
+            printf 'swap=1\n'
+        fi
+    } >"$I/installing.part" && sync && mv -f "$I/installing.part" "$I/installing" && sync
+}
+
+# write_result OUTCOME [REASON]: the answer, durable before anything that could still be
+# needed to finish this update is removed.
+write_result() {
+    reason=
+    if [ $# -ge 2 ]; then
+        reason=$(printf '%s\n' "$2" | head -n 1 | tr -cd ' -~' | cut -c 1-200)
+    fi
+
+    if [ "$1" != updated ] && [ -z "$reason" ]; then
+        reason="no reason was given"
+    fi
+
+    {
+        printf 'id=%s\noutcome=%s\n' "$ID" "$1"
+
+        if [ -n "$reason" ]; then
+            printf 'reason=%s\n' "$reason"
+        fi
+    } >"$I/result.part"
+    chmod 0644 "$I/result.part"
+    sync
+    mv -f "$I/result.part" "$I/result"
+    sync
+    log "$ID: $1${reason:+: $reason}"
+}
+
+remove_pass_files() {
+    rm -rf "$I"/*.part "$I/verified" "$I/verify.err" "$I/previous" "$B.update.part"
+    rm -f "$I/installing"
+}
+
+# Every end of a pass with an answer.
+end_with() {
+    write_result "$@"
+    remove_pass_files
+}
+
+# Restarts picoguard and waits until the previous binary gets an answer from it, for at most
+# DNS_WAIT seconds. The previous binary asks, so that a broken new version cannot pass its
+# own check. On failure DNS_FAILURE says why; the state at the deadline decides, because a
+# version that crashes over and over is between restarts at almost any moment.
+check_dns() {
+    read_dns_target
+    deadline=$(($(date +%s) + DNS_WAIT))
+
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        # A probe takes up to 2 seconds, so one that started just before the deadline could
+        # answer after it.
+        if service_active && "$I/previous" dns-check "$DNS_HOST" "$DNS_PORT" >/dev/null 2>&1 &&
+            [ "$(date +%s)" -lt "$deadline" ]; then
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    if service_active; then
+        DNS_FAILURE="did not answer DNS within $DNS_WAIT seconds"
+    else
+        DNS_FAILURE="did not start"
+    fi
+
+    return 1
+}
+
+# Puts the previous binary back and answers `rolled-back`. Returns 1, with the record and
+# the backup kept for the next pass, when it cannot put the binary back: the new binary is
+# still at $B then, and `rolled-back` would be a lie.
+roll_back() {
+    if ! { cp -p "$I/previous" "$B.update.part" && sync && mv -f "$B.update.part" "$B" && sync; }; then
+        rm -rf "$B.update.part"
+        log "$ID: rollback failed: could not put the previous binary back"
+
+        return 1
+    fi
+
+    restart_service || true
+
+    if check_dns; then
+        end_with rolled-back "the new version $1; the previous version runs again"
+    else
+        end_with rolled-back "the new version $1; the previous version does not answer either"
+    fi
+}
+
+# After a restart: keep the new binary when it answers, else put the previous one back.
+judge_new_binary() {
+    if check_dns; then
+        end_with updated
+    else
+        roll_back "$DNS_FAILURE"
+    fi
+}
+
+# What an earlier pass left when it stopped part way (killed, timed out, power lost).
+finish_interrupted() {
+    ID=$(sed -n 's/^id=//p' "$I/installing")
+    VERSION=$(sed -n 's/^version=//p' "$I/installing")
+    swap=$(sed -n 's/^swap=//p' "$I/installing")
+
+    if [ -z "$ID" ]; then
+        remove_pass_files
+
+        return 0
+    fi
+
+    log "$ID: finishing an interrupted update"
+
+    if [ -f "$I/result" ] && [ "$(sed -n 's/^id=//p' "$I/result")" = "$ID" ]; then
+        remove_pass_files
+    elif [ "$swap" = 1 ] && [ -f "$I/verified/picoguard" ] && cmp -s "$B" "$I/verified/picoguard"; then
+        restart_service || true
+        judge_new_binary
+    elif [ "$swap" = 1 ]; then
+        # A rollback had put the previous binary back, or install.sh replaced the binary.
+        restart_service || true
+        end_with failed "the installer was interrupted"
+    else
+        end_with failed "the installer was interrupted"
+    fi
+}
+
+# Verifies the staged update into $I/verified. Returns 0 to go on; any other end has
+# answered or dropped the request already.
+verify_staged() {
+    status=0
+    out=$(timeout "$VERIFY_WAIT" "$B" verify-update "$STAGED_DIR" "$I/verified" 2>"$I/verify.err") || status=$?
+    shown=$(parse_request "$out" | cut -d' ' -f1)
+
+    # What was verified must be the request this pass recorded; if the request changed under
+    # the pass, the new one gets its own pass.
+    if [ "$status" = 0 ] && [ "$shown" = "$ID" ]; then
+        return 0
+    fi
+
+    if { [ -n "$shown" ] && [ "$shown" != "$ID" ]; } || [ "$status" = 0 ]; then
+        remove_pass_files
+
+        return 1
+    fi
+
+    if ran_out "$status"; then
+        end_with failed "verify-update did not finish within $VERIFY_WAIT seconds"
+    elif [ "$status" = 1 ] && [ -n "$shown" ]; then
+        end_with failed "$(head -n 1 "$I/verify.err")"
+    elif [ "$status" = 1 ]; then
+        remove_pass_files
+    else
+        end_with failed "verify-update ended with status $status"
+    fi
+
+    return 1
+}
+
+install_verified() {
+    status=0
+    out=$(timeout "$CHECK_WAIT" "$I/verified/picoguard" --check -c "$CHECK_PATH" 2>&1) || status=$?
+
+    if ran_out "$status"; then
+        end_with failed "the new version did not check the config within $CHECK_WAIT seconds"
+
+        return 0
+    elif [ "$status" != 0 ]; then
+        end_with failed "the new version does not accept the config: $(printf '%s\n' "$out" | head -n 1)"
+
+        return 0
+    fi
+
+    if ! { cp -p "$B" "$I/previous.part" && sync && mv -f "$I/previous.part" "$I/previous" && sync; } ||
+        ! write_record swap; then
+        end_with failed "disk: could not keep the previous binary"
+
+        return 0
+    fi
+
+    if ! { cp "$I/verified/picoguard" "$B.update.part" && chmod 0755 "$B.update.part" && sync &&
+        mv -f "$B.update.part" "$B" && sync; }; then
+        rm -rf "$B.update.part"
+        end_with failed "disk: could not write the new binary"
+
+        return 0
+    fi
+
+    restart_service || true
+    judge_new_binary
+}
+
+# One pass: answers the request that waits, if there is one that is not answered yet. Every
+# end returns 0 except a failed rollback, which returns 1.
+run_once() {
+    if [ ! -d "$I" ]; then
+        return 0
+    fi
+
+    exec 9>>"$I/lock"
+    flock 9
+
+    # An uninstall or a rollback of install.sh removed $I while this pass waited.
+    if [ "$(stat -L -c %d:%i /proc/self/fd/9)" != "$(stat -c %d:%i "$I/lock" 2>/dev/null || echo gone)" ]; then
+        log "the lock changed while waiting"
+
+        return 0
+    fi
+
+    if [ -f "$I/installing" ]; then
+        finish_interrupted || return 1
+    fi
+
+    rm -rf "$I"/*.part "$I/verified" "$I/verify.err" "$I/previous" "$B.update.part"
+
+    status=0
+    request=$(read_request) || status=$?
+
+    if [ "$status" = 2 ]; then
+        # One line per run of this process, not one per poll of a watcher.
+        if [ "$CANNOT_VERIFY" != 1 ]; then
+            log "the installed picoguard cannot verify updates"
+        fi
+
+        CANNOT_VERIFY=1
+
+        return 0
+    fi
+
+    CANNOT_VERIFY=0
+
+    if [ "$status" != 0 ]; then
+        return 0
+    fi
+
+    ID=${request% *}
+    VERSION=${request#* }
+
+    if [ -f "$I/result" ] && [ "$(sed -n 's/^id=//p' "$I/result")" = "$ID" ]; then
+        return 0
+    fi
+
+    if ! write_record; then
+        rm -f "$I/installing.part"
+        log "$ID: could not write the record of the update"
+
+        return 0
+    fi
+
+    if verify_staged; then
+        install_verified
+    fi
+}
+
+# Polls instead of watching the directory: it must start with no directory to watch, and a
+# BusyBox `inotifyd` costs a third more memory. The pass runs in this process, not a subshell,
+# so that stopping the service stops it. A failed rollback ends the watcher; supervise-daemon
+# starts it again, and its first pass retries.
+watch() {
+    # A FIFO that nothing writes to: `read` on it is a sleep that is not a process of its own.
+    rm -f "$TICK"
+    mkfifo -m 0600 "$TICK"
+    exec 3<>"$TICK"
+    rm -f "$TICK"
+
+    while :; do
+        if [ -f "$I/installing" ] || [ -f "$REQUEST" ]; then
+            # Not `run_once || ...`: set -e is off for everything inside a function that is
+            # the left side of `||`.
+            run_once
+            exec 9>&-
+        fi
+
+        if [ -n "${BB_ASH_VERSION:-}" ]; then
+            # shellcheck disable=SC3045 # only BusyBox ash gets here
+            read -r -t "$POLL" _ <&3 || true
+        else
+            sleep "$POLL"
+        fi
+    done
+}
+
+case ${1:-}:${2:-} in
+    watch:openrc)
+        # shellcheck disable=SC2034 # common.sh reads it
+        INIT=openrc
+        watch
+        ;;
+    run:systemd)
+        # shellcheck disable=SC2034 # common.sh reads it
+        INIT=systemd
+        run_once
+        ;;
+    *)
+        echo "usage: update run systemd | watch openrc" >&2
+        exit 2
+        ;;
+esac
+UPDATE_HELPER
+}
+
+systemd_update_path_text() {
+    cat <<'SYSTEMD_UPDATE_PATH'
+[Unit]
+Description=Install a picoguard update that the status page staged
+
+[Path]
+# A new, a changed and a removed request all start the installer. It acts only on a request
+# that is whole and not yet answered, so the extra runs end at once.
+PathChanged=/var/lib/picoguard/update/request
+
+[Install]
+WantedBy=paths.target
+SYSTEMD_UPDATE_PATH
+}
+
+systemd_update_service_text() {
+    cat <<'SYSTEMD_UPDATE_SERVICE'
+[Unit]
+Description=Install a picoguard update that the status page staged
+# No Requires, BindsTo or PartOf: restarting picoguard must not stop the installer that asks
+# for it.
+After=picoguard.service
+# Every change of the request starts a pass, and a pass is cheap. With systemd's default limit
+# (5 starts in 10 seconds) a daemon that rewrites the request over and over would put this
+# unit, and the path unit with it, out of action until the next boot.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/picoguard/update run systemd
+TimeoutStartSec=10min
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin /var/lib/picoguard-update
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+# Also runs at boot: it finishes an update that a power loss interrupted.
+WantedBy=multi-user.target
+SYSTEMD_UPDATE_SERVICE
+}
+
+openrc_update_text() {
+    cat <<'OPENRC_UPDATE_SCRIPT'
+#!/sbin/openrc-run
+
+description="Install a picoguard update that the status page staged"
+
+command=/usr/local/lib/picoguard/update
+command_args="watch openrc"
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+# No `need picoguard`: OpenRC restarts the services that need a restarted one, which would
+# stop the installer in the middle of the update that restarts picoguard.
+depend() {
+    after picoguard
+    use logger
+}
+OPENRC_UPDATE_SCRIPT
+}
+
 owns_memory_dropin() {
     [ "$(head -n 1 "$SYSTEMD_MEMORY_DROPIN" 2>/dev/null)" = "$MEMORY_DROPIN_MARKER" ]
 }
@@ -1279,6 +1790,11 @@ install_systemd_service() {
         fi
     fi
 
+    systemd_update_path_text >"$TMP/picoguard-update.path"
+    install -m 0644 "$TMP/picoguard-update.path" "$SYSTEMD_UPDATE_PATH"
+    systemd_update_service_text >"$TMP/picoguard-update.service"
+    install -m 0644 "$TMP/picoguard-update.service" "$SYSTEMD_UPDATE_SERVICE"
+
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload
     fi
@@ -1292,9 +1808,37 @@ install_openrc_service() {
     mkdir -p "$(dirname "$OPENRC_SCRIPT")"
     openrc_script_text >"$TMP/picoguard.openrc"
     install -m 0755 "$TMP/picoguard.openrc" "$OPENRC_SCRIPT"
+    openrc_update_text >"$TMP/picoguard-update.openrc"
+    install -m 0755 "$TMP/picoguard-update.openrc" "$OPENRC_UPDATE_SCRIPT"
+}
+
+# The root installer of updates from the status page, what it sources, and the directory it
+# keeps its lock and its state in. Only root can write any of it: the daemon must not.
+install_update_helper() {
+    mkdir -p "$UPDATE_HELPER_DIR"
+    chown root:root "$UPDATE_HELPER_DIR"
+    chmod 0755 "$UPDATE_HELPER_DIR"
+    update_helper_text >"$TMP/picoguard-update"
+    install -m 0755 "$TMP/picoguard-update" "$UPDATE_HELPER"
+    common_text >"$TMP/picoguard-common.sh"
+    install -m 0644 "$TMP/picoguard-common.sh" "$UPDATE_COMMON"
+
+    mkdir -p "$UPDATE_DIR"
+    chown root:root "$UPDATE_DIR"
+    chmod 0755 "$UPDATE_DIR"
+
+    # Never replaced: a pass may hold a lock on this very file. The daemon cannot open it, or
+    # it could keep updates and this script waiting.
+    if [ ! -e "$UPDATE_DIR/lock" ]; then
+        : >"$UPDATE_DIR/lock"
+    fi
+
+    chmod 0600 "$UPDATE_DIR/lock"
 }
 
 install_service() {
+    install_update_helper
+
     case $INIT in
         systemd) install_systemd_service ;;
         openrc) install_openrc_service ;;
@@ -1304,6 +1848,40 @@ install_service() {
 install_binary() {
     mv -f "$STAGED" "$BIN_PATH"
     STAGED=
+}
+
+stop_update_installer() {
+    case $INIT in
+        systemd) systemctl stop picoguard-update.service 9>&- || true ;;
+        openrc) rc-service picoguard-update stop 9>&- || true ;;
+    esac
+}
+
+# Takes the lock that the update installer holds for a whole pass, and keeps it on fd 9 until
+# this script ends, so that the two never change the binary, the units or the installer's
+# folder at the same time. The services this script starts are started with 9>&-: OpenRC's
+# supervise-daemon keeps the descriptors it inherits, which would hold the lock until a reboot.
+# Without the folder (a first install, or an upgrade from a version that had no installer)
+# no installer can be running.
+lock_updates() {
+    if [ ! -d "$UPDATE_DIR" ]; then
+        return 0
+    fi
+
+    exec 9>>"$UPDATE_DIR/lock"
+
+    if timeout "$LOCK_WAIT" flock 9; then
+        return 0
+    fi
+
+    warn "an update is being installed and has not finished in $LOCK_WAIT seconds; stopping it"
+    stop_update_installer
+
+    # What the installer left running (a verification it was waiting for) ends within its own
+    # limits; until then it still holds the lock, and nothing may change under it.
+    if ! timeout "$STOPPED_WAIT" flock 9; then
+        warn "the stopped installer still holds the lock; going on anyway"
+    fi
 }
 
 # On an upgrade, keep what runs now, so that a failed restart can be undone.
@@ -1327,10 +1905,90 @@ backup_previous() {
     if [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
         cp -p "$SYSTEMD_MEMORY_DROPIN" "$BACKUP_DIR/memory-dropin"
     fi
+
+    update_files | while read -r name path; do
+        if [ -f "$path" ]; then
+            cp -p "$path" "$BACKUP_DIR/$name"
+        fi
+    done
+
+    if [ -d "$UPDATE_DIR" ]; then
+        : >"$BACKUP_DIR/had-update-dir"
+    fi
+}
+
+# The name a file is kept under in the backup, and its path: everything the installer of
+# updates puts on the device, except the folder it keeps its state in.
+update_files() {
+    cat <<LIST
+update-helper $UPDATE_HELPER
+update-common $UPDATE_COMMON
+systemd-update-path $SYSTEMD_UPDATE_PATH
+systemd-update-service $SYSTEMD_UPDATE_SERVICE
+openrc-update $OPENRC_UPDATE_SCRIPT
+LIST
+}
+
+# A trigger that this run added is stopped before anything else is put back, or it could
+# start an update over the binary that is being restored.
+stop_new_update_trigger() {
+    case $INIT in
+        systemd)
+            if [ ! -f "$BACKUP_DIR/systemd-update-path" ]; then
+                systemctl disable --now picoguard-update.path picoguard-update.service 9>&- || true
+            fi
+            ;;
+        openrc)
+            if [ ! -f "$BACKUP_DIR/openrc-update" ]; then
+                rc-service picoguard-update stop 9>&- || true
+                rc-update del picoguard-update || true
+            fi
+            ;;
+    esac
+}
+
+# Back to what was there before this run: a file that was backed up is copied back, one that
+# was not is removed.
+restore_or_remove() {
+    if [ -f "$BACKUP_DIR/$1" ]; then
+        cp -p "$BACKUP_DIR/$1" "$2"
+    else
+        rm -f "$2"
+    fi
+}
+
+restore_update_installer() {
+    update_files | while read -r name path; do
+        restore_or_remove "$name" "$path"
+    done
+
+    if [ ! -f "$BACKUP_DIR/had-update-dir" ]; then
+        rm -rf "$UPDATE_DIR"
+    fi
+
+    rmdir "$UPDATE_HELPER_DIR" 2>/dev/null || true
+}
+
+# Starts again the trigger that was there before this run.
+restart_old_update_trigger() {
+    case $INIT in
+        systemd)
+            if [ -f "$BACKUP_DIR/systemd-update-path" ]; then
+                systemctl restart picoguard-update.path 9>&- || true
+                systemctl start --no-block picoguard-update.service 9>&- || true
+            fi
+            ;;
+        openrc)
+            if [ -f "$BACKUP_DIR/openrc-update" ]; then
+                rc-service picoguard-update restart 9>&- || true
+            fi
+            ;;
+    esac
 }
 
 rollback_upgrade() {
     warn "the new version did not start or did not answer; putting $OLD_VERSION back"
+    stop_new_update_trigger
     cp -p "$BACKUP_DIR/binary" "$BIN_PATH.old.$$"
     mv -f "$BIN_PATH.old.$$" "$BIN_PATH"
 
@@ -1355,15 +2013,14 @@ rollback_upgrade() {
         secure_config_files
     fi
 
-    case $INIT in
-        systemd)
-            systemctl daemon-reload
-            systemctl restart picoguard || true
-            ;;
-        openrc)
-            rc-service picoguard restart || true
-            ;;
-    esac
+    restore_update_installer
+
+    if [ "$INIT" = systemd ]; then
+        systemctl daemon-reload
+    fi
+
+    restart_service || true
+    restart_old_update_trigger
 
     if service_active; then
         say "The previous version runs again."
@@ -1374,20 +2031,20 @@ rollback_upgrade() {
     fail "the upgrade failed and was rolled back"
 }
 
-service_active() {
-    case $INIT in
-        systemd) systemctl is-active --quiet picoguard ;;
-        openrc) rc-service picoguard status >/dev/null 2>&1 ;;
-    esac
-}
-
 start_service() {
     case $INIT in
         systemd)
-            systemctl enable picoguard && systemctl restart picoguard
+            # The oneshot is queued, not waited for: it runs once this script has ended, and
+            # answers a request that waited (a path unit started over an existing request does
+            # not fire).
+            systemctl enable picoguard picoguard-update.path picoguard-update.service 9>&- &&
+                systemctl restart picoguard 9>&- &&
+                systemctl restart picoguard-update.path 9>&- &&
+                systemctl start --no-block picoguard-update.service 9>&-
             ;;
         openrc)
-            rc-update add picoguard default && rc-service picoguard restart
+            rc-update add picoguard default && rc-update add picoguard-update default &&
+                rc-service picoguard restart 9>&- && rc-service picoguard-update restart 9>&-
             ;;
     esac
 }
@@ -1495,8 +2152,8 @@ report() {
         say ""
         say "Installed, not started (--no-start). Start it with:"
         case $INIT in
-            systemd) say "  systemctl enable --now picoguard" ;;
-            openrc) say "  rc-update add picoguard default && rc-service picoguard start" ;;
+            systemd) say "  systemctl enable --now picoguard picoguard-update.path picoguard-update.service" ;;
+            openrc) say "  rc-update add picoguard default && rc-update add picoguard-update default && rc-service picoguard start && rc-service picoguard-update start" ;;
             *) say "  /usr/local/bin/picoguard -c $CONFIG_PATH" ;;
         esac
         print_web_login
@@ -1577,8 +2234,18 @@ undo_resolved_fix() {
 uninstall() {
     say "Removing picoguard"
 
+    # Not while an update is being installed. The lock is kept until the installer's files and
+    # folder are gone; a pass that waited for it finds its lock removed and ends.
+    lock_updates
+
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl disable --now picoguard-update.path picoguard-update.service 9>&- 2>/dev/null || true
         systemctl disable --now picoguard 2>/dev/null || true
+    fi
+
+    if command -v rc-service >/dev/null 2>&1 && [ -f "$OPENRC_UPDATE_SCRIPT" ]; then
+        rc-service picoguard-update stop 9>&- 2>/dev/null || true
+        rc-update del picoguard-update 2>/dev/null || true
     fi
 
     if command -v rc-service >/dev/null 2>&1 && [ -f "$OPENRC_SCRIPT" ]; then
@@ -1587,6 +2254,8 @@ uninstall() {
     fi
 
     rm -f "$SYSTEMD_UNIT" "$OPENRC_SCRIPT" "$BIN_PATH"
+    rm -f "$SYSTEMD_UPDATE_PATH" "$SYSTEMD_UPDATE_SERVICE" "$OPENRC_UPDATE_SCRIPT"
+    rm -rf "$UPDATE_HELPER_DIR" "$UPDATE_DIR"
 
     if [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
         if owns_memory_dropin; then
@@ -1667,6 +2336,7 @@ main() {
 
     ensure_service_user
     migrate_dynamic_state
+    lock_updates
     backup_previous
     install_config
     secure_config_files

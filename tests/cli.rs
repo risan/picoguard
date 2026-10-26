@@ -1,7 +1,8 @@
 mod common;
 
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use common::process::{start, write_config};
 
@@ -251,7 +252,7 @@ fn help_lists_the_options() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = text(&output.stdout);
-    for option in ["--config", "--check", "--version", "--help"] {
+    for option in ["--config", "--check", "--version", "--help", "dns-check"] {
         assert!(stdout.contains(option), "{stdout}");
     }
 }
@@ -314,4 +315,193 @@ fn verify_update_refuses_what_the_built_in_key_did_not_sign() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(text(&output.stderr).trim().lines().count(), 1);
     assert!(!into.exists());
+}
+
+const QR: u8 = 0x80;
+const NOERROR: u8 = 0;
+const NXDOMAIN: u8 = 3;
+const SERVFAIL: u8 = 2;
+const REFUSED: u8 = 5;
+
+/// A reply to `query`: the same id and question, QR set, and `rcode`.
+fn reply_to(query: &[u8], rcode: u8) -> Vec<u8> {
+    let mut reply = query.to_vec();
+    reply[2] |= QR;
+    reply[3] = (reply[3] & 0xF0) | rcode;
+
+    reply
+}
+
+fn with_another_id(mut reply: Vec<u8>) -> Vec<u8> {
+    reply[0] ^= 0xFF;
+
+    reply
+}
+
+fn with_another_question(mut reply: Vec<u8>) -> Vec<u8> {
+    let at = reply
+        .windows(3)
+        .position(|window| window == b"com")
+        .expect("the query names example.com");
+    reply[at..at + 3].copy_from_slice(b"org");
+
+    reply
+}
+
+/// Binds `bind`, answers the first datagram with every datagram `replies` makes of it, in
+/// order, and returns the address. The thread ends after that one query.
+fn responder(
+    bind: &str,
+    replies: impl FnOnce(&[u8]) -> Vec<Vec<u8>> + Send + 'static,
+) -> Option<SocketAddr> {
+    let socket = UdpSocket::bind(bind).ok()?;
+    let address = socket.local_addr().unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    std::thread::spawn(move || {
+        let mut query = [0u8; 512];
+
+        if let Ok((length, peer)) = socket.recv_from(&mut query) {
+            for reply in replies(&query[..length]) {
+                socket.send_to(&reply, peer).unwrap();
+            }
+        }
+    });
+
+    Some(address)
+}
+
+fn dns_check(address: SocketAddr) -> Output {
+    picoguard(&[
+        "dns-check",
+        &address.ip().to_string(),
+        &address.port().to_string(),
+    ])
+}
+
+#[test]
+fn dns_check_accepts_noerror_and_nxdomain() {
+    for rcode in [NOERROR, NXDOMAIN] {
+        let address = responder("127.0.0.1:0", move |query| vec![reply_to(query, rcode)]).unwrap();
+
+        let output = dns_check(address);
+
+        assert_eq!(output.status.code(), Some(0), "rcode {rcode}");
+        assert!(text(&output.stderr).is_empty(), "{}", text(&output.stderr));
+    }
+}
+
+#[test]
+fn dns_check_refuses_servfail_refused_and_another_question() {
+    type MakeReply = fn(&[u8]) -> Vec<u8>;
+    let cases: [(&str, MakeReply); 3] = [
+        ("SERVFAIL", |query| reply_to(query, SERVFAIL)),
+        ("REFUSED", |query| reply_to(query, REFUSED)),
+        ("question", |query| {
+            with_another_question(reply_to(query, NOERROR))
+        }),
+    ];
+
+    for (name, make) in cases {
+        let address = responder("127.0.0.1:0", move |query| vec![make(query)]).unwrap();
+
+        let output = dns_check(address);
+
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert_eq!(text(&output.stderr).trim().lines().count(), 1, "{name}");
+        assert!(
+            text(&output.stderr).contains(name),
+            "{name}: {}",
+            text(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn dns_check_skips_another_id_and_takes_the_right_one() {
+    let address = responder("127.0.0.1:0", |query| {
+        vec![
+            with_another_id(reply_to(query, SERVFAIL)),
+            reply_to(query, NOERROR),
+        ]
+    })
+    .unwrap();
+
+    assert_eq!(dns_check(address).status.code(), Some(0));
+}
+
+#[test]
+fn dns_check_gives_up_when_only_another_id_answers() {
+    let address = responder("127.0.0.1:0", |query| {
+        vec![with_another_id(reply_to(query, NOERROR))]
+    })
+    .unwrap();
+    let started = Instant::now();
+
+    let output = dns_check(address);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(text(&output.stderr).trim().lines().count(), 1);
+}
+
+#[test]
+fn dns_check_gives_up_on_silence() {
+    let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let started = Instant::now();
+
+    let output = dns_check(silent.local_addr().unwrap());
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(text(&output.stderr).trim().lines().count(), 1);
+}
+
+#[test]
+fn dns_check_needs_an_address_and_a_port() {
+    for args in [
+        vec!["dns-check"],
+        vec!["dns-check", "127.0.0.1"],
+        vec!["dns-check", "127.0.0.1", "53", "extra"],
+        vec!["dns-check", "x", "53"],
+        vec!["dns-check", "127.0.0.1", "0"],
+        vec!["dns-check", "127.0.0.1", "70000"],
+    ] {
+        let output = picoguard(&args);
+
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(text(&output.stderr).contains("dns-check"), "{args:?}");
+        assert!(text(&output.stdout).is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn dns_check_asks_a_running_picoguard() {
+    let mut server = start("dns-check-running.toml", |port| {
+        format!(
+            "lists = []\nrules = [\"127.0.0.1 example.com\"]\n\
+             [server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+             [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
+             [web]\nenabled = false\n"
+        )
+    });
+
+    let output = picoguard(&["dns-check", "127.0.0.1", &server.port.to_string()]);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+}
+
+#[test]
+fn dns_check_over_ipv6_loopback() {
+    let Some(address) = responder("[::1]:0", |query| vec![reply_to(query, NOERROR)]) else {
+        eprintln!("skipped: ::1 cannot be bound here");
+
+        return;
+    };
+
+    assert_eq!(dns_check(address).status.code(), Some(0));
 }

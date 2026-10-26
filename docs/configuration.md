@@ -231,11 +231,13 @@ Statistics and the query log live in memory only and are lost on restart.
 
 The status page shows the running version. About once a day, picoguard also asks GitHub whether
 a newer release exists, and the page says "update available" with a short summary of the release
-notes and the command that updates your kind of build.
+notes and the command that updates your kind of build. A release binary installed with
+`install.sh`, shown to a signed-in user (`web.user` and `web.password`), also gets an **Update**
+button that installs it ([how it works](install.md#from-the-status-page)).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `check` | `true` | Look for a newer release. `false`: picoguard never contacts GitHub. |
+| `check` | `true` | Look for a newer release, and offer the button. `false`: picoguard never contacts GitHub, so there is no "update available" and no button. |
 
 What the check does:
 
@@ -249,6 +251,11 @@ What the check does:
   page. It never affects DNS answers.
 - With `check = false`, or with the status page turned off (`[web] enabled = false`), picoguard
   makes no request and no DNS lookup for GitHub.
+
+The button is the only thing in picoguard that installs a program. It does so through a separate
+root installer that `install.sh` sets up, not through picoguard itself, which still cannot write
+its own binary. Turning the button off for good, and removing the installer, is described in
+[install.md](install.md#from-the-status-page).
 
 The command shown depends on how the binary was built:
 
