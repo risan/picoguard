@@ -39,3 +39,20 @@ fn the_dockerfile_marks_docker_builds() {
 
     assert!(first_stage < marker && marker < build && build < last_stage);
 }
+
+#[test]
+fn the_dockerfile_copies_the_release_key() {
+    let dockerfile = read("Dockerfile");
+
+    let copy = dockerfile
+        .find("COPY dist/release-key.der")
+        .expect("the build stage copies the release key");
+    let build = dockerfile
+        .find("RUN cargo build")
+        .expect("the build stage runs cargo build");
+    let last_stage = dockerfile
+        .find("FROM scratch")
+        .expect("the Dockerfile has a final stage");
+
+    assert!(copy < build && build < last_stage);
+}
