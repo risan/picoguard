@@ -326,6 +326,10 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/resume",
         "/api/lists/refresh",
         "setInterval(update, 5000)",
+        "id=\"version\"",
+        "id=\"update\"",
+        "id=\"update-how\"",
+        "showUpdate(status)",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
@@ -350,6 +354,27 @@ async fn the_resume_button_is_shown_only_while_blocking_is_paused() {
 
     assert!(page.contains("#resume { display: none; }"));
     assert!(page.contains(".paused #resume { display: inline-block; }"));
+}
+
+/// No browser here, so the page source is checked for what hides the notice and what fills it.
+#[tokio::test]
+async fn the_update_notice_is_hidden_until_a_newer_version_is_known() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    assert!(page.contains("<section id=\"update\" hidden>"));
+    assert!(page.contains("$(\"update\").hidden = !status.update.latest;"));
+    for filled_as_text in [
+        "$(\"version\").textContent",
+        "$(\"update-text\").textContent",
+        "$(\"update-notes\").textContent",
+        "$(\"update-how\").textContent",
+    ] {
+        assert!(page.contains(filled_as_text), "{filled_as_text}");
+    }
+
+    assert!(page.contains("\"update available: v\""));
 }
 
 #[tokio::test]
