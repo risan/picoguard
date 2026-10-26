@@ -34,7 +34,8 @@ use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128};
 
 use super::compile::{
-    COMPILER_VERSION, CompileOptions, Compiled, NAME_OVERHEAD_BYTES, SlowRuleBudget, TEXT_BYTE_COST,
+    COMPILER_VERSION, CompileOptions, Compiled, NAME_OVERHEAD_BYTES, SlowRuleBudget,
+    TEXT_BYTE_COST, blocks_a_canary,
 };
 use super::engine::{CompiledList, FAST_KINDS, HostRules, MAX_HOST_GROUPS, SlowRule};
 use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
@@ -67,6 +68,9 @@ pub enum SnapshotError {
     TooLarge(&'static str),
     Corrupt(&'static str),
     BadChecksum,
+    /// The list blocks a canary name and the options ask for the check. The snapshot does
+    /// not record whether the check ran when it was made, so it is made again on load.
+    BlocksCanary,
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -102,6 +106,10 @@ impl std::fmt::Display for SnapshotError {
 
             SnapshotError::BadChecksum => {
                 write!(formatter, "checksum mismatch")
+            }
+
+            SnapshotError::BlocksCanary => {
+                write!(formatter, "the list blocks a canary name")
             }
         }
     }
@@ -860,6 +868,16 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         return Err(SnapshotError::Corrupt("fingerprint"));
     }
 
+    let list = Arc::new(CompiledList {
+        fast,
+        hosts,
+        slow,
+        regex_failed,
+    });
+    if options.check_canaries && blocks_a_canary(&list) {
+        return Err(SnapshotError::BlocksCanary);
+    }
+
     Ok(Snapshot {
         meta: Meta {
             fingerprint: stored_fingerprint,
@@ -875,12 +893,7 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
                 last_modified,
             },
         },
-        list: Arc::new(CompiledList {
-            fast,
-            hosts,
-            slow,
-            regex_failed,
-        }),
+        list,
         counters: counters_from(values, first_invalid),
     })
 }
@@ -1626,6 +1639,22 @@ ads.*.tracker
         fs::write(&path, &bytes).unwrap();
 
         assert!(matches!(rejected(&path), SnapshotError::OldCompiler(_)));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_that_blocks_a_canary_is_refused_only_when_canaries_are_checked() {
+        let state = TestDir::new("snap");
+        let (path, _) = saved_bytes(&state, "||*^\n").await;
+        let checked = CompileOptions {
+            check_canaries: true,
+            ..caps()
+        };
+
+        let unchecked = load(&path, &caps());
+        let refused = load(&path, &checked);
+
+        assert!(unchecked.is_ok());
+        assert!(matches!(refused, Err(SnapshotError::BlocksCanary)));
     }
 
     #[tokio::test]
