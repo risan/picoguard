@@ -135,6 +135,8 @@ async fn drafts_pre_releases_and_suffixed_tags_keep_the_result() {
     let ignored = [
         json!({ "tag_name": "v100.0.0", "draft": true }),
         json!({ "tag_name": "v100.0.0", "prerelease": true }),
+        json!({ "tag_name": "nightly", "draft": true }),
+        json!({ "tag_name": "nightly", "prerelease": true }),
         json!({ "tag_name": "v100.0.0-rc.1" }),
         json!({ "tag_name": "v100.0.0+meta" }),
     ];

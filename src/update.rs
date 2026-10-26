@@ -430,6 +430,11 @@ impl Checker {
             Ok(release) => release,
             Err(error) => return (Outcome::Failed(Failure::Invalid), error.to_string()),
         };
+
+        if release.draft || release.prerelease {
+            return (current_outcome(updates), String::new());
+        }
+
         let version = match parse_tag(&release.tag_name) {
             Tag::Release(version) => version,
             Tag::Suffixed => return (current_outcome(updates), String::new()),
@@ -440,10 +445,6 @@ impl Checker {
                 );
             }
         };
-
-        if release.draft || release.prerelease {
-            return (current_outcome(updates), String::new());
-        }
 
         let is_newer = self
             .running
