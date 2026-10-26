@@ -301,6 +301,67 @@ audit_scans_a_credential_only_a_merge_holds() {
     expect_line '^secret stripe-access-token ' "$merge" f.txt
 }
 
+# A list that only the working tree has, or an edit nobody committed, must not
+# explain a name: the audit reads the lists from HEAD.
+audit_explains_names_only_from_committed_lists() {
+    local repo
+
+    write_names
+    repo=$(new_repo uncommitted-list)
+    commit_file "$repo" lists/other.txt '0.0.0.0 example.org' >/dev/null
+    commit_file "$repo" docs/links.txt 'https://github.com/example' >/dev/null
+    printf '0.0.0.0 github.com\n' >"$repo/lists/untracked.txt"
+    printf '0.0.0.0 github.com\n' >>"$repo/lists/other.txt"
+    run_audit "$repo" --public-lists 'lists/*.txt'
+
+    expect_status 1
+    expect_line '^query-name unexplained github\.com ' docs/links.txt
+}
+
+audit_lists_every_place_of_an_explained_name() {
+    local repo first second
+
+    write_names
+    repo=$(new_repo explained-places)
+    commit_file "$repo" lists/public.txt '0.0.0.0 github.com' >/dev/null
+    first=$(commit_file "$repo" a.txt 'see github.com')
+    second=$(commit_file "$repo" b.txt 'see github.com again')
+    run_audit "$repo" --public-lists 'lists/*.txt'
+
+    expect_line '^query-name explained github\.com .* a\.txt$' "$first"
+    expect_line '^query-name explained github\.com .* b\.txt$' "$second"
+}
+
+audit_counts_names_without_a_dot() {
+    local repo
+
+    printf 'singlelabel A\nsecret-host.home.arpa A\n' >"$scratch/names.txt"
+    repo=$(new_repo single-label)
+    commit_file "$repo" a.txt 'singlelabel' >/dev/null
+    run_audit "$repo"
+
+    expect_line '^names without a dot, not scanned: 1$'
+    grep -q -F 'not scanned (no dot)' "$summary" || fail "the summary does not count them"
+    ! grep -q -F singlelabel "$summary" || fail "the summary holds a name"
+}
+
+# Only the host-name scan skips the public lists: a personal term, a home path
+# and a private address inside one are still reported.
+audit_scans_public_lists_for_personal_findings() {
+    local repo commit
+
+    write_names
+    printf 'dns0\n' >"$scratch/terms.txt"
+    repo=$(new_repo personal-in-list)
+    commit=$(commit_file "$repo" lists/public.txt $'0.0.0.0 hv0.lan\ndns0 /home/alice 192.168.1.5')
+    run_audit "$repo" --public-lists 'lists/*.txt' --personal-terms "$scratch/terms.txt"
+
+    expect_line '^personal term dns0 ' "$commit" lists/public.txt
+    expect_line '^personal home-path /home/alice ' "$commit" lists/public.txt
+    expect_line '^personal private-address 192\.168\.1\.5 ' "$commit" lists/public.txt
+    ! grep -q -E '^personal local-host hv0\.lan ' "$report" || fail "a list host name was reported"
+}
+
 run_case audit_reports_a_private_name
 run_case audit_marks_public_names_explained
 run_case audit_reports_a_secret_without_its_value
@@ -315,3 +376,7 @@ run_case audit_lists_personal_findings
 run_case audit_lists_identities
 run_case audit_scans_a_commit_the_remote_advertises
 run_case audit_scans_a_credential_only_a_merge_holds
+run_case audit_explains_names_only_from_committed_lists
+run_case audit_lists_every_place_of_an_explained_name
+run_case audit_counts_names_without_a_dot
+run_case audit_scans_public_lists_for_personal_findings
