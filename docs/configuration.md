@@ -44,7 +44,8 @@ rules = [
 
 The default `allow_from` is loopback (`127.0.0.0/8`, `::1/128`), RFC 1918 (`10.0.0.0/8`,
 `172.16.0.0/12`, `192.168.0.0/16`), `100.64.0.0/10` (Tailscale), link-local (`169.254.0.0/16`,
-`fe80::/10`) and `fc00::/7`. To allow everyone, use `["0.0.0.0/0", "::/0"]`. Do that only behind a
+`fe80::/10`) and `fc00::/7`. `100.64.0.0/10` is also the carrier-grade NAT space of some ISPs: remove
+it if you do not use Tailscale. To allow everyone, use `["0.0.0.0/0", "::/0"]`. Do that only behind a
 firewall: an open resolver is abused for attacks.
 
 ## `[upstream]`
@@ -181,8 +182,14 @@ These keep memory fixed. The defaults fit a 256 MB board; you rarely change them
 
 ## `[web]`
 
-The status page. Read-only: it shows totals, top blocked domains, top clients, recent queries and
-list status, and can pause blocking for a set time.
+The status page. With `user` and `password` set, it shows totals, top blocked domains, top clients,
+recent queries and list status, and can pause blocking for a set time and refresh the lists.
+
+Without a password the page is read-only and limited: it shows totals and list status only. The
+query log, the top lists, pause, resume and refresh answer 403 ("set web.user and web.password to
+use this"), and the page says so. picoguard logs one warning at start when no password is set.
+Every device that may open the page could otherwise read the household's queries and switch
+blocking off.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -191,7 +198,7 @@ list status, and can pause blocking for a set time.
 | `port` | `8080` | HTTP port. |
 | `allow_from` | same as `server.allow_from` | Only these networks may open the page. Others are disconnected. |
 | `hostnames` | `[]` | Host names the page answers to, besides IP addresses. Add the name you type in the browser, for example `["orangepi.lan"]`. |
-| `user`, `password` | not set | Set both to require basic auth. Neither can be empty; the user cannot contain `:`. |
+| `user`, `password` | not set | Set both to require basic auth on every request and to unlock the full page. Neither can be empty; the user cannot contain `:`. |
 
 Basic auth is sent in clear text over HTTP. Use it with `allow_from` on a trusted LAN, not across
 the internet.

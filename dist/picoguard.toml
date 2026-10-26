@@ -107,7 +107,8 @@ format = "adblock"
 # ]
 # Host names the status page answers to, besides IP addresses.
 # hostnames = []
-# Set both to require basic auth.
+# Set both to require basic auth and to unlock the query log, the top lists and
+# pause. Without them the page shows totals and list status only.
 # user = "admin"
 # password = "change-me"
 

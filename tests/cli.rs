@@ -76,6 +76,7 @@ fn run_until_ready(name: &str, log_level: &str) -> (u16, String) {
         format!(
             "lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
              [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
+             [web]\nenabled = false\n\
              [log]\nlevel = \"{log_level}\"\n"
         )
     });
@@ -106,6 +107,43 @@ fn running_at_the_default_log_level_prints_nothing() {
     assert!(stderr.is_empty(), "{stderr}");
 }
 
+fn stderr_of_a_run_with_the_status_page(name: &str, credentials: &str) -> String {
+    let web_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut server = start(name, |port| {
+        format!(
+            "lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+             [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
+             [web]\nbind = [\"127.0.0.1\"]\nport = {web_port}\n{credentials}"
+        )
+    });
+    server.child.kill().unwrap();
+
+    text(&server.child.wait_with_output().unwrap().stderr)
+}
+
+#[test]
+fn running_the_status_page_without_a_password_logs_one_warning() {
+    let stderr = stderr_of_a_run_with_the_status_page("web-open.toml", "");
+
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with("WARN "), "{stderr}");
+    assert!(stderr.contains("web.password"), "{stderr}");
+}
+
+#[test]
+fn running_the_status_page_with_a_password_logs_nothing() {
+    let stderr = stderr_of_a_run_with_the_status_page(
+        "web-password.toml",
+        "user = \"admin\"\npassword = \"s3cret\"\n",
+    );
+
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
 #[test]
 fn running_with_a_host_name_upstream_and_no_bootstrap_exits_one() {
     let path = write_config(
@@ -123,7 +161,10 @@ fn running_with_a_host_name_upstream_and_no_bootstrap_exits_one() {
 #[test]
 fn running_with_the_default_encrypted_upstreams_starts() {
     let mut server = start("default-upstreams.toml", |port| {
-        format!("lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n")
+        format!(
+            "lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+             [web]\nenabled = false\n"
+        )
     });
     server.child.kill().unwrap();
     let output = server.child.wait_with_output().unwrap();

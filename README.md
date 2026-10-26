@@ -36,7 +36,8 @@ picoguard about 8 bytes. Details, method and open measurements:
 - Lists download on a schedule with ETag / If-Modified-Since. A failed download keeps the last
   good list. A new list takes effect without a restart.
 - A small status page: totals, top blocked domains, top clients, recent queries, list status, and
-  a pause button. Optional basic auth, LAN only by default.
+  a pause button. Totals and list status are open on the LAN; the rest needs `web.user` and
+  `web.password`.
 - Almost no disk writes: no query log, no stats file. The only routine write is the last-good
   copy of a list, only when it changed, and it can be turned off.
 - Static binaries for ARMv7, ARM64 and x86_64 Linux, and a systemd unit.

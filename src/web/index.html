@@ -17,6 +17,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; padding: 12px; background: var(--bg); color: var(--text);
   font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
 main { max-width: 1000px; margin: 0 auto; display: grid; gap: 12px; }
@@ -67,6 +68,11 @@ button.go { background: var(--accent); border-color: var(--accent); color: #fff;
     <span id="state">connecting</span>
   </header>
 
+  <section id="limited" hidden>
+    <h2>Read-only</h2>
+    <p id="limited-note"></p>
+  </section>
+
   <section id="pause">
     <h2>Blocking</h2>
     <div class="pause">
@@ -90,13 +96,13 @@ button.go { background: var(--accent); border-color: var(--accent); color: #fff;
     <div class="axis" id="axis"></div>
   </section>
 
-  <div class="columns">
+  <div class="columns" id="tops">
     <section><h2>Top domains <small id="a-queried"></small></h2><div class="scroll" id="top-queried"></div></section>
     <section><h2>Top blocked <small id="a-blocked"></small></h2><div class="scroll" id="top-blocked"></div></section>
     <section><h2>Top clients <small id="a-clients"></small></h2><div class="scroll" id="top-clients"></div></section>
   </div>
 
-  <section>
+  <section id="log">
     <h2>Recent queries</h2>
     <div class="scroll" id="queries"></div>
   </section>
@@ -104,7 +110,7 @@ button.go { background: var(--accent); border-color: var(--accent); color: #fff;
   <section>
     <h2>Lists</h2>
     <div class="scroll" id="lists"></div>
-    <p><button id="refresh">Refresh all lists</button> <span id="refresh-note" class="empty"></span></p>
+    <p id="refresh-row"><button id="refresh">Refresh all lists</button> <span id="refresh-note" class="empty"></span></p>
   </section>
 </main>
 
@@ -278,17 +284,30 @@ function tick() {
     : "Blocking is on.";
 }
 
+// Without a password the server answers 403 to everything but totals and lists.
+function showLimited(note) {
+  $("limited-note").textContent = note || "";
+  $("limited").hidden = !note;
+  ["pause", "tops", "log", "refresh-row"].forEach((id) => { $(id).hidden = Boolean(note); });
+}
+
 async function update() {
   try {
-    const [status, log] = await Promise.all([api("/api/status"), api("/api/querylog?limit=50")]);
+    const status = await api("/api/status");
+    showLimited(status.limited);
     showCards(status.counters, status.blocked_percent);
     showChart(status.hourly);
-    showTop("top-queried", "a-queried", status.top_queried, "Domain");
-    showTop("top-blocked", "a-blocked", status.top_blocked, "Domain");
-    showTop("top-clients", "a-clients", status.top_clients, "Client");
-    showQueries(log.entries);
     showLists(status.lists);
-    showPause(status.pause);
+
+    if (!status.limited) {
+      const log = await api("/api/querylog?limit=50");
+      showTop("top-queried", "a-queried", status.top_queried, "Domain");
+      showTop("top-blocked", "a-blocked", status.top_blocked, "Domain");
+      showTop("top-clients", "a-clients", status.top_clients, "Client");
+      showQueries(log.entries);
+      showPause(status.pause);
+    }
+
     $("state").textContent = "updated " + new Date().toLocaleTimeString();
     $("state").className = "";
   } catch (error) {
