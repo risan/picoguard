@@ -37,6 +37,24 @@ fn modified_sums_is_rejected() {
 }
 
 #[test]
+fn a_corrupted_signature_is_rejected() {
+    let key = UnparsedPublicKey::new(&ED25519, raw_public_key(TEST_KEY));
+    let mut corrupted = SIGNATURE.to_vec();
+    corrupted[0] ^= 1;
+
+    assert!(key.verify(SUMS, &corrupted).is_err());
+    assert!(key.verify(SUMS, &SIGNATURE[..63]).is_err());
+}
+
+#[test]
+fn another_key_is_rejected() {
+    let other = UnparsedPublicKey::new(&ED25519, raw_public_key(RELEASE_KEY));
+
+    assert_ne!(RELEASE_KEY, TEST_KEY);
+    assert!(other.verify(SUMS, SIGNATURE).is_err());
+}
+
+#[test]
 fn release_key_has_the_published_format() {
     assert_eq!(RELEASE_KEY.len(), 44);
     assert_eq!(RELEASE_KEY[..12], SPKI_PREFIX);
