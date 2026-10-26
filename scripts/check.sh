@@ -29,5 +29,5 @@ if command -v shellcheck >/dev/null 2>&1; then
 fi
 
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
