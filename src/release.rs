@@ -2,9 +2,17 @@
 //! key, the target and asset names, `SHA256SUMS` and signature checks, and the request and
 //! result files that carry an update between them.
 
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use ring::digest;
 use ring::signature::{ED25519, UnparsedPublicKey};
 
-use crate::update::{Tag, parse_tag};
+use crate::update::{Tag, is_newer, parse_running, parse_tag};
 use crate::upstream::random_u64;
 
 const KEY_PREFIX: [u8; 12] = [
@@ -48,6 +56,18 @@ const fn raw_key(der: &[u8; 44]) -> [u8; 32] {
 
     key
 }
+
+pub const MAX_BINARY_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_SUMS_BYTES: u64 = 16 * 1024;
+const SIGNATURE_BYTES: u64 = 64;
+
+const VERSION_RUN_LIMIT: Duration = Duration::from_secs(10);
+const VERSION_POLL: Duration = Duration::from_millis(50);
+const VERSION_OUTPUT_BYTES: u64 = 256;
+/// `ETXTBSY`: another thread's `fork` can briefly hold the file we just wrote open.
+const TEXT_FILE_BUSY: i32 = 26;
+const SPAWN_ATTEMPTS: usize = 5;
+const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 const REQUEST_MAX_BYTES: usize = 256;
 const RESULT_MAX_BYTES: usize = 1024;
@@ -299,6 +319,310 @@ fn printable_reason(bytes: &[u8]) -> String {
             _ => '?',
         })
         .collect()
+}
+
+/// Opens a file that an untrusted user may have changed. A symbolic link as the last
+/// component is refused, and a FIFO opens at once instead of waiting for a writer, so what
+/// passes is a regular file of at most `cap` bytes whenever it was opened.
+pub fn open_regular(path: &Path, cap: u64) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+
+    if !metadata.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+
+    if metadata.len() > cap {
+        return Err(io::Error::other("larger than allowed"));
+    }
+
+    Ok(file)
+}
+
+/// The whole of a file `open_regular` accepts. It reads at most one byte past `cap`, so a file
+/// that grew after the check is refused too.
+pub fn read_regular(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    open_regular(path, cap)?
+        .take(cap + 1)
+        .read_to_end(&mut bytes)?;
+
+    if bytes.len() as u64 > cap {
+        return Err(io::Error::other("larger than allowed"));
+    }
+
+    Ok(bytes)
+}
+
+pub struct VerifySetup {
+    pub key: [u8; 32],
+    /// `None` for a build that is not one of the three release builds.
+    pub target: Option<&'static str>,
+    /// The version of the binary that runs `verify-update`.
+    pub running: &'static str,
+}
+
+#[derive(Debug)]
+pub struct Refusal {
+    /// One line of printable ASCII, at most 200 characters, never file content.
+    pub reason: String,
+    /// The staged request, when it was valid.
+    pub request: Option<Request>,
+}
+
+impl Refusal {
+    fn new(reason: &str, request: Option<&Request>) -> Refusal {
+        Refusal {
+            reason: one_line(reason),
+            request: request.cloned(),
+        }
+    }
+}
+
+fn one_line(text: &str) -> String {
+    printable_reason(text.as_bytes())
+}
+
+/// Copies a staged update out of a directory that the daemon's user can change, into a new
+/// directory of ours, and checks the copy (spec: `verify-update`, steps 1-6).
+pub fn verify_update(staged: &Path, into: &Path, setup: &VerifySetup) -> Result<Request, Refusal> {
+    let Some(target) = setup.target else {
+        return Err(Refusal::new("this build cannot verify updates", None));
+    };
+
+    let request_bytes = read_regular(&staged.join("request"), REQUEST_MAX_BYTES as u64)
+        .map_err(|error| Refusal::new(&format!("request: {error}"), None))?;
+    let request = Request::parse(&request_bytes)
+        .ok_or_else(|| Refusal::new("request: not in the expected form", None))?;
+    let refuse = |reason: String| Refusal::new(&reason, Some(&request));
+
+    let into = destination(into).map_err(refuse)?;
+
+    if let Err(error) = DirBuilder::new().mode(0o700).create(&into) {
+        return Err(refuse(format!("into-dir: cannot create it: {error}")));
+    }
+
+    match copy_and_check(staged, &into, &request_bytes, &request, setup, target) {
+        Ok(()) => Ok(request),
+
+        Err(reason) => {
+            let _ = fs::remove_dir_all(&into);
+
+            Err(refuse(reason))
+        }
+    }
+}
+
+/// The path to create: absolute, not there yet, and below directories that nobody but root
+/// or this user can rename or replace. Only the path returned here is used afterwards, so a
+/// symbolic link in the caller's spelling cannot be re-pointed to redirect the writes, the
+/// run and the cleanup.
+fn destination(into: &Path) -> Result<PathBuf, String> {
+    let into = std::path::absolute(into).map_err(|error| format!("into-dir: {error}"))?;
+
+    if fs::symlink_metadata(&into).is_ok() {
+        return Err("into-dir: already exists".to_string());
+    }
+
+    let (Some(parent), Some(name)) = (into.parent(), into.file_name()) else {
+        return Err("into-dir: has no parent directory".to_string());
+    };
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| format!("into-dir: the parent directory: {error}"))?;
+    let uid = caller_uid().map_err(|error| format!("into-dir: cannot tell the user: {error}"))?;
+
+    for directory in parent.ancestors() {
+        let metadata = fs::metadata(directory)
+            .map_err(|error| format!("into-dir: a directory above it: {error}"))?;
+        let is_ours = metadata.uid() == 0 || metadata.uid() == uid;
+
+        if !metadata.is_dir() || !is_ours || metadata.mode() & 0o022 != 0 {
+            return Err(
+                "into-dir: the parent or a directory above it can be changed by others".to_string(),
+            );
+        }
+    }
+
+    Ok(parent.join(name))
+}
+
+/// The effective user id: the second number of the `Uid:` line.
+fn caller_uid() -> io::Result<u32> {
+    let status = fs::read_to_string("/proc/self/status")?;
+
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|numbers| numbers.split_whitespace().nth(1))
+        .and_then(|number| number.parse().ok())
+        .ok_or_else(|| io::Error::other("no Uid line in /proc/self/status"))
+}
+
+fn create_private(path: &Path, mode: u32) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+}
+
+fn copy_small(staged: &Path, into: &Path, name: &str, cap: u64) -> Result<Vec<u8>, String> {
+    let bytes =
+        read_regular(&staged.join(name), cap).map_err(|error| format!("{name}: {error}"))?;
+    let mut file =
+        create_private(&into.join(name), 0o600).map_err(|error| format!("{name}: {error}"))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("{name}: {error}"))?;
+
+    Ok(bytes)
+}
+
+fn copy_and_check(
+    staged: &Path,
+    into: &Path,
+    request_bytes: &[u8],
+    request: &Request,
+    setup: &VerifySetup,
+    target: &str,
+) -> Result<(), String> {
+    create_private(&into.join("request"), 0o600)
+        .and_then(|mut file| file.write_all(request_bytes))
+        .map_err(|error| format!("request: {error}"))?;
+    let sums = copy_small(staged, into, "SHA256SUMS", MAX_SUMS_BYTES)?;
+    let signature = copy_small(staged, into, "SHA256SUMS.sig", SIGNATURE_BYTES)?;
+    let binary_hash = copy_binary(&staged.join("picoguard"), &into.join("picoguard"))?;
+
+    let offered = match parse_tag(&request.version) {
+        Tag::Release(version) => version,
+        Tag::Suffixed | Tag::Invalid => return Err("request: not a version".to_string()),
+    };
+    let running = parse_running(setup.running)
+        .ok_or_else(|| "version: this binary's own version is not readable".to_string())?;
+
+    if !is_newer(offered, running) {
+        return Err(format!(
+            "version: {offered} is not newer than {}",
+            setup.running
+        ));
+    }
+
+    if !verify_sums(&sums, &signature, &setup.key) {
+        return Err("signature: SHA256SUMS is not signed by the release key".to_string());
+    }
+
+    let expected = expected_hash(&sums, target).map_err(|error| match error {
+        SumsError::NoBinary => format!("the release has no binary for {target}"),
+        SumsError::Ambiguous => format!("SHA256SUMS lists {} more than once", asset(target)),
+    })?;
+
+    if binary_hash.as_ref() != expected {
+        return Err("the binary does not match SHA256SUMS".to_string());
+    }
+
+    run_version(&into.join("picoguard"), &request.version)
+}
+
+/// Copies the binary in pieces and returns the hash of the bytes it wrote.
+fn copy_binary(from: &Path, to: &Path) -> Result<digest::Digest, String> {
+    let fail = |error: io::Error| format!("picoguard: {error}");
+
+    let source = open_regular(from, MAX_BINARY_BYTES).map_err(fail)?;
+    let mut source = source.take(MAX_BINARY_BYTES + 1);
+    let mut target = create_private(to, 0o700).map_err(fail)?;
+    let mut hash = digest::Context::new(&digest::SHA256);
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+    let mut total = 0u64;
+
+    loop {
+        let read = source.read(&mut buffer).map_err(fail)?;
+
+        if read == 0 {
+            break;
+        }
+
+        total += read as u64;
+
+        if total > MAX_BINARY_BYTES {
+            return Err("picoguard: larger than allowed".to_string());
+        }
+
+        hash.update(&buffer[..read]);
+        target.write_all(&buffer[..read]).map_err(fail)?;
+    }
+
+    target.flush().map_err(fail)?;
+
+    Ok(hash.finish())
+}
+
+/// The copy must print its own version: a genuine release of another version, signed and
+/// served under a newer tag, fails here.
+fn run_version(binary: &Path, version: &str) -> Result<(), String> {
+    let mut child = spawn_version(binary)?;
+    let deadline = Instant::now() + VERSION_RUN_LIMIT;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(VERSION_POLL),
+
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+
+                return Err("picoguard --version did not finish within 10 seconds".to_string());
+            }
+
+            Err(error) => return Err(format!("picoguard --version: {error}")),
+        }
+    };
+
+    let mut output = Vec::new();
+
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(VERSION_OUTPUT_BYTES + 1)
+            .read_to_end(&mut output)
+            .map_err(|error| format!("picoguard --version: {error}"))?;
+    }
+
+    if status.success() && output == format!("picoguard {version}\n").as_bytes() {
+        return Ok(());
+    }
+
+    Err("picoguard --version printed another version or failed".to_string())
+}
+
+fn spawn_version(binary: &Path) -> Result<std::process::Child, String> {
+    let mut attempt = 1;
+
+    loop {
+        let spawned = Command::new(binary)
+            .arg("--version")
+            .env_clear()
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match spawned {
+            Ok(child) => return Ok(child),
+
+            Err(error)
+                if error.raw_os_error() == Some(TEXT_FILE_BUSY) && attempt < SPAWN_ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(VERSION_POLL);
+            }
+
+            Err(error) => return Err(format!("picoguard --version: {error}")),
+        }
+    }
 }
 
 #[cfg(test)]

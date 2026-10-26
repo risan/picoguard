@@ -271,3 +271,47 @@ fn config_flag_without_a_value_is_a_usage_error() {
     assert_eq!(output.status.code(), Some(2));
     assert!(text(&output.stderr).contains("-c"));
 }
+
+#[test]
+fn verify_update_needs_two_directories() {
+    let scratch =
+        std::env::temp_dir().join(format!("picoguard-verify-args-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir(&scratch).unwrap();
+    let staged = scratch.join("staged");
+    let into = scratch.join("into");
+    let (staged, into) = (staged.to_str().unwrap(), into.to_str().unwrap());
+
+    for args in [
+        vec!["verify-update"],
+        vec!["verify-update", staged],
+        vec!["verify-update", staged, into, "extra"],
+    ] {
+        let output = picoguard(&args);
+
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(text(&output.stderr).contains("verify-update"), "{args:?}");
+        assert!(text(&output.stdout).is_empty(), "{args:?}");
+    }
+
+    assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn verify_update_refuses_what_the_built_in_key_did_not_sign() {
+    let root = common::release::scratch("cli-verify-update");
+    let staged =
+        common::release::stage_dir(&root, "9.9.9", &common::release::script("9.9.9"), |_| {});
+    let into = root.join("into");
+
+    let output = picoguard(&[
+        "verify-update",
+        staged.to_str().unwrap(),
+        into.to_str().unwrap(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(text(&output.stderr).trim().lines().count(), 1);
+    assert!(!into.exists());
+}
