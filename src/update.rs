@@ -515,15 +515,21 @@ async fn run(mut checker: Checker, updates: Arc<Updates>, timing: CheckTiming) {
 
     loop {
         let started = Instant::now();
-        let (outcome, detail) = checker.check(&updates).await;
 
-        if let Some((level, line)) = log_line(&previous, &outcome, &detail) {
-            log::log!(level, "{line}");
-        }
-
-        previous = outcome;
+        previous = check_and_log(&mut checker, &updates, &previous).await;
         sleep_until(started + timing.next_delay()).await;
     }
+}
+
+/// A separate function, so the diagnostic is dropped before the long sleep.
+async fn check_and_log(checker: &mut Checker, updates: &Updates, previous: &Outcome) -> Outcome {
+    let (outcome, detail) = checker.check(updates).await;
+
+    if let Some((level, line)) = log_line(previous, &outcome, &detail) {
+        log::log!(level, "{line}");
+    }
+
+    outcome
 }
 
 #[cfg(test)]
