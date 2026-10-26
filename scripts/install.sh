@@ -13,6 +13,8 @@ STATE_DIR=/var/lib/picoguard
 SYSTEMD_UNIT=/etc/systemd/system/picoguard.service
 SYSTEMD_UNIT_DIR=/etc/systemd/system/picoguard.service.d
 SYSTEMD_MEMORY_DROPIN=$SYSTEMD_UNIT_DIR/memory.conf
+# First line of a drop-in that install.sh wrote. Any other memory.conf is the user's.
+MEMORY_DROPIN_MARKER='# Written by install.sh for the xlarge lists.'
 OPENRC_SCRIPT=/etc/init.d/picoguard
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/picoguard.conf
 RESOLV_SAVED_LINK=$CONFIG_DIR/resolv.conf.original-link
@@ -851,7 +853,16 @@ EOF
 
         printf '\n# Blocklists: %s\n' "$(lists_label "$LISTS")"
         lists_for "$LISTS" | while read -r name url; do
-            printf '[[lists]]\nname = "%s"\nurl = "%s"\nformat = "adblock"\n\n' "$name" "$url"
+            printf '[[lists]]\nname = "%s"\nurl = "%s"\nformat = "adblock"\n' "$name" "$url"
+
+            # The full TIF has about 2.1 million rules, over the default cap of 1.5 million.
+            case $name in
+                hagezi-ultimate|hagezi-tif)
+                    printf 'max_rules = 3000000\n'
+                    ;;
+            esac
+
+            printf '\n'
         done
     } >"$1"
 }
@@ -950,7 +961,7 @@ secure_config_files() {
     done
 }
 
-# Where to ask picoguard: the port and the first listen address of [server] in the config.
+# Where to ask picoguard: the port and an address of [server] bind that this machine can reach.
 read_dns_target() {
     port=$(awk '/^\[/ { in_server = ($0 == "[server]") } in_server && $1 == "port" { print $3; exit }' "$CHECK_PATH")
 
@@ -958,19 +969,37 @@ read_dns_target() {
         DNS_PORT=$port
     fi
 
-    bind=$(awk '/^\[/ { in_server = ($0 == "[server]") } in_server && $1 == "bind" { print; exit }' "$CHECK_PATH")
+    # The array may span several lines. Comments are cut off first.
+    addresses=$(awk '
+        /^\[/ { in_server = ($0 == "[server]"); collecting = 0 }
+        in_server && ($1 == "bind" || collecting) {
+            sub(/#.*/, "")
+            print
+            collecting = ($0 !~ /\]/)
+        }' "$CHECK_PATH" | grep -o '"[^"]*"' | tr -d '"' || true)
 
-    case $bind in
-        *0.0.0.0*|*127.*)
-            ;;
-        *)
-            address=$(printf '%s\n' "$bind" | grep -o '[0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}' | head -n 1 || true)
+    has_ipv4_loopback=0
+    has_ipv6_loopback=0
+    first_address=
 
-            if [ -n "$address" ]; then
-                DNS_HOST=$address
-            fi
-            ;;
-    esac
+    for address in $addresses; do
+        if [ -z "$first_address" ]; then
+            first_address=$address
+        fi
+
+        case $address in
+            0.0.0.0|127.*) has_ipv4_loopback=1 ;;
+            ::|::1) has_ipv6_loopback=1 ;;
+        esac
+    done
+
+    if [ "$has_ipv4_loopback" = 1 ]; then
+        DNS_HOST=127.0.0.1
+    elif [ "$has_ipv6_loopback" = 1 ]; then
+        DNS_HOST=::1
+    elif [ -n "$first_address" ]; then
+        DNS_HOST=$first_address
+    fi
 }
 
 # Prints "name pid" for each listener on the DNS port, one per line (pid is - when unknown).
@@ -1230,16 +1259,24 @@ start_pre() {
 OPENRC_SCRIPT
 }
 
+owns_memory_dropin() {
+    [ "$(head -n 1 "$SYSTEMD_MEMORY_DROPIN" 2>/dev/null)" = "$MEMORY_DROPIN_MARKER" ]
+}
+
 install_systemd_service() {
     systemd_unit_text >"$TMP/picoguard.service"
     install -m 0644 "$TMP/picoguard.service" "$SYSTEMD_UNIT"
 
     # The biggest lists need more than the 64 MB of the shipped unit.
     if [ "$WRITE_CONFIG" = 1 ]; then
-        if [ "$LISTS" = xlarge ]; then
+        if [ -f "$SYSTEMD_MEMORY_DROPIN" ] && ! owns_memory_dropin; then
+            if [ "$LISTS" = xlarge ]; then
+                warn "$SYSTEMD_MEMORY_DROPIN is not from install.sh, so it is left as it is. The xlarge lists need MemoryMax=192M or more in it."
+            fi
+        elif [ "$LISTS" = xlarge ]; then
             mkdir -p "$SYSTEMD_UNIT_DIR"
-            printf '# Written by install.sh for the xlarge lists.\n[Service]\nMemoryMax=192M\n' >"$SYSTEMD_MEMORY_DROPIN"
-        elif [ -f "$SYSTEMD_MEMORY_DROPIN" ] && grep -q 'Written by install.sh' "$SYSTEMD_MEMORY_DROPIN"; then
+            printf '%s\n[Service]\nMemoryMax=192M\n' "$MEMORY_DROPIN_MARKER" >"$SYSTEMD_MEMORY_DROPIN"
+        elif [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
             rm -f "$SYSTEMD_MEMORY_DROPIN"
             rmdir "$SYSTEMD_UNIT_DIR" 2>/dev/null || true
         fi
@@ -1289,6 +1326,10 @@ backup_previous() {
     if [ -f "$OPENRC_SCRIPT" ]; then
         cp -p "$OPENRC_SCRIPT" "$BACKUP_DIR/initscript"
     fi
+
+    if [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
+        cp -p "$SYSTEMD_MEMORY_DROPIN" "$BACKUP_DIR/memory-dropin"
+    fi
 }
 
 rollback_upgrade() {
@@ -1302,6 +1343,14 @@ rollback_upgrade() {
 
     if [ -f "$BACKUP_DIR/initscript" ]; then
         cp -p "$BACKUP_DIR/initscript" "$OPENRC_SCRIPT"
+    fi
+
+    if [ -f "$BACKUP_DIR/memory-dropin" ]; then
+        mkdir -p "$SYSTEMD_UNIT_DIR"
+        cp -p "$BACKUP_DIR/memory-dropin" "$SYSTEMD_MEMORY_DROPIN"
+    elif owns_memory_dropin; then
+        rm -f "$SYSTEMD_MEMORY_DROPIN"
+        rmdir "$SYSTEMD_UNIT_DIR" 2>/dev/null || true
     fi
 
     if [ -n "$BACKUP_CONFIG" ] && [ -f "$BACKUP_CONFIG" ]; then
@@ -1540,7 +1589,16 @@ uninstall() {
         rc-update del picoguard 2>/dev/null || true
     fi
 
-    rm -f "$SYSTEMD_UNIT" "$SYSTEMD_MEMORY_DROPIN" "$OPENRC_SCRIPT" "$BIN_PATH"
+    rm -f "$SYSTEMD_UNIT" "$OPENRC_SCRIPT" "$BIN_PATH"
+
+    if [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
+        if owns_memory_dropin; then
+            rm -f "$SYSTEMD_MEMORY_DROPIN"
+        else
+            warn "$SYSTEMD_MEMORY_DROPIN is not from install.sh, so it is left in place"
+        fi
+    fi
+
     rmdir "$SYSTEMD_UNIT_DIR" 2>/dev/null || true
 
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
