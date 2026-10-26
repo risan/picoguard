@@ -21,6 +21,7 @@ check_embedded scripts/install.sh COMMON dist/picoguard-common.sh
 check_embedded scripts/install.sh UPDATE_HELPER dist/picoguard-update.sh
 check_embedded scripts/install.sh SYSTEMD_UPDATE_PATH dist/picoguard-update.path
 check_embedded scripts/install.sh SYSTEMD_UPDATE_SERVICE dist/picoguard-update.service
+check_embedded scripts/install.sh OPENRC_UPDATE_SCRIPT dist/picoguard-update.openrc
 
 dash -n scripts/install.sh
 dash -n dist/picoguard-common.sh

@@ -6,6 +6,8 @@
 # binary back when there is no answer.
 #
 #   update run systemd     one pass (the oneshot of picoguard-update.service)
+#   update watch openrc    a pass at start and then whenever a request waits, polled every
+#                          POLL seconds (the service picoguard-update, under supervise-daemon)
 #
 # install.sh writes this file to /usr/local/lib/picoguard/update; scripts/check.sh keeps its
 # copy in install.sh equal to dist/picoguard-update.sh.
@@ -21,6 +23,8 @@ LIB_DIR=/usr/local/lib/picoguard
 VERIFY_WAIT=120
 CHECK_WAIT=30
 DNS_WAIT=30
+POLL=5
+TICK=/run/picoguard-update.tick
 
 # What common.sh reads and sets.
 CHECK_PATH=/etc/picoguard/picoguard.toml
@@ -41,6 +45,12 @@ CANNOT_VERIFY=0
 
 log() {
     printf 'picoguard update: %s\n' "$*" >&2
+
+    # supervise-daemon discards stderr. Its logger option would keep a `logger` process
+    # beside the watcher for as long as it runs, one process more than an idle watcher may be.
+    if [ "$INIT" = openrc ]; then
+        logger -t picoguard-update -p daemon.warning "$*" || true
+    fi
 }
 
 # `timeout` ends with 124 (GNU) or 143 (BusyBox, which kills with SIGTERM) when time ran out.
@@ -345,14 +355,47 @@ run_once() {
     fi
 }
 
+# Polls instead of watching the directory: it must start with no directory to watch, and a
+# BusyBox `inotifyd` costs a third more memory. The pass runs in this process, not a subshell,
+# so that stopping the service stops it. A failed rollback ends the watcher; supervise-daemon
+# starts it again, and its first pass retries.
+watch() {
+    # A FIFO that nothing writes to: `read` on it is a sleep that is not a process of its own.
+    rm -f "$TICK"
+    mkfifo -m 0600 "$TICK"
+    exec 3<>"$TICK"
+    rm -f "$TICK"
+
+    while :; do
+        if [ -f "$I/installing" ] || [ -f "$REQUEST" ]; then
+            # Not `run_once || ...`: set -e is off for everything inside a function that is
+            # the left side of `||`.
+            run_once
+            exec 9>&-
+        fi
+
+        if [ -n "${BB_ASH_VERSION:-}" ]; then
+            # shellcheck disable=SC3045 # only BusyBox ash gets here
+            read -r -t "$POLL" _ <&3 || true
+        else
+            sleep "$POLL"
+        fi
+    done
+}
+
 case ${1:-}:${2:-} in
+    watch:openrc)
+        # shellcheck disable=SC2034 # common.sh reads it
+        INIT=openrc
+        watch
+        ;;
     run:systemd)
         # shellcheck disable=SC2034 # common.sh reads it
         INIT=systemd
         run_once
         ;;
     *)
-        echo "usage: update run systemd" >&2
+        echo "usage: update run systemd | watch openrc" >&2
         exit 2
         ;;
 esac

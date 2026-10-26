@@ -22,6 +22,7 @@ UPDATE_COMMON=$UPDATE_HELPER_DIR/common.sh
 UPDATE_DIR=/var/lib/picoguard-update
 SYSTEMD_UPDATE_PATH=/etc/systemd/system/picoguard-update.path
 SYSTEMD_UPDATE_SERVICE=/etc/systemd/system/picoguard-update.service
+OPENRC_UPDATE_SCRIPT=/etc/init.d/picoguard-update
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/picoguard.conf
 RESOLV_SAVED_LINK=$CONFIG_DIR/resolv.conf.original-link
 RESOLV_SAVED_COPY=$CONFIG_DIR/resolv.conf.original
@@ -1301,6 +1302,8 @@ update_helper_text() {
 # binary back when there is no answer.
 #
 #   update run systemd     one pass (the oneshot of picoguard-update.service)
+#   update watch openrc    a pass at start and then whenever a request waits, polled every
+#                          POLL seconds (the service picoguard-update, under supervise-daemon)
 #
 # install.sh writes this file to /usr/local/lib/picoguard/update; scripts/check.sh keeps its
 # copy in install.sh equal to dist/picoguard-update.sh.
@@ -1316,6 +1319,8 @@ LIB_DIR=/usr/local/lib/picoguard
 VERIFY_WAIT=120
 CHECK_WAIT=30
 DNS_WAIT=30
+POLL=5
+TICK=/run/picoguard-update.tick
 
 # What common.sh reads and sets.
 CHECK_PATH=/etc/picoguard/picoguard.toml
@@ -1336,6 +1341,12 @@ CANNOT_VERIFY=0
 
 log() {
     printf 'picoguard update: %s\n' "$*" >&2
+
+    # supervise-daemon discards stderr. Its logger option would keep a `logger` process
+    # beside the watcher for as long as it runs, one process more than an idle watcher may be.
+    if [ "$INIT" = openrc ]; then
+        logger -t picoguard-update -p daemon.warning "$*" || true
+    fi
 }
 
 # `timeout` ends with 124 (GNU) or 143 (BusyBox, which kills with SIGTERM) when time ran out.
@@ -1640,14 +1651,47 @@ run_once() {
     fi
 }
 
+# Polls instead of watching the directory: it must start with no directory to watch, and a
+# BusyBox `inotifyd` costs a third more memory. The pass runs in this process, not a subshell,
+# so that stopping the service stops it. A failed rollback ends the watcher; supervise-daemon
+# starts it again, and its first pass retries.
+watch() {
+    # A FIFO that nothing writes to: `read` on it is a sleep that is not a process of its own.
+    rm -f "$TICK"
+    mkfifo -m 0600 "$TICK"
+    exec 3<>"$TICK"
+    rm -f "$TICK"
+
+    while :; do
+        if [ -f "$I/installing" ] || [ -f "$REQUEST" ]; then
+            # Not `run_once || ...`: set -e is off for everything inside a function that is
+            # the left side of `||`.
+            run_once
+            exec 9>&-
+        fi
+
+        if [ -n "${BB_ASH_VERSION:-}" ]; then
+            # shellcheck disable=SC3045 # only BusyBox ash gets here
+            read -r -t "$POLL" _ <&3 || true
+        else
+            sleep "$POLL"
+        fi
+    done
+}
+
 case ${1:-}:${2:-} in
+    watch:openrc)
+        # shellcheck disable=SC2034 # common.sh reads it
+        INIT=openrc
+        watch
+        ;;
     run:systemd)
         # shellcheck disable=SC2034 # common.sh reads it
         INIT=systemd
         run_once
         ;;
     *)
-        echo "usage: update run systemd" >&2
+        echo "usage: update run systemd | watch openrc" >&2
         exit 2
         ;;
 esac
@@ -1676,6 +1720,10 @@ Description=Install a picoguard update that the status page staged
 # No Requires, BindsTo or PartOf: restarting picoguard must not stop the installer that asks
 # for it.
 After=picoguard.service
+# Every change of the request starts a pass, and a pass is cheap. With systemd's default limit
+# (5 starts in 10 seconds) a daemon that rewrites the request over and over would put this
+# unit, and the path unit with it, out of action until the next boot.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -1692,6 +1740,27 @@ PrivateTmp=yes
 # Also runs at boot: it finishes an update that a power loss interrupted.
 WantedBy=multi-user.target
 SYSTEMD_UPDATE_SERVICE
+}
+
+openrc_update_text() {
+    cat <<'OPENRC_UPDATE_SCRIPT'
+#!/sbin/openrc-run
+
+description="Install a picoguard update that the status page staged"
+
+command=/usr/local/lib/picoguard/update
+command_args="watch openrc"
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+# No `need picoguard`: OpenRC restarts the services that need a restarted one, which would
+# stop the installer in the middle of the update that restarts picoguard.
+depend() {
+    after picoguard
+    use logger
+}
+OPENRC_UPDATE_SCRIPT
 }
 
 owns_memory_dropin() {
@@ -1735,6 +1804,8 @@ install_openrc_service() {
     mkdir -p "$(dirname "$OPENRC_SCRIPT")"
     openrc_script_text >"$TMP/picoguard.openrc"
     install -m 0755 "$TMP/picoguard.openrc" "$OPENRC_SCRIPT"
+    openrc_update_text >"$TMP/picoguard-update.openrc"
+    install -m 0755 "$TMP/picoguard-update.openrc" "$OPENRC_UPDATE_SCRIPT"
 }
 
 # The root installer of updates from the status page, what it sources, and the directory it
@@ -1851,7 +1922,8 @@ start_service() {
                 systemctl start --no-block picoguard-update.service 9>&-
             ;;
         openrc)
-            rc-update add picoguard default && rc-service picoguard restart
+            rc-update add picoguard default && rc-update add picoguard-update default &&
+                rc-service picoguard restart 9>&- && rc-service picoguard-update restart 9>&-
             ;;
     esac
 }
@@ -1960,7 +2032,7 @@ report() {
         say "Installed, not started (--no-start). Start it with:"
         case $INIT in
             systemd) say "  systemctl enable --now picoguard picoguard-update.path picoguard-update.service" ;;
-            openrc) say "  rc-update add picoguard default && rc-service picoguard start" ;;
+            openrc) say "  rc-update add picoguard default && rc-update add picoguard-update default && rc-service picoguard start && rc-service picoguard-update start" ;;
             *) say "  /usr/local/bin/picoguard -c $CONFIG_PATH" ;;
         esac
         print_web_login

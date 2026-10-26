@@ -38,22 +38,22 @@ group_style() {
 HELPER_CASES="update_good update_silent update_dies restart_fails update_late update_refused
     verifier_hangs verifier_crashes no_verify_update update_repeat update_bad_request
     request_swap_race swap_fails rollback_fails_then_recovers install_files install_rerun
-    install_answers_a_waiting_request privileges"
+    install_answers_a_waiting_request privileges idle_cost"
+
+# What only the OpenRC watcher has: a process that polls.
+OPENRC_CASES="answered_request_left_in_place watcher_starts_with_stale_fifo"
 
 group_cases() {
     case $1 in
         baseline) echo "baseline_install baseline_rerun baseline_failed_upgrade baseline_uninstall" ;;
         helper)
-            # The OpenRC trigger comes with S5.
-            if [ "$INIT" = systemd ]; then
-                echo "$HELPER_CASES"
+            echo "$HELPER_CASES"
+
+            if [ "$INIT" = openrc ]; then
+                echo "$OPENRC_CASES"
             fi
             ;;
-        fresh)
-            if [ "$INIT" = systemd ]; then
-                echo "install_no_start"
-            fi
-            ;;
+        fresh) echo "install_no_start" ;;
     esac
 }
 
@@ -246,25 +246,52 @@ expect_installer_dir_quiet() {
     [ -z "$(holders_of_lock)" ] || fail "something still holds $I/lock: $(holders_of_lock)"
 }
 
+# The pid of picoguard itself: systemd's main pid, or the child of OpenRC's supervise-daemon.
+children_of() {
+    grep -l "^PPid:[[:space:]]*$1\$" /proc/[0-9]*/status | sed 's|/proc/\([0-9]*\)/status|\1|'
+}
+
 picoguard_pid() {
     case $INIT in
         systemd) systemctl show -p MainPID --value picoguard ;;
+        openrc) children_of "$(cat /run/supervise-picoguard.pid)" ;;
     esac
 }
 
+# No pass of the installer is running.
 service_idle() {
-    state=$(systemctl is-active picoguard-update.service || true)
+    case $INIT in
+        systemd)
+            state=$(systemctl is-active picoguard-update.service || true)
 
-    [ "$state" != active ] && [ "$state" != activating ]
+            [ "$state" != active ] && [ "$state" != activating ]
+            ;;
+        openrc) [ -z "$(holders_of_lock)" ] ;;
+    esac
+}
+
+# How long a trigger may take to notice a change: the watcher polls every 5 seconds.
+trigger_gap() {
+    case $INIT in
+        openrc) sleep 7 ;;
+    esac
 }
 
 # Waits until no pass runs: a change that arrives while one runs is merged into it.
 settle() {
     case $INIT in
-        systemd)
-            sleep 1
-            wait_for 120 service_idle || fail "picoguard-update.service does not end"
-            ;;
+        systemd) sleep 1 ;;
+        openrc) sleep 7 ;;
+    esac
+
+    wait_for 120 service_idle || fail "the installer does not end"
+}
+
+# Starts a pass by hand where the trigger needs it; the OpenRC watcher polls by itself.
+start_pass() {
+    case $INIT in
+        systemd) systemctl start picoguard-update.service ;;
+        openrc) rc-service picoguard-update restart ;;
     esac
 }
 
@@ -331,6 +358,11 @@ exit 1'
 
 shorten_verify_wait() {
     sed -i "s/^VERIFY_WAIT=.*/VERIFY_WAIT=$1/" "$UPDATER"
+
+    # The watcher reads its constants once, when it starts.
+    case $INIT in
+        openrc) rc-service picoguard-update restart ;;
+    esac
 }
 
 # Back to a plain install of the real binary with nothing left by an earlier case.
@@ -342,7 +374,10 @@ reset() {
     rm -rf "${I:?}/installing" "${I:?}/previous" "${I:?}/verified" "${I:?}/verify.err" "${I:?}"/*.part
     # The restarts of the reset must not count towards systemd's limit of 5 starts in 10
     # seconds, or the update that follows could be refused one.
-    systemctl reset-failed picoguard picoguard-update.service 2>/dev/null || true
+    case $INIT in
+        systemd) systemctl reset-failed picoguard picoguard-update.service 2>/dev/null || true ;;
+    esac
+
     wait_for 30 dns_answers || fail "picoguard does not answer after the reset"
 }
 
@@ -351,9 +386,19 @@ installed_files() {
     cat <<LIST
 $UPDATER 755 root $FIXTURES/dist/picoguard-update.sh
 $LIB/common.sh 644 root $FIXTURES/dist/picoguard-common.sh
+LIST
+
+    case $INIT in
+        systemd)
+            cat <<LIST
 /etc/systemd/system/picoguard-update.path 644 root $FIXTURES/dist/picoguard-update.path
 /etc/systemd/system/picoguard-update.service 644 root $FIXTURES/dist/picoguard-update.service
 LIST
+            ;;
+        openrc)
+            echo "/etc/init.d/picoguard-update 755 root $FIXTURES/dist/picoguard-update.openrc"
+            ;;
+    esac
 }
 
 expect_installed_files() {
@@ -466,7 +511,9 @@ update_dies() {
     wait_result "$STAGED_ID" 90 || fail "no result within 90 seconds"
     note "rolled back in ${WAITED}s"
 
-    expect_result "$STAGED_ID" rolled-back "runs again" "did not start"
+    # supervise-daemon reports a service that crashes over and over as started, so OpenRC may
+    # say "did not answer DNS" instead.
+    expect_result "$STAGED_ID" rolled-back "runs again" "did not"
     same_file "$B" "$REAL" || fail "$B is not the real binary"
     service_up || fail "picoguard is not active"
 }
@@ -476,7 +523,7 @@ restart_fails() {
     wait_result "$STAGED_ID" 90 || fail "no result within 90 seconds"
     note "rolled back in ${WAITED}s"
 
-    expect_result "$STAGED_ID" rolled-back "did not start" "runs again"
+    expect_result "$STAGED_ID" rolled-back "did not" "runs again"
     same_file "$B" "$REAL" || fail "$B is not the real binary"
     service_up || fail "picoguard is not active"
 
@@ -552,6 +599,9 @@ no_verify_update() {
     before=$(stat -c %Y "$I/result" 2>/dev/null || echo none)
     stage good
     sleep 8
+    # Three polls of the OpenRC watcher: the line is logged once, not at every poll.
+    trigger_gap
+    trigger_gap
     settle
 
     [ "$(stat -c %Y "$I/result" 2>/dev/null || echo none)" = "$before" ] || fail "a result was written"
@@ -579,7 +629,7 @@ update_repeat() {
     sleep 1
     as_picoguard "mkdir -p $STAGE"
     write_request "$STAGED_ID"
-    systemctl start picoguard-update.service
+    start_pass
     settle
 
     [ "$(cksum <"$I/result")" = "$before" ] || fail "the result changed"
@@ -598,6 +648,7 @@ refuse_request() {
 
     as_picoguard "$2"
     wait_for 6 service_idle || fail "$1: the installer does not end within 6 seconds"
+    trigger_gap
     sleep 1
 
     [ "$(cksum <"$I/result" 2>/dev/null || echo none)" = "$before" ] || fail "$1: a result was written"
@@ -617,6 +668,12 @@ update_bad_request() {
     refuse_request "a third line" "printf 'id=0123456789abcdef\nversion=9.9.9\nx=1\n' >$STAGE/request"
     refuse_request "300 bytes" "printf 'id=0123456789abcdef\nversion=9.9.9\n%s\n' $(printf 'x%.0s' $(seq 270)) >$STAGE/request"
     refuse_request "no final newline" "printf 'id=0123456789abcdef\nversion=9.9.9' >$STAGE/request"
+
+    # The trigger still works after all of that.
+    as_picoguard "rm -f $STAGE/request"
+    stage good
+    wait_result "$STAGED_ID" 60 || fail "a good request after the bad ones gets no result"
+    expect_result "$STAGED_ID" updated
 }
 
 request_swap_race() {
@@ -647,6 +704,14 @@ request_swap_race() {
     fi
 
     rm -f /root/secret-request
+
+    # After that many starts the trigger still works: systemd's start limit must not have put
+    # it out of action.
+    as_picoguard "rm -f $STAGE/request $STAGE/request.part"
+    settle
+    stage good
+    wait_result "$STAGED_ID" 60 || fail "a good request after the race gets no result"
+    expect_result "$STAGED_ID" updated
 }
 
 swap_fails() {
@@ -673,7 +738,10 @@ rollback_fails_then_recovers() {
     wait_for 60 same_file "$B" "$FIXTURES/releases/silent/picoguard" || fail "the new binary never reached $B"
     block_part
     wait_for 90 rollback_failure_logged || fail "the log never names the failed rollback"
-    wait_for 30 service_idle || fail "the pass does not end"
+
+    case $INIT in
+        systemd) wait_for 30 service_idle || fail "the pass does not end" ;;
+    esac
 
     if [ -f "$I/result" ] && [ "$(result_value id)" = "$STAGED_ID" ]; then
         fail "a result was written"
@@ -683,7 +751,13 @@ rollback_fails_then_recovers() {
     [ -f "$I/previous" ] || fail "the backup was removed"
 
     unblock_part
-    systemctl start picoguard-update.service
+
+    # The OpenRC watcher ended with the failed rollback and supervise-daemon starts it again,
+    # which retries by itself.
+    case $INIT in
+        systemd) start_pass ;;
+    esac
+
     wait_result "$STAGED_ID" 120 || fail "no result after the retry"
     settle
 
@@ -701,24 +775,39 @@ install_files() {
             [ "$(systemctl is-enabled picoguard-update.service)" = enabled ] || fail "the service is not enabled"
             systemctl is-active --quiet picoguard-update.path || fail "the path unit is not active"
             ;;
+        openrc)
+            rc-update show default | grep -q picoguard-update || fail "the watcher is not in the default runlevel"
+            rc-service picoguard-update status >/dev/null || fail "the watcher is not running"
+            ;;
     esac
 
     settle
     touch /tmp/stamp
     sleep 1
-    systemctl start picoguard-update.service
+    start_pass
     settle
     [ -z "$(find "$I" -newer /tmp/stamp)" ] || fail "an idle pass wrote: $(find "$I" -newer /tmp/stamp)"
+}
+
+trigger_running() {
+    case $INIT in
+        systemd) systemctl is-active --quiet picoguard-update.path ;;
+        openrc) rc-service picoguard-update status >/dev/null 2>&1 ;;
+    esac
 }
 
 install_rerun() {
     install_real >/dev/null
     expect_installed_files
-    systemctl is-active --quiet picoguard-update.path || fail "the path unit is not active"
+    trigger_running || fail "the trigger is not running"
 }
 
 install_answers_a_waiting_request() {
-    systemctl stop picoguard-update.path
+    case $INIT in
+        systemd) systemctl stop picoguard-update.path ;;
+        openrc) rc-service picoguard-update stop ;;
+    esac
+
     stage good
     sleep 2
 
@@ -777,7 +866,128 @@ install_no_start() {
                 *) fail "the report does not show the start command" ;;
             esac
             ;;
+        openrc)
+            if rc-update show default | grep -q picoguard-update; then
+                fail "the watcher is in the default runlevel"
+            fi
+
+            if rc-service picoguard-update status >/dev/null 2>&1; then
+                fail "the watcher is running"
+            fi
+
+            case $out in
+                *"rc-update add picoguard default && rc-update add picoguard-update default && rc-service picoguard start && rc-service picoguard-update start"*) ;;
+                *) fail "the report does not show the start command" ;;
+            esac
+            ;;
     esac
+}
+
+# ---- OpenRC: what the polling watcher costs and how it starts ----
+
+# The pids below a process, itself included.
+tree_of() {
+    echo "$1"
+
+    for child in $(children_of "$1"); do
+        tree_of "$child"
+    done
+}
+
+idle_cost() {
+    settle
+    sleep 10
+
+    case $INIT in
+        systemd)
+            if pgrep -f "$UPDATER" >/dev/null; then
+                fail "an installer process runs while idle"
+            fi
+            ;;
+        openrc)
+            [ -f /run/supervise-picoguard-update.pid ] || fail "the watcher has no supervisor"
+            pids=$(tree_of "$(cat /run/supervise-picoguard-update.pid)")
+            count=0
+            pss=0
+
+            for pid in $pids; do
+                count=$((count + 1))
+                pss=$((pss + $(awk '/^Pss:/ { print $2 }' "/proc/$pid/smaps_rollup")))
+            done
+
+            note "the idle watcher: $count processes, $pss kB Pss"
+            [ "$count" -ge 2 ] || fail "the watcher is not running: $pids"
+            [ "$count" -le 2 ] || fail "$count processes: $pids"
+            [ "$pss" -lt 1024 ] || fail "$pss kB Pss, not under 1024"
+
+            # shellcheck disable=SC2086 # the pids are numbers, split on purpose
+            expect_no_writes_for 60 $pids
+            ;;
+    esac
+}
+
+# expect_no_writes_for SECONDS PID...: the processes write nothing to disk meanwhile. Where
+# the kernel counts bytes written per process (/proc/PID/io), those; else no file on the
+# system changes (the WSL2 kernel has no /proc/PID/io).
+expect_no_writes_for() {
+    seconds=$1
+    shift
+
+    if [ -r "/proc/$1/io" ]; then
+        before=
+        for pid in "$@"; do
+            before="$before $(awk '/^write_bytes/ { print $2 }' "/proc/$pid/io")"
+        done
+
+        sleep "$seconds"
+        after=
+        for pid in "$@"; do
+            after="$after $(awk '/^write_bytes/ { print $2 }' "/proc/$pid/io")"
+        done
+
+        [ "$after" = "$before" ] || fail "written to disk while idle: $before, then $after"
+
+        return 0
+    fi
+
+    note "no /proc/PID/io here: checking file modification times instead"
+    touch /tmp/stamp
+    sleep "$seconds"
+    changed=$(find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /tmp \) -prune -o -newer /tmp/stamp -print)
+    [ -z "$changed" ] || fail "changed while idle: $changed"
+}
+
+answered_request_left_in_place() {
+    stage good
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    expect_result "$STAGED_ID" updated
+    settle
+
+    # The daemon is not there to clean up after the answer, so the request stays.
+    rc-service picoguard stop
+    as_picoguard "mkdir -p $STAGE"
+    write_request "$STAGED_ID"
+    watcher=$(cat /run/supervise-picoguard-update.pid)
+    touch /tmp/stamp
+    sleep 1
+    before=$(cksum <"$I/result")
+    sleep 30
+
+    [ "$(cksum <"$I/result")" = "$before" ] || fail "the result changed"
+    [ -z "$(find "$I" -newer /tmp/stamp)" ] || fail "written: $(find "$I" -newer /tmp/stamp)"
+    [ "$(cat /run/supervise-picoguard-update.pid)" = "$watcher" ] || fail "the watcher was restarted"
+    kill -0 "$watcher" || fail "the watcher is gone"
+}
+
+watcher_starts_with_stale_fifo() {
+    rc-service picoguard-update stop
+    mkfifo /run/picoguard-update.tick
+    rc-service picoguard-update start
+    rc-service picoguard-update status >/dev/null || fail "the watcher does not run"
+
+    stage good
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    expect_result "$STAGED_ID" updated
 }
 
 group_of() {

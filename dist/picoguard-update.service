@@ -3,6 +3,10 @@ Description=Install a picoguard update that the status page staged
 # No Requires, BindsTo or PartOf: restarting picoguard must not stop the installer that asks
 # for it.
 After=picoguard.service
+# Every change of the request starts a pass, and a pass is cheap. With systemd's default limit
+# (5 starts in 10 seconds) a daemon that rewrites the request over and over would put this
+# unit, and the path unit with it, out of action until the next boot.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
