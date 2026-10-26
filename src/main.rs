@@ -1,9 +1,11 @@
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use picoguard::config::Config;
+use picoguard::dns_check;
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::{Downloader, resolver_over};
@@ -29,6 +31,7 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 const USAGE: &str = "\
 Usage: picoguard [OPTIONS]
        picoguard verify-update STAGED_DIR INTO_DIR
+       picoguard dns-check ADDRESS PORT
 
 Options:
   -c, --config FILE  Config file (default: /etc/picoguard/picoguard.toml)
@@ -37,7 +40,10 @@ Options:
   -h, --help         Print this help
 
 verify-update copies a staged update into the new directory INTO_DIR and checks it. It is
-run by the installer: exit 0 means every check passed, 1 that one failed.";
+run by the installer: exit 0 means every check passed, 1 that one failed.
+
+dns-check asks ADDRESS:PORT for example.com and waits 2 seconds. Exit 0 means it answered
+NOERROR or NXDOMAIN, 1 that it did not.";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -46,6 +52,7 @@ enum Command {
     Version,
     Help,
     VerifyUpdate { staged: PathBuf, into: PathBuf },
+    DnsCheck { target: SocketAddr },
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
@@ -61,6 +68,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             }),
 
             _ => Err("verify-update needs STAGED_DIR and INTO_DIR".to_string()),
+        };
+    }
+
+    if args.peek().map(String::as_str) == Some("dns-check") {
+        args.next();
+
+        return match (args.next(), args.next(), args.next()) {
+            (Some(address), Some(port), None) => parse_target(&address, &port),
+
+            _ => Err("dns-check needs an ADDRESS and a PORT".to_string()),
         };
     }
 
@@ -101,6 +118,21 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
     Ok(Command::Run { config_path })
 }
 
+fn parse_target(address: &str, port: &str) -> Result<Command, String> {
+    let address: IpAddr = address
+        .parse()
+        .map_err(|_| format!("dns-check: {address} is not an IP address"))?;
+    let port: u16 = port
+        .parse()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| format!("dns-check: {port} is not a port from 1 to 65535"))?;
+
+    Ok(Command::DnsCheck {
+        target: SocketAddr::new(address, port),
+    })
+}
+
 fn main() -> ExitCode {
     match parse_args(std::env::args().skip(1)) {
         Ok(Command::Run { config_path }) => run(&config_path),
@@ -120,6 +152,16 @@ fn main() -> ExitCode {
         }
 
         Ok(Command::VerifyUpdate { staged, into }) => verify(&staged, &into),
+
+        Ok(Command::DnsCheck { target }) => match dns_check::ask(target, dns_check::WAIT) {
+            Ok(()) => ExitCode::SUCCESS,
+
+            Err(message) => {
+                eprintln!("{message}");
+
+                ExitCode::FAILURE
+            }
+        },
 
         Err(message) => {
             eprintln!("picoguard: {message}\n\n{USAGE}");
@@ -450,6 +492,34 @@ mod tests {
             &["verify-update", "a"],
             &["verify-update", "a", "b", "c"],
             &["-c", "x", "verify-update", "a", "b"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn dns_check_takes_an_address_and_a_port() {
+        assert_eq!(
+            parse(&["dns-check", "127.0.0.1", "53"]),
+            Ok(Command::DnsCheck {
+                target: "127.0.0.1:53".parse().unwrap()
+            })
+        );
+        assert_eq!(
+            parse(&["dns-check", "::1", "5353"]),
+            Ok(Command::DnsCheck {
+                target: "[::1]:5353".parse().unwrap()
+            })
+        );
+
+        for args in [
+            &["dns-check"][..],
+            &["dns-check", "127.0.0.1"],
+            &["dns-check", "127.0.0.1", "53", "extra"],
+            &["dns-check", "x", "53"],
+            &["dns-check", "127.0.0.1", "0"],
+            &["dns-check", "127.0.0.1", "70000"],
+            &["-c", "x", "dns-check", "127.0.0.1", "53"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }
