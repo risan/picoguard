@@ -1906,10 +1906,90 @@ backup_previous() {
     if [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
         cp -p "$SYSTEMD_MEMORY_DROPIN" "$BACKUP_DIR/memory-dropin"
     fi
+
+    update_files | while read -r name path; do
+        if [ -f "$path" ]; then
+            cp -p "$path" "$BACKUP_DIR/$name"
+        fi
+    done
+
+    if [ -d "$UPDATE_DIR" ]; then
+        : >"$BACKUP_DIR/had-update-dir"
+    fi
+}
+
+# The name a file is kept under in the backup, and its path: everything the installer of
+# updates puts on the device, except the folder it keeps its state in.
+update_files() {
+    cat <<LIST
+update-helper $UPDATE_HELPER
+update-common $UPDATE_COMMON
+systemd-update-path $SYSTEMD_UPDATE_PATH
+systemd-update-service $SYSTEMD_UPDATE_SERVICE
+openrc-update $OPENRC_UPDATE_SCRIPT
+LIST
+}
+
+# A trigger that this run added is stopped before anything else is put back, or it could
+# start an update over the binary that is being restored.
+stop_new_update_trigger() {
+    case $INIT in
+        systemd)
+            if [ ! -f "$BACKUP_DIR/systemd-update-path" ]; then
+                systemctl disable --now picoguard-update.path picoguard-update.service 9>&- || true
+            fi
+            ;;
+        openrc)
+            if [ ! -f "$BACKUP_DIR/openrc-update" ]; then
+                rc-service picoguard-update stop 9>&- || true
+                rc-update del picoguard-update || true
+            fi
+            ;;
+    esac
+}
+
+# Back to what was there before this run: a file that was backed up is copied back, one that
+# was not is removed.
+restore_or_remove() {
+    if [ -f "$BACKUP_DIR/$1" ]; then
+        cp -p "$BACKUP_DIR/$1" "$2"
+    else
+        rm -f "$2"
+    fi
+}
+
+restore_update_installer() {
+    update_files | while read -r name path; do
+        restore_or_remove "$name" "$path"
+    done
+
+    if [ ! -f "$BACKUP_DIR/had-update-dir" ]; then
+        rm -rf "$UPDATE_DIR"
+    fi
+
+    rmdir "$UPDATE_HELPER_DIR" 2>/dev/null || true
+}
+
+# Starts again the trigger that was there before this run.
+restart_old_update_trigger() {
+    case $INIT in
+        systemd)
+            if [ -f "$BACKUP_DIR/systemd-update-path" ]; then
+                systemctl restart picoguard-update.path 9>&- || true
+                systemctl start --no-block picoguard-update.service 9>&- || true
+            fi
+            ;;
+        openrc)
+            if [ -f "$BACKUP_DIR/openrc-update" ]; then
+                rc-service picoguard-update restart 9>&- || true
+            fi
+            ;;
+    esac
 }
 
 rollback_upgrade() {
     warn "the new version did not start or did not answer; putting $OLD_VERSION back"
+    stop_new_update_trigger
     cp -p "$BACKUP_DIR/binary" "$BIN_PATH.old.$$"
     mv -f "$BIN_PATH.old.$$" "$BIN_PATH"
 
@@ -1934,11 +2014,14 @@ rollback_upgrade() {
         secure_config_files
     fi
 
+    restore_update_installer
+
     if [ "$INIT" = systemd ]; then
         systemctl daemon-reload
     fi
 
     restart_service || true
+    restart_old_update_trigger
 
     if service_active; then
         say "The previous version runs again."
@@ -2152,8 +2235,18 @@ undo_resolved_fix() {
 uninstall() {
     say "Removing picoguard"
 
+    # Not while an update is being installed. The lock is kept until the installer's files and
+    # folder are gone; a pass that waited for it finds its lock removed and ends.
+    lock_updates
+
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl disable --now picoguard-update.path picoguard-update.service 9>&- 2>/dev/null || true
         systemctl disable --now picoguard 2>/dev/null || true
+    fi
+
+    if command -v rc-service >/dev/null 2>&1 && [ -f "$OPENRC_UPDATE_SCRIPT" ]; then
+        rc-service picoguard-update stop 9>&- 2>/dev/null || true
+        rc-update del picoguard-update 2>/dev/null || true
     fi
 
     if command -v rc-service >/dev/null 2>&1 && [ -f "$OPENRC_SCRIPT" ]; then
@@ -2162,6 +2255,8 @@ uninstall() {
     fi
 
     rm -f "$SYSTEMD_UNIT" "$OPENRC_SCRIPT" "$BIN_PATH"
+    rm -f "$SYSTEMD_UPDATE_PATH" "$SYSTEMD_UPDATE_SERVICE" "$OPENRC_UPDATE_SCRIPT"
+    rm -rf "$UPDATE_HELPER_DIR" "$UPDATE_DIR"
 
     if [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
         if owns_memory_dropin; then

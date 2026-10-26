@@ -25,12 +25,12 @@ INIT=${INIT:-}
 # Groups. The style says how the host runs the group's cases: `each` in a fresh container,
 # `shared` in one container after another, `setup` in one container that `setup` has made
 # ready and `reset` puts back before every case.
-GROUPS_LIST="baseline helper fresh"
+GROUPS_LIST="baseline helper removal fresh"
 
 group_style() {
     case $1 in
         baseline) echo shared ;;
-        helper) echo setup ;;
+        helper | removal) echo setup ;;
         fresh) echo each ;;
     esac
 }
@@ -57,7 +57,8 @@ group_cases() {
                 echo "$OPENRC_CASES"
             fi
             ;;
-        fresh) echo "install_no_start" ;;
+        removal) echo "rollback_with_older_installer uninstall uninstall_purge" ;;
+        fresh) echo "install_no_start rollback_without_installer" ;;
     esac
 }
 
@@ -373,6 +374,8 @@ shorten_verify_wait() {
 reset() {
     unblock_part
     install_real >/dev/null
+    write_test_config
+    restart_picoguard
     as_picoguard "rm -rf $STAGE/* $STAGE/.[!.]*"
     settle
     rm -rf "${I:?}/installing" "${I:?}/previous" "${I:?}/verified" "${I:?}/verify.err" "${I:?}"/*.part
@@ -1292,6 +1295,87 @@ lock_not_inherited() {
     expect_result "$STAGED_ID" updated
     settle
     [ -z "$(holders_of_lock)" ] || fail "the update left the lock held: $(holders_of_lock)"
+}
+
+# ---- install.sh puts the installer back as it was, or removes it ----
+
+expect_no_installer() {
+    for path in "$LIB" "$I" /etc/systemd/system/picoguard-update.path \
+        /etc/systemd/system/picoguard-update.service /etc/init.d/picoguard-update; do
+        [ ! -e "$path" ] || fail "$path is still there"
+    done
+
+    case $INIT in
+        systemd)
+            if systemctl list-unit-files | grep -q picoguard-update; then
+                fail "a picoguard-update unit is still known: $(systemctl list-unit-files | grep picoguard-update)"
+            fi
+            ;;
+        openrc)
+            if rc-update show | grep -q picoguard-update; then
+                fail "picoguard-update is still in a runlevel"
+            fi
+            ;;
+    esac
+
+    if pgrep -f "$UPDATER" >/dev/null; then
+        fail "an installer process is still running"
+    fi
+}
+
+rollback_without_installer() {
+    sh "$FIXTURES/old-install.sh" --yes --binary "$FIXTURES/picoguard" --web-password none >/dev/null ||
+        fail "the installer of the last release failed"
+    write_test_config
+    restart_picoguard
+    wait_for 30 dns_answers || fail "picoguard does not answer"
+
+    if sh "$FIXTURES/install.sh" --yes --binary "$FIXTURES/releases/silent/picoguard" >/dev/null 2>&1; then
+        fail "an upgrade to a binary that never answers succeeded"
+    fi
+
+    same_file "$B" "$REAL" || fail "$B is not the real binary after the rollback"
+    expect_no_installer
+    wait_for 30 service_up || fail "picoguard is not active after the rollback"
+}
+
+rollback_with_older_installer() {
+    case $INIT in
+        systemd) files="$UPDATER $LIB/common.sh /etc/systemd/system/picoguard-update.path /etc/systemd/system/picoguard-update.service" ;;
+        openrc) files="$UPDATER $LIB/common.sh /etc/init.d/picoguard-update" ;;
+    esac
+
+    for file in $files; do
+        echo "# older" >>"$file"
+    done
+
+    if sh "$FIXTURES/install.sh" --yes --binary "$FIXTURES/releases/silent/picoguard" >/dev/null 2>&1; then
+        fail "an upgrade to a binary that never answers succeeded"
+    fi
+
+    for file in $files; do
+        [ "$(tail -n 1 "$file")" = "# older" ] || fail "$file was not put back as it was"
+    done
+
+    same_file "$B" "$REAL" || fail "$B is not the real binary after the rollback"
+    [ -f "$I/lock" ] || fail "$I/lock is gone"
+    enabled_at_boot || fail "the trigger is not enabled"
+    trigger_running || fail "the trigger is not running"
+    wait_for 30 service_up || fail "picoguard is not active after the rollback"
+}
+
+uninstall() {
+    sh "$FIXTURES/install.sh" --uninstall || fail "--uninstall failed"
+    expect_no_installer
+    [ ! -e "$B" ] || fail "$B is still there"
+    [ -f "$CONFIG" ] || fail "the config was removed without --purge"
+}
+
+uninstall_purge() {
+    sh "$FIXTURES/install.sh" --uninstall --purge || fail "--uninstall --purge failed"
+    expect_no_installer
+    [ ! -e "$B" ] || fail "$B is still there"
+    [ ! -e /etc/picoguard ] || fail "/etc/picoguard is still there"
 }
 
 group_of() {
