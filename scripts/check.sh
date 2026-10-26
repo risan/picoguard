@@ -26,7 +26,8 @@ if command -v shellcheck >/dev/null 2>&1; then
     shellcheck -s sh scripts/install.sh
     shellcheck -s bash scripts/proxmox-lxc.sh scripts/build-release.sh scripts/check.sh \
         scripts/release-preflight.sh scripts/sign-release.sh scripts/publish-crate.sh \
-        scripts/publish-github-release.sh scripts/test-release.sh
+        scripts/publish-github-release.sh scripts/test-release.sh \
+        scripts/audit-history.sh scripts/test-audit-history.sh
 fi
 
 cargo fmt --check
