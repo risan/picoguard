@@ -969,14 +969,14 @@ read_dns_target() {
         DNS_PORT=$port
     fi
 
-    # The array may span several lines. Comments are cut off first.
+    # The array may span several lines and use either TOML string quote. Comments are cut off first.
     addresses=$(awk '
         /^\[/ { in_server = ($0 == "[server]"); collecting = 0 }
-        in_server && ($1 == "bind" || collecting) {
+        in_server && ($0 ~ /^[ \t]*bind[ \t]*=/ || collecting) {
             sub(/#.*/, "")
             print
             collecting = ($0 !~ /\]/)
-        }' "$CHECK_PATH" | grep -o '"[^"]*"' | tr -d '"' || true)
+        }' "$CHECK_PATH" | grep -o "[\"'][^\"']*[\"']" | tr -d "\"'" || true)
 
     has_ipv4_loopback=0
     has_ipv6_loopback=0
