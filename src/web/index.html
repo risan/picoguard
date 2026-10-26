@@ -75,6 +75,8 @@ button.go { background: var(--accent); border-color: var(--accent); color: #fff;
     <h2>Update</h2>
     <p id="update-text"></p>
     <p id="update-notes"></p>
+    <p id="install-state"></p>
+    <button id="install" class="go" hidden>Update</button>
     <code id="update-how"></code>
   </section>
 
@@ -131,7 +133,17 @@ const QTYPES = { 1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16:
   28: "AAAA", 33: "SRV", 64: "SVCB", 65: "HTTPS", 255: "ANY" };
 const RESULTS = { pass: "upstream", cached: "cached", blocked_request: "blocked",
   blocked_response: "blocked (answer)", error: "error" };
+const INSTALL_TEXT = {
+  checking: () => "Checking the release...",
+  downloading: (i) => "Downloading " + (i.bytes / 1048576).toFixed(1) + " MB...",
+  verifying: () => "Verifying...",
+  waiting: () => "Installing, picoguard restarts...",
+  updated: (i) => "Updated to v" + i.version,
+  rolled_back: (i) => "Rolled back: " + i.reason,
+  failed: (i) => "Update failed: " + i.reason,
+};
 let pausedUntil = null;
+let latestVersion = null;
 
 // Names and errors come from the network: only ever set as text.
 function el(tag, text, className) {
@@ -296,11 +308,23 @@ function tick() {
 
 function showUpdate(status) {
   $("version").textContent = "v" + status.version;
-  $("update").hidden = !status.update.latest;
+  $("update").hidden = !status.update.latest && !status.update.install;
   $("update-text").textContent = status.update.latest ? "update available: v" + status.update.latest : "";
   $("update-notes").textContent = status.update.notes || "";
   $("update-notes").hidden = !status.update.notes;
   $("update-how").textContent = status.update.how || "";
+  showInstall(status.update);
+}
+
+function showInstall(update) {
+  const install = update.install;
+  latestVersion = update.latest || null;
+  $("install-state").textContent = install ? (INSTALL_TEXT[install.state] || (() => ""))(install) : "";
+  $("install").hidden = !update.can_install;
+
+  if (update.can_install) {
+    $("install").textContent = "Update to v" + latestVersion;
+  }
 }
 
 // Without a password the server answers 403 to everything but totals and lists.
@@ -355,6 +379,11 @@ document.querySelectorAll("button[data-minutes]").forEach((button) =>
   button.addEventListener("click", () =>
     act("/api/pause", { minutes: Number(button.dataset.minutes) })));
 $("resume").addEventListener("click", () => act("/api/resume", {}));
+$("install").addEventListener("click", () => {
+  if (confirm("Install v" + latestVersion + "? picoguard restarts.")) {
+    act("/api/update", { version: latestVersion });
+  }
+});
 $("refresh").addEventListener("click", () =>
   act("/api/lists/refresh", {}, "Refresh started; the table updates as lists finish."));
 

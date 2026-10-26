@@ -397,6 +397,9 @@ async fn the_page_is_served_with_protective_headers() {
     assert!(reply.header("access-control-allow-origin").is_none());
 }
 
+/// The page before the install button, for the growth budget.
+const PAGE_BYTES_BEFORE_INSTALL: usize = 12905;
+
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
     let (site, _upstream) = plain_site().await;
@@ -404,6 +407,11 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
     let page = site.send(get("/")).await.body;
 
     assert!(page.len() < 15 * 1024, "{} bytes", page.len());
+    assert!(
+        page.len() <= PAGE_BYTES_BEFORE_INSTALL + 1600,
+        "the install button may add 1600 bytes, not {}",
+        page.len() - PAGE_BYTES_BEFORE_INSTALL
+    );
     for external in [
         "src=", "href=", "http://", "https://", "url(", "@import", "<link",
     ] {
@@ -418,11 +426,16 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/pause",
         "/api/resume",
         "/api/lists/refresh",
+        "/api/update",
         "setInterval(update, 5000)",
         "id=\"version\"",
         "id=\"update\"",
         "id=\"update-how\"",
+        "id=\"install\"",
+        "id=\"install-state\"",
         "showUpdate(status)",
+        "showInstall(",
+        "confirm(",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
@@ -457,17 +470,36 @@ async fn the_update_notice_is_hidden_until_a_newer_version_is_known() {
     let page = site.send(get("/")).await.body;
 
     assert!(page.contains("<section id=\"update\" hidden>"));
-    assert!(page.contains("$(\"update\").hidden = !status.update.latest;"));
+    assert!(
+        page.contains("$(\"update\").hidden = !status.update.latest && !status.update.install;")
+    );
     for filled_as_text in [
         "$(\"version\").textContent",
         "$(\"update-text\").textContent",
         "$(\"update-notes\").textContent",
         "$(\"update-how\").textContent",
+        "$(\"install-state\").textContent",
     ] {
         assert!(page.contains(filled_as_text), "{filled_as_text}");
     }
 
     assert!(page.contains("\"update available: v\""));
+}
+
+/// No browser here: the click handler's source must ask before it posts.
+#[tokio::test]
+async fn the_install_button_asks_before_it_posts() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+    let handler = &page[page
+        .find("$(\"install\").addEventListener(")
+        .expect("a click handler")..];
+    let asks = handler.find("confirm(").expect("the handler asks");
+    let posts = handler.find("\"/api/update\"").expect("the handler posts");
+
+    assert!(asks < posts);
+    assert!(page.contains("$(\"install\").hidden = !update.can_install;"));
 }
 
 #[tokio::test]
