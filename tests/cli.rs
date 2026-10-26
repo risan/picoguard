@@ -62,6 +62,31 @@ fn check_rejects_an_unknown_key() {
 }
 
 #[test]
+fn check_rejects_an_upstream_that_cannot_be_built() {
+    let path = write_config(
+        "check-bad-upstream.toml",
+        "[upstream]\nservers = [\"https://dns.example/dns-query\"]\nbootstrap = []\n",
+    );
+
+    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stderr).contains("upstream.bootstrap"));
+}
+
+#[test]
+fn check_accepts_a_host_name_upstream_with_the_default_bootstrap() {
+    let path = write_config(
+        "check-host-upstream.toml",
+        "[upstream]\nservers = [\"https://unfiltered.adguard-dns.com/dns-query\"]\n",
+    );
+
+    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn check_rejects_a_missing_file() {
     let output = picoguard(&["--check", "-c", "/nonexistent/picoguard.toml"]);
 
@@ -149,7 +174,7 @@ fn running_with_a_host_name_upstream_and_no_bootstrap_exits_one() {
     let path = write_config(
         "https-host-upstream.toml",
         "[server]\nbind = [\"127.0.0.1\"]\nport = 0\n\
-         [upstream]\nservers = [\"https://dns.example/dns-query\"]\n",
+         [upstream]\nservers = [\"https://dns.example/dns-query\"]\nbootstrap = []\n",
     );
 
     let output = picoguard(&["-c", path.to_str().unwrap()]);

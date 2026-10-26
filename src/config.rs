@@ -6,6 +6,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::filter::compile::DEFAULT_SLOW_RULE_BUDGET;
+use crate::upstream::Upstreams;
 
 const UPSTREAM_SCHEMES: [&str; 4] = ["https://", "tls://", "udp://", "tcp://"];
 const LIST_URL_SCHEMES: [&str; 2] = ["http://", "https://"];
@@ -248,6 +249,9 @@ impl Config {
         self.stats.validate()?;
         self.state.validate()?;
 
+        // What the server would stop at when it starts.
+        Upstreams::from_config(&self.upstream, &self.limits).map_err(ConfigError::Invalid)?;
+
         Ok(())
     }
 }
@@ -309,7 +313,9 @@ impl Default for UpstreamConfig {
             ]
             .map(String::from)
             .to_vec(),
-            bootstrap: Vec::new(),
+            bootstrap: ["9.9.9.9", "1.1.1.1"]
+                .map(|address| address.parse().expect("bootstrap address is valid"))
+                .to_vec(),
             timeout_ms: 5000,
         }
     }
@@ -760,6 +766,51 @@ mod tests {
     #[test]
     fn empty_config_equals_defaults() {
         assert_eq!(Config::parse("").unwrap(), Config::default());
+    }
+
+    #[test]
+    fn the_default_bootstrap_is_the_documented_one() {
+        let expected: Vec<IpAddr> = vec!["9.9.9.9".parse().unwrap(), "1.1.1.1".parse().unwrap()];
+
+        assert_eq!(Config::default().upstream.bootstrap, expected);
+        assert!(EXAMPLE_CONFIG.contains(r#"# bootstrap = ["9.9.9.9", "1.1.1.1"]"#));
+    }
+
+    #[test]
+    fn an_upstream_that_cannot_be_built_is_rejected_with_the_config() {
+        let cases = [
+            (
+                "[upstream]\nservers = [\"https://dns.example/dns-query\"]\nbootstrap = []",
+                "upstream.bootstrap",
+            ),
+            (
+                "[upstream]\nservers = [\"tls://dns.example\"]\nbootstrap = []",
+                "upstream.bootstrap",
+            ),
+            (
+                "[upstream]\nservers = [\"udp://dns.example\"]",
+                "IP address",
+            ),
+            (
+                "[upstream]\nservers = [\"tls://1.1.1.1#not a name\"]",
+                "server name",
+            ),
+        ];
+
+        for (text, expected) in cases {
+            let message = error_of(text);
+
+            assert!(message.contains(expected), "{text}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_host_name_upstream_is_accepted_with_the_default_bootstrap() {
+        let config = Config::parse(
+            "[upstream]\nservers = [\"https://unfiltered.adguard-dns.com/dns-query\"]",
+        );
+
+        assert!(config.is_ok(), "{config:?}");
     }
 
     #[test]
