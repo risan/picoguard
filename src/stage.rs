@@ -10,7 +10,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use ring::digest;
 use serde::Serialize;
@@ -21,7 +21,10 @@ pub use crate::release::{MAX_BINARY_BYTES, MAX_SUMS_BYTES};
 use crate::lists::{
     Downloader, Fetch, FetchError, Limits, PIECE_QUEUE, Piece, Resolver, Validators,
 };
-use crate::release::{Request, SumsError, asset, expected_hash, verify_sums};
+use crate::release::{
+    InstallerResult, Outcome, Reading, Request, SumsError, asset, expected_hash, read_regular,
+    verify_sums,
+};
 use crate::update::{Build, Updates};
 use crate::upstream::tls::Tls;
 
@@ -36,6 +39,10 @@ const BINARY_TOTAL: Duration = Duration::from_secs(10 * 60);
 const IDLE: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
 const UPDATE_DIR: &str = "update";
+const REQUEST_MAX_BYTES: u64 = 256;
+const RESULT_MAX_BYTES: u64 = 1024;
+const NO_ANSWER: &str = "the installer did not answer within 10 minutes";
+const UNREADABLE_ANSWER: &str = "the installer's answer could not be read";
 
 /// The clock of the wait for the installer. Tests shrink it.
 #[derive(Debug, Clone)]
@@ -190,9 +197,9 @@ impl From<io::Error> for StageError {
 fn size_text(bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
 
-    if bytes % MIB == 0 {
+    if bytes.is_multiple_of(MIB) {
         format!("{} MiB", bytes / MIB)
-    } else if bytes % 1024 == 0 {
+    } else if bytes.is_multiple_of(1024) {
         format!("{} KiB", bytes / 1024)
     } else {
         format!("{bytes} bytes")
@@ -319,6 +326,145 @@ impl Stager {
         tokio::spawn(Arc::clone(self).run(request, target));
 
         Ok(())
+    }
+
+    /// Looks for the installer's answer to `request`: a result with its id.
+    fn installer_answer(&self, request: &Request) -> Option<Install> {
+        let bytes =
+            read_regular(&self.setup.installer_dir.join("result"), RESULT_MAX_BYTES).ok()?;
+        let version = request.version.clone();
+
+        match InstallerResult::parse(&bytes) {
+            Reading::Answer(result) if result.id == request.id => Some(match result.outcome {
+                Outcome::Updated => Install::Updated { version },
+                Outcome::RolledBack(reason) => Install::RolledBack { version, reason },
+                Outcome::Failed(reason) => Install::Failed { version, reason },
+            }),
+
+            Reading::Unreadable { id: Some(id) } if id == request.id => Some(Install::Failed {
+                version,
+                reason: UNREADABLE_ANSWER.to_string(),
+            }),
+
+            Reading::Answer(_) | Reading::Unreadable { .. } => None,
+        }
+    }
+
+    /// Waits for the installer's result on the calling thread (plan D13), then removes the
+    /// staged files, request first, and only then shows the end, so a new update never starts
+    /// while this cleanup runs. The thread sleeps instead of using the runtime so that
+    /// stopping picoguard never waits for it.
+    fn wait_for_installer(self: &Arc<Self>, request: &Request, written: SystemTime) {
+        let timing = &self.setup.timing;
+        let deadline = Instant::now() + wait_left(timing.wait, written, SystemTime::now());
+
+        let ended = loop {
+            std::thread::sleep(timing.poll);
+
+            if let Some(answer) = self.installer_answer(request) {
+                break answer;
+            }
+
+            if Instant::now() >= deadline {
+                break Install::Failed {
+                    version: request.version.clone(),
+                    reason: NO_ANSWER.to_string(),
+                };
+            }
+        };
+
+        self.clear_and_show(request, ended);
+    }
+
+    fn clear_and_show(&self, request: &Request, ended: Install) {
+        if let Err(error) = empty_dir(&self.setup.state_dir.join(UPDATE_DIR)) {
+            log::warn!("cannot remove the staged update: {error}");
+        }
+
+        log::info!("update to {}: {}", request.version, ended.view().state);
+        self.set(&request.id, ended);
+    }
+
+    /// Cleans up what an earlier run left in `<state.dir>/update` and picks up an update that
+    /// is waiting for the installer. It only removes: a start never writes anything new.
+    pub fn resume(self: &Arc<Self>) {
+        let staging = self.setup.state_dir.join(UPDATE_DIR);
+        let Ok(metadata) = fs::symlink_metadata(&staging) else {
+            return;
+        };
+
+        if !metadata.is_dir() {
+            if let Err(error) = fs::remove_file(&staging) {
+                log::warn!("cannot remove {}: {error}", staging.display());
+            }
+
+            return;
+        }
+
+        let request_path = staging.join("request");
+        let request = read_regular(&request_path, REQUEST_MAX_BYTES)
+            .ok()
+            .and_then(|bytes| Request::parse(&bytes));
+        let Some(request) = request else {
+            self.remove_leftovers(&staging);
+
+            return;
+        };
+        let written = fs::metadata(&request_path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let version = request.version.clone();
+
+        let ended = match self.installer_answer(&request) {
+            Some(answer) => answer,
+
+            None if wait_left(self.setup.timing.wait, written, SystemTime::now()).is_zero() => {
+                Install::Failed {
+                    version,
+                    reason: NO_ANSWER.to_string(),
+                }
+            }
+
+            None => {
+                self.wait_in_background(request, written);
+
+                return;
+            }
+        };
+
+        self.remove_leftovers(&staging);
+        self.show(&request.id, ended);
+    }
+
+    fn wait_in_background(self: &Arc<Self>, request: Request, written: SystemTime) {
+        self.show(
+            &request.id,
+            Install::Waiting {
+                version: request.version.clone(),
+            },
+        );
+        let stager = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("picoguard-update".to_string())
+            .spawn(move || stager.wait_for_installer(&request, written));
+
+        if let Err(error) = spawned {
+            log::warn!("cannot wait for the installer: {error}");
+        }
+    }
+
+    fn remove_leftovers(&self, staging: &Path) {
+        if let Err(error) = empty_dir(staging) {
+            log::warn!("cannot remove what an update left behind: {error}");
+        }
+    }
+
+    /// Shows the state of an update found at start, when no attempt of this run exists.
+    fn show(&self, id: &str, install: Install) {
+        *self.state.lock().unwrap() = Some(Attempt {
+            id: id.to_string(),
+            install,
+        });
     }
 
     /// Changes the state of the attempt `id`, unless it has ended or another one has begun.
@@ -528,7 +674,16 @@ impl Writer {
             let _ = empty_dir(&staging);
         }
 
+        let staged = written.is_ok();
         let _ = report.send(written);
+
+        if staged {
+            let written_at = fs::metadata(staging.join("request"))
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or_else(|_| SystemTime::now());
+
+            self.stager.wait_for_installer(&self.request, written_at);
+        }
     }
 
     /// Leaves `<state.dir>/update` an empty real directory, or fails. A link or file in its
@@ -615,6 +770,15 @@ impl Writer {
     }
 }
 
+/// How much of `wait` is left for a request written at `written`. A request from the future
+/// has not aged, and one older than `wait` has nothing left: a slow sync or a clock jump
+/// must give a passed deadline, never a subtraction that panics.
+fn wait_left(wait: Duration, written: SystemTime, now: SystemTime) -> Duration {
+    let age = now.duration_since(written).unwrap_or(Duration::ZERO);
+
+    wait.saturating_sub(age)
+}
+
 fn create_new(path: &Path, mode: u32) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
@@ -655,4 +819,34 @@ fn empty_dir(dir: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use super::*;
+
+    #[test]
+    fn the_wait_left_never_underflows() {
+        let wait = Duration::from_secs(600);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
+        let written = |age: Duration| now - age;
+
+        assert_eq!(wait_left(wait, now + Duration::from_secs(5), now), wait);
+        assert_eq!(wait_left(wait, written(Duration::ZERO), now), wait);
+        assert_eq!(
+            wait_left(wait, written(Duration::from_secs(100)), now),
+            Duration::from_secs(500)
+        );
+        assert_eq!(wait_left(wait, written(wait), now), Duration::ZERO);
+        assert_eq!(
+            wait_left(wait, written(wait + Duration::from_secs(1)), now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            wait_left(wait, written(Duration::from_secs(24 * 3600)), now),
+            Duration::ZERO
+        );
+    }
 }

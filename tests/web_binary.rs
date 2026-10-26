@@ -25,14 +25,17 @@ fn free_tcp_port() -> u16 {
 }
 
 fn config(dns_port: u16, web_port: u16, enabled: bool) -> String {
+    config_in(dns_port, web_port, enabled, &std::env::temp_dir())
+}
+
+fn config_in(dns_port: u16, web_port: u16, enabled: bool, state_dir: &std::path::Path) -> String {
     format!(
         "lists = []\n\
          [server]\nbind = [\"127.0.0.1\"]\nport = {dns_port}\n\
          [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
          [update]\ncheck = false\n\
          [web]\nenabled = {enabled}\nbind = [\"127.0.0.1\"]\nport = {web_port}\n\
-         [state]\ndir = {:?}\n",
-        std::env::temp_dir()
+         [state]\ndir = {state_dir:?}\n"
     )
 }
 
@@ -74,5 +77,35 @@ fn no_port_is_opened_when_the_status_page_is_disabled() {
     }));
 
     assert!(TcpStream::connect(("127.0.0.1", web_port)).is_err());
+    drop(server);
+}
+
+#[test]
+fn a_start_with_the_page_off_removes_update_leftovers() {
+    let state = common::release::scratch("web-binary-leftovers");
+    let update = state.join("update");
+    std::fs::create_dir(&update).unwrap();
+    std::fs::write(update.join("picoguard.part"), b"half a download").unwrap();
+    let files = common::release::Files::good("9.9.9", b"binary");
+    std::fs::write(update.join("request"), &files.request).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(update.join("request"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    let web_port = free_tcp_port();
+
+    let server = Stopped(start("web-leftovers.toml", |port| {
+        config_in(port, web_port, false, &state)
+    }));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::fs::read_dir(&update).unwrap().count() > 0 {
+        assert!(std::time::Instant::now() < deadline, "the leftovers stay");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert!(update.is_dir());
     drop(server);
 }

@@ -11,6 +11,9 @@ use picoguard::pipeline::Pipeline;
 use picoguard::release::{self, Refusal, VerifySetup};
 use picoguard::scheduler::{Scheduler, Timing};
 use picoguard::server::{self, Listeners};
+use picoguard::stage::{
+    INSTALLER_DIR, MAX_BINARY_BYTES, RELEASE_DOWNLOAD_URL, StageSetup, StageTiming, Stager,
+};
 use picoguard::update::{self, Build, CheckTiming, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
@@ -229,6 +232,23 @@ fn serve(config: Config) -> Result<(), String> {
             None
         };
         let updates = Arc::new(Updates::new(Build::current()));
+        let tls = Arc::new(Tls::with_webpki_roots());
+        let stager = Stager::new(
+            StageSetup {
+                target: release::target(),
+                base_url: RELEASE_DOWNLOAD_URL.to_string(),
+                state_dir: config.state.dir.clone(),
+                installer_dir: PathBuf::from(INSTALLER_DIR),
+                key: release::RELEASE_KEY,
+                max_binary_bytes: MAX_BINARY_BYTES,
+                timing: StageTiming::default(),
+            },
+            Arc::clone(&updates),
+            resolver_over(Arc::clone(pipeline.upstreams())),
+            Arc::clone(&tls),
+        );
+        // The page may be off; what an earlier update left behind is removed all the same.
+        stager.resume();
         let mut stop_signals = StopSignals::install()?;
 
         for address in listeners.udp_addresses() {
@@ -250,7 +270,6 @@ fn serve(config: Config) -> Result<(), String> {
             web::spawn(status_page, Arc::new(web));
         }
 
-        let tls = Arc::new(Tls::with_webpki_roots());
         let downloader = Downloader::new(
             resolver_over(Arc::clone(pipeline.upstreams())),
             Arc::clone(&tls),

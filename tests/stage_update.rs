@@ -22,7 +22,11 @@ const CAP: u64 = 64 * 1024;
 const FOUR_FILES: [&str; 4] = ["SHA256SUMS", "SHA256SUMS.sig", "picoguard", "request"];
 
 fn path(file: &str) -> String {
-    format!("/download/v{VERSION}/{file}")
+    path_of(VERSION, file)
+}
+
+fn path_of(version: &str, file: &str) -> String {
+    format!("/download/v{version}/{file}")
 }
 
 fn binary_path() -> String {
@@ -40,9 +44,16 @@ fn release_files() -> Files {
 }
 
 fn serve(server: &ListServer, files: &Files) {
-    server.serve_bytes(&path("SHA256SUMS"), files.sums.clone());
-    server.serve_bytes(&path("SHA256SUMS.sig"), files.signature.clone());
-    server.serve_bytes(&binary_path(), files.binary.clone());
+    serve_version(server, VERSION, files);
+}
+
+fn serve_version(server: &ListServer, version: &str, files: &Files) {
+    server.serve_bytes(&path_of(version, "SHA256SUMS"), files.sums.clone());
+    server.serve_bytes(&path_of(version, "SHA256SUMS.sig"), files.signature.clone());
+    server.serve_bytes(
+        &path_of(version, &format!("picoguard-{TARGET}")),
+        files.binary.clone(),
+    );
 }
 
 fn setup(server: &ListServer, root: &Path) -> StageSetup {
@@ -82,6 +93,7 @@ fn stager_from(setup: StageSetup, updates: Arc<Updates>) -> Arc<Stager> {
 struct Rig {
     server: ListServer,
     root: PathBuf,
+    updates: Arc<Updates>,
     stager: Arc<Stager>,
 }
 
@@ -92,16 +104,24 @@ impl Rig {
 }
 
 async fn make_rig(name: &str, files: &Files) -> Rig {
+    make_rig_waiting(name, files, Duration::from_secs(2)).await
+}
+
+async fn make_rig_waiting(name: &str, files: &Files, wait: Duration) -> Rig {
     let root = scratch(&format!("stage-update-{name}"));
     fs::create_dir(root.join("state")).unwrap();
     fs::create_dir(root.join("installer")).unwrap();
     let server = ListServer::start().await;
     serve(&server, files);
-    let stager = stager_from(setup(&server, &root), updates_with(VERSION));
+    let updates = updates_with(VERSION);
+    let mut setup = setup(&server, &root);
+    setup.timing.wait = wait;
+    let stager = stager_from(setup, Arc::clone(&updates));
 
     Rig {
         server,
         root,
+        updates,
         stager,
     }
 }
@@ -429,4 +449,321 @@ async fn a_disk_failure_stops_the_download_and_can_be_retried() {
     assert_eq!(view.state, "waiting");
     assert_eq!(names(&rig.staged()), FOUR_FILES);
     until("the connections to close", || rig.server.active() == 0).await;
+}
+
+fn write_result(rig_root: &Path, text: &str) {
+    let temporary = rig_root.join("installer/result.tmp");
+    fs::write(&temporary, text).unwrap();
+    fs::rename(&temporary, rig_root.join("installer/result")).unwrap();
+}
+
+fn staged_id(rig: &Rig) -> String {
+    Request::parse(&fs::read(rig.staged().join("request")).unwrap())
+        .unwrap()
+        .id
+}
+
+async fn staged_and_waiting(rig: &Rig) -> String {
+    assert_eq!(start_and_end(rig).await.state, "waiting");
+
+    staged_id(rig)
+}
+
+async fn view_is(stager: &Stager, state: &str) -> InstallView {
+    until(state, || {
+        stager.view().is_some_and(|view| view.state == state)
+    })
+    .await;
+
+    stager.view().unwrap()
+}
+
+#[tokio::test]
+async fn the_installer_result_ends_the_wait() {
+    for (outcome, state, reason) in [
+        ("outcome=updated\n", "updated", None),
+        (
+            "outcome=rolled-back\nreason=DNS did not answer\n",
+            "rolled_back",
+            Some("DNS did not answer"),
+        ),
+        (
+            "outcome=failed\nreason=no space left\n",
+            "failed",
+            Some("no space left"),
+        ),
+    ] {
+        let rig = make_rig(&format!("result-{state}"), &release_files()).await;
+        let id = staged_and_waiting(&rig).await;
+
+        write_result(&rig.root, &format!("id={id}\n{outcome}"));
+        let started = Instant::now();
+        let view = view_is(&rig.stager, state).await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(view.reason.as_deref(), reason);
+        assert!(names(&rig.staged()).is_empty(), "{state}");
+    }
+}
+
+#[tokio::test]
+async fn a_result_for_another_request_is_ignored() {
+    let rig = make_rig("other-result", &release_files()).await;
+    staged_and_waiting(&rig).await;
+
+    write_result(&rig.root, "id=ffffffffffffffff\noutcome=updated\n");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(rig.stager.view().unwrap().state, "waiting");
+    assert_eq!(names(&rig.staged()), FOUR_FILES);
+}
+
+#[tokio::test]
+async fn another_update_after_a_result() {
+    let files = release_files();
+    let rig = make_rig("second-update", &files).await;
+    let first = staged_and_waiting(&rig).await;
+    write_result(&rig.root, &format!("id={first}\noutcome=updated\n"));
+    view_is(&rig.stager, "updated").await;
+
+    serve_version(&rig.server, "9.9.10", &Files::good("9.9.10", &binary()));
+    rig.updates.show(Some(Latest {
+        version: "9.9.10".to_string(),
+        notes: String::new(),
+    }));
+    assert!(rig.stager.can_install());
+    rig.stager.start("9.9.10").unwrap();
+    let view = ended(&rig.stager).await;
+
+    assert_eq!(view.state, "waiting");
+    assert_eq!(view.version, "9.9.10");
+    assert_ne!(staged_id(&rig), first);
+}
+
+#[tokio::test]
+async fn an_unreadable_result_fails_the_update() {
+    for (name, text) in [
+        ("unknown-outcome", "outcome=maybe\n"),
+        ("repeated-key", "outcome=updated\nfuture=1\nfuture=2\n"),
+    ] {
+        let rig = make_rig(&format!("unreadable-{name}"), &release_files()).await;
+        let id = staged_and_waiting(&rig).await;
+
+        write_result(&rig.root, &format!("id={id}\n{text}"));
+        let view = view_is(&rig.stager, "failed").await;
+
+        assert!(view.reason.unwrap().contains("could not be read"), "{name}");
+        assert!(names(&rig.staged()).is_empty(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn no_result_times_out() {
+    let rig = make_rig_waiting("timeout", &release_files(), Duration::from_millis(200)).await;
+    staged_and_waiting(&rig).await;
+
+    let view = view_is(&rig.stager, "failed").await;
+
+    assert!(view.reason.unwrap().contains("did not answer"));
+    assert!(names(&rig.staged()).is_empty());
+}
+
+#[tokio::test]
+async fn a_wait_already_over_times_out_without_a_panic() {
+    let rig = make_rig_waiting("no-wait", &release_files(), Duration::ZERO).await;
+    rig.stager.start(VERSION).unwrap();
+
+    let view = view_is(&rig.stager, "failed").await;
+
+    assert!(view.reason.unwrap().contains("did not answer"));
+    assert!(names(&rig.staged()).is_empty());
+}
+
+struct Restart {
+    root: PathBuf,
+}
+
+impl Restart {
+    fn new(name: &str) -> Restart {
+        let root = scratch(&format!("stage-update-{name}"));
+        fs::create_dir(root.join("state")).unwrap();
+        fs::create_dir(root.join("installer")).unwrap();
+
+        Restart { root }
+    }
+
+    fn update_dir(&self) -> PathBuf {
+        self.root.join("state/update")
+    }
+
+    /// A new daemon over the same directories.
+    async fn daemon(&self, wait: Duration) -> Arc<Stager> {
+        let server = ListServer::start().await;
+        let mut setup = setup(&server, &self.root);
+        setup.timing.wait = wait;
+        let stager = stager_from(setup, updates_with(VERSION));
+        stager.resume();
+
+        stager
+    }
+}
+
+fn set_age(path: &Path, age: Duration) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_new_stager_resumes_a_fresh_request() {
+    let restart = Restart::new("resume-fresh");
+    release_files().write(&restart.update_dir());
+
+    let stager = restart.daemon(Duration::from_secs(2)).await;
+
+    let view = stager.view().unwrap();
+    assert_eq!((view.state, view.version.as_str()), ("waiting", VERSION));
+    assert!(!stager.can_install());
+
+    write_result(
+        &restart.root,
+        &format!("id={}\noutcome=updated\n", common::release::REQUEST_ID),
+    );
+
+    view_is(&stager, "updated").await;
+    assert!(names(&restart.update_dir()).is_empty());
+}
+
+#[tokio::test]
+async fn a_new_stager_shows_a_result_that_is_already_there() {
+    let restart = Restart::new("resume-answered");
+    release_files().write(&restart.update_dir());
+    write_result(
+        &restart.root,
+        &format!(
+            "id={}\noutcome=rolled-back\nreason=the check failed\n",
+            common::release::REQUEST_ID
+        ),
+    );
+
+    let stager = restart.daemon(Duration::from_secs(2)).await;
+
+    let view = stager.view().unwrap();
+    assert_eq!(view.state, "rolled_back");
+    assert_eq!(view.reason.as_deref(), Some("the check failed"));
+    assert!(names(&restart.update_dir()).is_empty());
+}
+
+#[tokio::test]
+async fn a_new_stager_drops_a_stale_request() {
+    let restart = Restart::new("resume-stale");
+    release_files().write(&restart.update_dir());
+    set_age(
+        &restart.update_dir().join("request"),
+        Duration::from_secs(3),
+    );
+
+    let stager = restart.daemon(Duration::from_secs(2)).await;
+
+    let view = stager.view().unwrap();
+    assert_eq!(view.state, "failed");
+    assert!(view.reason.unwrap().contains("did not answer"));
+    assert!(names(&restart.update_dir()).is_empty());
+}
+
+#[tokio::test]
+async fn a_new_stager_removes_leftovers() {
+    let restart = Restart::new("resume-leftovers");
+    fs::create_dir(restart.update_dir()).unwrap();
+    fs::write(restart.update_dir().join("picoguard.part"), b"half").unwrap();
+
+    let stager = restart.daemon(Duration::from_secs(2)).await;
+
+    assert_eq!(stager.view(), None);
+    assert!(names(&restart.update_dir()).is_empty());
+}
+
+#[tokio::test]
+async fn a_new_stager_without_a_directory_writes_nothing() {
+    let restart = Restart::new("resume-nothing");
+    let before = listing(&restart.root);
+
+    let stager = restart.daemon(Duration::from_secs(2)).await;
+
+    assert_eq!(stager.view(), None);
+    assert_eq!(listing(&restart.root), before);
+}
+
+/// A directory with files named like the staged ones, and a link to it at `update`.
+fn link_update_to_a_directory_with_sentinels(restart: &Restart) -> PathBuf {
+    let outside = restart.root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("request"), b"sentinel request").unwrap();
+    fs::write(outside.join("picoguard"), b"sentinel binary").unwrap();
+    std::os::unix::fs::symlink(&outside, restart.update_dir()).unwrap();
+
+    outside
+}
+
+fn assert_sentinels_unchanged(outside: &Path) {
+    assert_eq!(
+        fs::read(outside.join("request")).unwrap(),
+        b"sentinel request"
+    );
+    assert_eq!(
+        fs::read(outside.join("picoguard")).unwrap(),
+        b"sentinel binary"
+    );
+    assert_eq!(names(outside), ["picoguard", "request"]);
+}
+
+#[tokio::test]
+async fn a_linked_update_entry_is_removed_not_followed() {
+    let restart = Restart::new("resume-link");
+    let outside = link_update_to_a_directory_with_sentinels(&restart);
+
+    let stager = restart.daemon(Duration::from_secs(2)).await;
+
+    assert_eq!(stager.view(), None);
+    assert!(fs::symlink_metadata(restart.update_dir()).is_err());
+    assert_sentinels_unchanged(&outside);
+}
+
+#[tokio::test]
+async fn a_start_does_not_follow_a_linked_update_entry() {
+    let restart = Restart::new("start-link");
+    let outside = link_update_to_a_directory_with_sentinels(&restart);
+    let server = ListServer::start().await;
+    serve(&server, &release_files());
+    let stager = stager_from(setup(&server, &restart.root), updates_with(VERSION));
+
+    stager.start(VERSION).unwrap();
+
+    assert_eq!(ended(&stager).await.state, "waiting");
+    assert!(
+        !fs::symlink_metadata(restart.update_dir())
+            .unwrap()
+            .is_symlink()
+    );
+    assert_eq!(names(&restart.update_dir()), FOUR_FILES);
+    assert_sentinels_unchanged(&outside);
+}
+
+#[tokio::test]
+async fn a_fifo_request_does_not_block_the_start() {
+    let restart = Restart::new("resume-fifo");
+    fs::create_dir(restart.update_dir()).unwrap();
+    let fifo =
+        std::ffi::CString::new(restart.update_dir().join("request").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let started = Instant::now();
+    let stager = restart.daemon(Duration::from_secs(2)).await;
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(stager.view(), None);
+    assert!(names(&restart.update_dir()).is_empty());
 }
