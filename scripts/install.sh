@@ -13,6 +13,8 @@ STATE_DIR=/var/lib/picoguard
 SYSTEMD_UNIT=/etc/systemd/system/picoguard.service
 SYSTEMD_UNIT_DIR=/etc/systemd/system/picoguard.service.d
 SYSTEMD_MEMORY_DROPIN=$SYSTEMD_UNIT_DIR/memory.conf
+# First line of a drop-in that install.sh wrote. Any other memory.conf is the user's.
+MEMORY_DROPIN_MARKER='# Written by install.sh for the xlarge lists.'
 OPENRC_SCRIPT=/etc/init.d/picoguard
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/picoguard.conf
 RESOLV_SAVED_LINK=$CONFIG_DIR/resolv.conf.original-link
@@ -1239,16 +1241,24 @@ start_pre() {
 OPENRC_SCRIPT
 }
 
+owns_memory_dropin() {
+    [ "$(head -n 1 "$SYSTEMD_MEMORY_DROPIN" 2>/dev/null)" = "$MEMORY_DROPIN_MARKER" ]
+}
+
 install_systemd_service() {
     systemd_unit_text >"$TMP/picoguard.service"
     install -m 0644 "$TMP/picoguard.service" "$SYSTEMD_UNIT"
 
     # The biggest lists need more than the 64 MB of the shipped unit.
     if [ "$WRITE_CONFIG" = 1 ]; then
-        if [ "$LISTS" = xlarge ]; then
+        if [ -f "$SYSTEMD_MEMORY_DROPIN" ] && ! owns_memory_dropin; then
+            if [ "$LISTS" = xlarge ]; then
+                warn "$SYSTEMD_MEMORY_DROPIN is not from install.sh, so it is left as it is. The xlarge lists need MemoryMax=192M or more in it."
+            fi
+        elif [ "$LISTS" = xlarge ]; then
             mkdir -p "$SYSTEMD_UNIT_DIR"
-            printf '# Written by install.sh for the xlarge lists.\n[Service]\nMemoryMax=192M\n' >"$SYSTEMD_MEMORY_DROPIN"
-        elif [ -f "$SYSTEMD_MEMORY_DROPIN" ] && grep -q 'Written by install.sh' "$SYSTEMD_MEMORY_DROPIN"; then
+            printf '%s\n[Service]\nMemoryMax=192M\n' "$MEMORY_DROPIN_MARKER" >"$SYSTEMD_MEMORY_DROPIN"
+        elif [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
             rm -f "$SYSTEMD_MEMORY_DROPIN"
             rmdir "$SYSTEMD_UNIT_DIR" 2>/dev/null || true
         fi
@@ -1298,6 +1308,10 @@ backup_previous() {
     if [ -f "$OPENRC_SCRIPT" ]; then
         cp -p "$OPENRC_SCRIPT" "$BACKUP_DIR/initscript"
     fi
+
+    if [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
+        cp -p "$SYSTEMD_MEMORY_DROPIN" "$BACKUP_DIR/memory-dropin"
+    fi
 }
 
 rollback_upgrade() {
@@ -1311,6 +1325,14 @@ rollback_upgrade() {
 
     if [ -f "$BACKUP_DIR/initscript" ]; then
         cp -p "$BACKUP_DIR/initscript" "$OPENRC_SCRIPT"
+    fi
+
+    if [ -f "$BACKUP_DIR/memory-dropin" ]; then
+        mkdir -p "$SYSTEMD_UNIT_DIR"
+        cp -p "$BACKUP_DIR/memory-dropin" "$SYSTEMD_MEMORY_DROPIN"
+    elif owns_memory_dropin; then
+        rm -f "$SYSTEMD_MEMORY_DROPIN"
+        rmdir "$SYSTEMD_UNIT_DIR" 2>/dev/null || true
     fi
 
     if [ -n "$BACKUP_CONFIG" ] && [ -f "$BACKUP_CONFIG" ]; then
@@ -1549,7 +1571,16 @@ uninstall() {
         rc-update del picoguard 2>/dev/null || true
     fi
 
-    rm -f "$SYSTEMD_UNIT" "$SYSTEMD_MEMORY_DROPIN" "$OPENRC_SCRIPT" "$BIN_PATH"
+    rm -f "$SYSTEMD_UNIT" "$OPENRC_SCRIPT" "$BIN_PATH"
+
+    if [ -f "$SYSTEMD_MEMORY_DROPIN" ]; then
+        if owns_memory_dropin; then
+            rm -f "$SYSTEMD_MEMORY_DROPIN"
+        else
+            warn "$SYSTEMD_MEMORY_DROPIN is not from install.sh, so it is left in place"
+        fi
+    fi
+
     rmdir "$SYSTEMD_UNIT_DIR" 2>/dev/null || true
 
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
