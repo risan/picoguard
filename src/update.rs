@@ -4,9 +4,19 @@
 //! the page: the last known result stays.
 
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+use crate::lists::{Downloader, Fetch, FetchError, Limits, PIECE_QUEUE, Piece, Validators};
 use crate::scheduler::{jittered, unit_random};
+
+pub const RELEASES_URL: &str = "https://api.github.com/repos/risan/picoguard/releases/latest";
+
+/// The answer of the releases API is about 20 KiB; anything over this is not one.
+const MAX_ANSWER_BYTES: u64 = 256 * 1024;
 
 const UPDATE_COMMAND_RELEASE: &str =
     "curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh";
@@ -232,6 +242,246 @@ pub fn log_line(previous: &Outcome, now: &Outcome, detail: &str) -> Option<(log:
     };
 
     Some(line)
+}
+
+/// The newest release known, in the form the page shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Latest {
+    pub version: String,
+    pub notes: String,
+}
+
+/// What `/api/status` says about updates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdateView {
+    pub build: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub how: Option<&'static str>,
+}
+
+/// The result of the check, shared with the status page.
+pub struct Updates {
+    build: Build,
+    latest: Mutex<Option<Latest>>,
+}
+
+impl Updates {
+    pub fn new(build: Build) -> Updates {
+        Updates {
+            build,
+            latest: Mutex::new(None),
+        }
+    }
+
+    pub fn view(&self) -> UpdateView {
+        let latest = self.latest.lock().unwrap().clone();
+        let Some(latest) = latest else {
+            return UpdateView {
+                build: self.build.name(),
+                latest: None,
+                notes: None,
+                how: None,
+            };
+        };
+
+        UpdateView {
+            build: self.build.name(),
+            latest: Some(latest.version),
+            notes: Some(latest.notes).filter(|notes| !notes.is_empty()),
+            how: Some(self.build.how()),
+        }
+    }
+
+    pub fn show(&self, latest: Option<Latest>) {
+        *self.latest.lock().unwrap() = latest;
+    }
+
+    fn shown_version(&self) -> Option<String> {
+        self.latest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|latest| latest.version.clone())
+    }
+}
+
+/// The fields of GitHub's release answer that the check reads.
+#[derive(Deserialize)]
+struct Release {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+pub struct Checker {
+    downloader: Downloader,
+    url: String,
+    running: Option<Version>,
+    /// The ETag of the last 200 answer that arrived in full, with the outcome it gave, so a
+    /// 304 repeats that outcome.
+    cached: Option<(String, Outcome)>,
+}
+
+impl Checker {
+    pub fn new(downloader: Downloader, url: &str) -> Checker {
+        Checker {
+            downloader,
+            url: url.to_string(),
+            running: parse_running(env!("CARGO_PKG_VERSION")),
+            cached: None,
+        }
+    }
+
+    /// Asks once and updates what `updates` shows. The second item is the diagnostic for the
+    /// log line; it is not kept.
+    pub async fn check(&mut self, updates: &Updates) -> (Outcome, String) {
+        let previous = Validators {
+            etag: self.cached.as_ref().map(|(etag, _)| etag.clone()),
+            last_modified: None,
+        };
+        let limits = Limits {
+            max_body_bytes: MAX_ANSWER_BYTES,
+            idle_timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(60),
+            max_redirects: 5,
+        };
+
+        let download = match self.downloader.fetch(&self.url, &previous, &limits).await {
+            Ok(Fetch::Modified(download)) => download,
+
+            Ok(Fetch::NotModified) => {
+                return match &self.cached {
+                    Some((_, outcome)) => (outcome.clone(), String::new()),
+                    None => (
+                        Outcome::Failed(Failure::Invalid),
+                        "not modified, but no answer is kept".to_string(),
+                    ),
+                };
+            }
+
+            Err(error) => return (outcome_of(&error), error.to_string()),
+        };
+
+        let etag = download.validators.etag.clone();
+        let (sender, mut receiver) = mpsc::channel(PIECE_QUEUE);
+        // The pumping future owns the only sender, so the channel closes on any exit and the
+        // collector below cannot wait for ever.
+        let pumping = async move {
+            let result = download.pump(&sender).await;
+            drop(sender);
+
+            result
+        };
+        let collecting = async {
+            let mut body = Vec::new();
+
+            while let Some(piece) = receiver.recv().await {
+                match piece {
+                    Piece::Data(data) => body.extend_from_slice(&data),
+                    Piece::End => return (body, true),
+                }
+            }
+
+            (body, false)
+        };
+        let (pumped, (body, complete)) = tokio::join!(pumping, collecting);
+
+        if let Err(error) = pumped {
+            return (outcome_of(&error), error.to_string());
+        }
+
+        if !complete {
+            return (
+                Outcome::Failed(Failure::Network),
+                "the answer ended early".to_string(),
+            );
+        }
+
+        let (outcome, detail) = self.read_answer(&body, updates);
+        self.cached = etag.map(|etag| (etag, outcome.clone()));
+
+        (outcome, detail)
+    }
+
+    fn read_answer(&self, body: &[u8], updates: &Updates) -> (Outcome, String) {
+        let release = match serde_json::from_slice::<Release>(body) {
+            Ok(release) => release,
+            Err(error) => return (Outcome::Failed(Failure::Invalid), error.to_string()),
+        };
+        let version = match parse_tag(&release.tag_name) {
+            Tag::Release(version) => version,
+            Tag::Suffixed => return (current_outcome(updates), String::new()),
+            Tag::Invalid => {
+                return (
+                    Outcome::Failed(Failure::Invalid),
+                    format!("{:?} is not a version", release.tag_name),
+                );
+            }
+        };
+
+        if release.draft || release.prerelease {
+            return (current_outcome(updates), String::new());
+        }
+
+        let is_newer = self
+            .running
+            .is_some_and(|running| is_newer(version, running));
+
+        if !is_newer {
+            updates.show(None);
+
+            return (Outcome::UpToDate, String::new());
+        }
+
+        updates.show(Some(Latest {
+            version: version.to_string(),
+            notes: summarize(release.body.as_deref().unwrap_or_default()),
+        }));
+
+        (Outcome::Newer(version.to_string()), String::new())
+    }
+}
+
+/// What the check says while it leaves the shown result as it is.
+fn current_outcome(updates: &Updates) -> Outcome {
+    match updates.shown_version() {
+        Some(version) => Outcome::Newer(version),
+        None => Outcome::UpToDate,
+    }
+}
+
+fn outcome_of(error: &FetchError) -> Outcome {
+    match error {
+        FetchError::Status(404) => Outcome::NotFound,
+
+        FetchError::Status(status) => Outcome::Failed(Failure::Status(*status)),
+
+        FetchError::BodyTooLarge
+        | FetchError::HtmlPage
+        | FetchError::UnsupportedEncoding(_)
+        | FetchError::TooManyRedirects
+        | FetchError::BadRedirect(_)
+        | FetchError::InsecureRedirect
+        | FetchError::LocalRedirect(_) => Outcome::Failed(Failure::Invalid),
+
+        FetchError::BadUrl(_)
+        | FetchError::Resolve(_)
+        | FetchError::Connect(_)
+        | FetchError::Tls(_)
+        | FetchError::Timeout
+        | FetchError::DeadlinePassed
+        | FetchError::Http(_)
+        | FetchError::Io(_)
+        | FetchError::SinkClosed => Outcome::Failed(Failure::Network),
+    }
 }
 
 #[cfg(test)]
