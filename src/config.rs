@@ -383,6 +383,9 @@ pub struct ListConfig {
     pub max_body_bytes: u64,
     /// Estimated bytes the slow rules and regexes of the list may cost.
     pub slow_rule_budget: usize,
+    /// Lets a downloaded list answer a name with the IP of its hosts line. Without it any IP
+    /// but 0.0.0.0, ::, 127.0.0.1 and ::1 blocks like 0.0.0.0. Local files always may.
+    pub allow_redirects: bool,
 }
 
 impl Default for ListConfig {
@@ -396,6 +399,7 @@ impl Default for ListConfig {
             max_rules: 3_000_000,
             max_body_bytes: 64 * 1024 * 1024,
             slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
+            allow_redirects: false,
         }
     }
 }
@@ -892,6 +896,7 @@ mod tests {
             max_rules = 1000
             max_body_bytes = 1048576
             slow_rule_budget = 1048576
+            allow_redirects = true
 
             [[lists]]
             path = "/etc/picoguard/mine.txt"
@@ -939,6 +944,8 @@ mod tests {
         assert_eq!(config.lists[0].format, ListFormat::Hosts);
         assert_eq!(config.lists[1].format, ListFormat::Auto);
         assert_eq!(config.lists[0].slow_rule_budget, 1_048_576);
+        assert!(config.lists[0].allow_redirects);
+        assert!(!config.lists[1].allow_redirects);
         assert_eq!(config.lists[1].refresh_hours, 24);
         assert_eq!(config.stats.query_log_entries, 200);
         assert_eq!(config.stats.top_k, 20);

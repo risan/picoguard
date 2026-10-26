@@ -245,6 +245,9 @@ pub struct Parser {
     first_line: bool,
     max_rules: usize,
     emitted: usize,
+    /// False turns a host rule's answer IP into the null address unless it already is a null
+    /// route, so a list can block names but not point them somewhere.
+    allow_redirects: bool,
     counters: Counters,
     rpz: RpzReader,
 }
@@ -260,6 +263,7 @@ impl Parser {
             first_line: true,
             max_rules,
             emitted: 0,
+            allow_redirects: true,
             counters: Counters::default(),
             rpz: RpzReader::new(),
         }
@@ -412,7 +416,21 @@ impl Parser {
         *counter += 1;
     }
 
+    /// Keeps the answer IPs of host rules only when `allow` is true, or when the IP is one of
+    /// the null routes (`0.0.0.0`, `::`, `127.0.0.1`, `::1`); any other IP becomes `0.0.0.0`.
+    pub fn allow_redirects(mut self, allow: bool) -> Parser {
+        self.allow_redirects = allow;
+
+        self
+    }
+
     fn emit_host<F: FnMut(Rule<'_>)>(&mut self, ip: IpAddr, name: &str, sink: &mut F) {
+        let ip = if self.allow_redirects || is_null_route(ip) {
+            ip
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        };
+
         if name.chars().any(char::is_uppercase) {
             self.counters.unmatchable_hosts += 1;
         } else if self.emit(Rule::Host { ip, name }, sink) {
@@ -772,6 +790,16 @@ pub(crate) fn fast_rule(line: &str) -> Option<(FastKind, &str)> {
     };
 
     Some((kind, name))
+}
+
+fn is_null_route(ip: IpAddr) -> bool {
+    [
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ]
+    .contains(&ip)
 }
 
 /// urlfilter's `NewHostRule`, including its inline comment handling: the text is cut one
@@ -1534,6 +1562,53 @@ mod tests {
         assert_eq!(counters.headers, 1);
         assert_eq!(counters.cosmetic, 6);
         assert_eq!(counters.block_sub, 1);
+    }
+
+    #[test]
+    fn host_rules_keep_their_ip_unless_redirects_are_not_allowed() {
+        let text = "1.2.3.4 a.example\n0.0.0.0 b.example\n127.0.0.1 c.example\n::1 d.example\n:: e.example\n2001:db8::1 f.example\n10.0.0.1 g.example h.example\n";
+        for format in [ListFormat::Adblock, ListFormat::Hosts] {
+            let described = |mut parser: Parser| {
+                let mut rules = Vec::new();
+                let mut sink = |rule: Rule<'_>| rules.push(describe(&rule));
+                parser.push(text.as_bytes(), &mut sink);
+                parser.finish(&mut sink);
+
+                rules
+            };
+
+            let kept = described(Parser::new(format, usize::MAX));
+            let blocked = described(Parser::new(format, usize::MAX).allow_redirects(false));
+
+            assert_eq!(
+                kept,
+                [
+                    "host 1.2.3.4 a.example",
+                    "host 0.0.0.0 b.example",
+                    "host 127.0.0.1 c.example",
+                    "host ::1 d.example",
+                    "host :: e.example",
+                    "host 2001:db8::1 f.example",
+                    "host 10.0.0.1 g.example",
+                    "host 10.0.0.1 h.example",
+                ],
+                "{format:?}"
+            );
+            assert_eq!(
+                blocked,
+                [
+                    "host 0.0.0.0 a.example",
+                    "host 0.0.0.0 b.example",
+                    "host 127.0.0.1 c.example",
+                    "host ::1 d.example",
+                    "host :: e.example",
+                    "host 0.0.0.0 f.example",
+                    "host 0.0.0.0 g.example",
+                    "host 0.0.0.0 h.example",
+                ],
+                "{format:?}"
+            );
+        }
     }
 
     #[test]

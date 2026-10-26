@@ -163,7 +163,7 @@ async fn boot(config: &Config) -> (Scheduler, Arc<SnapshotStore>) {
     boot_with(config, SnapshotStore::open(&config.state.dir).unwrap()).await
 }
 
-fn blocked(policy: &Policy, name: &str) -> bool {
+fn decision(policy: &Policy, name: &str) -> Decision {
     let mut message = Message::query();
     message.add_query(DnsQuery::query(
         Name::from_ascii(name).unwrap(),
@@ -172,7 +172,18 @@ fn blocked(policy: &Policy, name: &str) -> bool {
     let packet = message.to_vec().unwrap();
     let query = Query::parse(&packet).unwrap();
 
-    policy.view(Instant::now()).check_request(&query) != Decision::Pass
+    policy.view(Instant::now()).check_request(&query)
+}
+
+fn blocked(policy: &Policy, name: &str) -> bool {
+    decision(policy, name) != Decision::Pass
+}
+
+fn answer_ips(policy: &Policy, name: &str) -> Vec<std::net::IpAddr> {
+    match decision(policy, name) {
+        Decision::Block { ips } => ips,
+        Decision::Pass => panic!("{name} is not blocked"),
+    }
 }
 
 fn generation(policy: &Policy) -> u64 {
@@ -416,7 +427,10 @@ async fn a_hosts_list_with_too_many_answer_ips_keeps_the_last_good_list() {
     server.serve("/hosts.txt", &hosts_with_ips(1024), Some("\"h1\""));
     let config = config_of(
         &dir,
-        vec![url_list("hosts-groups", server.url("/hosts.txt"))],
+        vec![ListConfig {
+            allow_redirects: true,
+            ..url_list("hosts-groups", server.url("/hosts.txt"))
+        }],
     );
     let (mut scheduler, _) = boot(&config).await;
     scheduler.refresh(0, &downloader()).await;
@@ -470,6 +484,41 @@ async fn a_refresh_over_max_rules_keeps_the_last_good_list_and_shows_the_error()
     assert!(!blocked(&policy, "tracker.example."));
     assert_eq!(generation(&policy), generation_before);
     assert_eq!(warnings_about("capped"), 1);
+}
+
+#[tokio::test]
+async fn a_downloaded_hosts_list_blocks_but_does_not_redirect_unless_the_list_allows_it() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    let hosts = "1.2.3.4 bank.example\n127.0.0.1 local.example\n";
+    server.serve("/plain.txt", hosts, None);
+    server.serve("/allowed.txt", hosts.replace("bank", "shop").as_str(), None);
+    fs::write(dir.file("local.txt"), hosts.replace("bank", "nas")).unwrap();
+    let hosts_list = |list: ListConfig| ListConfig {
+        format: ListFormat::Hosts,
+        ..list
+    };
+    let config = config_of(
+        &dir,
+        vec![
+            hosts_list(url_list("plain", server.url("/plain.txt"))),
+            hosts_list(ListConfig {
+                allow_redirects: true,
+                ..url_list("allowed", server.url("/allowed.txt"))
+            }),
+            hosts_list(path_list(dir.file("local.txt"))),
+        ],
+    );
+    let (mut scheduler, _) = boot(&config).await;
+    scheduler.refresh(0, &downloader()).await;
+    scheduler.refresh(1, &downloader()).await;
+    let policy = scheduler.policy();
+
+    let ip = |text: &str| -> Vec<std::net::IpAddr> { vec![text.parse().unwrap()] };
+    assert_eq!(answer_ips(&policy, "bank.example."), ip("0.0.0.0"));
+    assert_eq!(answer_ips(&policy, "local.example."), ip("127.0.0.1"));
+    assert_eq!(answer_ips(&policy, "shop.example."), ip("1.2.3.4"));
+    assert_eq!(answer_ips(&policy, "nas.example."), ip("1.2.3.4"));
 }
 
 #[tokio::test]
@@ -852,6 +901,7 @@ async fn age_snapshot(config: &Config, version: u32) {
         snapshot.meta.configured_format,
         snapshot.meta.effective_format,
         snapshot.meta.max_rules,
+        snapshot.meta.allow_redirects,
         version,
     );
     store.save(snapshot).await.unwrap();

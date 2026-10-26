@@ -644,6 +644,7 @@ impl Entry {
             source,
             key,
             options: CompileOptions {
+                allow_redirects: list.allow_redirects || list.url.is_none(),
                 slow_rule_budget: list.slow_rule_budget,
                 ..CompileOptions::new(list.format, list.max_rules)
             },

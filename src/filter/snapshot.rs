@@ -9,7 +9,7 @@
 //! ```text
 //! magic[8] file_version u32
 //! body: fingerprint u128, content_hash u128, compiler_version u32, configured_format u8,
-//!       effective_format u8, max_rules u32, source, etag?, last_modified?,
+//!       effective_format u8, max_rules u32, allow_redirects u8, source, etag?, last_modified?,
 //!       counters (u64 each), first_invalid?, regex_failed u64,
 //!       6 plain-rule arrays (u64 length, u64 hashes),
 //!       host groups (u32 count; IP text, u64 length, u64 hashes),
@@ -38,7 +38,7 @@ use super::engine::{CompiledList, FAST_KINDS, HostRules, SlowRule};
 use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
 use crate::lists::Validators;
 
-pub const FILE_VERSION: u32 = 3;
+pub const FILE_VERSION: u32 = 4;
 
 const MAGIC: [u8; 8] = *b"PICOSNAP";
 const PREAMBLE_BYTES: u64 = 12;
@@ -127,6 +127,7 @@ pub struct Meta {
     pub configured_format: ListFormat,
     pub effective_format: ListFormat,
     pub max_rules: u32,
+    pub allow_redirects: bool,
     /// URL or path of the list.
     pub source: String,
     pub validators: Validators,
@@ -140,19 +141,22 @@ pub struct Snapshot {
 }
 
 /// The fingerprint of plan D14: source content, effective format, per-list options
-/// (configured format and rule cap) and the compiler version.
+/// (configured format, rule cap and whether host rules may redirect) and the compiler
+/// version.
 pub fn fingerprint(
     content_hash: u128,
     configured_format: ListFormat,
     effective_format: ListFormat,
     max_rules: u32,
+    allow_redirects: bool,
     compiler_version: u32,
 ) -> u128 {
-    let mut parts = Vec::with_capacity(26);
+    let mut parts = Vec::with_capacity(27);
     parts.extend_from_slice(&content_hash.to_le_bytes());
     parts.push(format_code(configured_format));
     parts.push(format_code(effective_format));
     parts.extend_from_slice(&max_rules.to_le_bytes());
+    parts.push(u8::from(allow_redirects));
     parts.extend_from_slice(&compiler_version.to_le_bytes());
 
     xxh3_128(&parts)
@@ -198,6 +202,7 @@ impl Snapshot {
                 configured_format: options.format,
                 effective_format: compiled.summary.format,
                 max_rules: options.max_rules,
+                allow_redirects: options.allow_redirects,
                 source: source.to_string(),
                 validators,
             },
@@ -212,6 +217,7 @@ impl Snapshot {
         self.meta.source == source
             && self.meta.configured_format == options.format
             && self.meta.max_rules == options.max_rules
+            && self.meta.allow_redirects == options.allow_redirects
     }
 }
 
@@ -420,6 +426,7 @@ fn encode<W: Write>(snapshot: &Snapshot, mut out: W) -> io::Result<()> {
     encoder.u8(format_code(meta.configured_format))?;
     encoder.u8(format_code(meta.effective_format))?;
     encoder.u32(meta.max_rules)?;
+    encoder.u8(u8::from(meta.allow_redirects))?;
     encoder.text(&meta.source)?;
     encoder.optional_text(&meta.validators.etag)?;
     encoder.optional_text(&meta.validators.last_modified)?;
@@ -718,6 +725,11 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
     let configured_format = format_from_code(decoder.u8()?)?;
     let effective_format = format_from_code(decoder.u8()?)?;
     let meta_max_rules = decoder.u32()?;
+    let meta_allow_redirects = match decoder.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(SnapshotError::Corrupt("bad redirect flag")),
+    };
     let source = decoder.text(MAX_TEXT_BYTES, "source")?;
     let etag = decoder.optional_text("ETag")?;
     let last_modified = decoder.optional_text("Last-Modified")?;
@@ -781,6 +793,7 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         configured_format,
         effective_format,
         meta_max_rules,
+        meta_allow_redirects,
         compiler_version,
     );
     if stored_fingerprint != expected {
@@ -795,6 +808,7 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
             configured_format,
             effective_format,
             max_rules: meta_max_rules,
+            allow_redirects: meta_allow_redirects,
             source,
             validators: Validators {
                 etag,
@@ -2335,29 +2349,58 @@ ads.*.tracker
         assert_eq!(a.extension().unwrap(), "pgs");
     }
 
+    #[tokio::test]
+    async fn a_snapshot_fits_only_the_redirect_setting_it_was_made_with() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let store = SnapshotStore::open(state.path()).unwrap();
+        let blocking = CompileOptions {
+            allow_redirects: false,
+            ..options(ListFormat::Hosts)
+        };
+        let compiled = compile(&worker, "1.2.3.4 bank.example\n", blocking).await;
+        let snapshot = Snapshot::new(&compiled, &blocking, SOURCE, Validators::default());
+        store.save(clone_of(&snapshot)).await.unwrap();
+        store.flush().await;
+
+        let loaded = load(&store.path_for(SOURCE).unwrap(), &blocking).unwrap();
+
+        assert!(!loaded.meta.allow_redirects);
+        assert!(loaded.fits(SOURCE, &blocking));
+        let allowing = CompileOptions {
+            allow_redirects: true,
+            ..blocking
+        };
+        assert!(!loaded.fits(SOURCE, &allowing));
+    }
+
     #[test]
     fn the_fingerprint_depends_on_every_part() {
-        let base = fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, 1);
+        let base = fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, false, 1);
         let all: HashMap<&str, u128> = HashMap::from([
             (
                 "content",
-                fingerprint(2, ListFormat::Auto, ListFormat::Adblock, 10, 1),
+                fingerprint(2, ListFormat::Auto, ListFormat::Adblock, 10, false, 1),
             ),
             (
                 "configured",
-                fingerprint(1, ListFormat::Hosts, ListFormat::Adblock, 10, 1),
+                fingerprint(1, ListFormat::Hosts, ListFormat::Adblock, 10, false, 1),
             ),
             (
                 "effective",
-                fingerprint(1, ListFormat::Auto, ListFormat::Hosts, 10, 1),
+                fingerprint(1, ListFormat::Auto, ListFormat::Hosts, 10, false, 1),
             ),
             (
                 "cap",
-                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 11, 1),
+                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 11, false, 1),
+            ),
+            (
+                "redirects",
+                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, true, 1),
             ),
             (
                 "compiler",
-                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, 2),
+                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, false, 2),
             ),
         ]);
 
@@ -2367,7 +2410,7 @@ ads.*.tracker
 
         assert_eq!(
             base,
-            fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, 1)
+            fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, false, 1)
         );
     }
 }

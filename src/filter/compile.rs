@@ -19,18 +19,21 @@ use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 /// Bump on every change to compiled output (what any list text compiles to, in the parser,
 /// the compiler or the snapshot encoding), however small: snapshots written by an older
 /// compiler are then ignored and the lists compile again (plan D14).
-pub const COMPILER_VERSION: u32 = 7;
+pub const COMPILER_VERSION: u32 = 8;
 
 /// Default memory budget of the slow rules of one list. Plan section 5 leaves about 8 MB
 /// between the steady total (20 MB) and the refresh peak (28 MB). The real lists are far
 /// below it: the AdGuard DNS filter, with 878 slow rules and 22 regexes, is estimated at 1 MB.
 pub const DEFAULT_SLOW_RULE_BUDGET: usize = 8 * 1024 * 1024;
 
-/// The per-list settings that change the compiled result (the first two) or limit it.
+/// The per-list settings that change the compiled result (the first three) or limit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompileOptions {
     pub format: ListFormat,
     pub max_rules: u32,
+    /// False answers every host rule whose IP is not a null route with `0.0.0.0`, so the
+    /// list can block names but not point them at another address.
+    pub allow_redirects: bool,
     /// Bytes the slow rules and regexes of the list may cost, as `SlowRuleBudget` estimates.
     /// A list over it fails to compile or to load; it never changes what a list means, so
     /// it is not part of the fingerprint.
@@ -42,6 +45,7 @@ impl CompileOptions {
         CompileOptions {
             format,
             max_rules,
+            allow_redirects: true,
             slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
         }
     }
@@ -276,7 +280,8 @@ fn compile(
     mut pieces: mpsc::Receiver<Piece>,
 ) -> Result<Compiled, CompileError> {
     let mut builder = ListBuilder::new();
-    let mut parser = Parser::new(options.format, options.max_rules as usize);
+    let mut parser = Parser::new(options.format, options.max_rules as usize)
+        .allow_redirects(options.allow_redirects);
     let mut hasher = Xxh3::new();
     let mut budget = SlowRuleBudget::new(options.slow_rule_budget);
     let mut seen_slow_rules = HashSet::new();
@@ -352,6 +357,7 @@ fn compile(
             options.format,
             summary.format,
             options.max_rules,
+            options.allow_redirects,
             COMPILER_VERSION,
         ),
         content_hash,
@@ -374,6 +380,7 @@ mod tests {
         CompileOptions {
             format,
             max_rules: 1000,
+            allow_redirects: true,
             slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
         }
     }
@@ -560,6 +567,34 @@ mod tests {
             slow_rule_cost_of(&format!("|r1{}\n", "*^".repeat(2020)))
                 >= 4040 * crate::filter::pattern::GLOB_TOKEN_BYTES
         );
+    }
+
+    #[tokio::test]
+    async fn a_list_that_may_not_redirect_blocks_every_host_ip_like_the_null_address() {
+        let worker = CompileWorker::spawn().unwrap();
+        let text = b"1.2.3.4 bank.example\n127.0.0.1 local.example\n";
+        let may_not = CompileOptions {
+            allow_redirects: false,
+            ..options(ListFormat::Hosts)
+        };
+        let ips_of = |compiled: &Compiled, name: &str| {
+            let engine = Engine::new(vec![Arc::clone(&compiled.list)], Vec::new());
+
+            engine.check(name, TYPE_A, false)
+        };
+
+        let kept = compile_in_pieces(&worker, options(ListFormat::Hosts), text, 64)
+            .await
+            .unwrap();
+        let blocked_only = compile_in_pieces(&worker, may_not, text, 64).await.unwrap();
+
+        let ip = |text: &str| Decision::Block {
+            ips: vec![text.parse().unwrap()],
+        };
+        assert_eq!(ips_of(&kept, "bank.example"), ip("1.2.3.4"));
+        assert_eq!(ips_of(&blocked_only, "bank.example"), ip("0.0.0.0"));
+        assert_eq!(ips_of(&blocked_only, "local.example"), ip("127.0.0.1"));
+        assert_ne!(kept.fingerprint, blocked_only.fingerprint);
     }
 
     #[tokio::test]
