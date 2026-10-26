@@ -827,25 +827,26 @@ fn empty_dir(dir: &Path) -> io::Result<()> {
         return Err(io::Error::other("not a directory"));
     }
 
-    match fs::remove_file(dir.join("request")) {
-        Ok(()) => {}
-
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-
-        Err(error) => return Err(error),
-    }
+    remove_entry(&dir.join("request"))?;
 
     for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-
-        if fs::symlink_metadata(&path)?.is_dir() {
-            fs::remove_dir_all(&path)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
+        remove_entry(&entry?.path())?;
     }
 
     Ok(())
+}
+
+/// A file, a link (never followed) or a directory with what is in it; nothing there is fine.
+fn remove_entry(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+
+        Ok(_) => fs::remove_file(path),
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -893,6 +894,15 @@ mod tests {
         fs::create_dir(staging.join("sub")).unwrap();
         fs::write(staging.join("sub/inner"), b"x").unwrap();
         symlink(&outside, staging.join("link")).unwrap();
+
+        empty_dir(&staging).unwrap();
+
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        assert_eq!(fs::read(outside.join("file")).unwrap(), b"kept");
+
+        fs::create_dir(staging.join("request")).unwrap();
+        fs::write(staging.join("request/inner"), b"x").unwrap();
+        symlink(&outside, staging.join("sub")).unwrap();
 
         empty_dir(&staging).unwrap();
 

@@ -140,21 +140,22 @@ pub fn expected_hash(sums: &[u8], target: &str) -> Result<[u8; 32], SumsError> {
         .ok_or(SumsError::Malformed)
 }
 
-/// `None` for a line that is not about `name`; `Some(None)` for one whose hash is not hex.
+/// `None` for a line that is not about `name`; `Some(None)` for one whose hash is not 64 hex
+/// digits. The name is found first, so a hash of another length cannot hide a line.
 fn hash_of_line(line: &[u8], name: &[u8]) -> Option<Option<[u8; 32]>> {
-    let (hex, rest) = line.split_at_checked(64)?;
-    let rest = rest
-        .strip_prefix(b"  ")
-        .or_else(|| rest.strip_prefix(b" *"))?;
-
-    if rest != name {
-        return None;
-    }
+    let before = line.strip_suffix(name)?;
+    let hex = before
+        .strip_suffix(b"  ")
+        .or_else(|| before.strip_suffix(b" *"))?;
 
     Some(decode_hash(hex))
 }
 
 fn decode_hash(hex: &[u8]) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+
     let mut hash = [0u8; 32];
     let (pairs, _) = hex.as_chunks::<2>();
 
@@ -576,7 +577,16 @@ fn run_version(binary: &Path, version: &str) -> Result<(), String> {
     let too_slow = || "picoguard --version did not finish within 10 seconds".to_string();
     let mut child = spawn_version(binary)?;
     let deadline = Instant::now() + VERSION_RUN_LIMIT;
-    let output = read_output(child.stdout.take());
+    let output = match read_output(child.stdout.take()) {
+        Ok(output) => output,
+
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+
+            return Err(format!("picoguard --version: {error}"));
+        }
+    };
 
     let status = loop {
         match child.try_wait() {
@@ -609,23 +619,27 @@ fn run_version(binary: &Path, version: &str) -> Result<(), String> {
 
 /// Reads at most `VERSION_OUTPUT_BYTES` and one more from the child's output on a thread of
 /// its own, so that waiting for it can have a deadline.
-fn read_output(stdout: Option<std::process::ChildStdout>) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+fn read_output(
+    stdout: Option<std::process::ChildStdout>,
+) -> io::Result<mpsc::Receiver<io::Result<Vec<u8>>>> {
     let (sender, receiver) = mpsc::channel();
 
-    std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let read = match stdout {
-            Some(stdout) => stdout
-                .take(VERSION_OUTPUT_BYTES + 1)
-                .read_to_end(&mut output)
-                .map(|_| ()),
-            None => Ok(()),
-        };
+    std::thread::Builder::new()
+        .name("picoguard-version".to_string())
+        .spawn(move || {
+            let mut output = Vec::new();
+            let read = match stdout {
+                Some(stdout) => stdout
+                    .take(VERSION_OUTPUT_BYTES + 1)
+                    .read_to_end(&mut output)
+                    .map(|_| ()),
+                None => Ok(()),
+            };
 
-        let _ = sender.send(read.map(|()| output));
-    });
+            let _ = sender.send(read.map(|()| output));
+        })?;
 
-    receiver
+    Ok(receiver)
 }
 
 fn spawn_version(binary: &Path) -> Result<std::process::Child, String> {
@@ -739,10 +753,27 @@ mod tests {
             ),
             Err(SumsError::Ambiguous)
         );
-        assert_eq!(
-            expected_hash(format!("{}  {asset}\n", &hex(1)[1..]).as_bytes(), TARGET),
-            Err(SumsError::NoBinary)
-        );
+        let good = format!("{}  {asset}\n", hex(1));
+        for bad in [
+            hex(1)[1..].to_string(),
+            format!("{}0", hex(1)),
+            String::new(),
+        ] {
+            let bad = format!("{bad}  {asset}\n");
+
+            assert_eq!(
+                expected_hash(bad.as_bytes(), TARGET),
+                Err(SumsError::Malformed)
+            );
+            assert_eq!(
+                expected_hash(format!("{good}{bad}").as_bytes(), TARGET),
+                Err(SumsError::Ambiguous)
+            );
+            assert_eq!(
+                expected_hash(format!("{bad}{good}").as_bytes(), TARGET),
+                Err(SumsError::Ambiguous)
+            );
+        }
         assert_eq!(
             expected_hash(format!("{}  {asset}x\n", hex(1)).as_bytes(), TARGET),
             Err(SumsError::NoBinary)
