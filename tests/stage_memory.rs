@@ -8,8 +8,8 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use common::release::{Files, REQUEST_ID, TARGET, hex, scratch, sign, test_key};
@@ -28,6 +28,10 @@ const SHORT_RUNS: usize = 60;
 const LONG_RUNS: usize = 8;
 
 struct CountingAllocator;
+
+/// The counters are the process's, so the tests take turns: each holds this while it prepares
+/// and measures.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -125,6 +129,7 @@ async fn stage_once(stager: &Arc<Stager>, root: &std::path::Path) -> (usize, usi
 
 #[test]
 fn staging_peaks_below_a_megabyte_whatever_the_size_and_keeps_nothing() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -197,6 +202,7 @@ fn staging_peaks_below_a_megabyte_whatever_the_size_and_keeps_nothing() {
 
 #[test]
 fn verifying_an_update_peaks_below_a_megabyte() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let root = scratch("verify-memory");
     let script = b"#!/bin/sh\necho \"picoguard 9.9.9\"\nexit 0\n";
     let mut binary = script.to_vec();

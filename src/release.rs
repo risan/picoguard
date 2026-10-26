@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use ring::digest;
@@ -113,10 +114,13 @@ pub fn verify_sums(sums: &[u8], signature: &[u8], key: &[u8; 32]) -> bool {
 pub enum SumsError {
     NoBinary,
     Ambiguous,
+    /// A line for this asset whose hash is not 64 hex digits.
+    Malformed,
 }
 
-/// The hash `SHA256SUMS` gives for this target's binary. A line is 64 hex digits, two
-/// spaces or a space and `*`, and the name; lines for other names are not looked at.
+/// The hash `SHA256SUMS` gives for this target's binary. A line is 64 characters, two
+/// spaces or a space and `*`, and the name; lines for other names are not looked at, but
+/// every line for this name counts, whether or not its hash is well formed.
 pub fn expected_hash(sums: &[u8], target: &str) -> Result<[u8; 32], SumsError> {
     let name = asset(target);
     let mut found = None;
@@ -131,10 +135,13 @@ pub fn expected_hash(sums: &[u8], target: &str) -> Result<[u8; 32], SumsError> {
         }
     }
 
-    found.ok_or(SumsError::NoBinary)
+    found
+        .ok_or(SumsError::NoBinary)?
+        .ok_or(SumsError::Malformed)
 }
 
-fn hash_of_line(line: &[u8], name: &[u8]) -> Option<[u8; 32]> {
+/// `None` for a line that is not about `name`; `Some(None)` for one whose hash is not hex.
+fn hash_of_line(line: &[u8], name: &[u8]) -> Option<Option<[u8; 32]>> {
     let (hex, rest) = line.split_at_checked(64)?;
     let rest = rest
         .strip_prefix(b"  ")
@@ -144,8 +151,11 @@ fn hash_of_line(line: &[u8], name: &[u8]) -> Option<[u8; 32]> {
         return None;
     }
 
-    let mut hash = [0u8; 32];
+    Some(decode_hash(hex))
+}
 
+fn decode_hash(hex: &[u8]) -> Option<[u8; 32]> {
+    let mut hash = [0u8; 32];
     let (pairs, _) = hex.as_chunks::<2>();
 
     for (byte, [high, low]) in hash.iter_mut().zip(pairs) {
@@ -516,6 +526,7 @@ fn copy_and_check(
     let expected = expected_hash(&sums, target).map_err(|error| match error {
         SumsError::NoBinary => format!("the release has no binary for {target}"),
         SumsError::Ambiguous => format!("SHA256SUMS lists {} more than once", asset(target)),
+        SumsError::Malformed => format!("SHA256SUMS has a bad hash for {}", asset(target)),
     })?;
 
     if binary_hash.as_ref() != expected {
@@ -559,10 +570,13 @@ fn copy_binary(from: &Path, to: &Path) -> Result<digest::Digest, String> {
 }
 
 /// The copy must print its own version: a genuine release of another version, signed and
-/// served under a newer tag, fails here.
+/// served under a newer tag, fails here. One deadline covers the run and the reading of its
+/// output, so a child that left a process holding its output open cannot stall the check.
 fn run_version(binary: &Path, version: &str) -> Result<(), String> {
+    let too_slow = || "picoguard --version did not finish within 10 seconds".to_string();
     let mut child = spawn_version(binary)?;
     let deadline = Instant::now() + VERSION_RUN_LIMIT;
+    let output = read_output(child.stdout.take());
 
     let status = loop {
         match child.try_wait() {
@@ -574,27 +588,44 @@ fn run_version(binary: &Path, version: &str) -> Result<(), String> {
                 let _ = child.kill();
                 let _ = child.wait();
 
-                return Err("picoguard --version did not finish within 10 seconds".to_string());
+                return Err(too_slow());
             }
 
             Err(error) => return Err(format!("picoguard --version: {error}")),
         }
     };
 
-    let mut output = Vec::new();
-
-    if let Some(stdout) = child.stdout.take() {
-        stdout
-            .take(VERSION_OUTPUT_BYTES + 1)
-            .read_to_end(&mut output)
-            .map_err(|error| format!("picoguard --version: {error}"))?;
-    }
+    let output = output
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| too_slow())?
+        .map_err(|error| format!("picoguard --version: {error}"))?;
 
     if status.success() && output == format!("picoguard {version}\n").as_bytes() {
         return Ok(());
     }
 
     Err("picoguard --version printed another version or failed".to_string())
+}
+
+/// Reads at most `VERSION_OUTPUT_BYTES` and one more from the child's output on a thread of
+/// its own, so that waiting for it can have a deadline.
+fn read_output(stdout: Option<std::process::ChildStdout>) -> mpsc::Receiver<io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let read = match stdout {
+            Some(stdout) => stdout
+                .take(VERSION_OUTPUT_BYTES + 1)
+                .read_to_end(&mut output)
+                .map(|_| ()),
+            None => Ok(()),
+        };
+
+        let _ = sender.send(read.map(|()| output));
+    });
+
+    receiver
 }
 
 fn spawn_version(binary: &Path) -> Result<std::process::Child, String> {
@@ -715,6 +746,25 @@ mod tests {
         assert_eq!(
             expected_hash(format!("{}  {asset}x\n", hex(1)).as_bytes(), TARGET),
             Err(SumsError::NoBinary)
+        );
+        let not_hex = "g".repeat(64);
+        assert_eq!(
+            expected_hash(format!("{not_hex}  {asset}\n").as_bytes(), TARGET),
+            Err(SumsError::Malformed)
+        );
+        assert_eq!(
+            expected_hash(
+                format!("{}  {asset}\n{not_hex} *{asset}\n", hex(1)).as_bytes(),
+                TARGET
+            ),
+            Err(SumsError::Ambiguous)
+        );
+        assert_eq!(
+            expected_hash(
+                format!("{not_hex}  other\n{}  {asset}\n", hex(1)).as_bytes(),
+                TARGET
+            ),
+            Ok([1; 32])
         );
     }
 

@@ -145,6 +145,7 @@ enum StageError {
     Signature,
     NoBinary(&'static str),
     Ambiguous(&'static str),
+    BadHash(&'static str),
     Status { file: &'static str, status: u16 },
     Network(&'static str),
     Invalid(&'static str),
@@ -171,6 +172,9 @@ impl fmt::Display for StageError {
                     "SHA256SUMS lists {} more than once",
                     asset(target)
                 )
+            }
+            StageError::BadHash(target) => {
+                write!(formatter, "SHA256SUMS has a bad hash for {}", asset(target))
             }
             StageError::Status { file, status } => {
                 write!(formatter, "{file}: HTTP status {status}")
@@ -437,19 +441,29 @@ impl Stager {
     }
 
     fn wait_in_background(self: &Arc<Self>, request: Request, written: SystemTime) {
+        let version = request.version.clone();
+
         self.show(
             &request.id,
             Install::Waiting {
-                version: request.version.clone(),
+                version: version.clone(),
             },
         );
         let stager = Arc::clone(self);
+        let waiting = request.clone();
         let spawned = std::thread::Builder::new()
             .name("picoguard-update".to_string())
-            .spawn(move || stager.wait_for_installer(&request, written));
+            .spawn(move || stager.wait_for_installer(&waiting, written));
 
         if let Err(error) = spawned {
             log::warn!("cannot wait for the installer: {error}");
+            self.clear_and_show(
+                &request,
+                Install::Failed {
+                    version,
+                    reason: format!("cannot wait for the installer: {}", error.kind()),
+                },
+            );
         }
     }
 
@@ -529,6 +543,7 @@ impl Stager {
         let expected = expected_hash(&sums, target).map_err(|error| match error {
             SumsError::NoBinary => StageError::NoBinary(target),
             SumsError::Ambiguous => StageError::Ambiguous(target),
+            SumsError::Malformed => StageError::BadHash(target),
         })?;
 
         self.set(
@@ -804,9 +819,21 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Removes everything in `dir`, the request first so the installer never sees a request
-/// without its files. Links are removed, never followed.
+/// without its files; when the request cannot be removed nothing else is. Links are removed,
+/// never followed, and `dir` itself must be a real directory: a link in its place is refused,
+/// so cleaning up can never reach outside the staging directory.
 fn empty_dir(dir: &Path) -> io::Result<()> {
-    let _ = fs::remove_file(dir.join("request"));
+    if !fs::symlink_metadata(dir)?.is_dir() {
+        return Err(io::Error::other("not a directory"));
+    }
+
+    match fs::remove_file(dir.join("request")) {
+        Ok(()) => {}
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+
+        Err(error) => return Err(error),
+    }
 
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
@@ -823,9 +850,57 @@ fn empty_dir(dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
     use std::time::SystemTime;
 
     use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("picoguard-stage-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        dir
+    }
+
+    #[test]
+    fn cleaning_never_follows_a_link_in_place_of_the_directory() {
+        let root = scratch_dir("link");
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("request"), b"kept").unwrap();
+        fs::write(outside.join("other"), b"kept").unwrap();
+        symlink(&outside, root.join("update")).unwrap();
+
+        assert!(empty_dir(&root.join("update")).is_err());
+        assert_eq!(fs::read(outside.join("request")).unwrap(), b"kept");
+        assert_eq!(fs::read(outside.join("other")).unwrap(), b"kept");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cleaning_empties_a_real_directory_and_leaves_links_unfollowed() {
+        let root = scratch_dir("real");
+        let outside = root.join("outside");
+        let staging = root.join("update");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file"), b"kept").unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("request"), b"x").unwrap();
+        fs::write(staging.join("picoguard.part"), b"x").unwrap();
+        fs::create_dir(staging.join("sub")).unwrap();
+        fs::write(staging.join("sub/inner"), b"x").unwrap();
+        symlink(&outside, staging.join("link")).unwrap();
+
+        empty_dir(&staging).unwrap();
+
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        assert_eq!(fs::read(outside.join("file")).unwrap(), b"kept");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn the_wait_left_never_underflows() {

@@ -249,6 +249,8 @@ struct SiteKind {
     build: Build,
     /// Whether the installer directory exists.
     installer: bool,
+    /// Whether this is one of the three release targets.
+    release_target: bool,
 }
 
 static SITES: AtomicUsize = AtomicUsize::new(0);
@@ -281,6 +283,7 @@ async fn site(config: Config) -> Site {
         SiteKind {
             build: Build::current(),
             installer: true,
+            release_target: true,
         },
     )
     .await
@@ -294,6 +297,7 @@ async fn full_site(config: Config) -> Site {
         SiteKind {
             build: Build::Release,
             installer: true,
+            release_target: true,
         },
     )
     .await;
@@ -329,7 +333,7 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
     serve_release(&release, &Files::good(OFFERED, &release_binary()));
     let stager = Stager::new(
         StageSetup {
-            target: Some(TARGET),
+            target: kind.release_target.then_some(TARGET),
             base_url: release.url("/download"),
             state_dir: root.join("state"),
             installer_dir: root.join("installer"),
@@ -1396,6 +1400,7 @@ async fn update_site(kind: SiteKind) -> (Site, common::harness::FakeUpstream) {
 const RELEASE: SiteKind = SiteKind {
     build: Build::Release,
     installer: true,
+    release_target: true,
 };
 
 #[tokio::test]
@@ -1448,6 +1453,7 @@ async fn an_update_that_cannot_be_installed_from_the_page_answers_409() {
             SiteKind {
                 build: Build::Source,
                 installer: true,
+                release_target: true,
             },
         ),
         (
@@ -1455,6 +1461,7 @@ async fn an_update_that_cannot_be_installed_from_the_page_answers_409() {
             SiteKind {
                 build: Build::Docker,
                 installer: true,
+                release_target: true,
             },
         ),
         (
@@ -1462,6 +1469,15 @@ async fn an_update_that_cannot_be_installed_from_the_page_answers_409() {
             SiteKind {
                 build: Build::Release,
                 installer: false,
+                release_target: true,
+            },
+        ),
+        (
+            "a target without a release",
+            SiteKind {
+                build: Build::Release,
+                installer: true,
+                release_target: false,
             },
         ),
     ] {
@@ -1506,6 +1522,7 @@ async fn can_install_follows_every_condition() {
             SiteKind {
                 build: Build::Source,
                 installer: true,
+                release_target: true,
             },
         ),
         (
@@ -1513,6 +1530,15 @@ async fn can_install_follows_every_condition() {
             SiteKind {
                 build: Build::Release,
                 installer: false,
+                release_target: true,
+            },
+        ),
+        (
+            "a target without a release",
+            SiteKind {
+                build: Build::Release,
+                installer: true,
+                release_target: false,
             },
         ),
     ] {

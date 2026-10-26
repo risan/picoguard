@@ -253,6 +253,25 @@ fn each_bad_update_is_refused_and_leaves_nothing() {
 }
 
 #[test]
+fn a_process_that_keeps_the_output_open_cannot_outlast_the_limit() {
+    let root = scratch("verify-descendant");
+    let binary = format!("#!/bin/sh\necho \"picoguard {OFFERED}\"\nsleep 30 &\nexit 0\n");
+    let staged = stage_dir(&root, OFFERED, binary.as_bytes(), |_| {});
+    let into = root.join("out");
+
+    let started = Instant::now();
+    let refusal = refused(verify_update(&staged, &into, &setup()));
+
+    assert!(
+        refusal.reason.contains("10 seconds"),
+        "{:?}",
+        refusal.reason
+    );
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert!(!into.exists());
+}
+
+#[test]
 fn an_existing_into_dir_is_left_alone() {
     let root = scratch("verify-existing");
     let staged = stage_dir(&root, OFFERED, &script(OFFERED), |_| {});
