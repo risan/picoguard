@@ -292,9 +292,9 @@ install -d -m 0750 -o picoguard -g picoguard /var/lib/picoguard
 install -m 0755 picoguard.openrc /etc/init.d/picoguard
 ```
 
-The `--check` command must print `OK`. The default config blocks ads, trackers and malware with HaGeZi
-Pro and HaGeZi Threat Intelligence mini, and forwards to Cloudflare and Quad9 over DoH. To change
-anything, read [configuration.md](configuration.md).
+The `--check` command must print `OK`. The default config blocks ads, trackers and malware with the
+AdGuard DNS filter, HaGeZi Pro and HaGeZi Threat Intelligence mini, and forwards to Cloudflare and
+Quad9 over DoH. To change anything, read [configuration.md](configuration.md).
 
 If your router is at `192.168.1.1`, open the config and uncomment the `[local]` section with
 `resolver = "192.168.1.1:53"`. Then names and addresses of devices on your network keep working.

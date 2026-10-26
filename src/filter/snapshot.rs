@@ -9,7 +9,7 @@
 //! ```text
 //! magic[8] file_version u32
 //! body: fingerprint u128, content_hash u128, compiler_version u32, configured_format u8,
-//!       effective_format u8, max_rules u32, source, etag?, last_modified?,
+//!       effective_format u8, max_rules u32, allow_redirects u8, source, etag?, last_modified?,
 //!       counters (u64 each), first_invalid?, regex_failed u64,
 //!       6 plain-rule arrays (u64 length, u64 hashes),
 //!       host groups (u32 count; IP text, u64 length, u64 hashes),
@@ -33,12 +33,14 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128};
 
-use super::compile::{COMPILER_VERSION, CompileOptions, Compiled, SlowRuleBudget};
-use super::engine::{CompiledList, FAST_KINDS, HostRules, SlowRule};
+use super::compile::{
+    COMPILER_VERSION, CompileOptions, Compiled, NAME_OVERHEAD_BYTES, SlowRuleBudget, TEXT_BYTE_COST,
+};
+use super::engine::{CompiledList, FAST_KINDS, HostRules, MAX_HOST_GROUPS, SlowRule};
 use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
 use crate::lists::Validators;
 
-pub const FILE_VERSION: u32 = 3;
+pub const FILE_VERSION: u32 = 4;
 
 const MAGIC: [u8; 8] = *b"PICOSNAP";
 const PREAMBLE_BYTES: u64 = 12;
@@ -117,6 +119,30 @@ impl From<io::Error> for SnapshotError {
     }
 }
 
+/// The most bytes a snapshot of a list under `options` can take: no valid file is larger, so
+/// a larger one is refused before a byte of it is read. The parts are the fixed fields (a
+/// source, two validators and one invalid line, each up to `MAX_TEXT_BYTES`), 8 bytes for
+/// each rule the cap allows, the host groups, and half the slow-rule budget (a slow rule is
+/// charged 512 bytes and 4 per text byte, and takes less than half of that in the file).
+pub fn max_file_bytes(options: &CompileOptions) -> u64 {
+    const FIXED_BYTES: u64 = 4 * (MAX_TEXT_BYTES as u64 + 5) + 1024;
+    const HOST_GROUP_FILE_BYTES: u64 = 4 + 64;
+
+    let parts = [
+        PREAMBLE_BYTES,
+        CHECKSUM_BYTES,
+        FIXED_BYTES,
+        u64::from(options.max_rules).saturating_mul(8),
+        (MAX_HOST_GROUPS as u64).saturating_mul(HOST_GROUP_FILE_BYTES),
+        (options.slow_rule_budget as u64) / 2,
+    ];
+
+    parts
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .unwrap_or(u64::MAX)
+}
+
 /// What a snapshot is keyed by, and what the next request needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Meta {
@@ -127,6 +153,7 @@ pub struct Meta {
     pub configured_format: ListFormat,
     pub effective_format: ListFormat,
     pub max_rules: u32,
+    pub allow_redirects: bool,
     /// URL or path of the list.
     pub source: String,
     pub validators: Validators,
@@ -140,19 +167,22 @@ pub struct Snapshot {
 }
 
 /// The fingerprint of plan D14: source content, effective format, per-list options
-/// (configured format and rule cap) and the compiler version.
+/// (configured format, rule cap and whether host rules may redirect) and the compiler
+/// version.
 pub fn fingerprint(
     content_hash: u128,
     configured_format: ListFormat,
     effective_format: ListFormat,
     max_rules: u32,
+    allow_redirects: bool,
     compiler_version: u32,
 ) -> u128 {
-    let mut parts = Vec::with_capacity(26);
+    let mut parts = Vec::with_capacity(27);
     parts.extend_from_slice(&content_hash.to_le_bytes());
     parts.push(format_code(configured_format));
     parts.push(format_code(effective_format));
     parts.extend_from_slice(&max_rules.to_le_bytes());
+    parts.push(u8::from(allow_redirects));
     parts.extend_from_slice(&compiler_version.to_le_bytes());
 
     xxh3_128(&parts)
@@ -198,6 +228,7 @@ impl Snapshot {
                 configured_format: options.format,
                 effective_format: compiled.summary.format,
                 max_rules: options.max_rules,
+                allow_redirects: options.allow_redirects,
                 source: source.to_string(),
                 validators,
             },
@@ -212,6 +243,7 @@ impl Snapshot {
         self.meta.source == source
             && self.meta.configured_format == options.format
             && self.meta.max_rules == options.max_rules
+            && self.meta.allow_redirects == options.allow_redirects
     }
 }
 
@@ -420,6 +452,7 @@ fn encode<W: Write>(snapshot: &Snapshot, mut out: W) -> io::Result<()> {
     encoder.u8(format_code(meta.configured_format))?;
     encoder.u8(format_code(meta.effective_format))?;
     encoder.u32(meta.max_rules)?;
+    encoder.u8(u8::from(meta.allow_redirects))?;
     encoder.text(&meta.source)?;
     encoder.optional_text(&meta.validators.etag)?;
     encoder.optional_text(&meta.validators.last_modified)?;
@@ -473,6 +506,9 @@ struct Decoder<R: Read> {
     /// Rules (plain, host names and slow rules) the list may still hold under its cap.
     rules_left: u64,
     slow_budget: SlowRuleBudget,
+    /// What the modifier names of the rule being decoded may still cost: each name is
+    /// charged before it is allocated, as `slow_rule_cost` charges it afterwards.
+    name_allowance: usize,
 }
 
 impl<R: Read> Decoder<R> {
@@ -524,6 +560,17 @@ impl<R: Read> Decoder<R> {
 
     fn text(&mut self, limit: usize, what: &'static str) -> Result<String, SnapshotError> {
         let length = self.u32()? as usize;
+
+        self.text_of(length, limit, what)
+    }
+
+    /// The text of a length that has been read already.
+    fn text_of(
+        &mut self,
+        length: usize,
+        limit: usize,
+        what: &'static str,
+    ) -> Result<String, SnapshotError> {
         if length > limit {
             return Err(SnapshotError::TooLarge(what));
         }
@@ -561,11 +608,25 @@ impl<R: Read> Decoder<R> {
         (0..count).map(|_| self.u16()).collect()
     }
 
-    fn texts(&mut self, what: &'static str) -> Result<Vec<String>, SnapshotError> {
+    /// Names of a modifier. Each is charged to `name_allowance` from its length, before the
+    /// text is read.
+    fn names(&mut self, what: &'static str) -> Result<Vec<String>, SnapshotError> {
         let count = self.small_count(what)?;
-        (0..count)
-            .map(|_| self.text(MAX_LINE_BYTES, what))
-            .collect()
+        let mut names = Vec::new();
+        for _ in 0..count {
+            let length = self.u32()? as usize;
+            let cost = length
+                .checked_add(NAME_OVERHEAD_BYTES)
+                .and_then(|bytes| bytes.checked_mul(TEXT_BYTE_COST))
+                .ok_or(SnapshotError::TooLarge(what))?;
+            self.name_allowance = self
+                .name_allowance
+                .checked_sub(cost)
+                .ok_or(SnapshotError::TooLarge(what))?;
+            names.push(self.text_of(length, MAX_LINE_BYTES, what)?);
+        }
+
+        Ok(names)
     }
 
     /// Takes `count` rules from the budget of the list's cap.
@@ -627,6 +688,7 @@ impl<R: Read> Decoder<R> {
     }
 
     fn rule(&mut self) -> Result<SlowRule, SnapshotError> {
+        self.name_allowance = self.slow_budget.remaining();
         let flags = self.u8()?;
         let restricted_types = self.u32()?;
         let rule = NetworkRule {
@@ -637,17 +699,19 @@ impl<R: Read> Decoder<R> {
             pattern: self.text(MAX_LINE_BYTES, "rule pattern")?,
             dns_permitted: self.u16s("record types")?,
             dns_restricted: self.u16s("record types")?,
-            denyallow: self.texts("deny-allow names")?,
-            restricted_clients: ClientSet::new(&self.texts("client entries")?),
-            restricted_ctags: self.texts("tag entries")?,
+            denyallow: self.names("deny-allow names")?,
+            restricted_clients: ClientSet::new(&self.names("client entries")?),
+            restricted_ctags: self.names("tag entries")?,
         };
 
         self.charge(1, "slow rules")?;
+        let slow = SlowRule::compile(rule)
+            .map_err(|()| SnapshotError::Corrupt("a rule does not compile"))?;
         self.slow_budget
-            .charge(&rule)
+            .charge(&slow)
             .map_err(|_| SnapshotError::TooLarge("slow rule memory"))?;
 
-        SlowRule::compile(rule).map_err(|()| SnapshotError::Corrupt("a rule does not compile"))
+        Ok(slow)
     }
 }
 
@@ -697,6 +761,10 @@ fn check_preamble(file: &mut File) -> Result<u64, SnapshotError> {
 /// is ever acted on.
 pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotError> {
     let mut file = File::open(path)?;
+    if file.metadata()?.len() > max_file_bytes(options) {
+        return Err(SnapshotError::TooLarge("snapshot file"));
+    }
+
     let body_bytes = check_preamble(&mut file)?;
     if !body_checksum_matches(&mut file, body_bytes)? {
         return Err(SnapshotError::BadChecksum);
@@ -709,6 +777,7 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         max_rules: u64::from(options.max_rules),
         rules_left: u64::from(options.max_rules),
         slow_budget: SlowRuleBudget::new(options.slow_rule_budget),
+        name_allowance: 0,
     };
     let stored_fingerprint = decoder.u128()?;
     let content_hash = decoder.u128()?;
@@ -716,6 +785,11 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
     let configured_format = format_from_code(decoder.u8()?)?;
     let effective_format = format_from_code(decoder.u8()?)?;
     let meta_max_rules = decoder.u32()?;
+    let meta_allow_redirects = match decoder.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(SnapshotError::Corrupt("bad redirect flag")),
+    };
     let source = decoder.text(MAX_TEXT_BYTES, "source")?;
     let etag = decoder.optional_text("ETag")?;
     let last_modified = decoder.optional_text("Last-Modified")?;
@@ -779,6 +853,7 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         configured_format,
         effective_format,
         meta_max_rules,
+        meta_allow_redirects,
         compiler_version,
     );
     if stored_fingerprint != expected {
@@ -793,6 +868,7 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
             configured_format,
             effective_format,
             max_rules: meta_max_rules,
+            allow_redirects: meta_allow_redirects,
             source,
             validators: Validators {
                 etag,
@@ -1721,6 +1797,49 @@ ads.*.tracker
     }
 
     #[tokio::test]
+    async fn a_file_over_the_largest_possible_snapshot_is_refused_before_it_is_read() {
+        let state = TestDir::new("snap");
+        let path = state.path().join("sparse.pgs");
+        let options = capped(10);
+        let limit = max_file_bytes(&options);
+        let sparse = |length: u64| {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&MAGIC).unwrap();
+            file.write_all(&FILE_VERSION.to_le_bytes()).unwrap();
+            file.set_len(length).unwrap();
+        };
+
+        sparse(limit + 1);
+        let started = std::time::Instant::now();
+        let over = load(&path, &options).err().expect("refused");
+        sparse(1 << 40);
+        let huge = load(&path, &options).err().expect("refused");
+
+        assert!(matches!(over, SnapshotError::TooLarge(_)), "{over:?}");
+        assert!(matches!(huge, SnapshotError::TooLarge(_)), "{huge:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        sparse(limit);
+        let at_the_limit = load(&path, &options).err().expect("refused");
+        assert!(matches!(at_the_limit, SnapshotError::BadChecksum));
+    }
+
+    #[tokio::test]
+    async fn the_largest_possible_snapshot_is_never_smaller_than_a_real_one() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let store = SnapshotStore::open(state.path()).unwrap();
+        let snapshot = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
+        store.save(clone_of(&snapshot)).await.unwrap();
+        store.flush().await;
+        let path = store.path_for(SOURCE).unwrap();
+
+        let size = fs::metadata(&path).unwrap().len();
+
+        assert!(size <= max_file_bytes(&options(ListFormat::Auto)));
+        assert!(load(&path, &options(ListFormat::Auto)).is_ok());
+    }
+
+    #[tokio::test]
     async fn the_checksum_is_checked_before_any_count_is_read() {
         let state = TestDir::new("snap");
         let (path, good) = saved_bytes(&state, "||a.example^\n").await;
@@ -1744,12 +1863,7 @@ ads.*.tracker
         let text: String = (0..20).map(|i| format!("a{i}*b\n")).collect();
         let (path, _) = saved_bytes(&state, &text).await;
         let loaded = load(&path, &caps()).unwrap();
-        let total: usize = loaded
-            .list
-            .slow
-            .iter()
-            .map(|slow| slow_rule_cost(&slow.rule))
-            .sum();
+        let total: usize = loaded.list.slow.iter().map(slow_rule_cost).sum();
         let budget = |slow_rule_budget| CompileOptions {
             slow_rule_budget,
             ..caps()
@@ -2338,29 +2452,58 @@ ads.*.tracker
         assert_eq!(a.extension().unwrap(), "pgs");
     }
 
+    #[tokio::test]
+    async fn a_snapshot_fits_only_the_redirect_setting_it_was_made_with() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let store = SnapshotStore::open(state.path()).unwrap();
+        let blocking = CompileOptions {
+            allow_redirects: false,
+            ..options(ListFormat::Hosts)
+        };
+        let compiled = compile(&worker, "1.2.3.4 bank.example\n", blocking).await;
+        let snapshot = Snapshot::new(&compiled, &blocking, SOURCE, Validators::default());
+        store.save(clone_of(&snapshot)).await.unwrap();
+        store.flush().await;
+
+        let loaded = load(&store.path_for(SOURCE).unwrap(), &blocking).unwrap();
+
+        assert!(!loaded.meta.allow_redirects);
+        assert!(loaded.fits(SOURCE, &blocking));
+        let allowing = CompileOptions {
+            allow_redirects: true,
+            ..blocking
+        };
+        assert!(!loaded.fits(SOURCE, &allowing));
+    }
+
     #[test]
     fn the_fingerprint_depends_on_every_part() {
-        let base = fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, 1);
+        let base = fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, false, 1);
         let all: HashMap<&str, u128> = HashMap::from([
             (
                 "content",
-                fingerprint(2, ListFormat::Auto, ListFormat::Adblock, 10, 1),
+                fingerprint(2, ListFormat::Auto, ListFormat::Adblock, 10, false, 1),
             ),
             (
                 "configured",
-                fingerprint(1, ListFormat::Hosts, ListFormat::Adblock, 10, 1),
+                fingerprint(1, ListFormat::Hosts, ListFormat::Adblock, 10, false, 1),
             ),
             (
                 "effective",
-                fingerprint(1, ListFormat::Auto, ListFormat::Hosts, 10, 1),
+                fingerprint(1, ListFormat::Auto, ListFormat::Hosts, 10, false, 1),
             ),
             (
                 "cap",
-                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 11, 1),
+                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 11, false, 1),
+            ),
+            (
+                "redirects",
+                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, true, 1),
             ),
             (
                 "compiler",
-                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, 2),
+                fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, false, 2),
             ),
         ]);
 
@@ -2370,7 +2513,7 @@ ads.*.tracker
 
         assert_eq!(
             base,
-            fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, 1)
+            fingerprint(1, ListFormat::Auto, ListFormat::Adblock, 10, false, 1)
         );
     }
 }

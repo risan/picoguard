@@ -163,7 +163,7 @@ async fn boot(config: &Config) -> (Scheduler, Arc<SnapshotStore>) {
     boot_with(config, SnapshotStore::open(&config.state.dir).unwrap()).await
 }
 
-fn blocked(policy: &Policy, name: &str) -> bool {
+fn decision(policy: &Policy, name: &str) -> Verdict {
     let mut message = Message::query();
     message.add_query(DnsQuery::query(
         Name::from_ascii(name).unwrap(),
@@ -172,10 +172,18 @@ fn blocked(policy: &Policy, name: &str) -> bool {
     let packet = message.to_vec().unwrap();
     let query = Query::parse(&packet).unwrap();
 
-    matches!(
-        policy.view(Instant::now()).check_request(&query),
-        Verdict::Block { .. }
-    )
+    policy.view(Instant::now()).check_request(&query)
+}
+
+fn blocked(policy: &Policy, name: &str) -> bool {
+    matches!(decision(policy, name), Verdict::Block { .. })
+}
+
+fn answer_ips(policy: &Policy, name: &str) -> Vec<std::net::IpAddr> {
+    match decision(policy, name) {
+        Verdict::Block { ips } => ips,
+        _ => panic!("{name} is not blocked"),
+    }
 }
 
 fn generation(policy: &Policy) -> u64 {
@@ -419,7 +427,10 @@ async fn a_hosts_list_with_too_many_answer_ips_keeps_the_last_good_list() {
     server.serve("/hosts.txt", &hosts_with_ips(1024), Some("\"h1\""));
     let config = config_of(
         &dir,
-        vec![url_list("hosts-groups", server.url("/hosts.txt"))],
+        vec![ListConfig {
+            allow_redirects: true,
+            ..url_list("hosts-groups", server.url("/hosts.txt"))
+        }],
     );
     let (mut scheduler, _) = boot(&config).await;
     scheduler.refresh(0, &downloader()).await;
@@ -437,6 +448,144 @@ async fn a_hosts_list_with_too_many_answer_ips_keeps_the_last_good_list() {
     assert!(!blocked(&policy, "ads1024.example."));
     assert_eq!(generation(&policy), generation_before);
     assert_eq!(warnings_about("hosts-groups"), 1, "one warning per streak");
+}
+
+#[tokio::test]
+async fn a_refresh_over_max_rules_keeps_the_last_good_list_and_shows_the_error() {
+    capture_warnings();
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve(
+        "/l.txt",
+        "||ads.example^\n||malware.example^\n",
+        Some("\"v1\""),
+    );
+    let list = ListConfig {
+        max_rules: 2,
+        ..url_list("capped", server.url("/l.txt"))
+    };
+    let config = config_of(&dir, vec![list]);
+    let (mut scheduler, _) = boot(&config).await;
+    scheduler.refresh(0, &downloader()).await;
+    let policy = scheduler.policy();
+    let in_force = Arc::clone(scheduler.list(0).unwrap());
+    let generation_before = generation(&policy);
+    assert!(blocked(&policy, "malware.example."));
+
+    server.serve(
+        "/l.txt",
+        "||ads.example^\n||tracker.example^\n||malware.example^\n",
+        Some("\"v2\""),
+    );
+    scheduler.refresh(0, &downloader()).await;
+
+    assert!(Arc::ptr_eq(&in_force, scheduler.list(0).unwrap()));
+    assert!(blocked(&policy, "malware.example."));
+    assert!(!blocked(&policy, "tracker.example."));
+    assert_eq!(generation(&policy), generation_before);
+    assert_eq!(warnings_about("capped"), 1);
+}
+
+#[tokio::test]
+async fn a_downloaded_hosts_list_blocks_but_does_not_redirect_unless_the_list_allows_it() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    let hosts = "1.2.3.4 bank.example\n127.0.0.1 local.example\n";
+    server.serve("/plain.txt", hosts, None);
+    server.serve("/allowed.txt", hosts.replace("bank", "shop").as_str(), None);
+    fs::write(dir.file("local.txt"), hosts.replace("bank", "nas")).unwrap();
+    let hosts_list = |list: ListConfig| ListConfig {
+        format: ListFormat::Hosts,
+        ..list
+    };
+    let config = config_of(
+        &dir,
+        vec![
+            hosts_list(url_list("plain", server.url("/plain.txt"))),
+            hosts_list(ListConfig {
+                allow_redirects: true,
+                ..url_list("allowed", server.url("/allowed.txt"))
+            }),
+            hosts_list(path_list(dir.file("local.txt"))),
+        ],
+    );
+    let (mut scheduler, _) = boot(&config).await;
+    scheduler.refresh(0, &downloader()).await;
+    scheduler.refresh(1, &downloader()).await;
+    let policy = scheduler.policy();
+
+    let ip = |text: &str| -> Vec<std::net::IpAddr> { vec![text.parse().unwrap()] };
+    assert_eq!(answer_ips(&policy, "bank.example."), ip("0.0.0.0"));
+    assert_eq!(answer_ips(&policy, "local.example."), ip("127.0.0.1"));
+    assert_eq!(answer_ips(&policy, "shop.example."), ip("1.2.3.4"));
+    assert_eq!(answer_ips(&policy, "nas.example."), ip("1.2.3.4"));
+}
+
+#[tokio::test]
+async fn a_refresh_that_blocks_everything_keeps_the_last_good_list() {
+    capture_warnings();
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("broad", server.url("/l.txt"))]);
+    let (mut scheduler, _) = boot(&config).await;
+    scheduler.refresh(0, &downloader()).await;
+    let policy = scheduler.policy();
+    let in_force = Arc::clone(scheduler.list(0).unwrap());
+    let generation_before = generation(&policy);
+
+    for (version, broad) in ["||*^", "/./"].into_iter().enumerate() {
+        server.serve(
+            "/l.txt",
+            &format!("||ads.example^\n{broad}\n"),
+            Some(&format!("\"broad{version}\"")),
+        );
+        scheduler.refresh(0, &downloader()).await;
+
+        assert!(
+            Arc::ptr_eq(&in_force, scheduler.list(0).unwrap()),
+            "{broad}"
+        );
+        assert!(!blocked(&policy, "www.example.org."), "{broad}");
+        assert_eq!(generation(&policy), generation_before, "{broad}");
+    }
+
+    assert_eq!(warnings_about("broad"), 1, "one warning per streak");
+}
+
+#[tokio::test]
+async fn a_local_list_that_blocks_everything_is_refused_but_an_allowlist_may_allow_everything() {
+    let dir = StateDir::new();
+    fs::write(dir.file("allow.txt"), "||*^\n").unwrap();
+    fs::write(dir.file("block.txt"), "||*^\n").unwrap();
+    fs::write(dir.file("ads.txt"), "||ads.example^\n").unwrap();
+    let mut config = config_of(
+        &dir,
+        vec![
+            path_list(dir.file("block.txt")),
+            path_list(dir.file("ads.txt")),
+        ],
+    );
+    config.allowlists = vec![path_list(dir.file("allow.txt"))];
+
+    let (scheduler, _) = boot(&config).await;
+    let policy = scheduler.policy();
+
+    assert!(scheduler.list(0).is_none(), "the list is refused");
+    assert!(scheduler.list(1).is_some());
+    assert!(!blocked(&policy, "ads.example."), "the allowlist allows it");
+}
+
+#[tokio::test]
+async fn user_rules_that_block_everything_are_kept() {
+    let dir = StateDir::new();
+    let mut config = config_of(&dir, Vec::new());
+    config.rules = vec!["||*^".to_string()];
+
+    let (scheduler, _) = boot(&config).await;
+    let policy = scheduler.policy();
+
+    assert!(blocked(&policy, "www.example.org."));
 }
 
 #[tokio::test]
@@ -639,7 +788,8 @@ async fn local_files_rules_and_allowlists_make_one_engine() {
 }
 
 #[tokio::test]
-async fn unreadable_files_are_skipped_and_the_format_and_cap_are_honoured() {
+async fn unreadable_files_are_skipped_and_the_format_is_honoured_and_a_list_over_its_cap_is_refused()
+ {
     let dir = StateDir::new();
     fs::write(dir.file("ok.txt"), "||ok.example^\n").unwrap();
     fs::write(
@@ -665,9 +815,10 @@ async fn unreadable_files_are_skipped_and_the_format_and_cap_are_honoured() {
     let policy = scheduler.policy();
 
     assert!(blocked(&policy, "ok.example."));
-    assert!(blocked(&policy, "a.example."));
+    assert!(!blocked(&policy, "a.example."));
     assert!(!blocked(&policy, "b.example."));
     assert!(scheduler.list(0).is_none());
+    assert!(scheduler.list(2).is_none());
 
     // The missing file appears later and is picked up by its refresh.
     fs::write(dir.file("missing.txt"), "||late.example^\n").unwrap();
@@ -817,6 +968,7 @@ async fn age_snapshot(config: &Config, version: u32) {
         snapshot.meta.configured_format,
         snapshot.meta.effective_format,
         snapshot.meta.max_rules,
+        snapshot.meta.allow_redirects,
         version,
     );
     store.save(snapshot).await.unwrap();

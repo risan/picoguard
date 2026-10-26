@@ -77,8 +77,90 @@ fn peak_of_loading(path: &std::path::Path, options: &CompileOptions) -> (usize, 
     (peak - before, error)
 }
 
+/// A slow rule record with `strings` names of `length` bytes in each of its three modifier
+/// arrays (deny-allow names, client entries and tags), appended to the body of a snapshot
+/// that has no slow rules, with the count of slow rules set to one.
+fn with_modifier_strings(good: &[u8], strings: u32, length: usize) -> Vec<u8> {
+    let mut bytes = good.to_vec();
+    let end = bytes.len() - CHECKSUM_BYTES;
+    bytes.truncate(end);
+    let slow_count_at = end - 4;
+    bytes[slow_count_at..].copy_from_slice(&1u32.to_le_bytes());
+
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(b"a*b");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    for array in 0..3u32 {
+        bytes.extend_from_slice(&strings.to_le_bytes());
+        for index in 0..strings {
+            bytes.extend_from_slice(&(length as u32).to_le_bytes());
+            let name = format!("{array}x{index}.");
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.resize(bytes.len() + length - name.len(), b'a');
+        }
+    }
+
+    let sum = xxh3_128(&bytes[PREAMBLE_BYTES..]);
+    bytes.extend_from_slice(&sum.to_le_bytes());
+
+    bytes
+}
+
 #[tokio::test]
-async fn a_forged_count_reserves_nothing() {
+async fn a_hostile_snapshot_is_refused_before_its_memory_is_reserved() {
+    forged_counts_reserve_nothing().await;
+    modifier_strings_are_charged_before_they_are_allocated().await;
+}
+
+async fn modifier_strings_are_charged_before_they_are_allocated() {
+    let state = std::env::temp_dir().join(format!(
+        "picoguard-snapshot-hostile-strings-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&state);
+    let options = CompileOptions {
+        slow_rule_budget: 64 * 1024,
+        ..CompileOptions::new(ListFormat::Adblock, 3_000_000)
+    };
+    let worker = CompileWorker::spawn().unwrap();
+    let store = SnapshotStore::open(&state).unwrap();
+    let compilation = worker.start(options);
+    compilation
+        .pieces
+        .send(Piece::Data(b"||a.example^\n".to_vec()))
+        .await
+        .unwrap();
+    compilation.pieces.send(Piece::End).await.unwrap();
+    let compiled = compilation.result().await.unwrap();
+    store
+        .save(Snapshot::new(
+            &compiled,
+            &options,
+            "https://lists.example/strings",
+            Validators::default(),
+        ))
+        .await
+        .unwrap();
+    store.flush().await;
+    let path = store.path_for("https://lists.example/strings").unwrap();
+    let good = std::fs::read(&path).unwrap();
+    drop(compiled);
+
+    // Three arrays of 4,096 names of 100 bytes: 1.2 MB in the file, checksum correct, every
+    // count and length within its own limit, and far more than the 64 KiB budget allows.
+    std::fs::write(&path, with_modifier_strings(&good, 4096, 100)).unwrap();
+
+    let (peak, error) = peak_of_loading(&path, &options);
+
+    assert!(matches!(error, SnapshotError::TooLarge(_)), "{error:?}");
+    assert!(peak < 256 * 1024, "peak {peak}");
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+async fn forged_counts_reserve_nothing() {
     let state =
         std::env::temp_dir().join(format!("picoguard-snapshot-hostile-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state);

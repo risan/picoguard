@@ -55,9 +55,15 @@ servers = [
 
 # Blocklists. format is "auto" (default), "adblock", "hosts", "domains",
 # "wildcard", "dnsmasq" or "rpz". A list has either url or path. Per list:
-# refresh_hours = 24, max_rules = 3000000, max_body_bytes = 67108864,
+# refresh_hours = 24, max_rules = 1500000, max_body_bytes = 67108864,
 # slow_rule_budget = 8388608 (estimated bytes for rules that are not plain
-# domains; a list over it is not used).
+# domains; a list over it is not used), allow_redirects = false (a downloaded
+# hosts line with a real address blocks like 0.0.0.0; true answers with it).
+[[lists]]
+name = "adguard-dns"
+url = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"
+format = "adblock"
+
 [[lists]]
 name = "hagezi-pro"
 url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"

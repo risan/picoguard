@@ -11,26 +11,35 @@ use std::sync::mpsc as std_mpsc;
 use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
-use super::engine::{CompiledList, Engine, ListBuilder, MAX_HOST_GROUPS};
-use super::parse::{ListFormat, NetworkRule, ParseSummary, Parser, Rule};
+use super::engine::{
+    CompiledList, Decision, Engine, ListBuilder, MAX_HOST_GROUPS, SlowRule, TYPE_A,
+};
+use super::parse::{ListFormat, ParseSummary, Parser, Rule};
 use super::snapshot::{self, Snapshot, SnapshotError};
 use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 
 /// Bump on every change to compiled output (what any list text compiles to, in the parser,
 /// the compiler or the snapshot encoding), however small: snapshots written by an older
 /// compiler are then ignored and the lists compile again (plan D14).
-pub const COMPILER_VERSION: u32 = 4;
+pub const COMPILER_VERSION: u32 = 9;
 
 /// Default memory budget of the slow rules of one list. Plan section 5 leaves about 8 MB
 /// between the steady total (20 MB) and the refresh peak (28 MB). The real lists are far
 /// below it: the AdGuard DNS filter, with 878 slow rules and 22 regexes, is estimated at 1 MB.
 pub const DEFAULT_SLOW_RULE_BUDGET: usize = 8 * 1024 * 1024;
 
-/// The per-list settings that change the compiled result (the first two) or limit it.
+/// The per-list settings that change the compiled result (the first three) or limit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompileOptions {
     pub format: ListFormat,
     pub max_rules: u32,
+    /// False answers every host rule whose IP is not a null route with `0.0.0.0`, so the
+    /// list can block names but not point them at another address.
+    pub allow_redirects: bool,
+    /// Refuse a list that blocks any of the `CANARY_NAMES`: no real blocklist does, so a
+    /// list that does (`||*^`, `/./`) would take the whole network down. Only for lists that
+    /// block; an allowlist or the user's own rules may say what they like.
+    pub check_canaries: bool,
     /// Bytes the slow rules and regexes of the list may cost, as `SlowRuleBudget` estimates.
     /// A list over it fails to compile or to load; it never changes what a list means, so
     /// it is not part of the fingerprint.
@@ -42,16 +51,31 @@ impl CompileOptions {
         CompileOptions {
             format,
             max_rules,
+            allow_redirects: true,
+            check_canaries: false,
             slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
         }
     }
 }
 
-/// Estimated bytes of a compiled slow rule: measured at 430 to 800 bytes for glob rules and
-/// 3 to 20 KiB for regexes (a Unicode class such as `\p{L}` is the expensive one).
+/// Names that no real blocklist blocks.
+const CANARY_NAMES: [&str; 3] = [
+    "pg-canary-7f3a9c.com",
+    "pg-canary-b41d20.net",
+    "pg-canary-e86c5f.org",
+];
+
+/// Estimated bytes of a compiled slow rule without its matcher: measured at 430 to 800
+/// bytes for a glob rule. The matcher is charged as it reports (`Matcher::cost_bytes`).
 const SLOW_RULE_BYTES: usize = 512;
-const TEXT_BYTE_COST: usize = 4;
-const REGEX_BYTES: usize = 24 * 1024;
+pub(super) const TEXT_BYTE_COST: usize = 4;
+
+/// What each name of a modifier (`$denyallow`, `$client`, `$ctag`) costs besides its text.
+pub(super) const NAME_OVERHEAD_BYTES: usize = 24;
+
+/// The longest text of a `$client` address or subnet (`ffff:...:ffff/128`), which the
+/// snapshot keeps as text.
+const NET_TEXT_BYTES: usize = 43;
 
 /// What a host group (an answer IP of the host rules) costs, with its share of the lookup
 /// tables. The count of groups is capped as well, by `MAX_HOST_GROUPS`.
@@ -87,28 +111,33 @@ impl SlowRuleBudget {
         Ok(())
     }
 
-    pub(super) fn charge(&mut self, rule: &NetworkRule) -> Result<(), OverBudget> {
-        let cost = slow_rule_cost(rule);
+    /// What is left to charge.
+    pub(super) fn remaining(&self) -> usize {
+        self.left
+    }
+
+    pub(super) fn charge(&mut self, slow: &SlowRule) -> Result<(), OverBudget> {
+        let cost = slow_rule_cost(slow);
         self.left = self.left.checked_sub(cost).ok_or(OverBudget)?;
 
         Ok(())
     }
 }
 
-pub(super) fn slow_rule_cost(rule: &NetworkRule) -> usize {
+pub(super) fn slow_rule_cost(slow: &SlowRule) -> usize {
+    let rule = &slow.rule;
     let text = rule.pattern.len()
-        + 24 * rule.restricted_clients.nets.len()
+        + (NET_TEXT_BYTES + NAME_OVERHEAD_BYTES) * rule.restricted_clients.nets.len()
         + rule
             .denyallow
             .iter()
             .chain(&rule.restricted_clients.names)
             .chain(&rule.restricted_ctags)
-            .map(|name| name.len() + 24)
+            .map(|name| name.len() + NAME_OVERHEAD_BYTES)
             .sum::<usize>()
         + 2 * (rule.dns_permitted.len() + rule.dns_restricted.len());
-    let regex = if rule.is_regex() { REGEX_BYTES } else { 0 };
 
-    SLOW_RULE_BYTES + TEXT_BYTE_COST * text + regex
+    SLOW_RULE_BYTES + TEXT_BYTE_COST * text + slow.matcher_cost_bytes()
 }
 
 pub struct Compiled {
@@ -128,6 +157,11 @@ pub enum CompileError {
     WorkerStopped,
     /// The slow rules of the list cost more than `CompileOptions::slow_rule_budget`.
     OverBudget,
+    /// The list has more rules than `CompileOptions::max_rules`. A cut-off copy would drop
+    /// rules the list had before, so the list is refused instead.
+    OverRuleCap,
+    /// The list blocks a canary name, so it would block (nearly) everything.
+    BlocksCanary,
 }
 
 /// A compile job that is waiting for text. Send the pieces, then `Piece::End`, then await
@@ -274,7 +308,8 @@ fn compile(
     mut pieces: mpsc::Receiver<Piece>,
 ) -> Result<Compiled, CompileError> {
     let mut builder = ListBuilder::new();
-    let mut parser = Parser::new(options.format, options.max_rules as usize);
+    let mut parser = Parser::new(options.format, options.max_rules as usize)
+        .allow_redirects(options.allow_redirects);
     let mut hasher = Xxh3::new();
     let mut budget = SlowRuleBudget::new(options.slow_rule_budget);
     let mut seen_slow_rules = HashSet::new();
@@ -284,17 +319,24 @@ fn compile(
             return;
         }
 
-        if let Rule::Slow(slow) = &rule {
+        if let Rule::Slow(slow) = rule {
             // The debug text holds every field, so equal text means an identical rule.
             if !seen_slow_rules.insert(xxh3_128(format!("{slow:?}").as_bytes())) {
                 return;
             }
 
-            if budget.charge(slow).is_err() {
+            let compiled = SlowRule::compile(slow);
+            if let Ok(compiled) = &compiled
+                && budget.charge(compiled).is_err()
+            {
                 over_budget.set(true);
 
                 return;
             }
+
+            builder.add_slow(compiled);
+
+            return;
         }
 
         if let Rule::Host { ip, .. } = &rule
@@ -330,20 +372,37 @@ fn compile(
         return Err(CompileError::OverBudget);
     }
 
+    if summary.counters.over_cap > 0 {
+        return Err(CompileError::OverRuleCap);
+    }
+
     let content_hash = hasher.digest128();
+    let list = Arc::new(builder.finish(summary.format));
+    if options.check_canaries && blocks_a_canary(&list) {
+        return Err(CompileError::BlocksCanary);
+    }
 
     Ok(Compiled {
-        list: Arc::new(builder.finish(summary.format)),
+        list,
         fingerprint: snapshot::fingerprint(
             content_hash,
             options.format,
             summary.format,
             options.max_rules,
+            options.allow_redirects,
             COMPILER_VERSION,
         ),
         content_hash,
         summary,
     })
+}
+
+fn blocks_a_canary(list: &Arc<CompiledList>) -> bool {
+    let engine = Engine::new(vec![Arc::clone(list)], Vec::new());
+
+    CANARY_NAMES
+        .iter()
+        .any(|name| engine.check(name, TYPE_A, false) != Decision::Pass)
 }
 
 #[cfg(test)]
@@ -353,7 +412,6 @@ mod tests {
     use xxhash_rust::xxh3::xxh3_128;
 
     use super::*;
-    use crate::filter::engine::{Decision, Engine, TYPE_A};
 
     const LIST: &str = "||ads.example^\n@@||ok.ads.example^\n0.0.0.0 host.example\n/track[0-9]+/\n";
 
@@ -361,6 +419,8 @@ mod tests {
         CompileOptions {
             format,
             max_rules: 1000,
+            allow_redirects: true,
+            check_canaries: false,
             slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
         }
     }
@@ -500,7 +560,7 @@ mod tests {
         let mut parser = Parser::new(ListFormat::Adblock, 10);
         let mut sink = |rule: Rule<'_>| {
             if let Rule::Slow(slow) = rule {
-                cost = Some(slow_rule_cost(&slow));
+                cost = Some(slow_rule_cost(&SlowRule::compile(slow).unwrap()));
             }
         };
         parser.push(line.as_bytes(), &mut sink);
@@ -527,6 +587,106 @@ mod tests {
 
         assert_eq!(fits.unwrap().list.slow_rule_count(), 3);
         assert_eq!(over.err(), Some(CompileError::OverBudget));
+    }
+
+    #[tokio::test]
+    async fn long_glob_rules_are_charged_for_every_token_they_store() {
+        let worker = CompileWorker::spawn().unwrap();
+        let text: String = (0..500)
+            .map(|i| format!("|r{i}{}$dnstype=A\n", "*^".repeat(2020)))
+            .collect();
+        let uncapped = CompileOptions {
+            max_rules: 500,
+            ..options(ListFormat::Adblock)
+        };
+
+        let result = compile_in_pieces(&worker, uncapped, text.as_bytes(), 64 * 1024).await;
+
+        assert_eq!(result.err(), Some(CompileError::OverBudget));
+        assert!(
+            slow_rule_cost_of(&format!("|r1{}\n", "*^".repeat(2020)))
+                >= 4040 * crate::filter::pattern::GLOB_TOKEN_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn a_list_that_may_not_redirect_blocks_every_host_ip_like_the_null_address() {
+        let worker = CompileWorker::spawn().unwrap();
+        let text = b"1.2.3.4 bank.example\n127.0.0.1 local.example\n";
+        let may_not = CompileOptions {
+            allow_redirects: false,
+            ..options(ListFormat::Hosts)
+        };
+        let ips_of = |compiled: &Compiled, name: &str| {
+            let engine = Engine::new(vec![Arc::clone(&compiled.list)], Vec::new());
+
+            engine.check(name, TYPE_A, false)
+        };
+
+        let kept = compile_in_pieces(&worker, options(ListFormat::Hosts), text, 64)
+            .await
+            .unwrap();
+        let blocked_only = compile_in_pieces(&worker, may_not, text, 64).await.unwrap();
+
+        let ip = |text: &str| Decision::Block {
+            ips: vec![text.parse().unwrap()],
+        };
+        assert_eq!(ips_of(&kept, "bank.example"), ip("1.2.3.4"));
+        assert_eq!(ips_of(&blocked_only, "bank.example"), ip("0.0.0.0"));
+        assert_eq!(ips_of(&blocked_only, "local.example"), ip("127.0.0.1"));
+        assert_ne!(kept.fingerprint, blocked_only.fingerprint);
+    }
+
+    #[tokio::test]
+    async fn a_list_that_blocks_a_canary_name_fails_the_job_when_canaries_are_checked() {
+        let worker = CompileWorker::spawn().unwrap();
+        let checked = CompileOptions {
+            check_canaries: true,
+            ..options(ListFormat::Adblock)
+        };
+
+        for broad in [
+            "||*^",
+            "/./",
+            "||com^",
+            "||pg-canary-b41d20.net^",
+            "*canary*",
+        ] {
+            let text = format!("||ads.example^\n{broad}\n");
+
+            let refused = compile_in_pieces(&worker, checked, text.as_bytes(), 64).await;
+            let unchecked =
+                compile_in_pieces(&worker, options(ListFormat::Adblock), text.as_bytes(), 64).await;
+
+            assert_eq!(refused.err(), Some(CompileError::BlocksCanary), "{broad}");
+            assert!(unchecked.is_ok(), "{broad}");
+        }
+
+        let ordinary = "||ads.example^\n||*.tracker.example^\n/ads[0-9]+/\n0.0.0.0 bad.example\n";
+        let accepted = compile_in_pieces(&worker, checked, ordinary.as_bytes(), 64).await;
+        assert!(accepted.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_list_over_the_rule_cap_fails_the_job_instead_of_losing_its_last_rules() {
+        let worker = CompileWorker::spawn().unwrap();
+        let capped = CompileOptions {
+            max_rules: 2,
+            ..options(ListFormat::Adblock)
+        };
+        let text = b"||ads.example^\n||tracker.example^\n||malware.example^\n";
+
+        let at_the_cap = compile_in_pieces(&worker, capped, &text[..text.len() - 24], 64)
+            .await
+            .unwrap();
+        let over_the_cap = compile_in_pieces(&worker, capped, text, 64).await;
+
+        assert_eq!(at_the_cap.list.rule_count(), 2);
+        assert_eq!(over_the_cap.err(), Some(CompileError::OverRuleCap));
+        let next = compile_in_pieces(&worker, options(ListFormat::Auto), LIST.as_bytes(), 100)
+            .await
+            .unwrap();
+        assert!(blocked(&next.list, "ads.example"));
     }
 
     #[tokio::test]
@@ -625,6 +785,26 @@ mod tests {
     async fn many_regexes_fail_the_job_within_the_default_budget() {
         let worker = CompileWorker::spawn().unwrap();
         let text: String = (0..2000).map(|i| format!("/track{i}[0-9]+/\n")).collect();
+
+        let result = compile_in_pieces(
+            &worker,
+            options(ListFormat::Adblock),
+            text.as_bytes(),
+            64 * 1024,
+        )
+        .await;
+
+        assert_eq!(result.err(), Some(CompileError::OverBudget));
+    }
+
+    #[tokio::test]
+    async fn heavy_regexes_are_charged_what_they_hold_not_a_flat_amount() {
+        let worker = CompileWorker::spawn().unwrap();
+        // Each one compiles to about 1 MiB, so 320 of them held 330 MB under a flat charge
+        // of 24 KiB each (8 MiB in all).
+        let text: String = (0..320)
+            .map(|i| format!("/(\\pL|\\pN){{1,50}}x{i}/\n"))
+            .collect();
 
         let result = compile_in_pieces(
             &worker,

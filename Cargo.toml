@@ -19,7 +19,7 @@ hyper = { version = "1.12.0", default-features = false, features = ["client", "s
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 log = "0.4.34"
 lru = "0.19.0"
-regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-case", "unicode-gencat", "unicode-script", "perf-literal"] }
+regex-automata = { version = "0.4.18", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "unicode-case", "unicode-gencat", "unicode-script", "perf-literal"] }
 ring = { version = "0.17.14", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -43,4 +43,5 @@ flate2 = "1.1.10"
 hickory-proto = "0.26.3"
 hyper = { version = "1.12.0", features = ["server"] }
 proptest = "1.12.0"
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-case", "unicode-gencat", "unicode-script", "perf-literal"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }

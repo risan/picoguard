@@ -76,6 +76,12 @@ picoguard makes the same block/pass decision as AdGuard Home v0.107.79 on the sa
 - `$dnsrewrite` and `$respgeo` rules are counted and ignored, and `$client` / `$ctag` rules
   match as for a client without a name or tag (restrictions with `~` apply, permitted values
   never do).
+- A hosts line with a real address (`203.0.113.7 name`) in a downloaded list (`url`) blocks the
+  name like `0.0.0.0 name` instead of answering with that address, so a compromised list cannot
+  redirect names. AdGuard Home answers with the address. Set `allow_redirects = true` on the list
+  to get that back; lists with `path` and the `rules` key always answer with the address.
+- A list in `[[lists]]` that blocks any of three made-up names (`||*^`, `/./`) is refused and the
+  last good copy stays; AdGuard Home would install it and block everything.
 - IP addresses of a host rule that appears on several lines of one list are answered grouped
   by address, not in line order.
 - Non-ASCII input names are compared after lowercase only. Go folds case with the Unicode

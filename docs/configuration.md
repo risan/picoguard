@@ -74,9 +74,9 @@ They never go to the public servers.
 ## `[[lists]]` and `[[allowlists]]`
 
 Blocklists are `[[lists]]` tables. Allowlists (names that are never blocked) are
-`[[allowlists]]` with the same keys. If the file has no `[[lists]]` at all, picoguard uses
-HaGeZi Pro and HaGeZi Threat Intelligence mini. As soon as you write one `[[lists]]`, only your
-lists are used.
+`[[allowlists]]` with the same keys. If the file has no `[[lists]]` at all, picoguard uses the
+AdGuard DNS filter, HaGeZi Pro and HaGeZi Threat Intelligence mini. As soon as you write one
+`[[lists]]`, only your lists are used.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -85,13 +85,17 @@ lists are used.
 | `path` | none | Local file. Read at start and again every `refresh_hours`. |
 | `format` | `"auto"` | `auto`, `adblock`, `hosts`, `domains`, `wildcard`, `dnsmasq` or `rpz`. |
 | `refresh_hours` | `24` | How often to download again. |
-| `max_rules` | `3000000` | A list with more rules is not used. |
+| `max_rules` | `1500000` | A list with more rules is not used: the refresh fails, the status page shows the error and the last good copy stays. One list of 1.5 million rules takes about 12 MB, and the old and the new copy exist together during a refresh, which is what fits the 64 MB limit of the systemd unit. A bigger list, such as HaGeZi TIF (full, about 2.1 million rules), needs `max_rules` raised on purpose (and a unit memory limit to match). |
 | `max_body_bytes` | `67108864` (64 MiB) | A larger download is stopped and not used. |
-| `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A list over it is not used. |
+| `allow_redirects` | `false` | Hosts lines with a real address (`203.0.113.7 name`) are answered with that address only if this is `true`. Otherwise a downloaded list answers any address except `0.0.0.0`, `::`, `127.0.0.1` and `::1` like `0.0.0.0`, so a list can block names but not send them elsewhere. Lists with `path` and your own `rules` always keep the address (for local names). |
+| `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A regex is charged the memory it really holds (about 8 KB for `/track[0-9]+/`, close to 1 MB for `/(\pL\|\pN){1,50}x/`), a wildcard rule 64 bytes for each of its parts. A list over it is not used. |
 
 Downloads use `If-None-Match` and `If-Modified-Since`. A failed download keeps the last good list.
 A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private,
 link-local or unspecified address fails too, unless the list URL itself points into those ranges.
+A list in `[[lists]]` that blocks any of three made-up check names (for example because of a rule
+like `||*^` or `/./`) is refused the same way: the last good copy stays and the status page shows the
+error. Allowlists and your own `rules` are not checked.
 A new list takes effect without a restart and without dropping queries. One list refreshes at a time.
 
 Example:
@@ -248,10 +252,10 @@ The table is a plan from the formula above. It has not been measured on a board 
 
 | Board RAM | Lists | Rules | Cache | Expected RSS |
 |---|---|---|---|---|
-| 256 MB | The default: HaGeZi Pro and HaGeZi TIF mini | at most about 260k | 10,000 entries (default) | about 12 to 15 MB |
-| 256 MB, more blocking | Default plus AdGuard DNS filter | about 450k | 10,000 entries | about 16 MB (measured) |
+| 256 MB | The default: AdGuard DNS filter, HaGeZi Pro and HaGeZi TIF mini | about 450k | 10,000 entries (default) | about 11 MB idle, 19 MB after 49,000 queries (measured on x86_64) |
+| 256 MB, lighter | HaGeZi Pro and HaGeZi TIF mini only | at most about 260k | 10,000 entries | about 12 to 15 MB |
 | 512 MB | Above plus a larger HaGeZi list (for example Pro++) | up to about 1 million | `max_entries = 30000`, `max_bytes = 12582912` | about 25 to 35 MB |
-| 1 GB or more | Any mix, for example several regional lists | up to about 3 million | `max_entries = 100000`, `max_bytes = 41943040` | about 60 to 90 MB |
+| 1 GB or more | Any mix, for example several regional lists | up to about 3 million (raise `max_rules` for a list over 1.5 million) | `max_entries = 100000`, `max_bytes = 41943040` | about 60 to 90 MB |
 
 Notes:
 
@@ -259,4 +263,5 @@ Notes:
   costs 8 bytes.
 - The systemd unit sets `MemoryMax=64M`. If you go beyond the 512 MB row, raise it in a drop-in
   (`systemctl edit picoguard`).
-- Do not go above 3 million rules in one list: `max_rules` stops it.
+- Do not go above 1.5 million rules in one list unless you raised `max_rules` and the memory limit
+  of the unit: `max_rules` stops it.
