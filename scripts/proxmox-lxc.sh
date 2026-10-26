@@ -551,12 +551,17 @@ gather_files() {
     else
         fetch install.sh
         INSTALLER_PATH=$TMP/install.sh
-    fi
 
-    # It runs as root in the container, so check it when the manifest lists it.
-    if [ -f "$INSTALLER_PATH" ] && [ -f "$SUMS_PATH" ] && awk '{ n = $2; sub(/^\*/, "", n); if (n == "install.sh") { found = 1 } } END { exit !found }' "$SUMS_PATH"; then
-        verify_checksum "$INSTALLER_PATH" "$SUMS_PATH" install.sh
-        say "install.sh: checksum OK"
+        # It runs as root in the container, so a downloaded copy is always checked against
+        # the manifest of the same release, even when the binary comes from --binary.
+        if [ ! -f "$TMP/SHA256SUMS" ]; then
+            fetch SHA256SUMS
+        fi
+
+        if [ "$DRY_RUN" != 1 ]; then
+            verify_checksum "$INSTALLER_PATH" "$TMP/SHA256SUMS" install.sh
+            say "install.sh: checksum OK"
+        fi
     fi
 
     BINARY_ASSET=$asset
