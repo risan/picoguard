@@ -8,8 +8,12 @@ use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::{Downloader, resolver_over};
 use picoguard::pipeline::Pipeline;
+use picoguard::release::{self, Refusal, VerifySetup};
 use picoguard::scheduler::{Scheduler, Timing};
 use picoguard::server::{self, Listeners};
+use picoguard::stage::{
+    INSTALLER_DIR, MAX_BINARY_BYTES, RELEASE_DOWNLOAD_URL, StageSetup, StageTiming, Stager,
+};
 use picoguard::update::{self, Build, CheckTiming, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
@@ -24,12 +28,16 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
 const USAGE: &str = "\
 Usage: picoguard [OPTIONS]
+       picoguard verify-update STAGED_DIR INTO_DIR
 
 Options:
   -c, --config FILE  Config file (default: /etc/picoguard/picoguard.toml)
       --check        Load and validate the config, print OK or the error, then exit
       --version      Print the version
-  -h, --help         Print this help";
+  -h, --help         Print this help
+
+verify-update copies a staged update into the new directory INTO_DIR and checks it. It is
+run by the installer: exit 0 means every check passed, 1 that one failed.";
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -37,10 +45,25 @@ enum Command {
     Check { config_path: PathBuf },
     Version,
     Help,
+    VerifyUpdate { staged: PathBuf, into: PathBuf },
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
+
+    if args.peek().map(String::as_str) == Some("verify-update") {
+        args.next();
+
+        return match (args.next(), args.next(), args.next()) {
+            (Some(staged), Some(into), None) => Ok(Command::VerifyUpdate {
+                staged: PathBuf::from(staged),
+                into: PathBuf::from(into),
+            }),
+
+            _ => Err("verify-update needs STAGED_DIR and INTO_DIR".to_string()),
+        };
+    }
+
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut check = false;
 
@@ -96,10 +119,46 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
+        Ok(Command::VerifyUpdate { staged, into }) => verify(&staged, &into),
+
         Err(message) => {
             eprintln!("picoguard: {message}\n\n{USAGE}");
 
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Only a release build for one of the three release targets can verify: a source or Docker
+/// build is not what the release signs, whatever its target.
+fn verify_setup(build: Build) -> VerifySetup {
+    VerifySetup {
+        key: release::RELEASE_KEY,
+        target: if build == Build::Release {
+            release::target()
+        } else {
+            None
+        },
+        running: env!("CARGO_PKG_VERSION"),
+    }
+}
+
+fn verify(staged: &Path, into: &Path) -> ExitCode {
+    match release::verify_update(staged, into, &verify_setup(Build::current())) {
+        Ok(request) => {
+            print!("{}", request.format());
+
+            ExitCode::SUCCESS
+        }
+
+        Err(Refusal { reason, request }) => {
+            if let Some(request) = request {
+                print!("{}", request.format());
+            }
+
+            eprintln!("{reason}");
+
+            ExitCode::FAILURE
         }
     }
 }
@@ -173,6 +232,23 @@ fn serve(config: Config) -> Result<(), String> {
             None
         };
         let updates = Arc::new(Updates::new(Build::current()));
+        let tls = Arc::new(Tls::with_webpki_roots());
+        let stager = Stager::new(
+            StageSetup {
+                target: release::target(),
+                base_url: RELEASE_DOWNLOAD_URL.to_string(),
+                state_dir: config.state.dir.clone(),
+                installer_dir: PathBuf::from(INSTALLER_DIR),
+                key: release::RELEASE_KEY,
+                max_binary_bytes: MAX_BINARY_BYTES,
+                timing: StageTiming::default(),
+            },
+            Arc::clone(&updates),
+            resolver_over(Arc::clone(pipeline.upstreams())),
+            Arc::clone(&tls),
+        );
+        // The page may be off; what an earlier update left behind is removed all the same.
+        stager.resume();
         let mut stop_signals = StopSignals::install()?;
 
         for address in listeners.udp_addresses() {
@@ -190,11 +266,11 @@ fn serve(config: Config) -> Result<(), String> {
                 scheduler.policy(),
                 scheduler.control(),
                 Arc::clone(&updates),
+                Arc::clone(&stager),
             )?;
             web::spawn(status_page, Arc::new(web));
         }
 
-        let tls = Arc::new(Tls::with_webpki_roots());
         let downloader = Downloader::new(
             resolver_over(Arc::clone(pipeline.upstreams())),
             Arc::clone(&tls),
@@ -357,6 +433,36 @@ mod tests {
             parse(&["--config"]),
             Err("--config needs a file argument".to_string())
         );
+    }
+
+    #[test]
+    fn verify_update_takes_exactly_two_directories() {
+        assert_eq!(
+            parse(&["verify-update", "a", "b"]),
+            Ok(Command::VerifyUpdate {
+                staged: PathBuf::from("a"),
+                into: PathBuf::from("b")
+            })
+        );
+
+        for args in [
+            &["verify-update"][..],
+            &["verify-update", "a"],
+            &["verify-update", "a", "b", "c"],
+            &["-c", "x", "verify-update", "a", "b"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_release_build_verifies() {
+        for build in [Build::Source, Build::Docker] {
+            assert_eq!(verify_setup(build).target, None);
+        }
+
+        assert_eq!(verify_setup(Build::Release).target, release::target());
+        assert_eq!(verify_setup(Build::Release).key, release::RELEASE_KEY);
     }
 
     #[test]

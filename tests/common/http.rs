@@ -1,6 +1,6 @@
-//! A local HTTP/1.1 server for blocklists: conditional GET, error statuses, a delay, and
-//! counters for requests and for connections open at the same time. Nothing leaves the
-//! machine.
+//! A local HTTP/1.1 server for blocklists and release files: conditional GET, error statuses,
+//! redirects, bodies without a length, bodies that trickle, a delay, and counters for
+//! requests and for connections open now and at the same time. Nothing leaves the machine.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -15,11 +15,30 @@ use tokio::task::JoinHandle;
 #[derive(Clone)]
 enum Page {
     Text {
-        body: String,
+        body: Vec<u8>,
         etag: Option<String>,
         content_type: Option<String>,
     },
+    /// No `Content-Length`: the body ends when the server closes the connection.
+    Unsized(Vec<u8>),
+    Slow {
+        body: Vec<u8>,
+        chunk: usize,
+        pause: Duration,
+    },
+    Redirect(String),
     Status(u16),
+}
+
+/// What to send back for one request.
+enum Reply {
+    Whole(Vec<u8>),
+    Slow {
+        head: Vec<u8>,
+        body: Vec<u8>,
+        chunk: usize,
+        pause: Duration,
+    },
 }
 
 #[derive(Default)]
@@ -27,6 +46,7 @@ struct State {
     pages: Mutex<HashMap<String, Page>>,
     delay: Mutex<Duration>,
     requests: AtomicUsize,
+    requested: Mutex<HashMap<String, usize>>,
     not_modified: AtomicUsize,
     active: AtomicUsize,
     most_active: AtomicUsize,
@@ -72,9 +92,22 @@ impl ListServer {
                     let delay = *state.delay.lock().unwrap();
                     tokio::time::sleep(delay).await;
 
-                    let reply = answer(&state, &String::from_utf8_lossy(&head));
-                    let _ = stream.write_all(&reply).await;
-                    let _ = stream.shutdown().await;
+                    match answer(&state, &String::from_utf8_lossy(&head)) {
+                        Reply::Whole(reply) => {
+                            let _ = stream.write_all(&reply).await;
+                            let _ = stream.shutdown().await;
+                        }
+
+                        Reply::Slow {
+                            head,
+                            body,
+                            chunk,
+                            pause,
+                        } => {
+                            trickle(&mut stream, &head, &body, chunk, pause).await;
+                        }
+                    }
+
                     state.active.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -107,11 +140,51 @@ impl ListServer {
         self.state.pages.lock().unwrap().insert(
             path.to_string(),
             Page::Text {
-                body: body.to_string(),
+                body: body.as_bytes().to_vec(),
                 etag: etag.map(str::to_string),
                 content_type: content_type.map(str::to_string),
             },
         );
+    }
+
+    /// Serves bytes at `path`.
+    pub fn serve_bytes(&self, path: &str, body: Vec<u8>) {
+        self.state.pages.lock().unwrap().insert(
+            path.to_string(),
+            Page::Text {
+                body,
+                etag: None,
+                content_type: None,
+            },
+        );
+    }
+
+    /// Serves bytes without a `Content-Length`; the connection is closed after the body.
+    pub fn serve_unsized(&self, path: &str, body: Vec<u8>) {
+        self.state
+            .pages
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), Page::Unsized(body));
+    }
+
+    /// Serves bytes `chunk` at a time with `pause` between the chunks. The pause ends at once
+    /// when the client closes, so the connection count drops as soon as it gives up.
+    pub fn serve_slowly(&self, path: &str, body: Vec<u8>, chunk: usize, pause: Duration) {
+        self.state
+            .pages
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), Page::Slow { body, chunk, pause });
+    }
+
+    /// Answers `path` with a 302 to `location`.
+    pub fn redirect(&self, path: &str, location: &str) {
+        self.state
+            .pages
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), Page::Redirect(location.to_string()));
     }
 
     /// Answers `path` with an error status.
@@ -129,6 +202,22 @@ impl ListServer {
 
     pub fn requests(&self) -> usize {
         self.state.requests.load(Ordering::SeqCst)
+    }
+
+    /// How many requests asked for `path`.
+    pub fn requested(&self, path: &str) -> usize {
+        self.state
+            .requested
+            .lock()
+            .unwrap()
+            .get(path)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The connections open now.
+    pub fn active(&self) -> usize {
+        self.state.active.load(Ordering::SeqCst)
     }
 
     pub fn not_modified(&self) -> usize {
@@ -149,7 +238,38 @@ impl ListServer {
     }
 }
 
-fn answer(state: &State, head: &str) -> Vec<u8> {
+async fn trickle(
+    stream: &mut tokio::net::TcpStream,
+    head: &[u8],
+    body: &[u8],
+    chunk: usize,
+    pause: Duration,
+) {
+    if stream.write_all(head).await.is_err() {
+        return;
+    }
+
+    let mut pieces = body.chunks(chunk.max(1)).peekable();
+
+    while let Some(piece) = pieces.next() {
+        if stream.write_all(piece).await.is_err() {
+            return;
+        }
+
+        if pieces.peek().is_none() {
+            break;
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(pause) => {}
+            _ = stream.read_u8() => return,
+        }
+    }
+
+    let _ = stream.shutdown().await;
+}
+
+fn answer(state: &State, head: &str) -> Reply {
     let mut lines = head.lines();
     let path = lines
         .next()
@@ -160,6 +280,12 @@ fn answer(state: &State, head: &str) -> Vec<u8> {
         .filter_map(|line| line.split_once(':'))
         .find(|(name, _)| name.eq_ignore_ascii_case("if-none-match"))
         .map(|(_, value)| value.trim().to_string());
+    *state
+        .requested
+        .lock()
+        .unwrap()
+        .entry(path.clone())
+        .or_insert(0) += 1;
     let page = state.pages.lock().unwrap().get(&path).cloned();
 
     match page {
@@ -171,7 +297,9 @@ fn answer(state: &State, head: &str) -> Vec<u8> {
             if etag.is_some() && etag == if_none_match {
                 state.not_modified.fetch_add(1, Ordering::SeqCst);
 
-                return b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_vec();
+                return Reply::Whole(
+                    b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_vec(),
+                );
             }
 
             let etag = etag
@@ -185,18 +313,43 @@ fn answer(state: &State, head: &str) -> Vec<u8> {
                 body.len()
             )
             .into_bytes();
-            reply.extend_from_slice(body.as_bytes());
+            reply.extend_from_slice(&body);
 
-            reply
+            Reply::Whole(reply)
         }
 
-        Some(Page::Status(status)) => {
+        Some(Page::Unsized(body)) => {
+            let mut reply = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+            reply.extend_from_slice(&body);
+
+            Reply::Whole(reply)
+        }
+
+        Some(Page::Slow { body, chunk, pause }) => Reply::Slow {
+            head: format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes(),
+            body,
+            chunk,
+            pause,
+        },
+
+        Some(Page::Redirect(location)) => Reply::Whole(
+            format!(
+                "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes(),
+        ),
+
+        Some(Page::Status(status)) => Reply::Whole(
             format!("HTTP/1.1 {status} Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                .into_bytes()
-        }
+                .into_bytes(),
+        ),
 
-        None => {
-            b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_vec()
-        }
+        None => Reply::Whole(
+            b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ),
     }
 }
