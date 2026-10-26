@@ -88,6 +88,8 @@ lists are used.
 | `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A list over it is not used. |
 
 Downloads use `If-None-Match` and `If-Modified-Since`. A failed download keeps the last good list.
+A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private,
+link-local or unspecified address fails too, unless the list URL itself points into those ranges.
 A new list takes effect without a restart and without dropping queries. One list refreshes at a time.
 
 Example:
