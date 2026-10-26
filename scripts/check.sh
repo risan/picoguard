@@ -17,17 +17,20 @@ check_embedded() {
 
 check_embedded scripts/install.sh SYSTEMD_UNIT dist/picoguard.service
 check_embedded scripts/install.sh OPENRC_SCRIPT dist/picoguard.openrc
+check_embedded scripts/install.sh COMMON dist/picoguard-common.sh
 
 dash -n scripts/install.sh
+dash -n dist/picoguard-common.sh
 bash -n scripts/proxmox-lxc.sh
 scripts/test-release.sh
 
 if command -v shellcheck >/dev/null 2>&1; then
-    shellcheck -s sh scripts/install.sh
+    shellcheck -s sh scripts/install.sh dist/picoguard-common.sh \
+        scripts/test-update-helper/cases.sh scripts/test-update-helper/start.sh
     shellcheck -s bash scripts/proxmox-lxc.sh scripts/build-release.sh scripts/check.sh \
         scripts/release-preflight.sh scripts/sign-release.sh scripts/publish-crate.sh \
         scripts/publish-github-release.sh scripts/test-release.sh \
-        scripts/audit-history.sh scripts/test-audit-history.sh
+        scripts/audit-history.sh scripts/test-audit-history.sh scripts/test-update-helper.sh
 fi
 
 cargo fmt --check
