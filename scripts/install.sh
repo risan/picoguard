@@ -31,6 +31,10 @@ SERVICE_USER=picoguard
 HAGEZI=https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock
 ADGUARD_DNS_FILTER=https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
 
+# How long to wait for an update that is being installed, and then for the one this run stopped.
+LOCK_WAIT=${PICOGUARD_LOCK_WAIT:-300}
+STOPPED_WAIT=150
+
 BINARY_FILE=
 VERSION=latest
 INIT=
@@ -1846,6 +1850,41 @@ install_binary() {
     STAGED=
 }
 
+stop_update_installer() {
+    case $INIT in
+        systemd) systemctl stop picoguard-update.service 9>&- || true ;;
+        openrc) rc-service picoguard-update stop 9>&- || true ;;
+    esac
+}
+
+# Takes the lock the update installer takes for a whole pass, on fd 9 until this script ends,
+# so that the two never change the binary, the units or the installer's folder together.
+# Every child that can run long closes or keeps it on purpose: the installer's children keep
+# it, so it lasts as long as any of them; the services started here close it (9>&-), or
+# OpenRC's supervise-daemon would hold it until a reboot.
+# Without the folder (a first install, or an upgrade from a version without the installer) no
+# installer is running and there is nothing to wait for.
+lock_updates() {
+    if [ ! -d "$UPDATE_DIR" ]; then
+        return 0
+    fi
+
+    exec 9>>"$UPDATE_DIR/lock"
+
+    if timeout "$LOCK_WAIT" flock 9; then
+        return 0
+    fi
+
+    warn "an update is being installed and has not finished in $LOCK_WAIT seconds; stopping it"
+    stop_update_installer
+
+    # What the installer left running (a verification it was waiting for) ends within its own
+    # limits; until then it still holds the lock, and nothing may change under it.
+    if ! timeout "$STOPPED_WAIT" flock 9; then
+        warn "the stopped installer still holds the lock; going on anyway"
+    fi
+}
+
 # On an upgrade, keep what runs now, so that a failed restart can be undone.
 backup_previous() {
     if [ ! -x "$BIN_PATH" ]; then
@@ -2203,6 +2242,7 @@ main() {
 
     ensure_service_user
     migrate_dynamic_state
+    lock_updates
     backup_previous
     install_config
     secure_config_files

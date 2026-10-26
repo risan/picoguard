@@ -38,7 +38,11 @@ group_style() {
 HELPER_CASES="update_good update_silent update_dies restart_fails update_late update_refused
     verifier_hangs verifier_crashes no_verify_update update_repeat update_bad_request
     request_swap_race swap_fails rollback_fails_then_recovers install_files install_rerun
-    install_answers_a_waiting_request privileges idle_cost"
+    install_answers_a_waiting_request privileges idle_cost
+    interrupted_bad interrupted_good interrupted_before_swap interrupted_after_rollback_mv
+    interrupted_during_verify interrupted_after_result install_waits_for_lock
+    installer_waits_for_lock install_lock_timeout_stops_installer
+    install_lock_timeout_during_verify lock_replaced_while_waiting lock_not_inherited"
 
 # What only the OpenRC watcher has: a process that polls.
 OPENRC_CASES="answered_request_left_in_place watcher_starts_with_stale_fifo"
@@ -988,6 +992,306 @@ watcher_starts_with_stale_fifo() {
     stage good
     wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
     expect_result "$STAGED_ID" updated
+}
+
+# ---- interrupted runs and the lock ----
+
+# plant_interrupted RELEASE: what a pass leaves when it stops after the swap: the previous
+# binary, the verified copy of RELEASE, RELEASE at $B and a record with swap=1. Sets
+# STAGED_ID to the record's id.
+plant_interrupted() {
+    STAGED_ID=$(new_id)
+    cp -p "$REAL" "$I/previous"
+    mkdir -m 0700 "$I/verified"
+    cp "$FIXTURES/releases/$1/picoguard" "$I/verified/picoguard"
+    cp "$FIXTURES/releases/$1/picoguard" "$B.new"
+    chmod 0755 "$B.new"
+    mv -f "$B.new" "$B"
+    printf 'id=%s\nversion=9.9.9\nswap=1\n' "$STAGED_ID" >"$I/installing"
+}
+
+# The boot run: the installer service started at boot, or the watcher started.
+boot_run() {
+    case $INIT in
+        systemd) systemctl start picoguard-update.service ;;
+        openrc) rc-service picoguard-update restart ;;
+    esac
+}
+
+enabled_at_boot() {
+    case $INIT in
+        systemd) [ "$(systemctl is-enabled picoguard-update.service)" = enabled ] ;;
+        openrc) rc-update show default | grep -q picoguard-update ;;
+    esac
+}
+
+expect_no_pass_files() {
+    for name in installing previous verified verify.err; do
+        [ ! -e "$I/$name" ] || fail "$I/$name is still there"
+    done
+
+    [ -z "$(find "$I" -name '*.part')" ] || fail "a part file is still there"
+}
+
+interrupted_bad() {
+    plant_interrupted silent
+    boot_run
+    wait_result "$STAGED_ID" 120 || fail "no result within 120 seconds"
+    settle
+
+    expect_result "$STAGED_ID" rolled-back "runs again"
+    same_file "$B" "$REAL" || fail "$B is not the real binary"
+    expect_no_pass_files
+    enabled_at_boot || fail "the installer does not run at boot"
+}
+
+interrupted_good() {
+    plant_interrupted good
+    boot_run
+    wait_result "$STAGED_ID" 120 || fail "no result within 120 seconds"
+    settle
+
+    expect_result "$STAGED_ID" updated
+    same_file "$B" "$FIXTURES/releases/good/picoguard" || fail "$B is not the good release"
+    expect_no_pass_files
+}
+
+# interrupted_before SETUP-NAME: B is still the real binary and the record has no swap line.
+interrupted_before() {
+    STAGED_ID=$(new_id)
+    printf 'id=%s\nversion=9.9.9\n' "$STAGED_ID" >"$I/installing"
+    pid=$(picoguard_pid)
+
+    case $1 in
+        nothing) ;;
+        verified_and_part)
+            mkdir -m 0700 "$I/verified"
+            cp "$FIXTURES/releases/good/picoguard" "$I/verified/picoguard"
+            cp "$REAL" "$I/previous.part"
+            ;;
+        verified_and_previous)
+            mkdir -m 0700 "$I/verified"
+            cp "$FIXTURES/releases/good/picoguard" "$I/verified/picoguard"
+            cp -p "$REAL" "$I/previous"
+            ;;
+        verified_equals_b)
+            mkdir -m 0700 "$I/verified"
+            cp "$B" "$I/verified/picoguard"
+            cp -p "$REAL" "$I/previous"
+            ;;
+    esac
+
+    boot_run
+    wait_result "$STAGED_ID" 60 || fail "$1: no result within 60 seconds"
+    settle
+
+    expect_result "$STAGED_ID" failed "interrupted"
+    same_file "$B" "$REAL" || fail "$1: $B changed"
+    [ "$(picoguard_pid)" = "$pid" ] || fail "$1: picoguard was restarted"
+    expect_no_pass_files
+}
+
+interrupted_before_swap() {
+    interrupted_before nothing
+    interrupted_before verified_and_part
+    interrupted_before verified_and_previous
+    interrupted_before verified_equals_b
+}
+
+interrupted_after_rollback_mv() {
+    plant_interrupted silent
+    cp -p "$REAL" "$B"
+    pid=$(picoguard_pid)
+    boot_run
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    settle
+
+    expect_result "$STAGED_ID" failed "interrupted"
+    [ "$(picoguard_pid)" != "$pid" ] || fail "picoguard was not restarted"
+    service_up || fail "picoguard is not active"
+    expect_no_pass_files
+}
+
+interrupted_during_verify() {
+    pid=$(picoguard_pid)
+    stage slow
+    wait_for 60 test -f "$I/installing" || fail "the pass never started"
+
+    case $INIT in
+        systemd) systemctl kill -s KILL picoguard-update.service ;;
+        openrc) kill -9 "$(children_of "$(cat /run/supervise-picoguard-update.pid)")" ;;
+    esac
+
+    # The next pass: by hand on systemd; on OpenRC supervise-daemon starts the watcher again,
+    # and its first pass waits for the lock until the verification the kill left has ended.
+    case $INIT in
+        systemd)
+            sleep 1
+            systemctl start picoguard-update.service
+            ;;
+    esac
+
+    wait_result "$STAGED_ID" 90 || fail "no result within 90 seconds"
+    settle
+
+    expect_result "$STAGED_ID" failed "interrupted"
+    same_file "$B" "$REAL" || fail "$B changed"
+    [ "$(picoguard_pid)" = "$pid" ] || fail "picoguard was restarted"
+}
+
+interrupted_after_result() {
+    for outcome in updated rolled-back; do
+        plant_interrupted silent
+        cp -p "$REAL" "$B"
+        pid=$(picoguard_pid)
+
+        if [ "$outcome" = updated ]; then
+            printf 'id=%s\noutcome=updated\n' "$STAGED_ID" >"$I/result"
+        else
+            printf 'id=%s\noutcome=rolled-back\nreason=the new version did not start; the previous version runs again\n' "$STAGED_ID" >"$I/result"
+        fi
+
+        chmod 0644 "$I/result"
+        before=$(cksum <"$I/result")
+        boot_run
+        wait_for 60 test ! -e "$I/installing" || fail "$outcome: the record is still there"
+        settle
+
+        [ "$(cksum <"$I/result")" = "$before" ] || fail "$outcome: the result changed"
+        [ "$(picoguard_pid)" = "$pid" ] || fail "$outcome: picoguard was restarted"
+        expect_no_pass_files
+    done
+}
+
+# hold_lock SECONDS: someone else, for example a pass of the installer, holds $I/lock.
+install_with_lock_wait() {
+    PICOGUARD_LOCK_WAIT=$1 sh "$FIXTURES/install.sh" --yes --binary "$FIXTURES/picoguard" --web-password none
+}
+
+hold_lock() {
+    flock "$I/lock" sleep "$1" >/dev/null 2>&1 &
+    HOLDER=$!
+    sleep 1
+}
+
+install_waits_for_lock() {
+    hold_lock 15
+    started=$(date +%s)
+
+    install_real >/dev/null || fail "install.sh failed"
+    elapsed=$(($(date +%s) - started))
+    wait "$HOLDER" || true
+
+    note "install.sh took ${elapsed}s"
+    [ "$elapsed" -ge 10 ] || fail "install.sh did not wait for the lock: ${elapsed}s"
+}
+
+installer_waits_for_lock() {
+    hold_lock 15
+    stage good
+    sleep 10
+
+    if [ -f "$I/result" ] && [ "$(result_value id)" = "$STAGED_ID" ]; then
+        fail "answered while the lock was held"
+    fi
+
+    wait_result "$STAGED_ID" 60 || fail "no result after the lock was released"
+    expect_result "$STAGED_ID" updated
+    wait "$HOLDER" || true
+}
+
+install_lock_timeout_stops_installer() {
+    stage silent
+    wait_for 60 same_file "$B" "$FIXTURES/releases/silent/picoguard" || fail "the new binary never reached $B"
+
+    out=$(install_with_lock_wait 5 2>&1) || fail "install.sh failed: $out"
+    printf '%s\n' "$out"
+    ended=$(date +%s)
+
+    case $out in
+        *"stopping it"*) ;;
+        *) fail "install.sh did not warn about the wait" ;;
+    esac
+
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds of the run"
+    note "answered $(($(date +%s) - ended))s after the run"
+    expect_result "$STAGED_ID" failed "interrupted"
+    same_file "$B" "$REAL" || fail "$B is not the real binary"
+    wait_for 30 service_up || fail "picoguard is not active"
+}
+
+# The hung verifier of install_fake_verifier, which is `sleep 200`. Not `verify-update`: the
+# installer's next pass runs the real one at once.
+hung_verifier_running() {
+    pgrep -f "sleep 200" >/dev/null
+}
+
+install_lock_timeout_during_verify() {
+    shorten_verify_wait 20
+    install_fake_verifier hangs
+    stage good
+    wait_for 60 test -f "$I/installing" || fail "the pass never started"
+
+    started=$(date +%s)
+    out=$(install_with_lock_wait 5 2>&1) || fail "install.sh failed: $out"
+    printf '%s\n' "$out"
+    note "install.sh took $(($(date +%s) - started))s"
+
+    [ -z "$(holders_of_lock)" ] || fail "something still holds $I/lock: $(holders_of_lock)"
+
+    if hung_verifier_running; then
+        fail "the verification the stopped pass was waiting for is still running"
+    fi
+
+    same_file "$B" "$REAL" || fail "$B is not the real binary"
+    wait_result "$STAGED_ID" 90 || fail "no result within 90 seconds"
+    expect_result "$STAGED_ID" failed "interrupted"
+}
+
+lock_change_logged() {
+    installer_log | grep -q "the lock changed while waiting"
+}
+
+lock_replaced_while_waiting() {
+    flock "$I/lock" sleep 12 >/dev/null 2>&1 &
+    holder=$!
+    sleep 1
+    stage good
+    trigger_gap
+    sleep 2
+
+    : >"$I/lock.new"
+    chmod 0600 "$I/lock.new"
+    mv -f "$I/lock.new" "$I/lock"
+    wait "$holder" || true
+
+    wait_for 5 lock_change_logged || fail "the waiting pass did not log the changed lock"
+    [ ! -e "$I/installing" ] || fail "a record was written"
+
+    if [ -f "$I/result" ] && [ "$(result_value id)" = "$STAGED_ID" ]; then
+        fail "the pass answered on the old lock"
+    fi
+
+    same_file "$B" "$REAL" || fail "$B changed"
+
+    case $INIT in
+        systemd) systemctl start picoguard-update.service ;;
+    esac
+
+    wait_result "$STAGED_ID" 60 || fail "no result on the new lock"
+    expect_result "$STAGED_ID" updated
+}
+
+lock_not_inherited() {
+    install_real >/dev/null
+    settle
+    [ -z "$(holders_of_lock)" ] || fail "install.sh left the lock held: $(holders_of_lock)"
+
+    stage good
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    expect_result "$STAGED_ID" updated
+    settle
+    [ -z "$(holders_of_lock)" ] || fail "the update left the lock held: $(holders_of_lock)"
 }
 
 group_of() {
