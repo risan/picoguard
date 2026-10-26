@@ -29,6 +29,7 @@ fn config(dns_port: u16, web_port: u16, enabled: bool) -> String {
         "lists = []\n\
          [server]\nbind = [\"127.0.0.1\"]\nport = {dns_port}\n\
          [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
+         [update]\ncheck = false\n\
          [web]\nenabled = {enabled}\nbind = [\"127.0.0.1\"]\nport = {web_port}\n\
          [state]\ndir = {:?}\n",
         std::env::temp_dir()

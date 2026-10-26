@@ -24,8 +24,11 @@ main { max-width: 1000px; margin: 0 auto; display: grid; gap: 12px; }
 header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 h1 { font-size: 20px; margin: 0; flex: 1; }
 h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+h1 small { font-size: 13px; font-weight: 400; color: var(--muted); }
 h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; }
 section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-width: 0; }
+code { display: block; font-size: 13px; word-break: break-all; }
+#update-notes { overflow-wrap: anywhere; }
 #state { font-size: 13px; color: var(--muted); }
 #state.bad { color: var(--blocked); }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
@@ -64,9 +67,16 @@ button.go { background: var(--accent); border-color: var(--accent); color: #fff;
 <body>
 <main>
   <header>
-    <h1>picoguard</h1>
+    <h1>picoguard <small id="version"></small></h1>
     <span id="state">connecting</span>
   </header>
+
+  <section id="update" hidden>
+    <h2>Update</h2>
+    <p id="update-text"></p>
+    <p id="update-notes"></p>
+    <code id="update-how"></code>
+  </section>
 
   <section id="limited" hidden>
     <h2>Read-only</h2>
@@ -284,6 +294,15 @@ function tick() {
     : "Blocking is on.";
 }
 
+function showUpdate(status) {
+  $("version").textContent = "v" + status.version;
+  $("update").hidden = !status.update.latest;
+  $("update-text").textContent = status.update.latest ? "update available: v" + status.update.latest : "";
+  $("update-notes").textContent = status.update.notes || "";
+  $("update-notes").hidden = !status.update.notes;
+  $("update-how").textContent = status.update.how || "";
+}
+
 // Without a password the server answers 403 to everything but totals and lists.
 function showLimited(note) {
   $("limited-note").textContent = note || "";
@@ -294,6 +313,7 @@ function showLimited(note) {
 async function update() {
   try {
     const status = await api("/api/status");
+    showUpdate(status);
     showLimited(status.limited);
     showCards(status.counters, status.blocked_percent);
     showChart(status.hourly);
