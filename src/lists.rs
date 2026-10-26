@@ -29,7 +29,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
@@ -94,6 +94,9 @@ pub struct Limits {
     pub max_body_bytes: u64,
     /// How long connecting, the response head and each piece of the body may take.
     pub idle_timeout: Duration,
+    /// How long one download may take in all, redirects and the whole body included. A
+    /// server that sends a byte now and then stays within `idle_timeout` for ever.
+    pub total_timeout: Duration,
     pub max_redirects: usize,
 }
 
@@ -102,6 +105,7 @@ impl Default for Limits {
         Limits {
             max_body_bytes: 64 * 1024 * 1024,
             idle_timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(10 * 60),
             max_redirects: 5,
         }
     }
@@ -114,6 +118,8 @@ pub enum FetchError {
     Connect(io::Error),
     Tls(io::Error),
     Timeout,
+    /// The download did not finish within `Limits::total_timeout`.
+    DeadlinePassed,
     Http(hyper::Error),
     Status(u16),
     TooManyRedirects,
@@ -149,6 +155,10 @@ impl fmt::Display for FetchError {
 
             FetchError::Timeout => {
                 write!(formatter, "timed out")
+            }
+
+            FetchError::DeadlinePassed => {
+                write!(formatter, "the download took too long")
             }
 
             FetchError::Http(error) => {
@@ -437,6 +447,7 @@ pub struct Download {
     pub validators: Validators,
     body: Incoming,
     limits: Limits,
+    deadline: Instant,
     _connection: ConnectionTask,
 }
 
@@ -458,12 +469,27 @@ impl Downloader {
     }
 
     /// Follows redirects and returns at the first 200 or 304 response, before its body.
-    /// `previous` makes the request conditional.
+    /// `previous` makes the request conditional. The deadline of the whole download starts
+    /// here: it covers the redirects and `Download::pump`.
     pub async fn fetch(
         &self,
         url: &str,
         previous: &Validators,
         limits: &Limits,
+    ) -> Result<Fetch, FetchError> {
+        let deadline = Instant::now() + limits.total_timeout;
+
+        timeout_at(deadline, self.follow(url, previous, limits, deadline))
+            .await
+            .map_err(|_| FetchError::DeadlinePassed)?
+    }
+
+    async fn follow(
+        &self,
+        url: &str,
+        previous: &Validators,
+        limits: &Limits,
+        deadline: Instant,
     ) -> Result<Fetch, FetchError> {
         let mut target = Target::parse(url)?;
 
@@ -471,7 +497,7 @@ impl Downloader {
             let (head, body, connection) = self.request(&target, previous, limits).await?;
 
             if head.status == StatusCode::OK {
-                return download(head, body, connection, limits);
+                return download(head, body, connection, limits, deadline);
             }
 
             if head.status == StatusCode::NOT_MODIFIED && !previous.is_empty() {
@@ -662,6 +688,7 @@ fn download(
     body: Incoming,
     connection: ConnectionTask,
     limits: &Limits,
+    deadline: Instant,
 ) -> Result<Fetch, FetchError> {
     if let Some(coding) = header_tokens(&head.headers, &CONTENT_ENCODING)
         .find(|coding| !coding.eq_ignore_ascii_case("identity"))
@@ -693,6 +720,7 @@ fn download(
         validators: Validators::of_response(&head.headers),
         body,
         limits: limits.clone(),
+        deadline,
         _connection: connection,
     }))
 }
@@ -728,7 +756,13 @@ fn looks_like_html(start: &[u8]) -> bool {
 impl Download {
     /// Reads the body and sends it as pieces followed by `End`. On an error the caller drops
     /// the sender, which tells the compile worker to throw the partial text away.
-    pub async fn pump(mut self, sink: &PieceSender) -> Result<(), FetchError> {
+    pub async fn pump(self, sink: &PieceSender) -> Result<(), FetchError> {
+        timeout_at(self.deadline, self.read_body(sink))
+            .await
+            .map_err(|_| FetchError::DeadlinePassed)?
+    }
+
+    async fn read_body(mut self, sink: &PieceSender) -> Result<(), FetchError> {
         let mut piece = Vec::with_capacity(MAX_PIECE_BYTES);
         let mut total = 0u64;
         let mut sniffed = false;
@@ -1579,6 +1613,68 @@ mod tests {
         let error = fetch_error(&local(), &server.url("/"), &quick()).await;
 
         assert!(matches!(error, FetchError::Timeout), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_trickles_past_the_total_deadline_fails_the_download() {
+        let server = Server::start(|_, _, mut stream| async move {
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 600\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.unwrap();
+            for _ in 0..600 {
+                if stream.write_all(b"x").await.is_err() {
+                    return;
+                }
+
+                stream.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let limits = Limits {
+            total_timeout: Duration::from_millis(600),
+            ..quick()
+        };
+
+        let started = std::time::Instant::now();
+        let pumped = fetch_body(&local(), &server.url("/"), &limits).await;
+
+        assert!(
+            matches!(pumped.result, Err(FetchError::DeadlinePassed)),
+            "{:?}",
+            pumped.result
+        );
+        assert!(!pumped.ended);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn redirects_count_against_the_total_deadline() {
+        let server = Server::start(|index, request, mut stream| async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let location = format!("http://{}/{}", request.server, index + 1);
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        })
+        .await;
+        let limits = Limits {
+            total_timeout: Duration::from_millis(600),
+            ..quick()
+        };
+
+        let error = fetch_error(&local(), &server.url("/0"), &limits).await;
+
+        assert!(matches!(error, FetchError::DeadlinePassed), "{error:?}");
+    }
+
+    #[test]
+    fn the_default_total_deadline_is_ten_minutes() {
+        assert_eq!(Limits::default().total_timeout, Duration::from_secs(600));
     }
 
     #[tokio::test]
