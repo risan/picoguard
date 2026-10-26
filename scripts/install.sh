@@ -851,7 +851,16 @@ EOF
 
         printf '\n# Blocklists: %s\n' "$(lists_label "$LISTS")"
         lists_for "$LISTS" | while read -r name url; do
-            printf '[[lists]]\nname = "%s"\nurl = "%s"\nformat = "adblock"\n\n' "$name" "$url"
+            printf '[[lists]]\nname = "%s"\nurl = "%s"\nformat = "adblock"\n' "$name" "$url"
+
+            # The full TIF has about 2.1 million rules, over the default cap of 1.5 million.
+            case $name in
+                hagezi-ultimate|hagezi-tif)
+                    printf 'max_rules = 3000000\n'
+                    ;;
+            esac
+
+            printf '\n'
         done
     } >"$1"
 }
