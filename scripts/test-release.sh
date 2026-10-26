@@ -218,6 +218,22 @@ sign_removes_stale_signature() {
     [ ! -e "$dir/SHA256SUMS.sig" ] || fail "the stale signature survived a failed run"
 }
 
+sign_removes_stale_signature_when_an_input_is_missing() {
+    local dir
+
+    make_keypair good
+    dir=$(fake_release_dir stale-input)
+
+    echo stale >"$dir/SHA256SUMS.sig"
+    expect_failure sign_release "$(cat "$scratch/good.key")" "$dir" "$scratch/no-such-public-key"
+    [ ! -e "$dir/SHA256SUMS.sig" ] || fail "the stale signature survived a missing public key"
+
+    echo stale >"$dir/SHA256SUMS.sig"
+    rm "$dir/SHA256SUMS"
+    expect_failure sign_release "$(cat "$scratch/good.key")" "$dir" "$scratch/good.pub"
+    [ ! -e "$dir/SHA256SUMS.sig" ] || fail "the stale signature survived a missing SHA256SUMS"
+}
+
 sign_never_prints_key() {
     if grep -q -F -f "$sign_keys" "$sign_log"; then
         fail "a key appeared in the output of the sign script"
@@ -229,6 +245,7 @@ run_case sign_rejects_other_key
 run_case sign_requires_key
 run_case sign_rejects_malformed_key
 run_case sign_removes_stale_signature
+run_case sign_removes_stale_signature_when_an_input_is_missing
 run_case sign_never_prints_key
 
 # --- crates.io publish decision ----------------------------------------------

@@ -23,10 +23,10 @@ die() {
     exit 1
 }
 
+rm -f "$signature"
+
 [ -f "$sums" ] || die "$sums does not exist"
 [ -f "$public_key" ] || die "public key file $public_key does not exist"
-
-rm -f "$signature"
 
 [ -n "${RELEASE_SIGNING_KEY:-}" ] || die "RELEASE_SIGNING_KEY is not set or is empty"
 
