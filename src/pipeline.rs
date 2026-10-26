@@ -1242,6 +1242,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_compressed_question_is_answered_with_formerr() {
+        let mut config = Config::default();
+        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let mut request = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        request.extend_from_slice(&[0xC0, 0x04, 0, 1, 0, 1]);
+        let mut out = Vec::new();
+
+        let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut out);
+
+        assert_eq!(quick, Quick::Replied);
+        assert_eq!(out.len(), 12);
+        assert_eq!(u16::from(parse(&out).metadata.response_code), 1);
+    }
+
+    #[tokio::test]
     async fn a_blocked_decision_with_many_ips_is_recomputed_instead_of_held_in_the_cache() {
         let host_rules: String = (0..200)
             .map(|index| format!("10.0.{}.{} 9.9.9.9\n", index / 256, index % 256))
