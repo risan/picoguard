@@ -128,14 +128,22 @@ Good to know:
 - The service runs as the system user `picoguard`. The config is
   `/etc/picoguard/picoguard.toml`, owned by `root:picoguard` with mode `0640`, because it can hold
   the status page password.
-- When you upgrade, the script keeps the previous binary and unit. If the restart fails, or the
-  new version does not answer a test lookup, it puts them back, restarts the old version and says so.
+- When you upgrade, the script keeps the previous binary, unit, config and memory drop-in. If the
+  restart fails, or the new version does not answer a test lookup, it puts them back, restarts the
+  old version and says so. The test lookup goes to an address from `[server] bind` that the device
+  can reach (`127.0.0.1` for `0.0.0.0`, `::1` when only IPv6 is bound).
+- The xlarge lists (HaGeZi Ultimate and the full TIF) get `max_rules = 3000000` in the config and,
+  on systemd, a drop-in `/etc/systemd/system/picoguard.service.d/memory.conf` with `MemoryMax=192M`.
+  The script only creates, replaces or removes that drop-in while its first line is
+  `# Written by install.sh for the xlarge lists.`. A `memory.conf` of your own is left alone, and
+  the script warns when the xlarge lists need a higher limit than it sets.
 - If an install fails after the systemd-resolved change, the change is undone.
 - An existing config is never overwritten. `--reconfigure` asks the questions again and saves the
   old file as `picoguard.toml.bak.<time>` first.
 - `--no-start` installs everything and starts nothing.
 - `--binary FILE` installs a binary you built yourself, without a checksum check. `--version vX.Y.Z` picks a release.
-- `sh install.sh --uninstall` removes the binary, the service and the systemd-resolved change.
+- `sh install.sh --uninstall` removes the binary, the service and the systemd-resolved change. It
+  keeps a `memory.conf` that it did not write.
   It keeps `/etc/picoguard` and `/var/lib/picoguard` unless you add `--purge`.
 
 ### Install in a Proxmox LXC
