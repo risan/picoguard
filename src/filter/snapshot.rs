@@ -643,11 +643,13 @@ impl<R: Read> Decoder<R> {
         };
 
         self.charge(1, "slow rules")?;
+        let slow = SlowRule::compile(rule)
+            .map_err(|()| SnapshotError::Corrupt("a rule does not compile"))?;
         self.slow_budget
-            .charge(&rule)
+            .charge(&slow)
             .map_err(|_| SnapshotError::TooLarge("slow rule memory"))?;
 
-        SlowRule::compile(rule).map_err(|()| SnapshotError::Corrupt("a rule does not compile"))
+        Ok(slow)
     }
 }
 
@@ -1744,12 +1746,7 @@ ads.*.tracker
         let text: String = (0..20).map(|i| format!("a{i}*b\n")).collect();
         let (path, _) = saved_bytes(&state, &text).await;
         let loaded = load(&path, &caps()).unwrap();
-        let total: usize = loaded
-            .list
-            .slow
-            .iter()
-            .map(|slow| slow_rule_cost(&slow.rule))
-            .sum();
+        let total: usize = loaded.list.slow.iter().map(slow_rule_cost).sum();
         let budget = |slow_rule_budget| CompileOptions {
             slow_rule_budget,
             ..caps()

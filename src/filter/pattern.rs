@@ -5,8 +5,9 @@
 //! host name, or against the synthetic URL `http://<host>` for patterns with a URL prefix.
 //! Patterns that are not `/regex/` rules are matched here without a regex engine: the
 //! translation produces only literals, `.*`, the separator class and anchors, and a small
-//! backtracking matcher keeps each rule at a few dozen bytes. `/regex/` rules use the
-//! `regex` crate after a translation of the Go (RE2) syntax differences.
+//! position-set matcher (linear in the name, no allocation) keeps each rule at a few dozen
+//! bytes. `/regex/` rules use the `regex` crate after a translation of the Go (RE2) syntax
+//! differences.
 
 use std::fmt;
 
@@ -14,6 +15,10 @@ use regex::{Regex, RegexBuilder};
 
 /// Compiled regexes may not grow beyond this many bytes.
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// What a regex is charged in the slow-rule budget: measured at 3 to 20 KiB for the regexes
+/// of real lists (a Unicode class such as `\p{L}` is the expensive one).
+const REGEX_COST_BYTES: usize = 24 * 1024;
 
 /// The lazy DFA cache of one regex.
 const REGEX_DFA_LIMIT: usize = 1 << 17;
@@ -98,6 +103,16 @@ impl Matcher {
         })
     }
 
+    /// Estimated bytes the matcher holds and, for a glob, the time its tokens may take, as
+    /// the slow-rule budget counts them.
+    pub fn cost_bytes(&self) -> usize {
+        match &self.body {
+            Body::Any => 0,
+            Body::Glob(glob) => glob.cost_bytes(),
+            Body::Regex(_) => REGEX_COST_BYTES,
+        }
+    }
+
     /// The lowercase text a URL must contain for the rule to match; empty when the rule has
     /// no usable shortcut.
     pub fn shortcut(&self) -> &str {
@@ -170,8 +185,15 @@ struct Glob {
     start: Start,
     tokens: Vec<Token>,
     end: bool,
-    has_any: bool,
 }
+
+/// Position words that fit the stack buffer of a match: a 255-byte name behind `http://`,
+/// one bit per position.
+const INLINE_POSITION_WORDS: usize = 5;
+
+/// What one token costs in the slow-rule budget. A match visits every token for up to every
+/// position of the name, so the charge also bounds the time a list of tokens can take.
+pub const GLOB_TOKEN_BYTES: usize = 64;
 
 impl Glob {
     /// The same translation as urlfilter's `patternToRegexp`, without the regex: every
@@ -193,7 +215,11 @@ impl Glob {
         let mut buffer = [0; 4];
         for c in rest.chars() {
             match c {
-                '*' => tokens.push(Token::Any),
+                '*' => {
+                    if !matches!(tokens.last(), Some(Token::Any)) {
+                        tokens.push(Token::Any);
+                    }
+                }
                 '^' => tokens.push(Token::Separator),
                 _ => {
                     let mut lower = c.to_lowercase();
@@ -210,26 +236,48 @@ impl Glob {
             }
         }
 
-        let has_any = tokens.iter().any(|token| matches!(token, Token::Any));
-
-        Glob {
-            start,
-            tokens,
-            end,
-            has_any,
+        tokens.shrink_to_fit();
+        for token in &mut tokens {
+            if let Token::Literal(run) = token {
+                run.shrink_to_fit();
+            }
         }
+
+        Glob { start, tokens, end }
     }
 
+    /// The bytes the tokens are charged: their heap plus a fixed amount for each.
+    fn cost_bytes(&self) -> usize {
+        let literals: usize = self
+            .tokens
+            .iter()
+            .map(|token| match token {
+                Token::Literal(run) => run.len(),
+                _ => 0,
+            })
+            .sum();
+
+        self.tokens.len() * GLOB_TOKEN_BYTES + literals
+    }
+
+    /// Walks the tokens once with the set of positions the match can have reached, so the
+    /// work is at most tokens times positions however many `*` the pattern has, and the sets
+    /// live on the stack for any name a DNS message can hold.
     fn is_match(&self, subject: &[u8]) -> bool {
-        // A failed (token, position) pair fails from every start, so one memo serves all.
-        let mut failed = if self.has_any {
-            vec![false; self.tokens.len() * (subject.len() + 1)]
+        let words = (subject.len() + 1).div_ceil(64);
+        let mut inline = [0u64; 2 * INLINE_POSITION_WORDS];
+        let mut spilled;
+        let buffer: &mut [u64] = if words <= INLINE_POSITION_WORDS {
+            &mut inline[..2 * words]
         } else {
-            Vec::new()
+            spilled = vec![0u64; 2 * words];
+
+            &mut spilled
         };
+        let (mut reached, mut next) = buffer.split_at_mut(words);
 
         match self.start {
-            Start::Anchored => self.match_from(subject, 0, 0, &mut failed),
+            Start::Anchored => insert(reached, 0),
             Start::UrlHost => {
                 const SCHEME: &[u8] = b"http://";
                 if !subject
@@ -239,65 +287,117 @@ impl Glob {
                     return false;
                 }
 
-                // `([a-z0-9-_.]+\.)?` may skip leading labels made of name characters.
-                if self.match_from(subject, 0, SCHEME.len(), &mut failed) {
-                    return true;
-                }
+                insert(reached, SCHEME.len());
 
+                // `([a-z0-9-_.]+\.)?` may skip leading labels made of name characters.
                 for (at, &byte) in subject.iter().enumerate().skip(SCHEME.len()) {
                     if !is_name_byte(byte) {
                         break;
                     }
 
-                    if byte == b'.'
-                        && at > SCHEME.len()
-                        && self.match_from(subject, 0, at + 1, &mut failed)
-                    {
-                        return true;
+                    if byte == b'.' && at > SCHEME.len() {
+                        insert(reached, at + 1);
                     }
                 }
-
-                false
             }
-            Start::Anywhere => (0..=subject.len())
-                .filter(|&at| is_boundary(subject, at))
-                .any(|at| self.match_from(subject, 0, at, &mut failed)),
-        }
-    }
-
-    fn match_from(&self, subject: &[u8], token: usize, at: usize, failed: &mut [bool]) -> bool {
-        let Some(current) = self.tokens.get(token) else {
-            return !self.end || at == subject.len();
-        };
-
-        let memo = token * (subject.len() + 1) + at;
-        if self.has_any && failed[memo] {
-            return false;
-        }
-
-        let found = match current {
-            Token::Literal(literal) => {
-                subject[at..].starts_with(literal)
-                    && self.match_from(subject, token + 1, at + literal.len(), failed)
-            }
-            Token::Separator => match subject.get(at) {
-                None => self.match_from(subject, token + 1, at, failed),
-                Some(&byte) if is_separator(byte) => {
-                    self.match_from(subject, token + 1, at + char_len(byte), failed)
+            Start::Anywhere => {
+                for at in (0..=subject.len()).filter(|&at| is_boundary(subject, at)) {
+                    insert(reached, at);
                 }
-                Some(_) => false,
-            },
-            Token::Any => (at..=subject.len())
-                .filter(|&next| is_boundary(subject, next))
-                .any(|next| self.match_from(subject, token + 1, next, failed)),
-        };
-
-        if !found && self.has_any {
-            failed[memo] = true;
+            }
         }
 
-        found
+        let mut ascii = None;
+        for token in &self.tokens {
+            next.fill(0);
+            match token {
+                Token::Literal(literal) => {
+                    for at in positions(reached) {
+                        if subject[at..].starts_with(literal) {
+                            insert(next, at + literal.len());
+                        }
+                    }
+                }
+                Token::Separator => {
+                    for at in positions(reached) {
+                        match subject.get(at) {
+                            None => insert(next, at),
+                            Some(&byte) if is_separator(byte) => {
+                                insert(next, at + char_len(byte));
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                Token::Any => {
+                    let Some(first) = positions(reached).next() else {
+                        return false;
+                    };
+
+                    if *ascii.get_or_insert_with(|| subject.is_ascii()) {
+                        insert_range(next, first, subject.len());
+                    } else {
+                        for at in (first..=subject.len()).filter(|&at| is_boundary(subject, at)) {
+                            insert(next, at);
+                        }
+                    }
+                }
+            }
+
+            std::mem::swap(&mut reached, &mut next);
+            if reached.iter().all(|&word| word == 0) {
+                return false;
+            }
+        }
+
+        if self.end {
+            reached[subject.len() / 64] & (1 << (subject.len() % 64)) != 0
+        } else {
+            reached.iter().any(|&word| word != 0)
+        }
     }
+}
+
+fn insert(set: &mut [u64], at: usize) {
+    set[at / 64] |= 1 << (at % 64);
+}
+
+/// Inserts every position from `first` to `last`, both included.
+fn insert_range(set: &mut [u64], first: usize, last: usize) {
+    for (word, bits) in set
+        .iter_mut()
+        .enumerate()
+        .take(last / 64 + 1)
+        .skip(first / 64)
+    {
+        let mut mask = u64::MAX;
+        if word == first / 64 {
+            mask &= u64::MAX << (first % 64);
+        }
+
+        if word == last / 64 {
+            mask &= u64::MAX >> (63 - last % 64);
+        }
+
+        *bits |= mask;
+    }
+}
+
+fn positions(set: &[u64]) -> impl Iterator<Item = usize> + '_ {
+    set.iter().enumerate().flat_map(|(index, &word)| {
+        let mut bits = word;
+
+        std::iter::from_fn(move || {
+            if bits == 0 {
+                return None;
+            }
+
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+
+            Some(index * 64 + bit)
+        })
+    })
 }
 
 fn is_boundary(bytes: &[u8], at: usize) -> bool {
@@ -865,6 +965,35 @@ mod tests {
     }
 
     #[test]
+    fn many_wildcards_match_in_time_linear_in_the_name() {
+        let host = "a".repeat(250);
+        let url = format!("http://{host}");
+        for pattern in [format!("{}b", "*a".repeat(1500)), "*^".repeat(2000)] {
+            let matcher = Matcher::compile(&pattern).unwrap();
+
+            let started = std::time::Instant::now();
+            for _ in 0..20 {
+                assert_eq!(matcher.is_match(&host, &url), pattern.starts_with("*^"));
+            }
+
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(500),
+                "{:?} for {} tokens",
+                started.elapsed(),
+                pattern.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_of_stars_is_one_token() {
+        let cost = |pattern: &str| Matcher::compile(pattern).unwrap().cost_bytes();
+
+        assert_eq!(cost("a*****b"), cost("a*b"));
+        assert!(cost("a*^*^b") > cost("a*b"));
+    }
+
+    #[test]
     fn a_pipe_inside_the_pattern_is_literal() {
         assert!(matches("||mid|pipe.example^", "mid|pipe.example"));
         assert!(!matches("||mid|pipe.example^", "mid.pipe.example"));
@@ -1338,6 +1467,50 @@ mod tests {
         }
 
         assert!(checked > 9_000);
+    }
+
+    #[test]
+    fn random_globs_match_like_the_reference_regex_across_position_words() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut random = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+
+            (state % bound as u64) as usize
+        };
+        let pattern_symbols = ["a", "b", "*", "*", "^", ".", "-", "a", "b"];
+        let subject_symbols = ["a", "b", ".", "-", ":", "\u{e9}", "x", "a", "b"];
+        let anchors = ["||", "|", ""];
+        let ends = ["", "^", "|"];
+        let mut matched = 0;
+        for _ in 0..3_000 {
+            let body: String = (0..1 + random(7))
+                .map(|_| pattern_symbols[random(pattern_symbols.len())])
+                .collect();
+            let pattern = format!("{}{body}{}", anchors[random(3)], ends[random(3)]);
+            let reference = regex::RegexBuilder::new(&reference_regex(&pattern))
+                .case_insensitive(true)
+                .build()
+                .unwrap_or_else(|error| panic!("{pattern}: {error}"));
+            let long = random(4) == 0;
+            let length = if long { 60 + random(100) } else { random(12) };
+            let input: String = (0..length)
+                .map(|_| subject_symbols[random(subject_symbols.len())])
+                .collect();
+            let url = format!("http://{input}");
+            let subject = if uses_url(&pattern) { &url } else { &input };
+
+            let expected = reference.is_match(subject);
+            assert_eq!(
+                matches(&pattern, &input),
+                expected,
+                "pattern {pattern:?} input {input:?}"
+            );
+            matched += usize::from(expected);
+        }
+
+        assert!((300..2_700).contains(&matched), "{matched} matches");
     }
 
     #[test]

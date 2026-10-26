@@ -114,6 +114,11 @@ impl SlowRule {
             rule,
         })
     }
+
+    /// What the compiled matcher costs in the slow-rule budget.
+    pub(super) fn matcher_cost_bytes(&self) -> usize {
+        self.matcher.cost_bytes()
+    }
 }
 
 /// The rules of one list, ready for lookups. Shared between engines through an `Arc`
@@ -228,10 +233,15 @@ impl ListBuilder {
                 self.hosts.entries.push(HostRules::entry(hash(name), group));
             }
             Rule::Fast { kind, name } => self.fast[kind_index(kind)].push(hash(name)),
-            Rule::Slow(rule) => match SlowRule::compile(rule) {
-                Ok(slow) => self.slow.push(slow),
-                Err(()) => self.regex_failed += 1,
-            },
+            Rule::Slow(rule) => self.add_slow(SlowRule::compile(rule)),
+        }
+    }
+
+    /// Adds a slow rule that is already compiled, or counts the regex that failed to.
+    pub(super) fn add_slow(&mut self, slow: Result<SlowRule, ()>) {
+        match slow {
+            Ok(slow) => self.slow.push(slow),
+            Err(()) => self.regex_failed += 1,
         }
     }
 

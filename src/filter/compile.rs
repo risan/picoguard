@@ -11,15 +11,15 @@ use std::sync::mpsc as std_mpsc;
 use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
-use super::engine::{CompiledList, Engine, ListBuilder, MAX_HOST_GROUPS};
-use super::parse::{ListFormat, NetworkRule, ParseSummary, Parser, Rule};
+use super::engine::{CompiledList, Engine, ListBuilder, MAX_HOST_GROUPS, SlowRule};
+use super::parse::{ListFormat, ParseSummary, Parser, Rule};
 use super::snapshot::{self, Snapshot, SnapshotError};
 use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 
 /// Bump on every change to compiled output (what any list text compiles to, in the parser,
 /// the compiler or the snapshot encoding), however small: snapshots written by an older
 /// compiler are then ignored and the lists compile again (plan D14).
-pub const COMPILER_VERSION: u32 = 4;
+pub const COMPILER_VERSION: u32 = 5;
 
 /// Default memory budget of the slow rules of one list. Plan section 5 leaves about 8 MB
 /// between the steady total (20 MB) and the refresh peak (28 MB). The real lists are far
@@ -47,11 +47,10 @@ impl CompileOptions {
     }
 }
 
-/// Estimated bytes of a compiled slow rule: measured at 430 to 800 bytes for glob rules and
-/// 3 to 20 KiB for regexes (a Unicode class such as `\p{L}` is the expensive one).
+/// Estimated bytes of a compiled slow rule without its matcher: measured at 430 to 800
+/// bytes for a glob rule. The matcher is charged as it reports (`Matcher::cost_bytes`).
 const SLOW_RULE_BYTES: usize = 512;
 const TEXT_BYTE_COST: usize = 4;
-const REGEX_BYTES: usize = 24 * 1024;
 
 /// What a host group (an answer IP of the host rules) costs, with its share of the lookup
 /// tables. The count of groups is capped as well, by `MAX_HOST_GROUPS`.
@@ -87,15 +86,16 @@ impl SlowRuleBudget {
         Ok(())
     }
 
-    pub(super) fn charge(&mut self, rule: &NetworkRule) -> Result<(), OverBudget> {
-        let cost = slow_rule_cost(rule);
+    pub(super) fn charge(&mut self, slow: &SlowRule) -> Result<(), OverBudget> {
+        let cost = slow_rule_cost(slow);
         self.left = self.left.checked_sub(cost).ok_or(OverBudget)?;
 
         Ok(())
     }
 }
 
-pub(super) fn slow_rule_cost(rule: &NetworkRule) -> usize {
+pub(super) fn slow_rule_cost(slow: &SlowRule) -> usize {
+    let rule = &slow.rule;
     let text = rule.pattern.len()
         + 24 * rule.restricted_clients.nets.len()
         + rule
@@ -106,9 +106,8 @@ pub(super) fn slow_rule_cost(rule: &NetworkRule) -> usize {
             .map(|name| name.len() + 24)
             .sum::<usize>()
         + 2 * (rule.dns_permitted.len() + rule.dns_restricted.len());
-    let regex = if rule.is_regex() { REGEX_BYTES } else { 0 };
 
-    SLOW_RULE_BYTES + TEXT_BYTE_COST * text + regex
+    SLOW_RULE_BYTES + TEXT_BYTE_COST * text + slow.matcher_cost_bytes()
 }
 
 pub struct Compiled {
@@ -284,17 +283,24 @@ fn compile(
             return;
         }
 
-        if let Rule::Slow(slow) = &rule {
+        if let Rule::Slow(slow) = rule {
             // The debug text holds every field, so equal text means an identical rule.
             if !seen_slow_rules.insert(xxh3_128(format!("{slow:?}").as_bytes())) {
                 return;
             }
 
-            if budget.charge(slow).is_err() {
+            let compiled = SlowRule::compile(slow);
+            if let Ok(compiled) = &compiled
+                && budget.charge(compiled).is_err()
+            {
                 over_budget.set(true);
 
                 return;
             }
+
+            builder.add_slow(compiled);
+
+            return;
         }
 
         if let Rule::Host { ip, .. } = &rule
@@ -500,7 +506,7 @@ mod tests {
         let mut parser = Parser::new(ListFormat::Adblock, 10);
         let mut sink = |rule: Rule<'_>| {
             if let Rule::Slow(slow) = rule {
-                cost = Some(slow_rule_cost(&slow));
+                cost = Some(slow_rule_cost(&SlowRule::compile(slow).unwrap()));
             }
         };
         parser.push(line.as_bytes(), &mut sink);
@@ -527,6 +533,26 @@ mod tests {
 
         assert_eq!(fits.unwrap().list.slow_rule_count(), 3);
         assert_eq!(over.err(), Some(CompileError::OverBudget));
+    }
+
+    #[tokio::test]
+    async fn long_glob_rules_are_charged_for_every_token_they_store() {
+        let worker = CompileWorker::spawn().unwrap();
+        let text: String = (0..500)
+            .map(|i| format!("|r{i}{}$dnstype=A\n", "*^".repeat(2020)))
+            .collect();
+        let uncapped = CompileOptions {
+            max_rules: 500,
+            ..options(ListFormat::Adblock)
+        };
+
+        let result = compile_in_pieces(&worker, uncapped, text.as_bytes(), 64 * 1024).await;
+
+        assert_eq!(result.err(), Some(CompileError::OverBudget));
+        assert!(
+            slow_rule_cost_of(&format!("|r1{}\n", "*^".repeat(2020)))
+                >= 4040 * crate::filter::pattern::GLOB_TOKEN_BYTES
+        );
     }
 
     #[tokio::test]
