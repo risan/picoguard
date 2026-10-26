@@ -1,0 +1,10 @@
+[Unit]
+Description=Install a picoguard update that the status page staged
+
+[Path]
+# A new, a changed and a removed request all start the installer. It acts only on a request
+# that is whole and not yet answered, so the extra runs end at once.
+PathChanged=/var/lib/picoguard/update/request
+
+[Install]
+WantedBy=paths.target

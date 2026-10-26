@@ -13,6 +13,11 @@ FIXTURES=/fixtures
 B=/usr/local/bin/picoguard
 REAL=/opt/picoguard-test/picoguard
 CONFIG=/etc/picoguard/picoguard.toml
+S=/var/lib/picoguard
+STAGE=$S/update
+I=/var/lib/picoguard-update
+LIB=/usr/local/lib/picoguard
+UPDATER=$LIB/update
 CASE_LOG=/tmp/case.log
 CASE_REASON=/tmp/case.reason
 INIT=${INIT:-}
@@ -20,17 +25,35 @@ INIT=${INIT:-}
 # Groups. The style says how the host runs the group's cases: `each` in a fresh container,
 # `shared` in one container after another, `setup` in one container that `setup` has made
 # ready and `reset` puts back before every case.
-GROUPS_LIST="baseline"
+GROUPS_LIST="baseline helper fresh"
 
 group_style() {
     case $1 in
         baseline) echo shared ;;
+        helper) echo setup ;;
+        fresh) echo each ;;
     esac
 }
+
+HELPER_CASES="update_good update_silent update_dies restart_fails update_late update_refused
+    verifier_hangs verifier_crashes no_verify_update update_repeat update_bad_request
+    request_swap_race swap_fails rollback_fails_then_recovers install_files install_rerun
+    install_answers_a_waiting_request privileges"
 
 group_cases() {
     case $1 in
         baseline) echo "baseline_install baseline_rerun baseline_failed_upgrade baseline_uninstall" ;;
+        helper)
+            # The OpenRC trigger comes with S5.
+            if [ "$INIT" = systemd ]; then
+                echo "$HELPER_CASES"
+            fi
+            ;;
+        fresh)
+            if [ "$INIT" = systemd ]; then
+                echo "install_no_start"
+            fi
+            ;;
     esac
 }
 
@@ -113,9 +136,238 @@ setup() {
     wait_for 30 dns_answers || fail "picoguard does not answer after the setup"
 }
 
-reset() {
-    :
+# ---- what the cases of the update installer share ----
+
+# The id of the request `stage` wrote last, and how long `wait_result` waited.
+STAGED_ID=
+WAITED=0
+
+new_id() {
+    id=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+
+    case $id in
+        *[!0-9a-f]* | '') fail "a request id from od is not 16 hex digits: $id" ;;
+    esac
+
+    if [ "${#id}" != 16 ]; then
+        fail "a request id from od is not 16 hex digits: $id"
+    fi
+
+    printf '%s' "$id"
 }
+
+# As the picoguard user, the way the daemon writes: private files.
+as_picoguard() {
+    su -s /bin/sh picoguard -c "umask 077; $1"
+}
+
+# write_request ID: `request.part`, then a rename, so that the request appears whole.
+write_request() {
+    as_picoguard "printf 'id=%s\nversion=9.9.9\n' $1 >$STAGE/request.part && mv $STAGE/request.part $STAGE/request"
+}
+
+# stage RELEASE [copy|symlink|fifo]: puts a release in $STAGE the way the daemon does, the
+# request last, and sets STAGED_ID to its id. The variant is what the staged binary is.
+stage() {
+    STAGED_ID=$(new_id)
+    release=$FIXTURES/releases/$1
+
+    as_picoguard "mkdir -p $STAGE && rm -f $STAGE/picoguard && cp $release/SHA256SUMS $release/SHA256SUMS.sig $STAGE/"
+
+    case ${2:-copy} in
+        copy) as_picoguard "cp $release/picoguard $STAGE/picoguard" ;;
+        symlink) as_picoguard "ln -s $FIXTURES/releases/good/picoguard $STAGE/picoguard" ;;
+        fifo) as_picoguard "mkfifo $STAGE/picoguard" ;;
+    esac
+
+    write_request "$STAGED_ID"
+}
+
+result_value() {
+    sed -n "s/^$1=//p" "$I/result"
+}
+
+# wait_result ID SECONDS: until $I/result answers the request ID. Sets WAITED.
+wait_result() {
+    started=$(date +%s)
+    WAITED=0
+
+    while ! [ -f "$I/result" ] || [ "$(result_value id)" != "$1" ]; do
+        WAITED=$(($(date +%s) - started))
+
+        if [ "$WAITED" -ge "$2" ]; then
+            return 1
+        fi
+
+        sleep 1
+    done
+
+    WAITED=$(($(date +%s) - started))
+}
+
+# expect_result ID OUTCOME [PART OF THE REASON]...
+expect_result() {
+    id=$1
+    outcome=$2
+    shift 2
+
+    [ "$(result_value id)" = "$id" ] || fail "the result is for $(result_value id), not $id"
+    [ "$(result_value outcome)" = "$outcome" ] ||
+        fail "the outcome is $(result_value outcome) ($(result_value reason)), not $outcome"
+
+    reason=$(result_value reason)
+
+    for part in "$@"; do
+        case $reason in
+            *"$part"*) ;;
+            *) fail "the reason \"$reason\" does not contain \"$part\"" ;;
+        esac
+    done
+}
+
+# The processes that hold $I/lock open, by pid.
+holders_of_lock() {
+    for fd in /proc/[0-9]*/fd/*; do
+        if [ "$(readlink "$fd" 2>/dev/null)" = "$I/lock" ]; then
+            fd=${fd#/proc/}
+            printf '%s ' "${fd%%/*}"
+        fi
+    done
+}
+
+# The names in a directory, sorted, each followed by a space.
+listing() {
+    find "$1" -mindepth 1 -maxdepth 1 | sed 's|.*/||' | sort | tr '\n' ' '
+}
+
+# What stays in $I once a pass is over: the answer and the lock.
+expect_installer_dir_quiet() {
+    [ "$(listing "$I")" = "lock result " ] || fail "$I holds: $(listing "$I")"
+    [ -z "$(holders_of_lock)" ] || fail "something still holds $I/lock: $(holders_of_lock)"
+}
+
+picoguard_pid() {
+    case $INIT in
+        systemd) systemctl show -p MainPID --value picoguard ;;
+    esac
+}
+
+service_idle() {
+    state=$(systemctl is-active picoguard-update.service || true)
+
+    [ "$state" != active ] && [ "$state" != activating ]
+}
+
+# Waits until no pass runs: a change that arrives while one runs is merged into it.
+settle() {
+    case $INIT in
+        systemd)
+            sleep 1
+            wait_for 120 service_idle || fail "picoguard-update.service does not end"
+            ;;
+    esac
+}
+
+installer_log() {
+    case $INIT in
+        systemd) journalctl -u picoguard-update --no-pager ;;
+        openrc) cat /var/log/messages ;;
+    esac
+}
+
+api_status() {
+    case $INIT in
+        systemd)
+            bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf "GET /api/status HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n" >&3 && cat <&3'
+            ;;
+        openrc) wget -qO- http://127.0.0.1:8080/api/status ;;
+    esac
+}
+
+install_state() {
+    api_status | grep -o '"install":{[^}]*}' || true
+}
+
+install_state_is() {
+    case $(install_state) in
+        *"\"state\":\"$1\""*) return 0 ;;
+    esac
+
+    return 1
+}
+
+# A directory where the installer copies the new binary makes its `mv` over $B fail.
+block_part() {
+    mkdir "$B.update.part"
+}
+
+unblock_part() {
+    rm -rf "$B.update.part"
+}
+
+# Puts a script at $B that stands in for a `verify-update` that misbehaves. The running
+# picoguard keeps the file it started from.
+install_fake_verifier() {
+    # shellcheck disable=SC2016 # the fake script expands these itself
+    case $1 in
+        hangs)
+            body='case $3 in */verified) exec sleep 200 ;; esac
+cat "$2/request"
+exit 1'
+            ;;
+        crashes)
+            body='case $3 in */verified) kill -SEGV $$ ;; esac
+cat "$2/request"
+exit 1'
+            ;;
+        none) body='exit 2' ;;
+    esac
+
+    # shellcheck disable=SC2016 # same
+    printf '#!/bin/sh\nif [ "$1" = verify-update ]; then\n%s\nfi\nexec %s "$@"\n' "$body" "$REAL" >"$B.fake"
+    chmod 0755 "$B.fake"
+    mv -f "$B.fake" "$B"
+}
+
+shorten_verify_wait() {
+    sed -i "s/^VERIFY_WAIT=.*/VERIFY_WAIT=$1/" "$UPDATER"
+}
+
+# Back to a plain install of the real binary with nothing left by an earlier case.
+reset() {
+    unblock_part
+    install_real >/dev/null
+    as_picoguard "rm -rf $STAGE/* $STAGE/.[!.]*"
+    settle
+    rm -rf "${I:?}/installing" "${I:?}/previous" "${I:?}/verified" "${I:?}/verify.err" "${I:?}"/*.part
+    # The restarts of the reset must not count towards systemd's limit of 5 starts in 10
+    # seconds, or the update that follows could be refused one.
+    systemctl reset-failed picoguard picoguard-update.service 2>/dev/null || true
+    wait_for 30 dns_answers || fail "picoguard does not answer after the reset"
+}
+
+# The files install.sh puts on the device: path, mode, owner and the file they must equal.
+installed_files() {
+    cat <<LIST
+$UPDATER 755 root $FIXTURES/dist/picoguard-update.sh
+$LIB/common.sh 644 root $FIXTURES/dist/picoguard-common.sh
+/etc/systemd/system/picoguard-update.path 644 root $FIXTURES/dist/picoguard-update.path
+/etc/systemd/system/picoguard-update.service 644 root $FIXTURES/dist/picoguard-update.service
+LIST
+}
+
+expect_installed_files() {
+    installed_files | while read -r path mode owner source; do
+        [ "$(stat -c '%a %U' "$path")" = "$mode $owner" ] || fail "$path is $(stat -c '%a %U' "$path"), not $mode $owner"
+        same_file "$path" "$source" || fail "$path differs from $source"
+    done
+
+    [ "$(stat -c '%a %U' "$LIB")" = "755 root" ] || fail "$LIB is not 0755 root"
+    [ "$(stat -c '%a %U' "$I")" = "755 root" ] || fail "$I is not 0755 root"
+    [ "$(stat -c '%a %U' "$I/lock")" = "600 root" ] || fail "$I/lock is not 0600 root"
+}
+
+# ---- baseline: install.sh as it is, before and after the installer ----
 
 baseline_install() {
     out=$(install_real 2>&1) || fail "install.sh failed: $out"
@@ -170,6 +422,362 @@ baseline_uninstall() {
     if grep -q '^picoguard:' /etc/passwd; then
         fail "the picoguard user is still there"
     fi
+}
+
+# ---- helper: a staged update is installed, or rolled back ----
+
+update_good() {
+    stage good
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    note "updated in ${WAITED}s"
+
+    expect_result "$STAGED_ID" updated
+    same_file "$B" "$FIXTURES/releases/good/picoguard" || fail "$B is not the good release"
+    [ "$(stat -c '%a %U' "$B")" = "755 root" ] || fail "$B is not 0755 root"
+    service_up || fail "picoguard is not active"
+    wait_for 30 dns_answers || fail "dns-check gets no answer"
+    wait_for 10 install_state_is updated || fail "the page does not say updated: $(install_state)"
+    settle
+    [ -z "$(find "$STAGE" -mindepth 1)" ] || fail "$STAGE is not empty: $(listing "$STAGE")"
+    expect_installer_dir_quiet
+    [ "$(stat -c '%a %U' "$I/lock")" = "600 root" ] || fail "$I/lock is not 0600 root"
+    [ -z "$(find "$S" -user root)" ] || fail "root owns: $(find "$S" -user root)"
+}
+
+update_silent() {
+    stage silent
+    wait_result "$STAGED_ID" 90 || fail "no result within 90 seconds"
+    note "rolled back in ${WAITED}s"
+
+    expect_result "$STAGED_ID" rolled-back "did not answer DNS within 30 seconds" "runs again"
+    same_file "$B" "$REAL" || fail "$B is not the real binary"
+    service_up || fail "picoguard is not active"
+    wait_for 30 dns_answers || fail "dns-check gets no answer"
+    wait_for 10 install_state_is rolled_back || fail "the page does not say rolled back: $(install_state)"
+
+    case $(install_state) in
+        *"$(result_value reason)"*) ;;
+        *) fail "the page does not show the reason: $(install_state)" ;;
+    esac
+}
+
+update_dies() {
+    stage dies
+    wait_result "$STAGED_ID" 90 || fail "no result within 90 seconds"
+    note "rolled back in ${WAITED}s"
+
+    expect_result "$STAGED_ID" rolled-back "runs again" "did not start"
+    same_file "$B" "$REAL" || fail "$B is not the real binary"
+    service_up || fail "picoguard is not active"
+}
+
+restart_fails() {
+    stage cannot_exec
+    wait_result "$STAGED_ID" 90 || fail "no result within 90 seconds"
+    note "rolled back in ${WAITED}s"
+
+    expect_result "$STAGED_ID" rolled-back "did not start" "runs again"
+    same_file "$B" "$REAL" || fail "$B is not the real binary"
+    service_up || fail "picoguard is not active"
+
+    case $INIT in
+        systemd)
+            journalctl -u picoguard --no-pager | grep -Eq '203/EXEC|Failed at step EXEC' ||
+                fail "the journal shows no failed start of the new binary"
+            ;;
+    esac
+}
+
+update_late() {
+    stage late
+    wait_result "$STAGED_ID" 90 || fail "no result within 90 seconds"
+    note "rolled back in ${WAITED}s"
+
+    expect_result "$STAGED_ID" rolled-back "did not answer DNS within 30 seconds"
+    same_file "$B" "$REAL" || fail "$B is not the real binary"
+}
+
+# refuse RELEASE VARIANT PART-OF-THE-REASON: the request is answered `failed`, and neither
+# the binary nor the running picoguard changed.
+refuse() {
+    pid=$(picoguard_pid)
+    stage "$1" "$2"
+    wait_result "$STAGED_ID" 60 || fail "$1 $2: no result within 60 seconds"
+    settle
+
+    expect_result "$STAGED_ID" failed "$3"
+    note "$1 $2: $(result_value reason)"
+    same_file "$B" "$REAL" || fail "$1 $2: $B changed"
+    [ "$(picoguard_pid)" = "$pid" ] || fail "$1 $2: picoguard was restarted"
+    expect_installer_dir_quiet
+}
+
+update_refused() {
+    refuse badsig copy "signature"
+    refuse changed copy "does not match"
+    refuse good symlink "picoguard:"
+    refuse good fifo "picoguard:"
+    refuse badconfig copy "does not accept the config"
+    refuse hangcheck copy "did not check the config within 30 seconds"
+}
+
+verifier_hangs() {
+    shorten_verify_wait 5
+    install_fake_verifier hangs
+    pid=$(picoguard_pid)
+    stage good
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    settle
+
+    expect_result "$STAGED_ID" failed "verify-update did not finish within 5 seconds"
+    [ "$(picoguard_pid)" = "$pid" ] || fail "picoguard was restarted"
+    expect_installer_dir_quiet
+}
+
+verifier_crashes() {
+    install_fake_verifier crashes
+    pid=$(picoguard_pid)
+    stage good
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    settle
+
+    expect_result "$STAGED_ID" failed "verify-update ended with status 139"
+    [ "$(picoguard_pid)" = "$pid" ] || fail "picoguard was restarted"
+    expect_installer_dir_quiet
+}
+
+no_verify_update() {
+    install_fake_verifier none
+    pid=$(picoguard_pid)
+    before=$(stat -c %Y "$I/result" 2>/dev/null || echo none)
+    stage good
+    sleep 8
+    settle
+
+    [ "$(stat -c %Y "$I/result" 2>/dev/null || echo none)" = "$before" ] || fail "a result was written"
+    [ "$(picoguard_pid)" = "$pid" ] || fail "picoguard was restarted"
+
+    case $(listing "$I") in
+        "lock " | "lock result ") ;;
+        *) fail "$I holds: $(listing "$I")" ;;
+    esac
+
+    lines=$(installer_log | grep -c "cannot verify updates" || true)
+    [ "$lines" = 1 ] || fail "the log has $lines lines about it, not 1"
+}
+
+update_repeat() {
+    stage good
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    expect_result "$STAGED_ID" updated
+    wait_for 10 install_state_is updated || fail "the page does not say updated"
+    settle
+    wait_for 30 dns_answers || fail "dns-check gets no answer"
+
+    before=$(cksum <"$I/result")
+    touch /tmp/stamp
+    sleep 1
+    as_picoguard "mkdir -p $STAGE"
+    write_request "$STAGED_ID"
+    systemctl start picoguard-update.service
+    settle
+
+    [ "$(cksum <"$I/result")" = "$before" ] || fail "the result changed"
+    same_file "$B" "$FIXTURES/releases/good/picoguard" || fail "$B changed"
+    [ -z "$(find "$I" -newer /tmp/stamp)" ] || fail "written again: $(find "$I" -newer /tmp/stamp)"
+}
+
+# refuse_request WHAT COMMAND: a request the installer must not answer. No new result, nothing
+# written in $I, and the pass is over soon.
+refuse_request() {
+    as_picoguard "rm -f $STAGE/request $STAGE/request.part"
+    settle
+    touch /tmp/stamp
+    sleep 1
+    before=$(cksum <"$I/result" 2>/dev/null || echo none)
+
+    as_picoguard "$2"
+    wait_for 6 service_idle || fail "$1: the installer does not end within 6 seconds"
+    sleep 1
+
+    [ "$(cksum <"$I/result" 2>/dev/null || echo none)" = "$before" ] || fail "$1: a result was written"
+    [ -z "$(find "$I" -newer /tmp/stamp)" ] || fail "$1: written: $(find "$I" -newer /tmp/stamp)"
+}
+
+update_bad_request() {
+    # A first answer, so that there is a result to compare.
+    stage badsig
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    settle
+
+    refuse_request "a link to /etc/shadow" "ln -s /etc/shadow $STAGE/request"
+    refuse_request "a fifo" "mkfifo $STAGE/request"
+    refuse_request "an uppercase id" "printf 'id=ABCDEF0123456789\nversion=9.9.9\n' >$STAGE/request"
+    refuse_request "a v in the version" "printf 'id=0123456789abcdef\nversion=v9.9.9\n' >$STAGE/request"
+    refuse_request "a third line" "printf 'id=0123456789abcdef\nversion=9.9.9\nx=1\n' >$STAGE/request"
+    refuse_request "300 bytes" "printf 'id=0123456789abcdef\nversion=9.9.9\n%s\n' $(printf 'x%.0s' $(seq 270)) >$STAGE/request"
+    refuse_request "no final newline" "printf 'id=0123456789abcdef\nversion=9.9.9' >$STAGE/request"
+}
+
+request_swap_race() {
+    printf 'id=bbbbbbbbbbbbbbbb\nversion=9.9.9\n' >/root/secret-request
+    chmod 0600 /root/secret-request
+    as_picoguard "mkdir -p $STAGE"
+    settle
+
+    as_picoguard "
+        end=\$((\$(date +%s) + 20))
+        while [ \$(date +%s) -lt \$end ]; do
+            printf 'id=aaaaaaaaaaaaaaaa\nversion=9.9.9\n' >$STAGE/request.part
+            mv -f $STAGE/request.part $STAGE/request
+            sleep 0.2
+            ln -sf /root/secret-request $STAGE/request.part
+            mv -f $STAGE/request.part $STAGE/request
+            sleep 0.2
+        done"
+    wait_for 5 service_idle || fail "the installer does not end within 5 seconds of the last change"
+    settle
+
+    if installer_log | grep -q bbbbbbbbbbbbbbbb; then
+        fail "the log names the id of the root-only file"
+    fi
+
+    if grep -qs bbbbbbbbbbbbbbbb "$I/installing" "$I/result"; then
+        fail "$I names the id of the root-only file"
+    fi
+
+    rm -f /root/secret-request
+}
+
+swap_fails() {
+    pid=$(picoguard_pid)
+    stage slow
+    wait_for 60 test -f "$I/installing" || fail "the pass never started"
+    block_part
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds"
+    unblock_part
+    settle
+
+    expect_result "$STAGED_ID" failed "disk: could not write the new binary"
+    same_file "$B" "$REAL" || fail "$B changed"
+    [ "$(picoguard_pid)" = "$pid" ] || fail "picoguard was restarted"
+    expect_installer_dir_quiet
+}
+
+rollback_failure_logged() {
+    installer_log | grep -q "rollback failed"
+}
+
+rollback_fails_then_recovers() {
+    stage silent
+    wait_for 60 same_file "$B" "$FIXTURES/releases/silent/picoguard" || fail "the new binary never reached $B"
+    block_part
+    wait_for 90 rollback_failure_logged || fail "the log never names the failed rollback"
+    wait_for 30 service_idle || fail "the pass does not end"
+
+    if [ -f "$I/result" ] && [ "$(result_value id)" = "$STAGED_ID" ]; then
+        fail "a result was written"
+    fi
+
+    grep -q '^swap=1$' "$I/installing" || fail "the record has no swap line: $(cat "$I/installing")"
+    [ -f "$I/previous" ] || fail "the backup was removed"
+
+    unblock_part
+    systemctl start picoguard-update.service
+    wait_result "$STAGED_ID" 120 || fail "no result after the retry"
+    settle
+
+    expect_result "$STAGED_ID" rolled-back "runs again"
+    same_file "$B" "$REAL" || fail "$B is not the real binary"
+    [ ! -e "$I/installing" ] && [ ! -e "$I/previous" ] || fail "the record or the backup is still there"
+}
+
+install_files() {
+    expect_installed_files
+
+    case $INIT in
+        systemd)
+            [ "$(systemctl is-enabled picoguard-update.path)" = enabled ] || fail "the path unit is not enabled"
+            [ "$(systemctl is-enabled picoguard-update.service)" = enabled ] || fail "the service is not enabled"
+            systemctl is-active --quiet picoguard-update.path || fail "the path unit is not active"
+            ;;
+    esac
+
+    settle
+    touch /tmp/stamp
+    sleep 1
+    systemctl start picoguard-update.service
+    settle
+    [ -z "$(find "$I" -newer /tmp/stamp)" ] || fail "an idle pass wrote: $(find "$I" -newer /tmp/stamp)"
+}
+
+install_rerun() {
+    install_real >/dev/null
+    expect_installed_files
+    systemctl is-active --quiet picoguard-update.path || fail "the path unit is not active"
+}
+
+install_answers_a_waiting_request() {
+    systemctl stop picoguard-update.path
+    stage good
+    sleep 2
+
+    if [ -f "$I/result" ] && [ "$(result_value id)" = "$STAGED_ID" ]; then
+        fail "answered with the trigger stopped"
+    fi
+
+    install_real >/dev/null
+    wait_result "$STAGED_ID" 60 || fail "no result within 60 seconds of the run"
+    expect_result "$STAGED_ID" updated
+    note "answered ${WAITED}s after the run"
+}
+
+privileges() {
+    for dir in /usr/local/bin /etc/picoguard "$I" "$LIB"; do
+        if as_picoguard "touch $dir/probe" 2>/dev/null; then
+            rm -f "$dir/probe"
+            fail "the picoguard user can write in $dir"
+        fi
+    done
+
+    if as_picoguard ": <$I/lock" 2>/dev/null; then
+        fail "the picoguard user can open $I/lock"
+    fi
+
+    case $INIT in
+        systemd)
+            shown=$(systemctl show picoguard -p ProtectSystem -p ReadWritePaths | sort | tr '\n' ' ')
+            [ "$shown" = "ProtectSystem=strict ReadWritePaths= " ] || fail "picoguard.service shows: $shown"
+            ;;
+    esac
+
+    [ -z "$(find "$LIB" "$I" ! -user root)" ] || fail "not root's: $(find "$LIB" "$I" ! -user root)"
+}
+
+# ---- fresh: each case in a container of its own ----
+
+install_no_start() {
+    out=$(sh "$FIXTURES/install.sh" --yes --binary "$FIXTURES/picoguard" --web-password none --no-start 2>&1) ||
+        fail "install.sh --no-start failed: $out"
+    printf '%s\n' "$out"
+
+    expect_installed_files
+
+    case $INIT in
+        systemd)
+            [ "$(systemctl is-enabled picoguard-update.path 2>/dev/null || true)" != enabled ] || fail "the path unit is enabled"
+            [ "$(systemctl is-enabled picoguard-update.service 2>/dev/null || true)" != enabled ] || fail "the service is enabled"
+
+            if systemctl is-active --quiet picoguard-update.path; then
+                fail "the path unit is active"
+            fi
+
+            case $out in
+                *"systemctl enable --now picoguard picoguard-update.path picoguard-update.service"*) ;;
+                *) fail "the report does not show the start command" ;;
+            esac
+            ;;
+    esac
 }
 
 group_of() {
@@ -240,5 +848,8 @@ case ${1:-} in
     list) group_cases "$2" ;;
     setup) setup ;;
     run) run_case "$2" ;;
-    *) echo "usage: sh cases.sh groups | style GROUP | list GROUP | setup | run CASE" >&2; exit 2 ;;
+    *)
+        echo "usage: sh cases.sh groups | style GROUP | list GROUP | setup | run CASE" >&2
+        exit 2
+        ;;
 esac

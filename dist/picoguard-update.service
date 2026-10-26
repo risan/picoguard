@@ -1,0 +1,20 @@
+[Unit]
+Description=Install a picoguard update that the status page staged
+# No Requires, BindsTo or PartOf: restarting picoguard must not stop the installer that asks
+# for it.
+After=picoguard.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/picoguard/update run systemd
+TimeoutStartSec=10min
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin /var/lib/picoguard-update
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+# Also runs at boot: it finishes an update that a power loss interrupted.
+WantedBy=multi-user.target

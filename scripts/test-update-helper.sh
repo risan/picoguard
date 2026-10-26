@@ -221,7 +221,7 @@ wanted() {
 }
 
 run_init() {
-    local init=$1 group style name selected shared_started
+    local init=$1 group style name selected shared_started output
 
     docker build -q -t "picoguard-test-$init" -f "$cases_dir/Dockerfile.$init" "$cases_dir" >/dev/null
 
@@ -229,7 +229,7 @@ run_init() {
         style=$(sh "$cases_dir/cases.sh" style "$group")
         selected=()
 
-        for name in $(sh "$cases_dir/cases.sh" list "$group"); do
+        for name in $(INIT=$init sh "$cases_dir/cases.sh" list "$group"); do
             if wanted "$name"; then
                 selected+=("$name")
             fi
@@ -247,8 +247,10 @@ run_init() {
                 shared_started=1
 
                 if [ "$style" = setup ]; then
-                    docker exec -e "INIT=$init" "picoguard-test-$init" sh /fixtures/cases.sh setup ||
+                    output=$(docker exec -e "INIT=$init" "picoguard-test-$init" sh /fixtures/cases.sh setup 2>&1) || {
+                        printf '%s\n' "$output" >&2
                         die "the setup of the $group group failed on $init"
+                    }
                 fi
             fi
 
