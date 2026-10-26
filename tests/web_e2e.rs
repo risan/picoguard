@@ -18,6 +18,7 @@ use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::Downloader;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Scheduler, Timing};
+use picoguard::update::{self, Build, CheckTiming, Latest, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
 use serde_json::Value;
@@ -170,6 +171,7 @@ struct Site {
     web: SocketAddr,
     dns: Running,
     policy: Arc<Policy>,
+    updates: Arc<Updates>,
     /// Sends the administrator's credentials with every request that has none of its own.
     signs_in: bool,
 }
@@ -251,11 +253,13 @@ async fn site(config: Config) -> Site {
     let dns = start_with_policy(&config, Arc::clone(&policy)).await;
     let listeners = WebListeners::bind(&config.web).unwrap();
     let address = listeners.addresses()[0];
+    let updates = Arc::new(Updates::new(Build::current()));
     let web_state = Web::new(
         &config,
         Arc::clone(dns.pipeline.stats()),
         Arc::clone(&policy),
         Arc::clone(&control),
+        Arc::clone(&updates),
     )
     .unwrap();
     web::spawn(listeners, Arc::new(web_state));
@@ -264,6 +268,7 @@ async fn site(config: Config) -> Site {
         web: address,
         dns,
         policy,
+        updates,
         signs_in: config.web.password.is_some(),
     }
 }
@@ -746,6 +751,80 @@ async fn open_site() -> (Site, common::harness::FakeUpstream) {
     without_credentials(&mut config);
 
     (site(config).await, upstream)
+}
+
+#[tokio::test]
+async fn status_shows_the_version_with_and_without_a_password() {
+    let (with_password, _upstream) = plain_site().await;
+    let (without_password, _other) = open_site().await;
+
+    for site in [&with_password, &without_password] {
+        let status = site.send(get("/api/status")).await.json();
+
+        assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(status["update"]["build"], Build::current().name());
+        for absent in ["latest", "notes", "how"] {
+            assert!(status["update"].get(absent).is_none(), "{absent}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn status_shows_a_newer_version_with_notes_and_command() {
+    let (with_password, _upstream) = plain_site().await;
+    let (without_password, _other) = open_site().await;
+
+    for site in [&with_password, &without_password] {
+        site.updates.show(Some(Latest {
+            version: "9.9.9".to_string(),
+            notes: "Faster lists".to_string(),
+        }));
+
+        let status = site.send(get("/api/status")).await.json();
+
+        assert_eq!(status["update"]["latest"], "9.9.9");
+        assert_eq!(status["update"]["notes"], "Faster lists");
+        assert_eq!(status["update"]["how"], Build::current().how());
+    }
+}
+
+#[tokio::test]
+async fn a_hanging_check_holds_up_neither_dns_nor_the_page() {
+    let (site, _upstream) = plain_site().await;
+    let github = ListServer::start().await;
+    github.set_delay(Duration::from_secs(30));
+    let timing = CheckTiming {
+        first_min: Duration::ZERO,
+        first_max: Duration::ZERO,
+        every: Duration::from_secs(3600),
+    };
+    let check = update::start(
+        &Config::default(),
+        &github.url("/latest"),
+        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Arc::new(Tls::with_webpki_roots()),
+        Arc::clone(&site.updates),
+        timing,
+    )
+    .expect("the check is on");
+
+    let waiting = Instant::now();
+    while github.requests() == 0 {
+        assert!(waiting.elapsed() < Duration::from_secs(5), "no request");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let answers = async {
+        ask(&site.dns, "ok.example.", RecordType::A).await;
+        site.send(get("/api/status")).await
+    };
+    let status = tokio::time::timeout(Duration::from_secs(2), answers)
+        .await
+        .expect("DNS and the page answer while the check hangs");
+    check.abort();
+
+    assert_eq!(status.status, 200);
+    assert_eq!(github.requests(), 1);
 }
 
 const SET_A_PASSWORD: &str = "set web.user and web.password to use this";

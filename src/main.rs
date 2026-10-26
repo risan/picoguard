@@ -10,6 +10,7 @@ use picoguard::lists::{Downloader, resolver_over};
 use picoguard::pipeline::Pipeline;
 use picoguard::scheduler::{Scheduler, Timing};
 use picoguard::server::{self, Listeners};
+use picoguard::update::{self, Build, CheckTiming, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -171,6 +172,7 @@ fn serve(config: Config) -> Result<(), String> {
         } else {
             None
         };
+        let updates = Arc::new(Updates::new(Build::current()));
         let mut stop_signals = StopSignals::install()?;
 
         for address in listeners.udp_addresses() {
@@ -187,18 +189,29 @@ fn serve(config: Config) -> Result<(), String> {
                 Arc::clone(pipeline.stats()),
                 scheduler.policy(),
                 scheduler.control(),
+                Arc::clone(&updates),
             )?;
             web::spawn(status_page, Arc::new(web));
         }
 
+        let tls = Arc::new(Tls::with_webpki_roots());
         let downloader = Downloader::new(
             resolver_over(Arc::clone(pipeline.upstreams())),
-            Arc::new(Tls::with_webpki_roots()),
+            Arc::clone(&tls),
         );
         let (stop_refreshing, stopped) = oneshot::channel::<()>();
         let mut refreshing = tokio::spawn(scheduler.run(downloader, async {
             let _ = stopped.await;
         }));
+        // Never awaited: stopping does not wait for a check, the runtime drops it.
+        let _ = update::start(
+            &config,
+            update::RELEASES_URL,
+            resolver_over(Arc::clone(pipeline.upstreams())),
+            tls,
+            updates,
+            CheckTiming::default(),
+        );
         server::spawn(listeners, pipeline, &config);
 
         stop_signals.received().await;

@@ -36,6 +36,7 @@ use crate::policy::Policy;
 use crate::scheduler::{ListControl, ListStatus, Role};
 use crate::server::bind_tcp;
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, Stats, TopEntry};
+use crate::update::{UpdateView, Updates};
 
 const PAGE: &str = include_str!("web/index.html");
 
@@ -59,6 +60,7 @@ pub struct Web {
     stats: Arc<Stats>,
     policy: Arc<Policy>,
     lists: Arc<ListControl>,
+    updates: Arc<Updates>,
     allow_from: Vec<Cidr>,
     hostnames: Vec<String>,
     /// The `Authorization` credentials a client must send; `None` when no password is set.
@@ -72,6 +74,7 @@ impl Web {
         stats: Arc<Stats>,
         policy: Arc<Policy>,
         lists: Arc<ListControl>,
+        updates: Arc<Updates>,
     ) -> Result<Web, String> {
         let web = &config.web;
         let credentials = match (&web.user, &web.password) {
@@ -91,6 +94,7 @@ impl Web {
             stats,
             policy,
             lists,
+            updates,
             allow_from: web.allow_from.clone(),
             hostnames: web.hostnames.clone(),
             credentials,
@@ -401,6 +405,8 @@ impl Web {
                 Ok(json(
                     StatusCode::OK,
                     &StatusView {
+                        version: env!("CARGO_PKG_VERSION"),
+                        update: self.updates.view(),
                         counters: &snapshot.counters,
                         blocked_percent: blocked_percent(&snapshot.counters),
                         hourly: &snapshot.hourly,
@@ -741,6 +747,8 @@ struct QueryLogView {
 
 #[derive(Serialize)]
 struct StatusView<'a> {
+    version: &'static str,
+    update: UpdateView,
     counters: &'a Counters,
     /// Of answered queries, blocked by a request or a response rule; one decimal.
     blocked_percent: f64,
@@ -773,6 +781,7 @@ fn blocked_percent(counters: &Counters) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update::Build;
 
     fn web_with_names(names: &[&str]) -> Web {
         let mut config = Config::default();
@@ -785,6 +794,7 @@ mod tests {
             Arc::new(Stats::new(Default::default())),
             policy,
             lists,
+            Arc::new(Updates::new(Build::current())),
         )
         .unwrap()
     }
