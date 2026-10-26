@@ -221,19 +221,22 @@ normalize_names "$names_file" >"$work/names.txt"
 comm -12 "$work/names.txt" "$work/public-names.txt" >"$work/explained-names.txt"
 
 # A name without a dot is a token only when it stands alone: "name.example" and
-# "my-name" are other names, not a use of "name".
-grep -v '\.' "$work/names.txt" | sed 's,[][\\.*^$+?(){}|/],\\&,g' | paste -s -d'|' >"$work/single-names.txt" || true
+# "my-name" are other names, not a use of "name". Maximal tokens are read, so
+# two names next to each other are both found.
+{ grep -v '\.' "$work/names.txt" || true; } >"$work/single-names.txt"
 
 {
     { grep -a -r -o -i -H -E "$domain_tokens" "$blob_dir" || true; } |
-        tr '[:upper:]' '[:lower:]' | sed 's/\.$//'
+        tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | blob_of_file |
+        awk -F'\t' -v OFS='\t' '{ print $2, $1 }'
 
     if [ -s "$work/single-names.txt" ]; then
-        { grep -a -r -o -i -H -E "(^|[^a-z0-9_.-])($(cat "$work/single-names.txt"))([^a-z0-9_.-]|$)" "$blob_dir" || true; } |
-            tr '[:upper:]' '[:lower:]' | sed -E 's/:[^a-z0-9_.-]+/:/; s/[^a-z0-9_.-]+$//'
+        { grep -a -r -o -i -H -E '[a-z0-9_.-]+' "$blob_dir" || true; } |
+            tr '[:upper:]' '[:lower:]' | sed -E 's/\.+$//' | blob_of_file |
+            awk -F'\t' -v OFS='\t' 'FILENAME == ARGV[1] { wanted[$1] = 1; next }
+                ($2 in wanted) { print $2, $1 }' "$work/single-names.txt" -
     fi
-} | blob_of_file | awk -F'\t' -v OFS='\t' '{ print $2, $1 }' |
-    sort -t "$tab" -k1,1 -k2,2 -u >"$work/tokens.tsv"
+} | sort -t "$tab" -k1,1 -k2,2 -u >"$work/tokens.tsv"
 
 join -t "$tab" "$work/names.txt" "$work/tokens.tsv" |
     awk -F'\t' -v OFS='\t' '{ print $2, $1 }' >"$work/name-hits.tsv"

@@ -355,6 +355,21 @@ audit_finds_a_name_without_a_dot() {
     expect_line '^query-name explained singlelabel ' "$alone" a.txt
 }
 
+# The names next to each other in one line are both found.
+audit_finds_adjacent_names_without_a_dot() {
+    local repo commit
+
+    printf 'publicword A\nsecretword A\n' >"$scratch/names.txt"
+    printf 'publicword\n' >"$scratch/known.txt"
+    repo=$(new_repo adjacent)
+    commit=$(commit_file "$repo" a.txt 'publicword secretword, publicword,secretword.')
+    run_audit "$repo" --known-public "$scratch/known.txt"
+
+    expect_status 1
+    expect_line '^query-name unexplained secretword ' "$commit" a.txt
+    expect_line '^query-name explained publicword ' "$commit" a.txt
+}
+
 # A list path is no exemption: a personal term, a home path, a private address
 # and a host name inside one are all reported.
 audit_scans_public_lists_for_personal_findings() {
@@ -389,4 +404,5 @@ run_case audit_scans_a_credential_only_a_merge_holds
 run_case audit_explains_names_only_from_committed_lists
 run_case audit_lists_every_place_of_an_explained_name
 run_case audit_finds_a_name_without_a_dot
+run_case audit_finds_adjacent_names_without_a_dot
 run_case audit_scans_public_lists_for_personal_findings
