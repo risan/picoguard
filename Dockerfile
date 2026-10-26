@@ -13,6 +13,8 @@ FROM rust:1.99.1-alpine3.24 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# The status page shows the update command of a Docker build.
+ENV PICOGUARD_BUILD=docker
 RUN cargo build --release --locked
 
 # The final image has no shell, so the state directory is made here.

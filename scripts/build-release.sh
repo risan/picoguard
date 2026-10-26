@@ -3,6 +3,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+export PICOGUARD_BUILD=release
+
 targets=(
     x86_64-unknown-linux-musl
     aarch64-unknown-linux-musl
