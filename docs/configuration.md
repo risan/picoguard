@@ -227,6 +227,40 @@ Statistics and the query log live in memory only and are lost on restart.
 | `dir` | `"/var/lib/picoguard"` | Where list snapshots go. The systemd unit creates this directory (`StateDirectory=picoguard`). |
 | `persist_lists` | `true` | Keep a copy of each changed list on disk. This is the only routine write. When `false`, nothing is written; lists live in memory and download again at every start. |
 
+## `[update]`
+
+The status page shows the running version. About once a day, picoguard also asks GitHub whether
+a newer release exists, and the page says "update available" with a short summary of the release
+notes and the command that updates your kind of build.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `check` | `true` | Look for a newer release. `false`: picoguard never contacts GitHub. |
+
+What the check does:
+
+- It asks `api.github.com` for the latest release of picoguard: once a few minutes after start,
+  then once a day. It goes through your configured `[upstream]` servers like a list download and
+  keeps nothing on disk.
+- It sends a plain GET whose only identifying part is picoguard's User-Agent, which holds the
+  version (`picoguard/0.2.0`), and, from the second check on, the ETag of the last answer. No
+  cookie, no token, no account.
+- A failed check is logged once at `warn` (a missing release at `info`) and changes nothing on the
+  page. It never affects DNS answers.
+- With `check = false`, or with the status page turned off (`[web] enabled = false`), picoguard
+  makes no request and no DNS lookup for GitHub.
+
+The command shown depends on how the binary was built:
+
+| Build | Command |
+|---|---|
+| Release binary (`install.sh`, the release assets) | `curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh \| sudo sh` |
+| Docker image | `git pull && docker compose up -d --build` |
+| Source (`cargo install`, `cargo build`) | `cargo install --locked picoguard` |
+
+An older picoguard rejects an `[update]` section as an unknown key. When you go back to an older
+version, remove the section first.
+
 ## `[log]`
 
 | Key | Default | Meaning |

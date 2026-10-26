@@ -119,6 +119,8 @@ container) and give both addresses to your router as primary and secondary DNS.
   last good copy.
 - Status page: totals and list status for everyone on the LAN; query log, top lists and pause
   only with the password.
+- The status page shows the version and, once a day, whether a newer release exists. Turn it off
+  with `[update] check = false`.
 - Almost no disk writes: the query log and statistics live in memory. The only routine write is
   the last good copy of a list, only when it changed, and it can be turned off.
 - Hardened service: its own system user, port 53 as the only privilege, and a systemd sandbox.
