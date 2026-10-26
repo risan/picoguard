@@ -68,6 +68,10 @@ const CANARY_NAMES: [&str; 3] = [
 /// Estimated bytes of a compiled slow rule without its matcher: measured at 430 to 800
 /// bytes for a glob rule. The matcher is charged as it reports (`Matcher::cost_bytes`).
 const SLOW_RULE_BYTES: usize = 512;
+
+/// What the compiler's duplicate check keeps for every distinct slow rule it sees, valid or
+/// not: a `u128` hash and the table slack around it.
+const SEEN_SLOW_RULE_BYTES: usize = 32;
 pub(super) const TEXT_BYTE_COST: usize = 4;
 
 /// What each name of a modifier (`$denyallow`, `$client`, `$ctag`) costs besides its text.
@@ -117,7 +121,22 @@ impl SlowRuleBudget {
     }
 
     pub(super) fn charge(&mut self, slow: &SlowRule) -> Result<(), OverBudget> {
-        let cost = slow_rule_cost(slow);
+        self.take(slow_rule_cost(slow))
+    }
+
+    /// The duplicate check of the compiler remembers every distinct slow rule, including
+    /// the ones that do not compile.
+    fn charge_seen(&mut self) -> Result<(), OverBudget> {
+        self.take(SEEN_SLOW_RULE_BYTES)
+    }
+
+    /// A rule that failed to compile holds nothing but its counted failure, yet its text
+    /// went through the parser, so a list of nothing but bad regexes cannot be free.
+    fn charge_failed(&mut self, pattern_len: usize) -> Result<(), OverBudget> {
+        self.take(TEXT_BYTE_COST * pattern_len)
+    }
+
+    fn take(&mut self, cost: usize) -> Result<(), OverBudget> {
         self.left = self.left.checked_sub(cost).ok_or(OverBudget)?;
 
         Ok(())
@@ -325,10 +344,13 @@ fn compile(
                 return;
             }
 
+            let pattern_len = slow.pattern.len();
             let compiled = SlowRule::compile(slow);
-            if let Ok(compiled) = &compiled
-                && budget.charge(compiled).is_err()
-            {
+            let charged = budget.charge_seen().and_then(|()| match &compiled {
+                Ok(compiled) => budget.charge(compiled),
+                Err(()) => budget.charge_failed(pattern_len),
+            });
+            if charged.is_err() {
                 over_budget.set(true);
 
                 return;
@@ -579,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn slow_rules_are_charged_against_the_budget_to_the_byte() {
         let worker = CompileWorker::spawn().unwrap();
-        let cost = slow_rule_cost_of("a1*b\n");
+        let cost = slow_rule_cost_of("a1*b\n") + SEEN_SLOW_RULE_BYTES;
         let lines = |count: usize| -> String { (0..count).map(|i| format!("a{i}*b\n")).collect() };
 
         let fits = compile_in_pieces(&worker, with_budget(3 * cost), lines(3).as_bytes(), 64).await;
@@ -587,6 +609,24 @@ mod tests {
 
         assert_eq!(fits.unwrap().list.slow_rule_count(), 3);
         assert_eq!(over.err(), Some(CompileError::OverBudget));
+    }
+
+    #[tokio::test]
+    async fn distinct_invalid_regexes_are_charged_against_the_budget() {
+        let worker = CompileWorker::spawn().unwrap();
+        let lines = |count: usize| -> String { (0..count).map(|i| format!("/[x{i}/\n")).collect() };
+        let capped = |slow_rule_budget| CompileOptions {
+            max_rules: 100_000,
+            slow_rule_budget,
+            ..options(ListFormat::Adblock)
+        };
+
+        let few = compile_in_pieces(&worker, capped(64 * 1024), lines(10).as_bytes(), 64).await;
+        let many =
+            compile_in_pieces(&worker, capped(64 * 1024), lines(5000).as_bytes(), 1024).await;
+
+        assert_eq!(few.unwrap().list.regex_failed(), 10);
+        assert_eq!(many.err(), Some(CompileError::OverBudget));
     }
 
     #[tokio::test]
