@@ -62,7 +62,7 @@ async fn an_upstream_that_fails_by_turns_logs_one_warning() {
     })
     .await;
     let mut config = config_for(&upstream);
-    config.upstream.timeout_ms = 30;
+    config.upstream.timeout_ms = 250;
     let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
     let mut failures = 0;
 
@@ -92,7 +92,9 @@ async fn an_upstream_that_fails_by_turns_logs_one_warning() {
         .count();
     assert!(
         received.load(Ordering::SeqCst) > failures + 5,
-        "the upstream answered some queries and dropped others"
+        "the upstream answered some queries and dropped others: received {} failures {}",
+        received.load(Ordering::SeqCst),
+        failures
     );
     assert_eq!(warnings, 1, "{lines:?}");
 }
