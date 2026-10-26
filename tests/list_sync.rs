@@ -17,7 +17,7 @@ use hickory_proto::rr::{Name, RecordType};
 use picoguard::config::{Config, ListConfig, ListFormat, StateConfig};
 use picoguard::dns::wire::Query;
 use picoguard::filter::compile::{CompileOptions, CompileWorker};
-use picoguard::filter::engine::Decision;
+use picoguard::filter::engine::Verdict;
 use picoguard::filter::snapshot::{self, SnapshotStore};
 use picoguard::lists::{Downloader, resolver_over};
 use picoguard::policy::Policy;
@@ -172,7 +172,10 @@ fn blocked(policy: &Policy, name: &str) -> bool {
     let packet = message.to_vec().unwrap();
     let query = Query::parse(&packet).unwrap();
 
-    policy.view(Instant::now()).check_request(&query) != Decision::Pass
+    matches!(
+        policy.view(Instant::now()).check_request(&query),
+        Verdict::Block { .. }
+    )
 }
 
 fn generation(policy: &Policy) -> u64 {

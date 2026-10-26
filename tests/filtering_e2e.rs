@@ -333,6 +333,75 @@ async fn a_cached_reply_served_during_a_pause_is_blocked_on_the_first_hit_after_
 }
 
 #[tokio::test]
+async fn a_response_is_not_filtered_when_an_allow_rule_matched_the_request() {
+    let upstream = fake_upstream(|query| {
+        vec![(
+            Duration::ZERO,
+            reply_to(
+                query,
+                cloaked("good.example.", "cdn.tracker.example.", [9, 9, 9, 9]),
+            ),
+        )]
+    })
+    .await;
+    let server = start(
+        &config_for(&upstream),
+        engine_of(
+            &["@@||good.example^\n||tracker.example^\n"],
+            &["||listed.example^\n"],
+        ),
+    )
+    .await;
+
+    for _ in 0..2 {
+        let reply = ask(&server, "good.example.", RecordType::A).await;
+
+        assert_eq!(
+            answer_addresses(&reply),
+            ["cdn.tracker.example.", "9.9.9.9"]
+        );
+    }
+    assert_eq!(upstream.count(), 1, "the second reply came from the cache");
+
+    let reply = ask(&server, "listed.example.", RecordType::A).await;
+    assert_eq!(answer_addresses(&reply).len(), 2);
+
+    // A name no rule matches is still blocked through its CNAME.
+    let reply = ask(&server, "other.example.", RecordType::A).await;
+    assert!(is_blocked_a(&reply), "{:?}", answer_addresses(&reply));
+}
+
+#[tokio::test]
+async fn a_cached_reply_is_filtered_again_once_the_allow_rule_is_gone() {
+    let upstream = fake_upstream(|query| {
+        vec![(
+            Duration::ZERO,
+            reply_to(
+                query,
+                cloaked("good.example.", "cdn.tracker.example.", [9, 9, 9, 9]),
+            ),
+        )]
+    })
+    .await;
+    let server = start(
+        &config_for(&upstream),
+        engine_of(&["@@||good.example^\n||tracker.example^\n"], &[]),
+    )
+    .await;
+
+    let allowed = ask(&server, "good.example.", RecordType::A).await;
+    assert_eq!(answer_addresses(&allowed).len(), 2);
+
+    server
+        .policy
+        .swap_engine(engine_of(&["||tracker.example^\n"], &[]));
+    let after = ask(&server, "good.example.", RecordType::A).await;
+
+    assert!(is_blocked_a(&after), "{:?}", answer_addresses(&after));
+    assert_eq!(upstream.count(), 1);
+}
+
+#[tokio::test]
 async fn the_answer_address_of_a_reply_is_checked_with_the_go_text_form() {
     // AAAA ::ffff:203.0.113.7 is the text 203.0.113.7 for AdGuard Home.
     let upstream = fake_upstream(|query| {

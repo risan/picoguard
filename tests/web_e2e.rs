@@ -82,6 +82,12 @@ impl Request {
         self
     }
 
+    fn is_signed_in(&self) -> bool {
+        self.headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("authorization"))
+    }
+
     fn signed_in(self, credentials: &str) -> Request {
         self.header("Authorization", &format!("Basic {credentials}"))
     }
@@ -164,10 +170,17 @@ struct Site {
     web: SocketAddr,
     dns: Running,
     policy: Arc<Policy>,
+    /// Sends the administrator's credentials with every request that has none of its own.
+    signs_in: bool,
 }
 
 impl Site {
     async fn send(&self, request: Request) -> Reply {
+        let request = if self.signs_in && !request.is_signed_in() {
+            request.signed_in(ADMIN)
+        } else {
+            request
+        };
         let bytes = exchange(self.web, &request.bytes(self.web)).await;
 
         parse_reply(&bytes).unwrap_or_else(|| panic!("no reply: {bytes:?}"))
@@ -198,6 +211,7 @@ fn local_config(upstream: &common::harness::FakeUpstream) -> Config {
     config.rules = vec!["||ads.example^".to_string()];
     config.web.bind = vec!["127.0.0.1".parse().unwrap()];
     config.web.port = 0;
+    with_credentials(&mut config);
 
     config
 }
@@ -205,6 +219,11 @@ fn local_config(upstream: &common::harness::FakeUpstream) -> Config {
 fn with_credentials(config: &mut Config) {
     config.web.user = Some("admin".to_string());
     config.web.password = Some("s3cret".to_string());
+}
+
+fn without_credentials(config: &mut Config) {
+    config.web.user = None;
+    config.web.password = None;
 }
 
 /// A scheduler that refreshes nothing by itself for a day, so a refresh is always asked for.
@@ -245,6 +264,7 @@ async fn site(config: Config) -> Site {
         web: address,
         dns,
         policy,
+        signs_in: config.web.password.is_some(),
     }
 }
 
@@ -720,11 +740,110 @@ async fn assert_mutations_are_rejected(site: &Site, credentials: Option<&str>) {
     }
 }
 
+async fn open_site() -> (Site, common::harness::FakeUpstream) {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+
+    (site(config).await, upstream)
+}
+
+const SET_A_PASSWORD: &str = "set web.user and web.password to use this";
+
+#[tokio::test]
+async fn without_a_password_the_page_shows_totals_and_lists_and_nothing_else() {
+    let (site, _upstream) = open_site().await;
+    ask(&site.dns, "ads.example.", RecordType::A).await;
+    ask(&site.dns, "ok.example.", RecordType::A).await;
+
+    assert_eq!(site.send(get("/")).await.status, 200);
+    assert_eq!(site.send(get("/api/lists")).await.status, 200);
+
+    let reply = site.send(get("/api/status")).await;
+    let status = reply.json();
+
+    assert_eq!(reply.status, 200);
+    assert_eq!(status["counters"]["total"], 2);
+    assert_eq!(status["blocked_percent"], 50.0);
+    assert!(status["lists"].is_array());
+    assert_eq!(status["limited"], SET_A_PASSWORD);
+    for private in ["top_queried", "top_blocked", "top_clients"] {
+        assert!(status.get(private).is_none(), "{private}");
+    }
+    assert!(!reply.body.contains("ads.example"));
+}
+
+#[tokio::test]
+async fn without_a_password_the_log_and_every_change_are_forbidden() {
+    let (site, _upstream) = open_site().await;
+    ask(&site.dns, "ads.example.", RecordType::A).await;
+
+    let log = site.send(get("/api/querylog")).await;
+    assert_eq!(log.status, 403);
+    assert!(log.json()["error"].as_str().unwrap().contains("web.user"));
+    assert!(
+        log.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("web.password")
+    );
+    assert!(!log.body.contains("ads.example"));
+
+    for (what, request) in [
+        ("pause", post("/api/pause", "{\"minutes\": 5}")),
+        ("resume", post("/api/resume", "")),
+        ("refresh", post("/api/lists/refresh", "")),
+        ("a get of pause", get("/api/pause")),
+    ] {
+        let reply = site.send(request).await;
+
+        assert_eq!(reply.status, 403, "{what}");
+        assert_eq!(reply.json()["error"], SET_A_PASSWORD, "{what}");
+    }
+
+    assert!(!site.is_paused());
+}
+
+#[tokio::test]
+async fn with_a_password_the_status_keeps_its_top_lists_and_is_not_limited() {
+    let (site, _upstream) = plain_site().await;
+    ask(&site.dns, "ads.example.", RecordType::A).await;
+
+    let status = site.send(get("/api/status")).await.json();
+
+    assert!(status.get("limited").is_none());
+    for private in ["top_queried", "top_blocked", "top_clients"] {
+        assert!(status.get(private).is_some(), "{private}");
+    }
+}
+
+#[tokio::test]
+async fn the_page_asks_for_the_log_only_when_the_status_is_not_limited() {
+    let (site, _upstream) = open_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    assert!(page.contains("status.limited"));
+    assert!(page.contains("[hidden]"));
+}
+
 #[tokio::test]
 async fn unsafe_mutations_are_rejected_without_a_password() {
-    let (site, _upstream) = plain_site().await;
+    let (site, _upstream) = open_site().await;
 
-    assert_mutations_are_rejected(&site, None).await;
+    for (what, request, _) in rejected_mutations() {
+        let target = request.path.clone();
+        let reply = site.send(request).await;
+
+        // A path that no password guards keeps its own answer for a bad method.
+        let expected = if matches!(target.as_str(), "/api/status" | "/") {
+            405
+        } else {
+            403
+        };
+        assert_eq!(reply.status, expected, "{what}");
+        assert!(!site.is_paused(), "{what} paused blocking");
+    }
 }
 
 #[tokio::test]
@@ -753,7 +872,8 @@ async fn the_page_and_every_endpoint_need_the_password_when_one_is_set() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
     let mut config = local_config(&upstream);
     with_credentials(&mut config);
-    let site = site(config).await;
+    let mut site = site(config).await;
+    site.signs_in = false;
     let reads = ["/", "/api/status", "/api/querylog", "/api/lists"];
     let changes = [
         ("/api/pause", "{\"minutes\": 5}"),

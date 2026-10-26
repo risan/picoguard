@@ -387,6 +387,11 @@ pub fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), WireError> {
     Ok((name, end))
 }
 
+/// Whether the name at `start` ends in a compression pointer.
+fn is_compressed(msg: &[u8], start: usize) -> bool {
+    walk_name(msg, start, |_| Ok(())).is_ok_and(|span| span.pointer_at.is_some())
+}
+
 /// Returns the offset just after the name at `start`. The name is walked
 /// without being kept, so a bad pointer is an error here too.
 pub fn skip_name(msg: &[u8], start: usize) -> Result<usize, WireError> {
@@ -457,8 +462,13 @@ impl<'a> Query<'a> {
             return Err(reject(rcode::FORMERR));
         }
 
-        let (question, question_end) =
-            read_question(raw, HEADER_LEN).map_err(|_| reject(rcode::FORMERR))?;
+        // A client never compresses the question, and a pointer there can only point into the
+        // header. Replies copy the question as sent, so one that is not plain would not line
+        // up with the records built after it.
+        let (question, question_end) = read_question(raw, HEADER_LEN)
+            .ok()
+            .filter(|_| !is_compressed(raw, HEADER_LEN))
+            .ok_or_else(|| reject(rcode::FORMERR))?;
         let edns = read_query_edns(raw, question_end, header.additional_count)
             .map_err(|_| reject(rcode::FORMERR))?;
 
@@ -1127,6 +1137,35 @@ mod tests {
                 other => panic!("expected a rejection, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_question_name_that_is_a_compression_pointer_is_rejected() {
+        // The pointer leads to the high byte of the question count, which reads as the root.
+        let mut bytes = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(&[0xC0, 0x04, 0, 1, 0, 1]);
+
+        match Query::parse(&bytes) {
+            Err(QueryError::Reject { header, rcode }) => {
+                assert_eq!(header.id, 0x1234);
+                assert_eq!(rcode, rcode::FORMERR);
+            }
+
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+
+        let mut labels_then_pointer = bytes[..HEADER_LEN].to_vec();
+        labels_then_pointer.extend_from_slice(&[1, b'a', 0xC0, 0x04, 0, 1, 0, 1]);
+        assert!(matches!(
+            Query::parse(&labels_then_pointer),
+            Err(QueryError::Reject {
+                rcode: rcode::FORMERR,
+                ..
+            })
+        ));
+
+        let plain = QuerySpec::new("example.com.", RecordType::A).bytes();
+        assert!(Query::parse(&plain).is_ok());
     }
 
     #[test]

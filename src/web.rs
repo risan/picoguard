@@ -5,6 +5,8 @@
 //! - a peer outside `web.allow_from` is closed before a byte is read;
 //! - `Host` must be an IP address or a configured name, which defeats DNS rebinding;
 //! - with a password configured, `Authorization` must match, compared in constant time;
+//! - without a password the page is read-only and shows totals and list status only: the
+//!   query log, the top lists and every change answer 403;
 //! - a mutation must be `POST` with `Content-Type: application/json` (which a cross-site form
 //!   cannot send, and a cross-site script can only send after a CORS preflight that is never
 //!   answered), carry no `Origin` other than the page's own, and have a body of at most 1 KiB.
@@ -50,6 +52,7 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 const MIN_PAUSE_MINUTES: u32 = 1;
 const MAX_PAUSE_MINUTES: u32 = 24 * 60;
 const DEFAULT_QUERY_LOG_LIMIT: usize = 100;
+const PASSWORD_NEEDED: &str = "set web.user and web.password to use this";
 
 /// Everything the handlers read or change.
 pub struct Web {
@@ -77,6 +80,12 @@ impl Web {
             ))?),
             _ => None,
         };
+        if credentials.is_none() {
+            log::warn!(
+                "the status page has no password: it shows totals and list status only. \
+                 Set web.user and web.password for the query log, the top lists and pause."
+            );
+        }
 
         Ok(Web {
             stats,
@@ -216,6 +225,15 @@ impl Route {
             _ => None,
         }
     }
+
+    /// Whether the page shows this only to a signed-in user: the query log, the top lists
+    /// and every change.
+    fn needs_password(&self) -> bool {
+        match self {
+            Route::Read(Read::QueryLog) | Route::Change(_) => true,
+            Route::Read(Read::Page | Read::Status | Read::Lists) => false,
+        }
+    }
 }
 
 /// A request that is answered with an error and nothing else.
@@ -282,6 +300,9 @@ impl Web {
 
         let route = Route::of(head.uri.path())
             .ok_or_else(|| Rejection::new(StatusCode::NOT_FOUND, "no such page"))?;
+        if route.needs_password() && self.credentials.is_none() {
+            return Err(Rejection::new(StatusCode::FORBIDDEN, PASSWORD_NEEDED));
+        }
 
         match route {
             Route::Read(read) => {
@@ -375,6 +396,7 @@ impl Web {
             Read::Status => {
                 let snapshot = self.stats.snapshot();
                 let view = self.policy.view(Instant::now());
+                let is_open = self.credentials.is_some();
 
                 Ok(json(
                     StatusCode::OK,
@@ -382,9 +404,10 @@ impl Web {
                         counters: &snapshot.counters,
                         blocked_percent: blocked_percent(&snapshot.counters),
                         hourly: &snapshot.hourly,
-                        top_queried: TopList::of(&snapshot.top_queried),
-                        top_blocked: TopList::of(&snapshot.top_blocked),
-                        top_clients: TopList::of(&snapshot.top_clients),
+                        limited: (!is_open).then_some(PASSWORD_NEEDED),
+                        top_queried: is_open.then(|| TopList::of(&snapshot.top_queried)),
+                        top_blocked: is_open.then(|| TopList::of(&snapshot.top_blocked)),
+                        top_clients: is_open.then(|| TopList::of(&snapshot.top_clients)),
                         lists: self.list_views(),
                         generation: view.generation,
                         pause: self.pause_view(),
@@ -723,9 +746,15 @@ struct StatusView<'a> {
     blocked_percent: f64,
     /// Oldest first; the last bucket is the current UTC hour.
     hourly: &'a [HourlyBucket],
-    top_queried: TopList<'a, Box<str>>,
-    top_blocked: TopList<'a, Box<str>>,
-    top_clients: TopList<'a, IpAddr>,
+    /// Why the top lists are left out: set only while no password is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limited: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_queried: Option<TopList<'a, Box<str>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_blocked: Option<TopList<'a, Box<str>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_clients: Option<TopList<'a, IpAddr>>,
     lists: Vec<ListView>,
     generation: u64,
     pause: PauseView,

@@ -385,9 +385,10 @@ Next, open the status page in a browser on a computer in your network:
 http://DEVICE_IP:8080/
 ```
 
-It shows totals, the share blocked, the top blocked domains, the top clients, the recent queries
-and the state of each list (size, age, errors). A list shows an error here when its download
-failed. You can pause blocking from this page for a set time.
+It shows totals, the share blocked and the state of each list (size, age, errors). A list shows an
+error here when its download failed. Until you set `web.user` and `web.password` (see
+`docs/configuration.md`), that is all: the top domains, the top clients, the recent queries and the
+pause button need the password.
 
 Logs: `journalctl -u picoguard` (systemd) or syslog (OpenRC, when a logger runs). The default level is
 `warn`, so the log is empty when all is well.

@@ -318,11 +318,13 @@ impl<'q, 'a> Reply<'q, 'a> {
         }
     }
 
+    /// The client's size, capped by our own (RFC 6891 section 6.2.5): a spoofed query that
+    /// asks for 64 KiB does not get more than we announced.
     fn udp_limit(&self) -> usize {
         let advertised = self
             .query
             .edns
-            .map_or(CLASSIC_UDP_LIMIT, |edns| edns.udp_size);
+            .map_or(CLASSIC_UDP_LIMIT, |edns| edns.udp_size.min(self.udp_size));
 
         usize::from(advertised.max(CLASSIC_UDP_LIMIT))
     }
@@ -701,7 +703,7 @@ mod tests {
 
     #[test]
     fn too_many_addresses_for_a_udp_reply_truncate_it() {
-        let addresses = many_v4(100);
+        let addresses = many_v4(60);
 
         for (edns, fits) in [(None, false), (Some((4096, false)), true)] {
             let mut spec = QuerySpec::new("host.example.", RecordType::A);
@@ -710,7 +712,7 @@ mod tests {
             let (_, message) = address_reply(&spec, Protocol::Udp, &addresses);
 
             assert_eq!(message.metadata.truncation, !fits, "{edns:?}");
-            assert_eq!(message.answers.len(), if fits { 100 } else { 0 });
+            assert_eq!(message.answers.len(), if fits { 60 } else { 0 });
         }
     }
 
@@ -934,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn the_client_size_decides_when_it_is_larger_than_the_reply() {
+    fn the_server_size_caps_a_larger_client_size() {
         let mut client = QuerySpec::new("big.example.com.", RecordType::TXT);
         client.edns = Some((4096, false));
         let upstream = large_answer(&client);
@@ -942,8 +944,46 @@ mod tests {
         let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
 
         let message = parse(&out);
-        assert!(!message.metadata.truncation);
-        assert_eq!(message.answers.len(), 1);
+        assert!(message.metadata.truncation);
+        assert!(message.answers.is_empty());
+        assert!(message.edns.is_some());
+        assert!(out.len() <= usize::from(SERVER_UDP_SIZE));
+    }
+
+    #[test]
+    fn a_reply_that_fits_the_server_size_is_not_truncated_for_a_larger_client_size() {
+        let mut client = QuerySpec::new("big.example.com.", RecordType::TXT);
+        client.edns = Some((4096, false));
+        let upstream = reply_of_len(
+            &client,
+            usize::from(SERVER_UDP_SIZE) - OPT_RECORD_LEN,
+            false,
+        );
+
+        let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
+
+        assert_eq!(out.len(), usize::from(SERVER_UDP_SIZE));
+        assert!(!parse(&out).metadata.truncation);
+    }
+
+    #[test]
+    fn a_server_size_of_512_caps_every_client_size() {
+        let mut client = QuerySpec::new("big.example.com.", RecordType::TXT);
+        client.edns = Some((4096, false));
+        let upstream = reply_of_len(&client, 700, false);
+        let bytes = client.bytes();
+        let query = Query::parse(&bytes).unwrap();
+        let parts = ReplyParts {
+            bytes: &upstream,
+            ttl_offsets: &[],
+            opt_start: None,
+        };
+        let mut out = Vec::new();
+
+        Reply::new(&query, 512, Protocol::Udp).from_upstream(parts, no_aging(), &mut out);
+
+        assert!(parse(&out).metadata.truncation);
+        assert!(out.len() <= 512);
     }
 
     #[test]

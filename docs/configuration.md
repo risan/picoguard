@@ -44,7 +44,8 @@ rules = [
 
 The default `allow_from` is loopback (`127.0.0.0/8`, `::1/128`), RFC 1918 (`10.0.0.0/8`,
 `172.16.0.0/12`, `192.168.0.0/16`), `100.64.0.0/10` (Tailscale), link-local (`169.254.0.0/16`,
-`fe80::/10`) and `fc00::/7`. To allow everyone, use `["0.0.0.0/0", "::/0"]`. Do that only behind a
+`fe80::/10`) and `fc00::/7`. `100.64.0.0/10` is also the carrier-grade NAT space of some ISPs: remove
+it if you do not use Tailscale. To allow everyone, use `["0.0.0.0/0", "::/0"]`. Do that only behind a
 firewall: an open resolver is abused for attacks.
 
 ## `[upstream]`
@@ -61,7 +62,9 @@ Forms of a server: `https://IP/path` (DoH by IP), `https://host/path` (DoH by na
 ## `[local]`
 
 Off by default. Set it to send reverse lookups of private addresses and your local domain to the
-router. Without it, such queries get NXDOMAIN.
+router. Without it, such queries get NXDOMAIN. This includes every name under the private
+reverse zones of RFC 6303, such as the DNS-SD names `lb._dns-sd._udp.0.1.168.192.in-addr.arpa`.
+They never go to the public servers.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -87,6 +90,8 @@ lists are used.
 | `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A list over it is not used. |
 
 Downloads use `If-None-Match` and `If-Modified-Since`. A failed download keeps the last good list.
+A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private,
+link-local or unspecified address fails too, unless the list URL itself points into those ranges.
 A new list takes effect without a restart and without dropping queries. One list refreshes at a time.
 
 Example:
@@ -139,6 +144,10 @@ The same order as AdGuard Home:
 2. Otherwise, among all matching rules: `$important` allow, then `$important` block, then allow
    (`@@`), then block.
 
+When a rule allows the name that was asked (an allowlist, or `@@` in a list or in `rules`), the
+answer is not checked either: a CNAME target or an answer address that a blocklist matches does
+not block it, as in AdGuard Home.
+
 Your `rules` count as one more list. So `||example.com^$important` in a list still beats
 `@@||example.com^` in `rules`, as in AdGuard Home.
 
@@ -177,8 +186,14 @@ These keep memory fixed. The defaults fit a 256 MB board; you rarely change them
 
 ## `[web]`
 
-The status page. Read-only: it shows totals, top blocked domains, top clients, recent queries and
-list status, and can pause blocking for a set time.
+The status page. With `user` and `password` set, it shows totals, top blocked domains, top clients,
+recent queries and list status, and can pause blocking for a set time and refresh the lists.
+
+Without a password the page is read-only and limited: it shows totals and list status only. The
+query log, the top lists, pause, resume and refresh answer 403 ("set web.user and web.password to
+use this"), and the page says so. picoguard logs one warning at start when no password is set.
+Every device that may open the page could otherwise read the household's queries and switch
+blocking off.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -187,7 +202,7 @@ list status, and can pause blocking for a set time.
 | `port` | `8080` | HTTP port. |
 | `allow_from` | same as `server.allow_from` | Only these networks may open the page. Others are disconnected. |
 | `hostnames` | `[]` | Host names the page answers to, besides IP addresses. Add the name you type in the browser, for example `["orangepi.lan"]`. |
-| `user`, `password` | not set | Set both to require basic auth. Neither can be empty; the user cannot contain `:`. |
+| `user`, `password` | not set | Set both to require basic auth on every request and to unlock the full page. Neither can be empty; the user cannot contain `:`. |
 
 Basic auth is sent in clear text over HTTP. Use it with `allow_from` on a trusted LAN, not across
 the internet.

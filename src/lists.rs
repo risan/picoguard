@@ -29,7 +29,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
@@ -94,6 +94,9 @@ pub struct Limits {
     pub max_body_bytes: u64,
     /// How long connecting, the response head and each piece of the body may take.
     pub idle_timeout: Duration,
+    /// How long one download may take in all, redirects and the whole body included. A
+    /// server that sends a byte now and then stays within `idle_timeout` for ever.
+    pub total_timeout: Duration,
     pub max_redirects: usize,
 }
 
@@ -102,6 +105,7 @@ impl Default for Limits {
         Limits {
             max_body_bytes: 64 * 1024 * 1024,
             idle_timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(10 * 60),
             max_redirects: 5,
         }
     }
@@ -114,11 +118,15 @@ pub enum FetchError {
     Connect(io::Error),
     Tls(io::Error),
     Timeout,
+    /// The download did not finish within `Limits::total_timeout`.
+    DeadlinePassed,
     Http(hyper::Error),
     Status(u16),
     TooManyRedirects,
     BadRedirect(String),
     InsecureRedirect,
+    /// A redirect from a public host to an address of this machine or its network.
+    LocalRedirect(String),
     BodyTooLarge,
     UnsupportedEncoding(String),
     /// A web page (a login or error page served with status 200), not a list.
@@ -151,6 +159,10 @@ impl fmt::Display for FetchError {
                 write!(formatter, "timed out")
             }
 
+            FetchError::DeadlinePassed => {
+                write!(formatter, "the download took too long")
+            }
+
             FetchError::Http(error) => {
                 write!(formatter, "HTTP error: {error}")
             }
@@ -169,6 +181,13 @@ impl fmt::Display for FetchError {
 
             FetchError::InsecureRedirect => {
                 write!(formatter, "redirect from https to http")
+            }
+
+            FetchError::LocalRedirect(host) => {
+                write!(
+                    formatter,
+                    "redirect to {host}, which is on this machine or its network"
+                )
             }
 
             FetchError::BodyTooLarge => {
@@ -376,6 +395,28 @@ impl Target {
     }
 }
 
+/// Loopback, private, link-local and unspecified addresses: where a list server must not be
+/// able to send a request from inside the network.
+fn is_local_address(address: IpAddr) -> bool {
+    match address.to_canonical() {
+        IpAddr::V4(address) => {
+            address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_unspecified()
+        }
+
+        IpAddr::V6(address) => {
+            let first_segment = address.segments()[0];
+
+            address.is_loopback()
+                || address.is_unspecified()
+                || first_segment & 0xFE00 == 0xFC00
+                || first_segment & 0xFFC0 == 0xFE80
+        }
+    }
+}
+
 fn has_scheme(location: &str) -> bool {
     location.split_once("://").is_some_and(|(scheme, _)| {
         !scheme.is_empty()
@@ -425,6 +466,16 @@ pub struct Downloader {
     tls: Arc<Tls>,
     /// Hosts that refused the ChaCha20-only offer of a CPU without AES (plan D10).
     full_suites: Mutex<HashSet<String>>,
+    /// Which addresses a redirect may not lead to; a test replaces it.
+    is_local: fn(IpAddr) -> bool,
+}
+
+/// A response whose body has not been read yet, and whether the server is on a local address.
+struct Response {
+    head: http::response::Parts,
+    body: Incoming,
+    connection: ConnectionTask,
+    is_local: bool,
 }
 
 pub enum Fetch {
@@ -437,6 +488,7 @@ pub struct Download {
     pub validators: Validators,
     body: Incoming,
     limits: Limits,
+    deadline: Instant,
     _connection: ConnectionTask,
 }
 
@@ -454,24 +506,53 @@ impl Downloader {
             resolver,
             tls,
             full_suites: Mutex::new(HashSet::new()),
+            is_local: is_local_address,
         }
     }
 
     /// Follows redirects and returns at the first 200 or 304 response, before its body.
-    /// `previous` makes the request conditional.
+    /// `previous` makes the request conditional. The deadline of the whole download starts
+    /// here: it covers the redirects and `Download::pump`.
     pub async fn fetch(
         &self,
         url: &str,
         previous: &Validators,
         limits: &Limits,
     ) -> Result<Fetch, FetchError> {
+        let deadline = Instant::now() + limits.total_timeout;
+
+        timeout_at(deadline, self.follow(url, previous, limits, deadline))
+            .await
+            .map_err(|_| FetchError::DeadlinePassed)?
+    }
+
+    async fn follow(
+        &self,
+        url: &str,
+        previous: &Validators,
+        limits: &Limits,
+        deadline: Instant,
+    ) -> Result<Fetch, FetchError> {
         let mut target = Target::parse(url)?;
+        // A list that is served from the local network may redirect there too; any other
+        // may not, however many hops it takes.
+        let mut refuse_local = false;
 
         for redirects in 0..=limits.max_redirects {
-            let (head, body, connection) = self.request(&target, previous, limits).await?;
+            let Response {
+                head,
+                body,
+                connection,
+                is_local,
+            } = self
+                .request(&target, previous, limits, refuse_local)
+                .await?;
+            if redirects == 0 {
+                refuse_local = !is_local;
+            }
 
             if head.status == StatusCode::OK {
-                return download(head, body, connection, limits);
+                return download(head, body, connection, limits, deadline);
             }
 
             if head.status == StatusCode::NOT_MODIFIED && !previous.is_empty() {
@@ -502,31 +583,58 @@ impl Downloader {
         target: &Target,
         previous: &Validators,
         limits: &Limits,
-    ) -> Result<(http::response::Parts, Incoming, ConnectionTask), FetchError> {
+        refuse_local: bool,
+    ) -> Result<Response, FetchError> {
         let request = build_request(target, previous)?;
         let idle = limits.idle_timeout;
 
         if target.https {
-            let stream = self.connect_tls(target, idle).await?;
+            let stream = self.connect_tls(target, idle, refuse_local).await?;
+            let is_local = self.is_server_local(stream.get_ref().0);
 
-            return exchange(stream, request, idle).await;
+            return exchange(stream, request, idle, is_local).await;
         }
 
-        let stream = timeout(idle, self.connect_tcp(&target.host, target.port))
-            .await
-            .map_err(|_| FetchError::Timeout)??;
+        let stream = timeout(
+            idle,
+            self.connect_tcp(&target.host, target.port, refuse_local),
+        )
+        .await
+        .map_err(|_| FetchError::Timeout)??;
+        let is_local = self.is_server_local(&stream);
 
-        exchange(stream, request, idle).await
+        exchange(stream, request, idle, is_local).await
     }
 
-    async fn connect_tcp(&self, host: &str, port: u16) -> Result<TcpStream, FetchError> {
-        let addresses = match host.parse::<IpAddr>() {
+    fn is_server_local(&self, stream: &TcpStream) -> bool {
+        stream
+            .peer_addr()
+            .is_ok_and(|peer| (self.is_local)(peer.ip()))
+    }
+
+    /// Connects to the first address of `host` that answers. With `refuse_local`, addresses
+    /// of this machine or its network are skipped, and a host with only such addresses is an
+    /// error, so a name that is made to resolve there is no way in.
+    async fn connect_tcp(
+        &self,
+        host: &str,
+        port: u16,
+        refuse_local: bool,
+    ) -> Result<TcpStream, FetchError> {
+        let mut addresses = match host.parse::<IpAddr>() {
             Ok(address) => vec![address],
 
             Err(_) => (self.resolver)(host.to_string())
                 .await
                 .map_err(|error| FetchError::Resolve(format!("{host}: {error}")))?,
         };
+        if refuse_local {
+            addresses.retain(|address| !(self.is_local)(*address));
+
+            if addresses.is_empty() {
+                return Err(FetchError::LocalRedirect(host.to_string()));
+            }
+        }
 
         let mut last_error = FetchError::Resolve(format!("{host}: no addresses"));
         for address in addresses {
@@ -546,10 +654,14 @@ impl Downloader {
         &self,
         target: &Target,
         idle: Duration,
+        refuse_local: bool,
     ) -> Result<TlsStream<TcpStream>, FetchError> {
         let full_suites = self.full_suites.lock().unwrap().contains(&target.host);
 
-        match self.handshake(target, full_suites, idle).await {
+        match self
+            .handshake(target, full_suites, idle, refuse_local)
+            .await
+        {
             Err(FetchError::Tls(error)) if !full_suites && lacks_shared_cipher(&error) => {
                 let first_time = self.full_suites.lock().unwrap().insert(target.host.clone());
                 if first_time {
@@ -559,7 +671,7 @@ impl Downloader {
                     );
                 }
 
-                self.handshake(target, true, idle).await
+                self.handshake(target, true, idle, refuse_local).await
             }
 
             result => result,
@@ -571,13 +683,16 @@ impl Downloader {
         target: &Target,
         full_suites: bool,
         idle: Duration,
+        refuse_local: bool,
     ) -> Result<TlsStream<TcpStream>, FetchError> {
         let name = ServerName::try_from(target.host.clone())
             .map_err(|_| FetchError::BadUrl(target.host.clone()))?;
         let connector = TlsConnector::from(self.tls.config(Alpn::Http1, full_suites));
 
         let connect = async {
-            let tcp = self.connect_tcp(&target.host, target.port).await?;
+            let tcp = self
+                .connect_tcp(&target.host, target.port, refuse_local)
+                .await?;
 
             connector.connect(name, tcp).await.map_err(FetchError::Tls)
         };
@@ -619,7 +734,8 @@ async fn exchange<S>(
     stream: S,
     request: Request<Empty<Bytes>>,
     idle: Duration,
-) -> Result<(http::response::Parts, Incoming, ConnectionTask), FetchError>
+    is_local: bool,
+) -> Result<Response, FetchError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -640,7 +756,12 @@ where
         .map_err(FetchError::Http)?;
     let (head, body) = response.into_parts();
 
-    Ok((head, body, connection))
+    Ok(Response {
+        head,
+        body,
+        connection,
+        is_local,
+    })
 }
 
 /// The comma-separated values of every field named `name`, without empty items.
@@ -662,6 +783,7 @@ fn download(
     body: Incoming,
     connection: ConnectionTask,
     limits: &Limits,
+    deadline: Instant,
 ) -> Result<Fetch, FetchError> {
     if let Some(coding) = header_tokens(&head.headers, &CONTENT_ENCODING)
         .find(|coding| !coding.eq_ignore_ascii_case("identity"))
@@ -693,6 +815,7 @@ fn download(
         validators: Validators::of_response(&head.headers),
         body,
         limits: limits.clone(),
+        deadline,
         _connection: connection,
     }))
 }
@@ -728,7 +851,13 @@ fn looks_like_html(start: &[u8]) -> bool {
 impl Download {
     /// Reads the body and sends it as pieces followed by `End`. On an error the caller drops
     /// the sender, which tells the compile worker to throw the partial text away.
-    pub async fn pump(mut self, sink: &PieceSender) -> Result<(), FetchError> {
+    pub async fn pump(self, sink: &PieceSender) -> Result<(), FetchError> {
+        timeout_at(self.deadline, self.read_body(sink))
+            .await
+            .map_err(|_| FetchError::DeadlinePassed)?
+    }
+
+    async fn read_body(mut self, sink: &PieceSender) -> Result<(), FetchError> {
         let mut piece = Vec::with_capacity(MAX_PIECE_BYTES);
         let mut total = 0u64;
         let mut sniffed = false;
@@ -1579,6 +1708,243 @@ mod tests {
         let error = fetch_error(&local(), &server.url("/"), &quick()).await;
 
         assert!(matches!(error, FetchError::Timeout), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_trickles_past_the_total_deadline_fails_the_download() {
+        let server = Server::start(|_, _, mut stream| async move {
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 600\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.unwrap();
+            for _ in 0..600 {
+                if stream.write_all(b"x").await.is_err() {
+                    return;
+                }
+
+                stream.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let limits = Limits {
+            total_timeout: Duration::from_millis(600),
+            ..quick()
+        };
+
+        let started = std::time::Instant::now();
+        let pumped = fetch_body(&local(), &server.url("/"), &limits).await;
+
+        assert!(
+            matches!(pumped.result, Err(FetchError::DeadlinePassed)),
+            "{:?}",
+            pumped.result
+        );
+        assert!(!pumped.ended);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn redirects_count_against_the_total_deadline() {
+        let server = Server::start(|index, request, mut stream| async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let location = format!("http://{}/{}", request.server, index + 1);
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        })
+        .await;
+        let limits = Limits {
+            total_timeout: Duration::from_millis(600),
+            ..quick()
+        };
+
+        let error = fetch_error(&local(), &server.url("/0"), &limits).await;
+
+        assert!(matches!(error, FetchError::DeadlinePassed), "{error:?}");
+    }
+
+    #[test]
+    fn the_default_total_deadline_is_ten_minutes() {
+        assert_eq!(Limits::default().total_timeout, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn local_addresses_are_loopback_private_link_local_and_unspecified() {
+        for local in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "10.1.2.3",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00::1",
+            "fc00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(is_local_address(local.parse().unwrap()), "{local}");
+        }
+
+        for public in [
+            "8.8.8.8",
+            "172.15.0.1",
+            "172.32.0.1",
+            "192.169.0.1",
+            "100.64.0.1",
+            "2606:4700::1111",
+            "fec0::1",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(!is_local_address(public.parse().unwrap()), "{public}");
+        }
+    }
+
+    /// Redirects `/start` to `target`, and answers any other path with a list.
+    async fn redirecting_server(target: &'static str) -> Server {
+        Server::start(move |_, request, mut stream| async move {
+            if request.path == "/start" {
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+            } else {
+                respond(&mut stream, "200 OK", &[], b"||ads.example^\n").await;
+            }
+        })
+        .await
+    }
+
+    /// A downloader that counts only `127.0.0.2` as local, so that the test server on
+    /// `127.0.0.1` stands for a public host.
+    fn downloader_with_one_local_address(resolver: Resolver) -> Downloader {
+        let mut downloader = downloader(resolver);
+        downloader.is_local = |address| address.to_canonical() == IpAddr::from([127, 0, 0, 2]);
+
+        downloader
+    }
+
+    #[tokio::test]
+    async fn a_redirect_from_a_public_host_to_a_local_address_is_refused() {
+        for target in [
+            "http://127.0.0.2:9/end",
+            "//127.0.0.2:9/end",
+            "http://[::ffff:127.0.0.2]:9/end",
+        ] {
+            let server = redirecting_server(target).await;
+
+            let error = fetch_error(
+                &downloader_with_one_local_address(never_resolve()),
+                &server.url("/start"),
+                &quick(),
+            )
+            .await;
+
+            assert!(
+                matches!(error, FetchError::LocalRedirect(_)),
+                "{target}: {error:?}"
+            );
+            assert_eq!(server.request_count(), 1, "{target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_name_that_resolves_to_a_local_address_is_refused() {
+        let server = redirecting_server("http://rebind.example:9/end").await;
+        let resolver: Resolver = Arc::new(|name| {
+            Box::pin(async move {
+                assert_eq!(name, "rebind.example");
+
+                Ok(vec![IpAddr::from([127, 0, 0, 2])])
+            })
+        });
+
+        let error = fetch_error(
+            &downloader_with_one_local_address(resolver),
+            &server.url("/start"),
+            &quick(),
+        )
+        .await;
+
+        assert!(matches!(error, FetchError::LocalRedirect(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_public_address_is_followed() {
+        let server = Server::start(|_, request, mut stream| async move {
+            if request.path == "/start" {
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{}/end\r\nContent-Length: 0\r\n\r\n",
+                    request.server
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+            } else {
+                respond(&mut stream, "200 OK", &[], b"||ads.example^\n").await;
+            }
+        })
+        .await;
+
+        let pumped = fetch_body(
+            &downloader_with_one_local_address(never_resolve()),
+            &server.url("/start"),
+            &quick(),
+        )
+        .await;
+
+        assert_eq!(pumped.text(), b"||ads.example^\n");
+    }
+
+    #[tokio::test]
+    async fn a_list_that_is_itself_local_may_redirect_to_a_local_address() {
+        let server = Server::start(|_, request, mut stream| async move {
+            if request.path == "/start" {
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{}/end\r\nContent-Length: 0\r\n\r\n",
+                    request.server
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+            } else {
+                respond(&mut stream, "200 OK", &[], b"||ads.example^\n").await;
+            }
+        })
+        .await;
+        let mut downloader = local();
+        downloader.is_local = |_| true;
+
+        let pumped = fetch_body(&downloader, &server.url("/start"), &quick()).await;
+
+        assert_eq!(pumped.text(), b"||ads.example^\n");
+    }
+
+    #[tokio::test]
+    async fn a_public_list_cannot_bounce_through_a_second_redirect_into_the_local_network() {
+        let server = Server::start(|_, request, mut stream| async move {
+            let location = match request.path.as_str() {
+                "/start" => format!("http://{}/second", request.server),
+                _ => "http://127.0.0.2:9/end".to_string(),
+            };
+            let head =
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.write_all(head.as_bytes()).await;
+        })
+        .await;
+
+        let error = fetch_error(
+            &downloader_with_one_local_address(never_resolve()),
+            &server.url("/start"),
+            &quick(),
+        )
+        .await;
+
+        assert!(matches!(error, FetchError::LocalRedirect(_)), "{error:?}");
     }
 
     #[tokio::test]
