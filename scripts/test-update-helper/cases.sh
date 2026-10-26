@@ -530,7 +530,13 @@ restart_fails() {
     wait_result "$STAGED_ID" 90 || fail "no result within 90 seconds"
     note "rolled back in ${WAITED}s"
 
-    expect_result "$STAGED_ID" rolled-back "did not" "runs again"
+    # supervise-daemon reports a service that cannot start as started, so OpenRC may say "did
+    # not answer DNS" instead; systemd never counts it as active.
+    case $INIT in
+        systemd) expect_result "$STAGED_ID" rolled-back "did not start" "runs again" ;;
+        openrc) expect_result "$STAGED_ID" rolled-back "did not" "runs again" ;;
+    esac
+
     same_file "$B" "$REAL" || fail "$B is not the real binary"
     service_up || fail "picoguard is not active"
 
@@ -974,7 +980,7 @@ answered_request_left_in_place() {
     rc-service picoguard stop
     as_picoguard "mkdir -p $STAGE"
     write_request "$STAGED_ID"
-    watcher=$(cat /run/supervise-picoguard-update.pid)
+    watcher=$(children_of "$(cat /run/supervise-picoguard-update.pid)")
     touch /tmp/stamp
     sleep 1
     before=$(cksum <"$I/result")
@@ -982,7 +988,7 @@ answered_request_left_in_place() {
 
     [ "$(cksum <"$I/result")" = "$before" ] || fail "the result changed"
     [ -z "$(find "$I" -newer /tmp/stamp)" ] || fail "written: $(find "$I" -newer /tmp/stamp)"
-    [ "$(cat /run/supervise-picoguard-update.pid)" = "$watcher" ] || fail "the watcher was restarted"
+    [ "$(children_of "$(cat /run/supervise-picoguard-update.pid)")" = "$watcher" ] || fail "the watcher was restarted"
     kill -0 "$watcher" || fail "the watcher is gone"
 }
 

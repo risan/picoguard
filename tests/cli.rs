@@ -433,6 +433,21 @@ fn dns_check_skips_another_id_and_takes_the_right_one() {
 }
 
 #[test]
+fn dns_check_gives_up_when_only_another_id_answers() {
+    let address = responder("127.0.0.1:0", |query| {
+        vec![with_another_id(reply_to(query, NOERROR))]
+    })
+    .unwrap();
+    let started = Instant::now();
+
+    let output = dns_check(address);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(text(&output.stderr).trim().lines().count(), 1);
+}
+
+#[test]
 fn dns_check_gives_up_on_silence() {
     let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
     let started = Instant::now();

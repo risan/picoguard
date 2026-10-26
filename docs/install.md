@@ -145,7 +145,8 @@ Good to know:
   old file as `picoguard.toml.bak.<time>` first.
 - `--no-start` installs everything and starts nothing.
 - `--binary FILE` installs a binary you built yourself, without a checksum check. `--version vX.Y.Z` picks a release.
-- `sh install.sh --uninstall` removes the binary, the service and the systemd-resolved change. It
+- `sh install.sh --uninstall` removes the binary, the service, the update installer with its
+  trigger and folder (see "Update picoguard") and the systemd-resolved change. It
   keeps a `memory.conf` that it did not write.
   It keeps `/etc/picoguard` and `/var/lib/picoguard` unless you add `--purge`.
 
@@ -251,7 +252,7 @@ What is on the device for this (`install.sh` writes and replaces all of it):
 | `/usr/local/lib/picoguard/update` and `common.sh` | The installer and the shell functions it shares with `install.sh`. Owned by root. |
 | `/etc/systemd/system/picoguard-update.path` and `.service` | systemd: the path unit starts the installer when `/var/lib/picoguard/update/request` changes, and the service runs once at boot. |
 | `/etc/init.d/picoguard-update` | OpenRC: a root service that looks for a request every 5 seconds (two small processes, under 1 MB of memory together, and no disk writes while idle). |
-| `/var/lib/picoguard-update/` | Its lock, the answer (`result`), and while an update runs its record, the previous binary and the verified copy. Owned by root; picoguard cannot write or even open anything in it but `result`. |
+| `/var/lib/picoguard-update/` | Its lock, the answer (`result`), and while an update runs its record, the previous binary and the verified copy. Owned by root; picoguard can read `result` but cannot write in the folder or open its lock. |
 
 The service file of picoguard itself does not change: it still cannot write its binary, `/etc` or
 the installer's folder.
