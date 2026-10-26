@@ -12,13 +12,13 @@ name = "picoguard"
 path = "src/main.rs"
 
 [dependencies]
+bytemuck = "1.25.2"
 bytes = "1.12.1"
 http = "1.5.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", default-features = false, features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 log = "0.4.34"
-lru = "0.19.0"
 regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-case", "unicode-gencat", "unicode-script", "perf-literal"] }
 ring = { version = "0.17.14", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
