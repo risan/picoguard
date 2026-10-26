@@ -1,0 +1,45 @@
+# picoguard configuration inside the Docker image (/etc/picoguard/picoguard.toml).
+# To change it, copy this file to ./picoguard.toml next to compose.yaml and edit
+# the copy. All settings: docs/configuration.md. Check a file with:
+#   docker run --rm -v "$PWD/picoguard.toml:/c.toml:ro" picoguard:local --check -c /c.toml
+#
+# Only private networks may query and open the status page (the defaults of
+# server.allow_from and web.allow_from). Docker shows clients behind the
+# published port with their real address, so a phone on your LAN is allowed.
+
+[server]
+bind = ["0.0.0.0", "::"]
+port = 53
+
+[upstream]
+servers = [
+    "https://1.1.1.1/dns-query",
+    "https://1.0.0.1/dns-query",
+    "https://9.9.9.10/dns-query",
+    "https://149.112.112.10/dns-query",
+]
+
+# Your router answers names of devices in your network. Uncomment and set it:
+# [local]
+# resolver = "192.168.1.1:53"
+# domains = ["lan", "home.arpa"]
+
+[web]
+bind = ["0.0.0.0", "::"]
+port = 8080
+# Set both to require a password for the status page.
+# user = "admin"
+# password = "change-me"
+
+[state]
+dir = "/var/lib/picoguard"
+
+[[lists]]
+name = "hagezi-pro"
+url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"
+format = "adblock"
+
+[[lists]]
+name = "hagezi-tif-mini"
+url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.mini.txt"
+format = "adblock"
