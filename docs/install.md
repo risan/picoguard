@@ -81,22 +81,25 @@ Check the CPU: `uname -m` must say `x86_64`.
 your CPU, checks its checksum, asks four questions, writes the config, frees port 53, installs the
 service (systemd or OpenRC) and starts it. Run it as root on the device.
 
-While the repository is private, download the release with the GitHub CLI (`gh auth login` once),
-on the device or on another computer:
-
-```sh
-gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh
-sudo sh install.sh
-```
-
-`install.sh` uses the `picoguard-<target>` file next to it and checks it with `SHA256SUMS`, which
-must be there too. If you downloaded on another computer, copy the three files to the device first.
-
-Once the repository is public, one line is enough. It downloads the binary and checks it:
+One line downloads the installer, which downloads the binary and checks it:
 
 ```sh
 curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh
 ```
+
+To read the script before you run it, download it first. Run it on the device, or on another
+computer and copy it over:
+
+```sh
+curl -fsSLO https://github.com/risan/picoguard/releases/latest/download/install.sh
+sudo sh install.sh
+```
+
+Without internet on the device, download `install.sh`, `SHA256SUMS` and the `picoguard-<target>`
+file for your CPU (the table at the top) from the
+[releases page](https://github.com/risan/picoguard/releases), copy the three files to one
+folder on the device and run `sudo sh install.sh` there. `install.sh` uses the
+`picoguard-<target>` file next to it and checks it with `SHA256SUMS`, which must be there too.
 
 The four questions (press Enter for the default; every question also has a flag, see
 `sh install.sh --help`):
@@ -154,13 +157,6 @@ it and runs `install.sh` there. It never touches another container, and it refus
 that exists.
 
 ```sh
-gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh -p proxmox-lxc.sh
-bash proxmox-lxc.sh
-```
-
-Once the repository is public:
-
-```sh
 curl -fsSL https://github.com/risan/picoguard/releases/latest/download/proxmox-lxc.sh | bash
 ```
 
@@ -193,8 +189,6 @@ cp dist/picoguard.docker.toml picoguard.toml
 docker compose up -d --build
 ```
 
-(While the repository is private, clone it with `gh repo clone risan/picoguard`.)
-
 - Edit `picoguard.toml` for your upstreams, lists and router, then `docker compose restart`.
   It is mounted read-only. The list copies live in the volume `picoguard-state`.
 - The container publishes 53/udp, 53/tcp and 8080. Port 53 must be free on the host (see "Free
@@ -217,13 +211,6 @@ Run `install.sh` again. It downloads the latest release (or uses the files next 
 the binary, keeps your config and restarts the service:
 
 ```sh
-gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh --clobber
-sudo sh install.sh
-```
-
-or, once the repository is public:
-
-```sh
 curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh
 ```
 
@@ -241,16 +228,7 @@ your system has neither systemd nor OpenRC. Run them as root (`sudo -i`) on the 
 
 `SHA256SUMS` lists the checksums of the release files. Replace `TARGET` with the name from the table at the top (for example `aarch64-unknown-linux-musl`).
 
-The repository is private for now, so a plain download needs a login. Use the GitHub CLI
-(`gh auth login` once), on the board or on another computer:
-
-```sh
-cd /tmp
-gh release download v0.2.0 -R risan/picoguard -p "picoguard-TARGET" -p SHA256SUMS
-sha256sum -c --ignore-missing SHA256SUMS
-```
-
-When the repository is public, `wget` works without a login:
+Download the two files on the board or on another computer:
 
 ```sh
 cd /tmp
@@ -260,6 +238,38 @@ sha256sum -c --ignore-missing SHA256SUMS
 ```
 
 You must see `picoguard-TARGET: OK`. If you see `FAILED`, do not use the file. Download it again.
+
+#### Check the signature
+
+Releases from v0.3.0 on also carry `SHA256SUMS.sig`, an Ed25519 signature of `SHA256SUMS` made
+with the project's release key. The checksum only shows that the files match `SHA256SUMS`; the
+signature shows that `SHA256SUMS` itself comes from the release workflow. You need OpenSSL 3.
+Use the same version for every download (here `v0.3.0`), and keep `SHA256SUMS` from that version
+in the folder:
+
+```sh
+cd /tmp
+wget "https://github.com/risan/picoguard/releases/download/v0.3.0/SHA256SUMS.sig"
+wget "https://raw.githubusercontent.com/risan/picoguard/main/dist/release-key.der"
+sha256sum release-key.der
+```
+
+The fingerprint must be
+
+```
+5724aad59c1a5c73be060aaffe293b0b56e5092b71ebb0073e19b1c4238656cf
+```
+
+the same as in the [README](../README.md#documentation). If it differs, stop: do not trust that
+key file. Then check the signature:
+
+```sh
+openssl pkeyutl -verify -pubin -inkey release-key.der -keyform DER \
+    -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
+```
+
+You must see `Signature Verified Successfully`. Anything else means `SHA256SUMS` is not the
+one the project signed. Do not use the files.
 
 You can also build the binaries yourself on another computer with `scripts/build-release.sh`
 (needs Rust, `cargo-zigbuild` and `zig`). They land in `dist/bin/<target>/picoguard`.

@@ -484,16 +484,14 @@ fetch() {
         fail "need curl or wget to download picoguard (or pass --binary and use install.sh next to this script)"
     fi
 
-    local tag=
-    if [ "$VERSION" != latest ]; then
-        tag="$VERSION "
-    fi
-
     {
         printf 'error: could not download %s\n' "$url"
-        printf 'While the repository is private, GitHub answers 404 to a plain download.\n'
-        printf 'Download the release with the GitHub CLI, then run this script from that folder:\n\n'
-        printf "  gh release download %s-R %s -p 'picoguard-*' -p SHA256SUMS -p install.sh -p proxmox-lxc.sh\n" "$tag" "$REPO"
+        printf 'Check that the version exists: %s\n' "$BASE_URL"
+        printf 'To download the files by hand, then run this script from that folder:\n\n'
+        printf '  curl -fsSLO %s\n' "$(release_url "picoguard-$(target_for_host)")"
+        printf '  curl -fsSLO %s\n' "$(release_url SHA256SUMS)"
+        printf '  curl -fsSLO %s\n' "$(release_url install.sh)"
+        printf '  curl -fsSLO %s\n' "$(release_url proxmox-lxc.sh)"
         printf '  bash proxmox-lxc.sh\n'
     } >&2
 

@@ -14,19 +14,19 @@ Pick one path. Each one asks a few questions, then prints the address to give to
 | A Proxmox VE host | `bash proxmox-lxc.sh` (on the host) | [Proxmox LXC](docs/install.md#install-in-a-proxmox-lxc) |
 | A machine that already runs Docker | `docker compose up -d --build` | [Docker](docs/install.md#run-in-docker) |
 
-The repository is private for now, so get the release files with the GitHub CLI first
-(`gh auth login` once):
+One line downloads the installer, which downloads the binary and checks it:
 
 ```sh
-gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh -p proxmox-lxc.sh
-sudo sh install.sh            # on a board or VM
-bash proxmox-lxc.sh           # or: on the Proxmox host, creates an Alpine container
+curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh   # on a board or VM
+curl -fsSL https://github.com/risan/picoguard/releases/latest/download/proxmox-lxc.sh | bash  # or: on the Proxmox host, creates an Alpine container
 ```
 
-Once the repository is public, one line is enough:
+To read a script before you run it, download it first:
 
 ```sh
-curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh
+curl -fsSLO https://github.com/risan/picoguard/releases/latest/download/install.sh
+less install.sh
+sudo sh install.sh
 ```
 
 Then:
@@ -133,12 +133,15 @@ container) and give both addresses to your router as primary and secondary DNS.
 - [docs/configuration.md](docs/configuration.md): every config key, the list formats, and which
   lists fit 256 MB, 512 MB and 1 GB.
 - [docs/benchmarks.md](docs/benchmarks.md): measurements and method.
+- [docs/releasing.md](docs/releasing.md): how a release is made and signed. The release public key
+  (`dist/release-key.der`) has the SHA-256 fingerprint
+  `5724aad59c1a5c73be060aaffe293b0b56e5092b71ebb0073e19b1c4238656cf`.
 - [dist/](dist/): example config, systemd unit, OpenRC script, Docker config.
 - [tools/README.md](tools/README.md): the AdGuard Home oracle tools behind the compatibility tests.
 
 ## Status
 
-Version 0.2.0 is released (private). Measured on x86_64 so far; numbers from a real ARM board
+Version 0.2.0 is released. Measured on x86_64 so far; numbers from a real ARM board
 are still to come.
 
 ## Known differences from AdGuard Home

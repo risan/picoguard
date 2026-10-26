@@ -380,20 +380,17 @@ download_release_file() {
         DOWNLOAD_CODE=
     fi
 
-    tag=
-    if [ "$VERSION" != latest ]; then
-        tag="$VERSION "
-    fi
-
     {
         printf 'error: could not download %s' "$url"
         if [ -n "$DOWNLOAD_CODE" ]; then
             printf ' (HTTP %s)' "$DOWNLOAD_CODE"
         fi
         printf '\n'
-        printf 'While the repository is private, GitHub answers 404 to a plain download.\n'
-        printf 'Download the release with the GitHub CLI, then run the script from that folder:\n\n'
-        printf "  gh release download %s-R %s -p 'picoguard-*' -p SHA256SUMS -p install.sh\n" "$tag" "$REPO"
+        printf 'Check that the version exists: %s\n' "$BASE_URL"
+        printf 'To download the files by hand, then run the script from that folder:\n\n'
+        printf '  curl -fsSLO %s\n' "$(release_url "picoguard-$TARGET")"
+        printf '  curl -fsSLO %s\n' "$(release_url SHA256SUMS)"
+        printf '  curl -fsSLO %s\n' "$(release_url install.sh)"
         printf '  sudo sh install.sh\n'
     } >&2
 
