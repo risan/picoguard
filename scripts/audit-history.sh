@@ -194,10 +194,6 @@ domain_tokens='[a-z0-9_-]+(\.[a-z0-9_-]+)+\.?'
 
 normalize_names "$names_file" >"$work/names.txt"
 
-# Tokens are matched as dotted names; a one-word name would match every word of
-# every file, so it is counted and left to the reader.
-single_label_count=$({ grep -c -v '\.' "$work/names.txt" || true; })
-
 # The lists that explain a name are read from the HEAD commit, never from the
 # working tree, so an untracked or edited file cannot hide a finding.
 { git_repo ls-tree -r --name-only HEAD 2>/dev/null || true; } |
@@ -224,9 +220,19 @@ single_label_count=$({ grep -c -v '\.' "$work/names.txt" || true; })
 
 comm -12 "$work/names.txt" "$work/public-names.txt" >"$work/explained-names.txt"
 
-{ grep -a -r -o -i -H -E "$domain_tokens" "$blob_dir" || true; } |
-    tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | blob_of_file |
-    awk -F'\t' -v OFS='\t' '{ print $2, $1 }' |
+# A name without a dot is a token only when it stands alone: "name.example" and
+# "my-name" are other names, not a use of "name".
+grep -v '\.' "$work/names.txt" | sed 's,[][\\.*^$+?(){}|/],\\&,g' | paste -s -d'|' >"$work/single-names.txt" || true
+
+{
+    { grep -a -r -o -i -H -E "$domain_tokens" "$blob_dir" || true; } |
+        tr '[:upper:]' '[:lower:]' | sed 's/\.$//'
+
+    if [ -s "$work/single-names.txt" ]; then
+        { grep -a -r -o -i -H -E "(^|[^a-z0-9_.-])($(cat "$work/single-names.txt"))([^a-z0-9_.-]|$)" "$blob_dir" || true; } |
+            tr '[:upper:]' '[:lower:]' | sed -E 's/:[^a-z0-9_.-]+/:/; s/[^a-z0-9_.-]+$//'
+    fi
+} | blob_of_file | awk -F'\t' -v OFS='\t' '{ print $2, $1 }' |
     sort -t "$tab" -k1,1 -k2,2 -u >"$work/tokens.tsv"
 
 join -t "$tab" "$work/names.txt" "$work/tokens.tsv" |
@@ -336,13 +342,8 @@ scan_personal() {
     fi
 } | sort -u >"$work/personal-hits.tsv"
 
-# A third-party list is full of ".local" and ".lan" names that are not the
-# user's, so only that scan skips the list paths. Home paths, addresses and
-# personal terms are reported there too.
 attach_locations "$work/personal-hits.tsv" |
-    awk -F'\t' 'FILENAME == ARGV[1] { list[$0] = 1; next }
-        !($5 in list && $2 == "local-host") { print "personal " $2 " " $3 " " $4 " " $5 }' \
-        "$work/public-list-paths.txt" - | sort >"$work/personal.txt"
+    awk -F'\t' '{ print "personal " $2 " " $3 " " $4 " " $5 }' | sort >"$work/personal.txt"
 
 # --- report, summary, verdict -------------------------------------------------
 
@@ -379,7 +380,6 @@ personal_count() {
     cat "$work/missing-remote.txt"
     echo
     echo "## Query names"
-    echo "names without a dot, not scanned: $single_label_count"
     cat "$work/name-unexplained.txt" "$work/name-explained.txt"
     echo
     echo "## Paths to review"
@@ -406,8 +406,7 @@ fi
     echo "commits: $commit_count"
     echo "refs: $local_ref_count in this clone, $remote_ref_count advertised by the remote"
     echo "file versions scanned: $blob_count"
-    echo "query names: $unexplained_count unexplained findings, $explained_count explained names," \
-        "$single_label_count not scanned (no dot)"
+    echo "query names: $unexplained_count unexplained findings, $explained_count explained names"
     echo "secrets: $secret_count findings"
     echo "remote objects not in this clone: $missing_count"
     echo "paths to review: $review_count"

@@ -136,19 +136,28 @@ A stable tag publishes the crate, and crates.io shows the source, so the reposit
 to be public first. In this order:
 
 1. The rehearsal above has passed, and you have checked its release by hand.
-2. Audit the whole history. The report names private query names, so keep it outside the
-   repository, and keep the names file there too:
+2. Audit the whole history. Run `git fetch --all` first, so the clone holds every object the
+   remote has. The report names private query names, so keep it outside the repository, and keep
+   the names file and your own host names there too:
 
    ```sh
    scripts/audit-history.sh --names ~/private/queries.txt \
+       --personal-terms ~/private/home-terms.txt \
        --report ~/private/audit-report.md --summary ~/private/audit-summary.md
    ```
 
-   It needs `gitleaks`, `jq` and `git`. It exits 1 on an unexplained query name or a secret.
-   Read the report. Fix real findings, and list names that are public in a file for
-   `--known-public`. Findings that are only about personal details are for you to accept or act on.
-3. Look at the report once more and confirm in that moment that the repository may be public.
-   Then make it public: `gh repo edit risan/picoguard --visibility public
+   It needs `gitleaks`, `jq` and `git`. It exits 1 on an unexplained query name, a secret or a
+   remote object missing from the clone. A name with no dot is found only when it stands alone,
+   so an ordinary word in the names file reports many places; if it is public, list it in the
+   `--known-public` file.
+3. Read the report. For each finding, either it is a false positive or public (for a name, add it
+   to a file of public names and pass it as `--known-public`), or it is real. A real private name,
+   secret or personal detail stops here: do not make the repository public, and decide with the
+   project owner how to remove it, which may mean rewriting history. That is a separate change.
+   Run the audit again until it exits 0; never flip the repository while it exits 1. The personal findings (identities, home paths, addresses, host names) never fail the
+   run; you accept or act on them yourself.
+   Then look at the final report once more, confirm in that moment that the repository may be
+   public, and only then make it public: `gh repo edit risan/picoguard --visibility public
    --accept-visibility-change-consequences`.
 4. Check that an unauthenticated download works:
    `curl -fsSLO https://github.com/risan/picoguard/releases/latest/download/SHA256SUMS`.

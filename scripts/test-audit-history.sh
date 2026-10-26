@@ -332,21 +332,31 @@ audit_lists_every_place_of_an_explained_name() {
     expect_line '^query-name explained github\.com .* b\.txt$' "$second"
 }
 
-audit_counts_names_without_a_dot() {
-    local repo
+# A name without a dot is found when it stands alone, but not inside another
+# name, and a --known-public entry explains it like any other.
+audit_finds_a_name_without_a_dot() {
+    local repo alone inside
 
-    printf 'singlelabel A\nsecret-host.home.arpa A\n' >"$scratch/names.txt"
+    printf 'singlelabel A\n' >"$scratch/names.txt"
     repo=$(new_repo single-label)
-    commit_file "$repo" a.txt 'singlelabel' >/dev/null
+    alone=$(commit_file "$repo" a.txt 'host singlelabel is up')
+    inside=$(commit_file "$repo" b.txt 'singlelabel.example and my-singlelabel only')
     run_audit "$repo"
 
-    expect_line '^names without a dot, not scanned: 1$'
-    grep -q -F 'not scanned (no dot)' "$summary" || fail "the summary does not count them"
+    expect_status 1
+    expect_line '^query-name unexplained singlelabel ' "$alone" a.txt
+    ! grep -E '^query-name ' "$report" | grep -q -F "$inside" || fail "a longer name counted as the single name"
     ! grep -q -F singlelabel "$summary" || fail "the summary holds a name"
+
+    printf 'singlelabel\n' >"$scratch/known.txt"
+    run_audit "$repo" --known-public "$scratch/known.txt"
+
+    expect_status 0
+    expect_line '^query-name explained singlelabel ' "$alone" a.txt
 }
 
-# Only the host-name scan skips the public lists: a personal term, a home path
-# and a private address inside one are still reported.
+# A list path is no exemption: a personal term, a home path, a private address
+# and a host name inside one are all reported.
 audit_scans_public_lists_for_personal_findings() {
     local repo commit
 
@@ -359,7 +369,7 @@ audit_scans_public_lists_for_personal_findings() {
     expect_line '^personal term dns0 ' "$commit" lists/public.txt
     expect_line '^personal home-path /home/alice ' "$commit" lists/public.txt
     expect_line '^personal private-address 192\.168\.1\.5 ' "$commit" lists/public.txt
-    ! grep -q -E '^personal local-host hv0\.lan ' "$report" || fail "a list host name was reported"
+    expect_line '^personal local-host hv0\.lan ' "$commit" lists/public.txt
 }
 
 run_case audit_reports_a_private_name
@@ -378,5 +388,5 @@ run_case audit_scans_a_commit_the_remote_advertises
 run_case audit_scans_a_credential_only_a_merge_holds
 run_case audit_explains_names_only_from_committed_lists
 run_case audit_lists_every_place_of_an_explained_name
-run_case audit_counts_names_without_a_dot
+run_case audit_finds_a_name_without_a_dot
 run_case audit_scans_public_lists_for_personal_findings
