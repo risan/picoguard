@@ -230,3 +230,80 @@ run_case sign_requires_key
 run_case sign_rejects_malformed_key
 run_case sign_removes_stale_signature
 run_case sign_never_prints_key
+
+# --- crates.io publish decision ----------------------------------------------
+
+crate_prerelease_is_check_only() {
+    expect_success scripts/publish-crate.sh --decide 0.3.0-rc.1 true
+    expect_output "check-only"
+}
+
+# fake_bin <name>: a stub command whose body is read from stdin, in a directory
+# to put first on PATH.
+fake_bin() {
+    mkdir -p "$scratch/fake-bin"
+    {
+        echo '#!/usr/bin/env bash'
+        cat
+    } >"$scratch/fake-bin/$1"
+    chmod +x "$scratch/fake-bin/$1"
+}
+
+with_fake_bin() {
+    PATH="$scratch/fake-bin:$PATH" "$@"
+}
+
+crate_decides_from_the_registry_status() {
+    fake_bin curl <<'STUB'
+printf %s "$FAKE_HTTP_CODE"
+STUB
+
+    expect_success with_fake_bin env FAKE_HTTP_CODE=200 scripts/publish-crate.sh --decide 1.0.0 false
+    expect_output "skip"
+
+    expect_success with_fake_bin env FAKE_HTTP_CODE=404 scripts/publish-crate.sh --decide 1.0.0 false
+    expect_output "publish"
+
+    expect_failure with_fake_bin env FAKE_HTTP_CODE=503 scripts/publish-crate.sh --decide 1.0.0 false
+    expect_output "503"
+}
+
+crate_publish_needs_a_token() {
+    fake_bin curl <<'STUB'
+printf 404
+STUB
+    fake_bin cargo <<'STUB'
+echo "cargo $*" >>"$FAKE_CARGO_LOG"
+STUB
+    : >"$scratch/cargo.log"
+
+    expect_failure with_fake_bin env CARGO_REGISTRY_TOKEN= FAKE_CARGO_LOG="$scratch/cargo.log" \
+        scripts/publish-crate.sh 1.0.0 false
+    expect_output "CARGO_REGISTRY_TOKEN"
+    [ ! -s "$scratch/cargo.log" ] || fail "cargo ran without a token"
+
+    expect_success with_fake_bin env CARGO_REGISTRY_TOKEN=token FAKE_CARGO_LOG="$scratch/cargo.log" \
+        scripts/publish-crate.sh 1.0.0 false
+    grep -q -x 'cargo publish --locked --no-verify' "$scratch/cargo.log" || fail "cargo publish was not run as planned"
+}
+
+crate_skip_and_check_only_never_publish() {
+    fake_bin curl <<'STUB'
+printf 200
+STUB
+    fake_bin cargo <<'STUB'
+echo "cargo $*" >>"$FAKE_CARGO_LOG"
+STUB
+    : >"$scratch/cargo.log"
+
+    expect_success with_fake_bin env CARGO_REGISTRY_TOKEN=token FAKE_CARGO_LOG="$scratch/cargo.log" \
+        scripts/publish-crate.sh 1.0.0 false
+    expect_success with_fake_bin env CARGO_REGISTRY_TOKEN=token FAKE_CARGO_LOG="$scratch/cargo.log" \
+        scripts/publish-crate.sh 1.0.0-rc.1 true
+    [ ! -s "$scratch/cargo.log" ] || fail "cargo ran although nothing is to be published"
+}
+
+run_case crate_prerelease_is_check_only
+run_case crate_decides_from_the_registry_status
+run_case crate_publish_needs_a_token
+run_case crate_skip_and_check_only_never_publish
