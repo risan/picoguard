@@ -244,12 +244,12 @@ You must see `picoguard-TARGET: OK`. If you see `FAILED`, do not use the file. D
 Releases from v0.3.0 on also carry `SHA256SUMS.sig`, an Ed25519 signature of `SHA256SUMS` made
 with the project's release key. The checksum only shows that the files match `SHA256SUMS`; the
 signature shows that `SHA256SUMS` itself comes from the release workflow. You need OpenSSL 3.
-Use the same version for every download (here `v0.3.0`), and keep `SHA256SUMS` from that version
-in the folder:
+Take every file from the same version (here `v0.3.0`), in a new folder:
 
 ```sh
-cd /tmp
-wget "https://github.com/risan/picoguard/releases/download/v0.3.0/SHA256SUMS.sig"
+mkdir signed && cd signed
+base="https://github.com/risan/picoguard/releases/download/v0.3.0"
+wget "$base/picoguard-TARGET" "$base/SHA256SUMS" "$base/SHA256SUMS.sig"
 wget "https://raw.githubusercontent.com/risan/picoguard/main/dist/release-key.der"
 sha256sum release-key.der
 ```
@@ -269,7 +269,8 @@ openssl pkeyutl -verify -pubin -inkey release-key.der -keyform DER \
 ```
 
 You must see `Signature Verified Successfully`. Anything else means `SHA256SUMS` is not the
-one the project signed. Do not use the files.
+one the project signed. Do not use the files. Last, in the same folder, check the binary against
+the signed list: `sha256sum -c --ignore-missing SHA256SUMS`.
 
 You can also build the binaries yourself on another computer with `scripts/build-release.sh`
 (needs Rust, `cargo-zigbuild` and `zig`). They land in `dist/bin/<target>/picoguard`.

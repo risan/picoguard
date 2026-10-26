@@ -67,7 +67,8 @@ the last step of the `crate` job, and only for stable tags.
 
 Instead of letting CI make the first publish, you can run `cargo publish --locked` by hand on the
 release commit before you push the tag. The workflow then sees the version on crates.io and
-skips the publish.
+skips the publish. Do this only after "Before the first stable release" below: publishing to
+crates.io also makes the source public.
 
 ### 4. Recommended repository settings
 
@@ -129,6 +130,30 @@ verify it as below. Afterwards delete the prerelease and its tag:
 gh release delete v0.3.0-rc.1 --cleanup-tag --yes
 ```
 
+## Before the first stable release
+
+A stable tag publishes the crate, and crates.io shows the source, so the repository must be ready
+to be public first. In this order:
+
+1. The rehearsal above has passed, and you have checked its release by hand.
+2. Audit the whole history. The report names private query names, so keep it outside the
+   repository, and keep the names file there too:
+
+   ```sh
+   scripts/audit-history.sh --names ~/private/queries.txt \
+       --report ~/private/audit-report.md --summary ~/private/audit-summary.md
+   ```
+
+   It needs `gitleaks`, `jq` and `git`. It exits 1 on an unexplained query name or a secret.
+   Read the report. Fix real findings, and list names that are public in a file for
+   `--known-public`. Findings that are only about personal details are for you to accept or act on.
+3. Look at the report once more and confirm in that moment that the repository may be public.
+   Then make it public: `gh repo edit risan/picoguard --visibility public
+   --accept-visibility-change-consequences`.
+4. Check that an unauthenticated download works:
+   `curl -fsSLO https://github.com/risan/picoguard/releases/latest/download/SHA256SUMS`.
+5. Make sure the `CARGO_REGISTRY_TOKEN` secret is set, then cut the stable release.
+
 ## Verify a release by hand
 
 ```sh
@@ -157,10 +182,21 @@ RELEASE_SIGNING_KEY=<the base64 line from the backup> scripts/sign-release.sh di
 ```
 
 The script refuses a key that does not match `dist/release-key.der`, checks the signature, and
-leaves no signature behind when anything fails. Then create the release from `dist/release` with
-`gh release create`, the same seven files and the notes of the tag. Put the key in the shell only
-for that command, for example by reading it with `read -rs`, and do not leave it in the shell
-history.
+leaves no signature behind when anything fails. Put the key in the shell only for that command,
+for example by reading it with `read -rs`, and do not leave it in the shell history.
+
+Then push the annotated tag if it is not pushed yet, and publish with the same script CI uses. It
+creates a draft, attaches the seven files, checks them and only then publishes, with the notes of
+the tag, and it refuses to touch a release that is already published:
+
+```sh
+export GITHUB_REPOSITORY=risan/picoguard
+tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v0.3.0" --jq .object.sha)
+scripts/publish-github-release.sh v0.3.0 "$tag_object" false dist/release
+```
+
+Use `true` instead of `false` for a prerelease tag. The crate is not published by this; run
+`scripts/publish-crate.sh 0.3.0 false` with `CARGO_REGISTRY_TOKEN` set, or `cargo publish --locked`.
 
 ## A lost key
 
