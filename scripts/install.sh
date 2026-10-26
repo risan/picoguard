@@ -961,7 +961,7 @@ secure_config_files() {
     done
 }
 
-# Where to ask picoguard: the port and the first listen address of [server] in the config.
+# Where to ask picoguard: the port and an address of [server] bind that this machine can reach.
 read_dns_target() {
     port=$(awk '/^\[/ { in_server = ($0 == "[server]") } in_server && $1 == "port" { print $3; exit }' "$CHECK_PATH")
 
@@ -969,19 +969,37 @@ read_dns_target() {
         DNS_PORT=$port
     fi
 
-    bind=$(awk '/^\[/ { in_server = ($0 == "[server]") } in_server && $1 == "bind" { print; exit }' "$CHECK_PATH")
+    # The array may span several lines. Comments are cut off first.
+    addresses=$(awk '
+        /^\[/ { in_server = ($0 == "[server]"); collecting = 0 }
+        in_server && ($1 == "bind" || collecting) {
+            sub(/#.*/, "")
+            print
+            collecting = ($0 !~ /\]/)
+        }' "$CHECK_PATH" | grep -o '"[^"]*"' | tr -d '"' || true)
 
-    case $bind in
-        *0.0.0.0*|*127.*)
-            ;;
-        *)
-            address=$(printf '%s\n' "$bind" | grep -o '[0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}' | head -n 1 || true)
+    has_ipv4_loopback=0
+    has_ipv6_loopback=0
+    first_address=
 
-            if [ -n "$address" ]; then
-                DNS_HOST=$address
-            fi
-            ;;
-    esac
+    for address in $addresses; do
+        if [ -z "$first_address" ]; then
+            first_address=$address
+        fi
+
+        case $address in
+            0.0.0.0|127.*) has_ipv4_loopback=1 ;;
+            ::|::1) has_ipv6_loopback=1 ;;
+        esac
+    done
+
+    if [ "$has_ipv4_loopback" = 1 ]; then
+        DNS_HOST=127.0.0.1
+    elif [ "$has_ipv6_loopback" = 1 ]; then
+        DNS_HOST=::1
+    elif [ -n "$first_address" ]; then
+        DNS_HOST=$first_address
+    fi
 }
 
 # Prints "name pid" for each listener on the DNS port, one per line (pid is - when unknown).
