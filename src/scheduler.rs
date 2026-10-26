@@ -680,12 +680,12 @@ async fn compile_user_rules(
     Ok(Some(Arc::new(list)))
 }
 
-fn unit_random() -> f64 {
+pub(crate) fn unit_random() -> f64 {
     (random_u64() >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// `interval` moved by up to `INTERVAL_JITTER` either way.
-fn jittered(interval: Duration) -> Duration {
+pub(crate) fn jittered(interval: Duration) -> Duration {
     interval.mul_f64(1.0 - INTERVAL_JITTER + 2.0 * INTERVAL_JITTER * unit_random())
 }
 

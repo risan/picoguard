@@ -10,6 +10,7 @@ pub mod policy;
 pub mod scheduler;
 pub mod server;
 pub mod stats;
+pub mod update;
 pub mod upstream;
 pub mod web;
 
