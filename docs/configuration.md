@@ -62,7 +62,9 @@ Forms of a server: `https://IP/path` (DoH by IP), `https://host/path` (DoH by na
 ## `[local]`
 
 Off by default. Set it to send reverse lookups of private addresses and your local domain to the
-router. Without it, such queries get NXDOMAIN.
+router. Without it, such queries get NXDOMAIN. This includes every name under the private
+reverse zones of RFC 6303, such as the DNS-SD names `lb._dns-sd._udp.0.1.168.192.in-addr.arpa`.
+They never go to the public servers.
 
 | Key | Default | Meaning |
 |---|---|---|

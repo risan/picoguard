@@ -36,6 +36,21 @@ const PRIVATE_NETWORKS: [&str; 7] = [
     "fc00::/7",
     "fe80::/10",
 ];
+/// The reverse zones of RFC 6303 that are served locally: a name at or under one of them is
+/// answered like the reverse name of a private address, DNS-SD browse names included.
+const PRIVATE_REVERSE_ZONES: [&str; 11] = [
+    "10.in-addr.arpa",
+    "168.192.in-addr.arpa",
+    "127.in-addr.arpa",
+    "254.169.in-addr.arpa",
+    "d.f.ip6.arpa",
+    "c.f.ip6.arpa",
+    "8.e.f.ip6.arpa",
+    "9.e.f.ip6.arpa",
+    "a.e.f.ip6.arpa",
+    "b.e.f.ip6.arpa",
+    "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+];
 const IPV4_REVERSE_LABELS: usize = 6;
 const IPV6_REVERSE_LABELS: usize = 34;
 
@@ -266,6 +281,7 @@ pub struct Pipeline {
     max_waiting_clients: usize,
     blocked_hosts: Vec<Name>,
     local_domains: Vec<Name>,
+    private_reverse_zones: Vec<Name>,
     private_networks: Vec<Cidr>,
     upstreams: Arc<Upstreams>,
     local_resolver: Option<Upstreams>,
@@ -295,6 +311,7 @@ impl Pipeline {
             max_waiting_clients: config.limits.max_waiting_clients,
             blocked_hosts: parse_names("blocked_hosts", &config.blocked_hosts)?,
             local_domains: parse_names("local.domains", &config.local.domains)?,
+            private_reverse_zones: private_reverse_zones(),
             private_networks: PRIVATE_NETWORKS
                 .iter()
                 .map(|network| network.parse().expect("private network is valid"))
@@ -832,6 +849,7 @@ impl Pipeline {
         let is_local_domain = self
             .local_domains
             .iter()
+            .chain(&self.private_reverse_zones)
             .any(|domain| name.is_subdomain_of(domain));
 
         if is_private_reverse || is_local_domain {
@@ -960,6 +978,17 @@ fn parse_names(field: &str, texts: &[String]) -> Result<Vec<Name>, String> {
             Name::from_text(text)
                 .ok_or_else(|| format!("{field}: {text:?} is not a valid domain name"))
         })
+        .collect()
+}
+
+fn private_reverse_zones() -> Vec<Name> {
+    let private_172 = (16..=31).map(|second| format!("{second}.172.in-addr.arpa"));
+
+    PRIVATE_REVERSE_ZONES
+        .iter()
+        .map(|zone| zone.to_string())
+        .chain(private_172)
+        .map(|zone| Name::from_text(&zone).expect("private reverse zone is valid"))
         .collect()
 }
 
@@ -1099,6 +1128,7 @@ mod tests {
             "1.1.168.192.in-addr.arpa",
             "5.0.64.100.in-addr.arpa",
             "5.0.254.169.in-addr.arpa",
+            "1.0.0.127.in-addr.arpa",
             "printer.lan",
             "lan",
             "a.b.home.arpa",
@@ -1106,7 +1136,44 @@ mod tests {
             assert_eq!(route(local), Route::Local, "{local}");
         }
 
+        for subtree in [
+            "10.in-addr.arpa",
+            "2.10.in-addr.arpa",
+            "16.172.in-addr.arpa",
+            "31.172.in-addr.arpa",
+            "168.192.in-addr.arpa",
+            "lb._dns-sd._udp.0.1.168.192.in-addr.arpa",
+            "b._dns-sd._udp.0.0.10.in-addr.arpa",
+            "127.in-addr.arpa",
+            "254.169.in-addr.arpa",
+            "d.f.ip6.arpa",
+            "c.f.ip6.arpa",
+            "1.0.d.f.ip6.arpa",
+            "8.e.f.ip6.arpa",
+            "9.e.f.ip6.arpa",
+            "a.e.f.ip6.arpa",
+            "b.E.f.ip6.arpa",
+            "lb._dns-sd._udp.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.c.f.ip6.arpa",
+        ] {
+            assert_eq!(route(subtree), Route::Local, "{subtree}");
+        }
+
+        let loopback = ipv6_reverse("::1");
+        assert_eq!(route(&loopback), Route::Local, "{loopback}");
+        assert_eq!(route(&format!("lb._dns-sd.{loopback}")), Route::Local);
+
         for public in [
+            "in-addr.arpa",
+            "ip6.arpa",
+            "11.in-addr.arpa",
+            "15.172.in-addr.arpa",
+            "32.172.in-addr.arpa",
+            "169.192.in-addr.arpa",
+            "253.169.in-addr.arpa",
+            "169.in-addr.arpa",
+            "e.f.ip6.arpa",
+            "c.e.f.ip6.arpa",
+            "0.f.ip6.arpa",
             "4.3.2.8.in-addr.arpa",
             "1.0.32.172.in-addr.arpa",
             "5.0.128.100.in-addr.arpa",
@@ -1115,6 +1182,25 @@ mod tests {
             "lan.example.com",
         ] {
             assert_eq!(route(public), Route::Default, "{public}");
+        }
+    }
+
+    #[tokio::test]
+    async fn names_under_a_private_reverse_zone_never_go_upstream() {
+        let pipeline = pipeline_with_local(&[], None);
+
+        for name in [
+            "lb._dns-sd._udp.0.1.168.192.in-addr.arpa.",
+            "10.in-addr.arpa.",
+            "b._dns-sd._udp.0.0.10.in-addr.arpa.",
+        ] {
+            let request = QuerySpec::new(name, RecordType::PTR).bytes();
+            let mut out = Vec::new();
+
+            let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut out);
+
+            assert_eq!(quick, Quick::Replied, "{name}");
+            assert_eq!(u16::from(parse(&out).metadata.response_code), 3, "{name}");
         }
     }
 
