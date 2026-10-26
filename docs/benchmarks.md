@@ -58,3 +58,30 @@ Not measured yet:
 - **Memory per extra 100k domains.** Expected near 0.8 MB of rule arrays plus the list's parse
   scratch during a refresh.
 - **Disk writes over 24 hours** with unchanged lists (the goal is 0 bytes), measured on a board.
+
+## Cache memory after v0.1.0
+
+Measured on a WSL2 x86_64 box with static musl release builds (the allocator of the boards), the
+v0.1.0 lists (HaGeZi Pro and TIF mini, about 420k rules) and a fake UDP upstream that answers every
+query. The cache is the default 10,000 entries. RSS is `RssAnon` after replaying 12,000 unique
+queries of the real-network file, which fills the cache and evicts a few hundred entries. Boot is
+3.75 MB of `RssAnon` in both builds.
+
+| Build | `RssAnon` with a full cache (three runs) | Per cached entry |
+|---|---|---|
+| v0.1.0 (3 allocations per entry, `lru` crate) | 14.3, 14.2, 15.6 MB | about 1.1 KB |
+| One allocation per entry, index-linked LRU | 8.3, 10.9, 10.8 MB | about 0.6 KB |
+
+A single 30,000-query run gave 13.7 MB before and 8.8 MB after. The run-to-run spread (2 to 3 MB)
+comes from how the allocator fragments under concurrent misses; the improvement is larger than the
+spread in every run.
+
+`opt-level = "s"` was tried on top of this and not adopted. The binary shrinks from 4.48 to 3.47 MB
+and CPU per query is within noise end to end (`Engine::check` is 7 to 8% slower), but the same replay gave 14.0, 11.8 and 12.7 MB of
+`RssAnon`, about 2.8 MB more than `opt-level = 3` on average. Only `RssFile` gets smaller, by under
+1 MB. Measure it on an ARM board before trying again.
+
+The allocator behind these numbers is the one `cargo zigbuild` links: with zig 0.17 the static musl
+binaries call Zig's own `malloc` (`SmpAllocator`), not musl's `mallocng`. Memory after a burst of
+misses depends on that allocator, so measure again when the zig version of the release build
+changes.
