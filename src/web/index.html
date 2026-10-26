@@ -9,11 +9,13 @@
   color-scheme: light dark;
   --bg: #f4f6f9; --card: #fff; --text: #1b2230; --muted: #667085; --line: #e3e7ee;
   --accent: #2563eb; --blocked: #dc2626; --good: #16a34a; --warn: #b45309;
+  --on-accent: #fff;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #0f131a; --card: #171d27; --text: #e5e8ee; --muted: #8b95a7; --line: #283142;
     --accent: #6ea0ff; --blocked: #f87171; --good: #4ade80; --warn: #fbbf24;
+    --on-accent: #0f131a;
   }
 }
 * { box-sizing: border-box; }
@@ -54,7 +56,7 @@ td.name { word-break: break-all; }
 button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line);
   background: var(--card); color: var(--text); cursor: pointer; }
 button:hover { border-color: var(--accent); }
-button.go { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.go { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 #resume { display: none; }
 .paused #resume { display: inline-block; }
 .r-blocked_request, .r-blocked_response { color: var(--blocked); }
