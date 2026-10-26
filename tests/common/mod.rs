@@ -6,6 +6,7 @@ pub mod harness;
 pub mod http;
 pub mod process;
 pub mod release;
+pub mod stream;
 
 use std::fs;
 use std::io::Read;
