@@ -1,23 +1,29 @@
 # Install picoguard
 
-picoguard is one static program. It needs no other packages. This guide has three targets:
+picoguard is one static program. It needs no other packages. Pick the path that fits your setup.
+Each one starts with a quick path of a few commands.
 
-| Your device | CPU | Binary to download |
-|---|---|---|
-| Used TV box (ZTE B860H, Fiberhome HG680P) with Armbian | ARM64 | `picoguard-aarch64-unknown-linux-musl` |
-| Orange Pi Zero or Zero LTS with Armbian | ARMv7 | `picoguard-armv7-unknown-linux-musleabihf` |
-| Proxmox LXC or any x86_64 Linux | x86_64 | `picoguard-x86_64-unknown-linux-musl` |
-
-Not sure which one you have? Run `uname -m` on the device.
-
-| `uname -m` says | Use |
+| You have | Path |
 |---|---|
-| `aarch64` | ARM64 |
-| `armv7l` | ARMv7 |
-| `x86_64` | x86_64 |
+| A board (TV box, Orange Pi, Raspberry Pi) or any Linux machine or VM, with systemd or OpenRC | [install.sh](#install-on-a-board-or-vm-with-installsh) |
+| A Proxmox VE host | [proxmox-lxc.sh](#install-in-a-proxmox-lxc) |
+| A machine that already runs Docker | [Docker](#run-in-docker) |
 
-Part 1 gets the device ready. Part 2 is the same for every device. Part 3 points your network at
-it. Part 4 makes the SD card last. Part 5 is for when something goes wrong.
+Part 1 gets a board ready. Part 2 installs picoguard. Part 3 points your network at it. Part 4 makes
+the SD card last. Part 5 is for when something goes wrong.
+
+On a 256 MB board, use `install.sh`, not Docker: Docker's own daemon costs tens of MB of RAM.
+
+Release files are named `picoguard-<target>`. Not sure which one fits? Run `uname -m` on the device.
+`install.sh` picks the right one by itself.
+
+| Your device | CPU | `uname -m` says | Binary |
+|---|---|---|---|
+| Used TV box (ZTE B860H, Fiberhome HG680P) with Armbian | ARM64 | `aarch64` | `picoguard-aarch64-unknown-linux-musl` |
+| Orange Pi Zero or Zero LTS with Armbian | ARMv7 | `armv7l` | `picoguard-armv7-unknown-linux-musleabihf` |
+| Proxmox LXC or any x86_64 Linux | x86_64 | `x86_64` | `picoguard-x86_64-unknown-linux-musl` |
+
+ARMv6 boards (Raspberry Pi 1 and Zero) are not supported.
 
 ## 1. Prepare the device
 
@@ -60,26 +66,157 @@ Both work the same for picoguard.
 
 Check the CPU: `uname -m` must say `armv7l`.
 
-### Proxmox LXC or any x86_64 Linux
+### x86_64 Linux or a Proxmox LXC
 
-Use any Linux with systemd, for example Debian or Ubuntu. For a Proxmox LXC container:
-
-1. Create a Debian container: 1 core and 256 MB of RAM are enough, and 1 GB of disk.
-2. Give it a fixed IP address (or a DHCP reservation in your router).
-3. The service unit uses `DynamicUser` and `PrivateDevices`. If the service fails to start with a
-   namespace or sandbox error inside the container, turn on the container option "Nesting"
-   (`Options > Features`) and restart the container.
+Use any Linux with systemd (Debian, Ubuntu) or OpenRC (Alpine). On Proxmox, the
+[script below](#install-in-a-proxmox-lxc) creates the container for you.
 
 Check the CPU: `uname -m` must say `x86_64`.
 
 ## 2. Install picoguard
 
-Run these steps as root (`sudo -i`) on the device.
+### Install on a board or VM with install.sh
 
-### Download and check the binary
+`scripts/install.sh` does everything in "Manual install" below for you: it picks the binary for
+your CPU, checks its checksum, asks four questions, writes the config, frees port 53, installs the
+service (systemd or OpenRC) and starts it. Run it as root on the device.
 
-Release files are named `picoguard-<target>`, and `SHA256SUMS` lists their checksums. Replace
-`TARGET` with the name from the first table (for example `aarch64-unknown-linux-musl`).
+While the repository is private, download the release with the GitHub CLI (`gh auth login` once),
+on the device or on another computer:
+
+```sh
+gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh
+sudo sh install.sh
+```
+
+`install.sh` uses the `picoguard-<target>` file next to it (and checks it with `SHA256SUMS`).
+If you downloaded on another computer, copy the three files to the device first.
+
+Once the repository is public, one line is enough. It downloads the binary and checks it:
+
+```sh
+curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh
+```
+
+The four questions (press Enter for the default; every question also has a flag, see
+`sh install.sh --help`):
+
+1. **Upstream DNS.** Cloudflare and Quad9 over DoH (default), Cloudflare only, Quad9 only,
+   AdGuard DNS unfiltered, or your own URLs.
+2. **Blocklists.** The menu shows your RAM. The default is HaGeZi Pro and TIF mini, which fit a
+   256 MB board. The other rows are those of
+   [Choose lists for your board](configuration.md#choose-lists-for-your-board).
+3. **Router.** Its address (default: this device's gateway) goes into the `[local]` section, so
+   names and reverse lookups of your own devices keep working.
+4. **Status page.** The port (8080) and a password for the user `admin`. Press Enter and the
+   script makes a random 16-character password and shows it once at the end. Type your own, or
+   `none` for no password.
+
+`--yes` takes every default and asks nothing (good for scripts). It never stops another DNS server.
+
+What the script does about **port 53**: if systemd-resolved holds it, the script offers the fix
+from "Free port 53" below and applies it when you agree. If another DNS server holds it
+(AdGuard Home, dnsmasq, Pi-hole, unbound), the script names it and stops. It stops and disables
+that server only when you answer yes to its question, or pass `--stop-conflicting`.
+
+When it is done, the script runs a test lookup and prints the device address and the status page
+URL. Next, [point your network at picoguard](#3-point-your-network-at-picoguard).
+
+Good to know:
+
+- The service runs as the system user `picoguard`. The config is
+  `/etc/picoguard/picoguard.toml`, owned by `root:picoguard` with mode `0640`, because it can hold
+  the status page password.
+- An existing config is never overwritten. `--reconfigure` asks the questions again and saves the
+  old file as `picoguard.toml.bak.<time>` first.
+- `--no-start` installs everything and starts nothing.
+- `--binary FILE` installs a binary you built yourself. `--version vX.Y.Z` picks a release.
+- `sh install.sh --uninstall` removes the binary, the service and the systemd-resolved change.
+  It keeps `/etc/picoguard` and `/var/lib/picoguard` unless you add `--purge`.
+
+### Install in a Proxmox LXC
+
+`scripts/proxmox-lxc.sh` runs on the Proxmox VE host, as root. It creates an unprivileged Alpine
+container (1 core, 128 MB RAM, 1 GB disk, start at boot), copies the binary and `install.sh` into
+it and runs `install.sh` there. It never touches another container, and it refuses a container ID
+that exists.
+
+```sh
+gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh -p proxmox-lxc.sh
+bash proxmox-lxc.sh
+```
+
+Once the repository is public:
+
+```sh
+curl -fsSL https://github.com/risan/picoguard/releases/latest/download/proxmox-lxc.sh | bash
+```
+
+The questions have defaults: the next free container ID, hostname `picoguard`, the root disk on
+`local-lvm`, the template on `local`, bridge `vmbr0`, and DHCP. **Give the container a fixed
+address instead** (for example `--ip 192.168.1.53/24 --gateway 192.168.1.1`): it becomes the DNS
+server of your whole network, so its address must not change. At the end the script prints the
+container address, the status page URL and the generated password.
+
+`--yes` takes all defaults, and `--dry-run` shows every `pct` and `pveam` command that would
+change something, without running it. `bash proxmox-lxc.sh --help` lists all flags.
+
+The container is Alpine with OpenRC, so no systemd sandbox is involved. To update picoguard later,
+see "Update picoguard" below.
+
+### Run in Docker
+
+The image is built from source: a static musl binary in an image with nothing else in it, running
+as a non-root user. You need the repository.
+
+```sh
+git clone https://github.com/risan/picoguard && cd picoguard
+cp dist/picoguard.docker.toml picoguard.toml
+docker compose up -d --build
+```
+
+(While the repository is private, clone it with `gh repo clone risan/picoguard`.)
+
+- Edit `picoguard.toml` for your upstreams, lists and router, then `docker compose restart`.
+  It is mounted read-only. The list copies live in the volume `picoguard-state`.
+- The container publishes 53/udp, 53/tcp and 8080. Port 53 must be free on the host (see "Free
+  port 53" below if systemd-resolved holds it).
+- `compose.yaml` runs it with a read-only root file system, no capabilities, `no-new-privileges`
+  and a 64 MB memory limit. A non-root user can open port 53 in the container because Docker sets
+  `net.ipv4.ip_unprivileged_port_start=0` there.
+- Host networking (`network_mode: host`) is the alternative: no NAT, and picoguard sees the real
+  address of each client. See the comment in `compose.yaml`.
+- Docker's own daemon costs tens of MB of RAM. On a 256 MB board, use `install.sh` instead.
+
+### Update picoguard
+
+Run `install.sh` again. It downloads the latest release (or uses the files next to it), replaces
+the binary, keeps your config and restarts the service:
+
+```sh
+gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh --clobber
+sudo sh install.sh
+```
+
+or, once the repository is public:
+
+```sh
+curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh
+```
+
+The script checks your config against the new binary first and stops if it does not accept it.
+In a Proxmox container, run `pct push` for the new files and `pct exec` for `install.sh --yes`,
+or enter the container with `pct enter` and run the commands above. For Docker:
+`git pull && docker compose up -d --build`.
+
+### Manual install
+
+These are the steps that `install.sh` automates. Use them when you want to see each one, or when
+your system has neither systemd nor OpenRC. Run them as root (`sudo -i`) on the device.
+
+#### Download and check the binary
+
+`SHA256SUMS` lists the checksums of the release files. Replace `TARGET` with the name from the table at the top (for example `aarch64-unknown-linux-musl`).
 
 The repository is private for now, so a plain download needs a login. Use the GitHub CLI
 (`gh auth login` once), on the board or on another computer:
@@ -104,32 +241,56 @@ You must see `picoguard-TARGET: OK`. If you see `FAILED`, do not use the file. D
 You can also build the binaries yourself on another computer with `scripts/build-release.sh`
 (needs Rust, `cargo-zigbuild` and `zig`). They land in `dist/bin/<target>/picoguard`.
 
-### Put the files in place
+#### Put the files in place
 
 ```sh
 install -m 0755 picoguard-TARGET /usr/local/bin/picoguard
 picoguard --version
-
-mkdir -p /etc/picoguard
 ```
 
-Copy `picoguard.toml` and `picoguard.service` from the `dist/` folder of the release (or of the
-source) to the device. Then:
+Create the system user that runs the service. The config can hold the status page password, so
+only root and this user may read it:
 
 ```sh
-install -m 0644 picoguard.toml /etc/picoguard/picoguard.toml
-install -m 0644 picoguard.service /etc/systemd/system/picoguard.service
+# Debian, Ubuntu, Armbian, Raspberry Pi OS
+useradd --system --user-group --no-create-home --home-dir /var/lib/picoguard \
+    --shell /usr/sbin/nologin picoguard
+
+# Alpine (BusyBox)
+addgroup -S picoguard
+adduser -S -D -H -h /var/lib/picoguard -s /sbin/nologin -G picoguard picoguard
+```
+
+Copy `picoguard.toml` and `picoguard.service` (systemd) or `picoguard.openrc` (Alpine) from the
+`dist/` folder of the source to the device. Then:
+
+```sh
+install -d -m 0750 -o root -g picoguard /etc/picoguard
+install -m 0640 -g picoguard picoguard.toml /etc/picoguard/picoguard.toml
 picoguard --check -c /etc/picoguard/picoguard.toml
 ```
 
-The last command must print `OK`. The default config blocks ads, trackers and malware with HaGeZi
+and, with systemd:
+
+```sh
+install -m 0644 picoguard.service /etc/systemd/system/picoguard.service
+```
+
+or, with OpenRC:
+
+```sh
+install -d -m 0750 -o picoguard -g picoguard /var/lib/picoguard
+install -m 0755 picoguard.openrc /etc/init.d/picoguard
+```
+
+The `--check` command must print `OK`. The default config blocks ads, trackers and malware with HaGeZi
 Pro and HaGeZi Threat Intelligence mini, and forwards to Cloudflare and Quad9 over DoH. To change
 anything, read [configuration.md](configuration.md).
 
 If your router is at `192.168.1.1`, open the config and uncomment the `[local]` section with
 `resolver = "192.168.1.1:53"`. Then names and addresses of devices on your network keep working.
 
-### Free port 53
+#### Free port 53
 
 picoguard needs port 53. See who has it:
 
@@ -161,7 +322,9 @@ systemctl disable --now dnsmasq
 
 Run `ss -lunpt 'sport = :53'` again. It must show nothing.
 
-### Start the service
+#### Start the service
+
+With systemd:
 
 ```sh
 systemctl daemon-reload
@@ -169,14 +332,21 @@ systemctl enable --now picoguard
 systemctl status picoguard
 ```
 
-The service runs as a temporary user with almost no rights. It may only open port 53 and write to
-`/var/lib/picoguard`.
+With OpenRC:
+
+```sh
+rc-update add picoguard default
+rc-service picoguard start
+```
+
+The service runs as the `picoguard` user with almost no rights. It may only open port 53 and
+write to `/var/lib/picoguard`.
 
 On the first start picoguard downloads the lists. This takes a few seconds to a minute, depending
 on your line. After that, it keeps a copy of each list in `/var/lib/picoguard`, so a restart blocks
 again in about a second.
 
-### Check that it works
+#### Check that it works
 
 Ask it for a normal name:
 
@@ -191,7 +361,7 @@ line to `/etc/picoguard/picoguard.toml`, **before** the first `[section]` header
 rules = ["||picoguard-test.example^"]
 ```
 
-Restart and ask:
+Restart (`systemctl restart picoguard` or `rc-service picoguard restart`) and ask:
 
 ```sh
 systemctl restart picoguard
@@ -210,17 +380,8 @@ It shows totals, the share blocked, the top blocked domains, the top clients, th
 and the state of each list (size, age, errors). A list shows an error here when its download
 failed. You can pause blocking from this page for a set time.
 
-Logs: `journalctl -u picoguard`. The default level is `warn`, so the log is empty when all is well.
-
-### Update picoguard
-
-```sh
-systemctl stop picoguard
-install -m 0755 picoguard-TARGET /usr/local/bin/picoguard
-systemctl start picoguard
-```
-
-Your config and list copies stay as they are.
+Logs: `journalctl -u picoguard` (systemd) or syslog (OpenRC, when a logger runs). The default level is
+`warn`, so the log is empty when all is well.
 
 ## 3. Point your network at picoguard
 
@@ -388,6 +549,11 @@ Restart picoguard once the time is right: `systemctl restart picoguard`.
 **Check the config before a restart.**
 `picoguard --check -c /etc/picoguard/picoguard.toml`. It names the first bad key.
 
+**The service does not start in a Debian container: a namespace or sandbox error.**
+The unit uses `PrivateDevices`, `ProtectProc` and a system call filter. In a Proxmox container,
+turn on the container option "Nesting" (`Options > Features`) and restart the container, or use
+the Alpine container from `proxmox-lxc.sh`, which has no sandbox.
+
 **The service is killed (out of memory).**
 The unit allows 64 MB (`MemoryMax=64M`). With very large lists, raise it:
 `systemctl edit picoguard`, then add
@@ -398,3 +564,4 @@ MemoryMax=128M
 ```
 
 See [configuration.md](configuration.md) for memory per list.
+
