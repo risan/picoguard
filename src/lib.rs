@@ -7,6 +7,7 @@ pub mod lists;
 pub mod log;
 pub mod pipeline;
 pub mod policy;
+pub mod release;
 pub mod scheduler;
 pub mod server;
 pub mod stats;
