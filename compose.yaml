@@ -4,7 +4,14 @@
 #   docker compose up -d --build
 #
 # Port 53 must be free on the host. On Ubuntu, systemd-resolved holds it; see
-# docs/install.md. The status page is at http://HOST_IP:8080/.
+# docs/install.md. The status page is at http://HOST_IP:8080/. Set web.user and
+# web.password in picoguard.toml.
+#
+# The ports are published on IPv4 only (0.0.0.0, or the address in PICOGUARD_BIND,
+# for example PICOGUARD_BIND=192.168.1.53 docker compose up -d). Docker's proxy turns
+# a connection that arrives over IPv6 into one from a private bridge address, which
+# would pass picoguard's allow_from check. Do not add IPv6 ports unless you set
+# allow_from yourself.
 #
 # Docker's own daemon costs tens of MB of RAM. On a 256 MB board, install the
 # binary with scripts/install.sh instead.
@@ -21,9 +28,9 @@ services:
     image: picoguard:local
     container_name: picoguard
     ports:
-      - "53:53/udp"
-      - "53:53/tcp"
-      - "8080:8080"
+      - "${PICOGUARD_BIND:-0.0.0.0}:53:53/udp"
+      - "${PICOGUARD_BIND:-0.0.0.0}:53:53/tcp"
+      - "${PICOGUARD_BIND:-0.0.0.0}:8080:8080"
     volumes:
       - ./picoguard.toml:/etc/picoguard/picoguard.toml:ro
       - picoguard-state:/var/lib/picoguard

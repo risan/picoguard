@@ -57,11 +57,11 @@ Container:
 
 picoguard (passed on to install.sh):
   --binary FILE          Use this binary. Otherwise a picoguard-<target> file next to this script
-                         (checked with SHA256SUMS) or the downloaded release is used.
+                         (SHA256SUMS must be there too) or the downloaded release is used.
   --version vX.Y.Z       Release to download (default: latest).
   --upstream NAME        cloudflare-quad9 (default), cloudflare, quad9, adguard.
   --upstream-url URL     Your own upstream server; repeat for several.
-  --lists NAME           default (HaGeZi Pro + TIF mini), more (+ AdGuard DNS filter).
+  --lists NAME           default (AdGuard DNS filter + HaGeZi Pro + TIF mini, about 12 MB).
                          large and xlarge need more memory than the 128 MB default.
   --router IP|none       Router for local names (default: the container's gateway).
   --web-port PORT        Status page port (default: 8080).
@@ -387,7 +387,7 @@ ask_picoguard_settings() {
         prompt UPSTREAM "Upstream DNS" cloudflare-quad9
     fi
 
-    tell "  lists: default (HaGeZi Pro + TIF mini), more (+ AdGuard DNS filter)"
+    tell "  lists: default (AdGuard DNS filter + HaGeZi Pro + TIF mini), large, xlarge (need more memory)"
     prompt LISTS "Blocklists" default
     prompt WEB_PORT "Status page port" 8080
 
@@ -408,7 +408,7 @@ ask_picoguard_settings() {
     done
 
     case $LISTS in
-        default|more) ;;
+        default) ;;
         large)
             if [ "$MEMORY" -lt 384 ]; then
                 warn "the 'large' lists are meant for 384 MB or more; this container gets $MEMORY MB (--memory)"
@@ -419,7 +419,7 @@ ask_picoguard_settings() {
                 warn "the 'xlarge' lists are meant for 768 MB or more; this container gets $MEMORY MB (--memory)"
             fi
             ;;
-        *) fail "unknown lists '$LISTS' (default, more, large, xlarge)" ;;
+        *) fail "unknown lists '$LISTS' (default, large, xlarge)" ;;
     esac
 
     if ! is_number "$WEB_PORT" || [ "$WEB_PORT" -lt 1 ] || [ "$WEB_PORT" -gt 65535 ]; then
@@ -527,13 +527,13 @@ gather_files() {
     elif [ -f "$SCRIPT_DIR/$asset" ]; then
         BINARY_PATH=$SCRIPT_DIR/$asset
 
-        if [ -f "$SCRIPT_DIR/SHA256SUMS" ]; then
-            SUMS_PATH=$SCRIPT_DIR/SHA256SUMS
-            verify_checksum "$BINARY_PATH" "$SUMS_PATH" "$asset"
-            say "Using $BINARY_PATH (checksum OK)"
-        else
-            warn "no SHA256SUMS next to $asset, so it is not checked"
+        if [ ! -f "$SCRIPT_DIR/SHA256SUMS" ]; then
+            fail "found $BINARY_PATH but no SHA256SUMS next to it. Download SHA256SUMS from the same release, or pass --binary FILE to skip the check."
         fi
+
+        SUMS_PATH=$SCRIPT_DIR/SHA256SUMS
+        verify_checksum "$BINARY_PATH" "$SUMS_PATH" "$asset"
+        say "Using $BINARY_PATH (checksum OK)"
     else
         fetch "$asset"
         fetch SHA256SUMS
@@ -551,6 +551,12 @@ gather_files() {
     else
         fetch install.sh
         INSTALLER_PATH=$TMP/install.sh
+    fi
+
+    # It runs as root in the container, so check it when the manifest lists it.
+    if [ -f "$INSTALLER_PATH" ] && [ -f "$SUMS_PATH" ] && awk '{ n = $2; sub(/^\*/, "", n); if (n == "install.sh") { found = 1 } } END { exit !found }' "$SUMS_PATH"; then
+        verify_checksum "$INSTALLER_PATH" "$SUMS_PATH" install.sh
+        say "install.sh: checksum OK"
     fi
 
     BINARY_ASSET=$asset

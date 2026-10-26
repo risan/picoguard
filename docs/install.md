@@ -89,8 +89,8 @@ gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install
 sudo sh install.sh
 ```
 
-`install.sh` uses the `picoguard-<target>` file next to it (and checks it with `SHA256SUMS`).
-If you downloaded on another computer, copy the three files to the device first.
+`install.sh` uses the `picoguard-<target>` file next to it and checks it with `SHA256SUMS`, which
+must be there too. If you downloaded on another computer, copy the three files to the device first.
 
 Once the repository is public, one line is enough. It downloads the binary and checks it:
 
@@ -103,8 +103,8 @@ The four questions (press Enter for the default; every question also has a flag,
 
 1. **Upstream DNS.** Cloudflare and Quad9 over DoH (default), Cloudflare only, Quad9 only,
    AdGuard DNS unfiltered, or your own URLs.
-2. **Blocklists.** The menu shows your RAM. The default is HaGeZi Pro and TIF mini, which fit a
-   256 MB board. The other rows are those of
+2. **Blocklists.** The menu shows your RAM. The default is the AdGuard DNS filter plus HaGeZi Pro
+   and TIF mini (about 12 MB, fits a 256 MB board). The other rows are the bigger boards of
    [Choose lists for your board](configuration.md#choose-lists-for-your-board).
 3. **Router.** Its address (default: this device's gateway) goes into the `[local]` section, so
    names and reverse lookups of your own devices keep working.
@@ -112,12 +112,13 @@ The four questions (press Enter for the default; every question also has a flag,
    script makes a random 16-character password and shows it once at the end. Type your own, or
    `none` for no password.
 
-`--yes` takes every default and asks nothing (good for scripts). It never stops another DNS server.
+`--yes` takes every default and asks nothing (good for scripts).
 
-What the script does about **port 53**: if systemd-resolved holds it, the script offers the fix
-from "Free port 53" below and applies it when you agree. If another DNS server holds it
-(AdGuard Home, dnsmasq, Pi-hole, unbound), the script names it and stops. It stops and disables
-that server only when you answer yes to its question, or pass `--stop-conflicting`.
+What the script does about **port 53**: if the systemd-resolved stub listener holds it, the script
+offers the fix from "Free port 53" below and applies it when you agree (`--yes` agrees). It saves
+what `/etc/resolv.conf` was first, and `--uninstall` puts that back, unless you changed the file
+since. If anything else holds the port (AdGuard Home, dnsmasq, Pi-hole, unbound), the script names
+the process and its unit, prints what to do, and stops. It never stops another DNS server itself.
 
 When it is done, the script runs a test lookup and prints the device address and the status page
 URL. Next, [point your network at picoguard](#3-point-your-network-at-picoguard).
@@ -127,10 +128,13 @@ Good to know:
 - The service runs as the system user `picoguard`. The config is
   `/etc/picoguard/picoguard.toml`, owned by `root:picoguard` with mode `0640`, because it can hold
   the status page password.
+- When you upgrade, the script keeps the previous binary and unit. If the restart fails, or the
+  new version does not answer a test lookup, it puts them back, restarts the old version and says so.
+- If an install fails after the systemd-resolved change, the change is undone.
 - An existing config is never overwritten. `--reconfigure` asks the questions again and saves the
   old file as `picoguard.toml.bak.<time>` first.
 - `--no-start` installs everything and starts nothing.
-- `--binary FILE` installs a binary you built yourself. `--version vX.Y.Z` picks a release.
+- `--binary FILE` installs a binary you built yourself, without a checksum check. `--version vX.Y.Z` picks a release.
 - `sh install.sh --uninstall` removes the binary, the service and the systemd-resolved change.
   It keeps `/etc/picoguard` and `/var/lib/picoguard` unless you add `--purge`.
 
@@ -184,6 +188,11 @@ docker compose up -d --build
 - `compose.yaml` runs it with a read-only root file system, no capabilities, `no-new-privileges`
   and a 64 MB memory limit. A non-root user can open port 53 in the container because Docker sets
   `net.ipv4.ip_unprivileged_port_start=0` there.
+- The ports are published on IPv4 only (`PICOGUARD_BIND=192.168.1.53 docker compose up -d`
+  picks one address). Docker's proxy turns a connection that arrives over IPv6 into one from a
+  private bridge address, and picoguard would then let it in. Set `web.user` and `web.password` in
+  `picoguard.toml` too.
+- The image builds on x86_64 and ARM64. On an ARMv7 board, use `install.sh`.
 - Host networking (`network_mode: host`) is the alternative: no NAT, and picoguard sees the real
   address of each client. See the comment in `compose.yaml`.
 - Docker's own daemon costs tens of MB of RAM. On a 256 MB board, use `install.sh` instead.

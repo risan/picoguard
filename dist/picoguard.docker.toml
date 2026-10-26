@@ -4,8 +4,10 @@
 #   docker run --rm -v "$PWD/picoguard.toml:/c.toml:ro" picoguard:local --check -c /c.toml
 #
 # Only private networks may query and open the status page (the defaults of
-# server.allow_from and web.allow_from). Docker shows clients behind the
-# published port with their real address, so a phone on your LAN is allowed.
+# server.allow_from and web.allow_from). Docker keeps the real address of an IPv4
+# client, so a phone on your LAN is allowed. compose.yaml publishes IPv4 only,
+# because Docker's proxy hides the real address of an IPv6 client behind a private
+# one, which would defeat allow_from.
 
 [server]
 bind = ["0.0.0.0", "::"]
@@ -27,12 +29,18 @@ servers = [
 [web]
 bind = ["0.0.0.0", "::"]
 port = 8080
-# Set both to require a password for the status page.
+# Set both. Without a password the status page is read-only, and anyone who can
+# reach it sees the query log.
 # user = "admin"
 # password = "change-me"
 
 [state]
 dir = "/var/lib/picoguard"
+
+[[lists]]
+name = "adguard-dns"
+url = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"
+format = "adblock"
 
 [[lists]]
 name = "hagezi-pro"

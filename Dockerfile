@@ -5,7 +5,8 @@
 #   docker run -d -p 53:53/udp -p 53:53/tcp -p 8080:8080 picoguard
 #
 # compose.yaml in this folder runs it with a read-only root file system and no
-# capabilities.
+# capabilities. The rust image exists for x86_64 and ARM64, so this builds on
+# those; on an ARMv7 board use scripts/install.sh.
 
 FROM rust:1.99.1-alpine3.24 AS build
 

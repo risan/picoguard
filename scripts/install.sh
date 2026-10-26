@@ -15,7 +15,9 @@ SYSTEMD_UNIT_DIR=/etc/systemd/system/picoguard.service.d
 SYSTEMD_MEMORY_DROPIN=$SYSTEMD_UNIT_DIR/memory.conf
 OPENRC_SCRIPT=/etc/init.d/picoguard
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/picoguard.conf
-RESOLV_BACKUP=/etc/resolv.conf.picoguard-bak
+RESOLV_SAVED_LINK=$CONFIG_DIR/resolv.conf.original-link
+RESOLV_SAVED_COPY=$CONFIG_DIR/resolv.conf.original
+OLD_STATE_DIR=/var/lib/private/picoguard
 SERVICE_USER=picoguard
 HAGEZI=https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock
 ADGUARD_DNS_FILTER=https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
@@ -34,7 +36,6 @@ NO_START=0
 RECONFIGURE=0
 UNINSTALL=0
 PURGE=0
-STOP_CONFLICTING=0
 
 ANSWER=
 HAVE_TTY=0
@@ -47,6 +48,13 @@ BINARY=
 SCRIPT_DIR=
 WRITE_CONFIG=0
 PASSWORD_GENERATED=0
+RESOLVED_APPLIED=0
+INSTALL_DONE=0
+BACKUP_DIR=
+BACKUP_CONFIG=
+LOOKUP=failed
+DNS_HOST=127.0.0.1
+DNS_PORT=53
 
 usage() {
     cat <<'EOF'
@@ -56,14 +64,15 @@ Installs picoguard, or upgrades it when it is already installed. Run it as root.
 A new install asks four questions; --yes takes the default for every question.
 
 Binary:
-  --binary FILE         Install this file. Otherwise the script uses a picoguard-<target>
-                        file next to it (checked with SHA256SUMS), or downloads the release.
+  --binary FILE         Install this file, unchecked. Otherwise the script uses a
+                        picoguard-<target> file next to it (SHA256SUMS must be there too),
+                        or downloads the release and checks it.
   --version vX.Y.Z      Release to download (default: latest).
 
 Questions (each has a flag; a flag skips its question):
   --upstream NAME       cloudflare-quad9 (default), cloudflare, quad9, adguard.
   --upstream-url URL    Your own upstream server; repeat for several. Replaces --upstream.
-  --lists NAME          default (HaGeZi Pro + TIF mini), more (+ AdGuard DNS filter),
+  --lists NAME          default (AdGuard DNS filter + HaGeZi Pro + TIF mini, 256 MB and up),
                         large (512 MB and up), xlarge (1 GB and up).
   --router IP|none      Router for local names and reverse lookups (default: the gateway).
   --web-port PORT       Status page port (default: 8080).
@@ -71,8 +80,7 @@ Questions (each has a flag; a flag skips its question):
                         (default: a random one, shown once at the end).
 
 Behavior:
-  -y, --yes             Take the default for every question. Never stops another DNS server.
-  --stop-conflicting    Stop and disable another DNS server that holds port 53.
+  -y, --yes             Take the default for every question.
   --no-start            Install only; do not enable or start the service.
   --reconfigure         Ask again and replace the config (the old one is saved as .bak).
   --init systemd|openrc Init system (default: detected).
@@ -81,7 +89,9 @@ Behavior:
                         and the picoguard user.
   -h, --help            Show this help.
 
-An existing config is never overwritten without --reconfigure.
+An existing config is never overwritten without --reconfigure. If another DNS server holds
+port 53, the script names it and stops; it only turns off the systemd-resolved stub listener,
+after asking (--yes answers yes).
 Environment: PICOGUARD_BASE_URL replaces https://github.com/risan/picoguard/releases.
 EOF
 }
@@ -168,10 +178,6 @@ parse_args() {
                 ;;
             -y|--yes)
                 ASSUME_YES=1
-                shift
-                ;;
-            --stop-conflicting)
-                STOP_CONFLICTING=1
                 shift
                 ;;
             --no-start)
@@ -316,6 +322,11 @@ confirm() {
 }
 
 cleanup() {
+    if [ "$INSTALL_DONE" != 1 ] && [ "$RESOLVED_APPLIED" = 1 ]; then
+        warn "the install did not finish; undoing the systemd-resolved change"
+        undo_resolved_fix
+    fi
+
     if [ -n "$TMP" ]; then
         rm -rf "$TMP"
     fi
@@ -436,12 +447,12 @@ fetch_binary() {
     if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/$asset" ]; then
         BINARY=$SCRIPT_DIR/$asset
 
-        if [ -f "$SCRIPT_DIR/SHA256SUMS" ]; then
-            verify_checksum "$BINARY" "$SCRIPT_DIR/SHA256SUMS" "$asset"
-            say "Using $BINARY (checksum OK)"
-        else
-            warn "no SHA256SUMS next to $asset, so it is not checked"
+        if [ ! -f "$SCRIPT_DIR/SHA256SUMS" ]; then
+            fail "found $BINARY but no SHA256SUMS next to it. Download SHA256SUMS from the same release, or pass --binary FILE to skip the check."
         fi
+
+        verify_checksum "$BINARY" "$SCRIPT_DIR/SHA256SUMS" "$asset"
+        say "Using $BINARY (checksum OK)"
 
         return 0
     fi
@@ -551,6 +562,32 @@ upstream_servers() {
     esac
 }
 
+# A host name in an upstream URL needs plain DNS servers to resolve it.
+upstream_needs_bootstrap() {
+    urls=$(upstream_servers)
+    set -f
+
+    for url in $urls; do
+        rest=${url#*://}
+        host=${rest%%[/#:]*}
+
+        case $host in
+            '['*) ;;
+            *)
+                if ! is_ipv4 "$host"; then
+                    set +f
+
+                    return 0
+                fi
+                ;;
+        esac
+    done
+
+    set +f
+
+    return 1
+}
+
 choose_upstream() {
     if [ -z "$UPSTREAM" ]; then
         tell ""
@@ -609,39 +646,34 @@ choose_upstream() {
 lists_for() {
     case $1 in
         default)
+            printf '%s %s\n' adguard-dns "$ADGUARD_DNS_FILTER"
             printf '%s %s\n' hagezi-pro "$HAGEZI/pro.txt"
             printf '%s %s\n' hagezi-tif-mini "$HAGEZI/tif.mini.txt"
             ;;
-        more)
-            lists_for default
-            printf '%s %s\n' adguard-dns "$ADGUARD_DNS_FILTER"
-            ;;
         large)
+            printf '%s %s\n' adguard-dns "$ADGUARD_DNS_FILTER"
             printf '%s %s\n' hagezi-pro-plus "$HAGEZI/pro.plus.txt"
             printf '%s %s\n' hagezi-tif-mini "$HAGEZI/tif.mini.txt"
-            printf '%s %s\n' adguard-dns "$ADGUARD_DNS_FILTER"
             ;;
         xlarge)
+            printf '%s %s\n' adguard-dns "$ADGUARD_DNS_FILTER"
             printf '%s %s\n' hagezi-ultimate "$HAGEZI/ultimate.txt"
             printf '%s %s\n' hagezi-tif "$HAGEZI/tif.txt"
-            printf '%s %s\n' adguard-dns "$ADGUARD_DNS_FILTER"
             ;;
     esac
 }
 
 lists_label() {
     case $1 in
-        default) say "HaGeZi Pro + TIF mini" ;;
-        more) say "HaGeZi Pro + TIF mini + AdGuard DNS filter" ;;
-        large) say "HaGeZi Pro++ + TIF mini + AdGuard DNS filter" ;;
-        xlarge) say "HaGeZi Ultimate + TIF + AdGuard DNS filter" ;;
+        default) say "AdGuard DNS filter + HaGeZi Pro + TIF mini" ;;
+        large) say "AdGuard DNS filter + HaGeZi Pro++ + TIF mini" ;;
+        xlarge) say "AdGuard DNS filter + HaGeZi Ultimate + TIF" ;;
     esac
 }
 
 lists_min_ram_mib() {
     case $1 in
         default) say 192 ;;
-        more) say 192 ;;
         large) say 384 ;;
         xlarge) say 768 ;;
     esac
@@ -657,24 +689,22 @@ choose_lists() {
         else
             tell "2) Blocklists"
         fi
-        tell "   1  HaGeZi Pro + TIF mini: about 260k rules, 12-15 MB (default, fits 256 MB boards)"
-        tell "   2  Default + AdGuard DNS filter: about 450k rules, 16 MB (fits 256 MB boards)"
-        tell "   3  HaGeZi Pro++ + TIF mini + AdGuard DNS filter, larger cache: 25-35 MB (512 MB and up)"
-        tell "   4  HaGeZi Ultimate + TIF + AdGuard DNS filter, biggest cache: 60-90 MB (1 GB and up)"
+        tell "   1  AdGuard DNS filter + HaGeZi Pro + TIF mini: about 12 MB (default, fits 256 MB boards)"
+        tell "   2  AdGuard DNS filter + HaGeZi Pro++ + TIF mini, larger cache: 25-35 MB (512 MB and up)"
+        tell "   3  AdGuard DNS filter + HaGeZi Ultimate + TIF, biggest cache: 60-90 MB (1 GB and up)"
         ask "Choose" 1
 
         case $ANSWER in
             1) LISTS=default ;;
-            2) LISTS='more' ;;
-            3) LISTS=large ;;
-            4) LISTS=xlarge ;;
+            2) LISTS=large ;;
+            3) LISTS=xlarge ;;
             *) fail "unknown choice: $ANSWER" ;;
         esac
     fi
 
     case $LISTS in
-        default|more|large|xlarge) ;;
-        *) fail "unknown lists '$LISTS' (default, more, large, xlarge)" ;;
+        default|large|xlarge) ;;
+        *) fail "unknown lists '$LISTS' (default, large, xlarge)" ;;
     esac
 
     needed=$(lists_min_ram_mib "$LISTS")
@@ -787,6 +817,10 @@ EOF
         done
         printf ']\n'
 
+        if upstream_needs_bootstrap; then
+            printf '# Plain DNS servers that resolve the host names above.\nbootstrap = ["9.9.9.9", "1.1.1.1"]\n'
+        fi
+
         if [ "$ROUTER" != none ]; then
             cat <<EOF
 
@@ -855,17 +889,18 @@ install_config() {
     mkdir -p "$CONFIG_DIR"
 
     if [ -f "$CONFIG_PATH" ]; then
-        backup=$CONFIG_PATH.bak.$(date +%Y%m%d%H%M%S)
-        cp -p "$CONFIG_PATH" "$backup"
-        say "Saved the old config as $backup"
+        BACKUP_CONFIG=$CONFIG_PATH.bak.$(date +%Y%m%d%H%M%S)
+        cp -p "$CONFIG_PATH" "$BACKUP_CONFIG"
+        say "Saved the old config as $BACKUP_CONFIG"
     fi
 
     install -m 0640 "$TMP/picoguard.toml" "$CONFIG_PATH"
     say "Wrote $CONFIG_PATH"
 }
 
+# systemd's DynamicUser makes a "picoguard" user that id finds but /etc/passwd does not hold.
 ensure_service_user() {
-    if id "$SERVICE_USER" >/dev/null 2>&1; then
+    if grep -q "^$SERVICE_USER:" /etc/passwd; then
         return 0
     fi
 
@@ -881,6 +916,21 @@ ensure_service_user() {
     fi
 
     say "Created the system user $SERVICE_USER"
+}
+
+# systemd keeps the state of a DynamicUser service in /var/lib/private/picoguard and links
+# /var/lib/picoguard to it. The static user needs a real directory it owns.
+migrate_dynamic_state() {
+    if [ "$INIT" != systemd ] || [ ! -L "$STATE_DIR" ] || [ ! -d "$OLD_STATE_DIR" ]; then
+        return 0
+    fi
+
+    say "Moving the state of the old DynamicUser service to $STATE_DIR"
+    systemctl stop picoguard 2>/dev/null || true
+    rm -f "$STATE_DIR"
+    mv "$OLD_STATE_DIR" "$STATE_DIR"
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$STATE_DIR"
+    chmod 0750 "$STATE_DIR"
 }
 
 # The config can hold the status page password: only root and the service may read it.
@@ -900,26 +950,56 @@ secure_config_files() {
     done
 }
 
-# Prints the program name of each listener on port 53, one per line.
+# Where to ask picoguard: the port and the first listen address of [server] in the config.
+read_dns_target() {
+    port=$(awk '/^\[/ { in_server = ($0 == "[server]") } in_server && $1 == "port" { print $3; exit }' "$CHECK_PATH")
+
+    if is_port "$port"; then
+        DNS_PORT=$port
+    fi
+
+    bind=$(awk '/^\[/ { in_server = ($0 == "[server]") } in_server && $1 == "bind" { print; exit }' "$CHECK_PATH")
+
+    case $bind in
+        *0.0.0.0*|*127.*)
+            ;;
+        *)
+            address=$(printf '%s\n' "$bind" | grep -o '[0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}' | head -n 1 || true)
+
+            if [ -n "$address" ]; then
+                DNS_HOST=$address
+            fi
+            ;;
+    esac
+}
+
+# Prints "name pid" for each listener on the DNS port, one per line (pid is - when unknown).
 port_53_owners() {
     if command -v ss >/dev/null 2>&1; then
-        ss -lntup 2>/dev/null | awk '
-            $5 ~ /:53$/ {
+        ss -lntup 2>/dev/null | awk -v port="$DNS_PORT" '
+            $5 ~ (":" port "$") {
                 name = "unknown"
+                pid = "-"
                 if (match($0, /users:\(\("[^"]*"/)) {
                     name = substr($0, RSTART + 9, RLENGTH - 10)
                 }
-                print name
+                if (match($0, /pid=[0-9]+/)) {
+                    pid = substr($0, RSTART + 4, RLENGTH - 4)
+                }
+                print name, pid
             }'
     elif command -v netstat >/dev/null 2>&1; then
-        netstat -lntup 2>/dev/null | awk '
-            $4 ~ /:53$/ {
-                name = $NF
-                sub(/^[0-9]+\//, "", name)
-                if (name == "-") {
-                    name = "unknown"
+        netstat -lntup 2>/dev/null | awk -v port="$DNS_PORT" '
+            $4 ~ (":" port "$") {
+                name = "unknown"
+                pid = "-"
+                if ($NF ~ /^[0-9]+\//) {
+                    pid = $NF
+                    sub(/\/.*/, "", pid)
+                    name = $NF
+                    sub(/^[0-9]+\//, "", name)
                 }
-                print name
+                print name, pid
             }'
     else
         proc_net_port_53_owners
@@ -927,13 +1007,15 @@ port_53_owners() {
 }
 
 proc_net_port_53_owners() {
-    inodes=$(awk '
-        FNR > 1 && $2 ~ /:0035$/ && (($4 == "0A" && FILENAME ~ /tcp/) || ($4 == "07" && FILENAME ~ /udp/)) {
+    hex_port=$(printf '%04X' "$DNS_PORT")
+    inodes=$(awk -v hex_port="$hex_port" '
+        FNR > 1 && $2 ~ (":" hex_port "$") && (($4 == "0A" && FILENAME ~ /tcp/) || ($4 == "07" && FILENAME ~ /udp/)) {
             print $10
         }' /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null)
 
     for inode in $inodes; do
         name=unknown
+        pid=-
 
         for fd in /proc/[0-9]*/fd/*; do
             if [ "$(readlink "$fd" 2>/dev/null)" = "socket:[$inode]" ]; then
@@ -944,49 +1026,35 @@ proc_net_port_53_owners() {
             fi
         done
 
-        say "$name"
+        say "$name $pid"
     done
 }
 
-systemd_unit_of() {
-    for pid in $(pidof "$1" 2>/dev/null); do
-        unit=$(sed -n 's|.*/\([^/]*\.service\)$|\1|p' "/proc/$pid/cgroup" 2>/dev/null | head -n 1)
-
-        if [ -n "$unit" ]; then
-            printf '%s' "$unit"
-
-            return 0
-        fi
-    done
-
-    return 1
+systemd_unit_of_pid() {
+    sed -n 's|.*/\([^/]*\.service\)$|\1|p' "/proc/$1/cgroup" 2>/dev/null | head -n 1
 }
 
-stop_other_server() {
-    name=$1
+# Saves what /etc/resolv.conf is now, so that --uninstall can put it back exactly.
+save_resolv_conf() {
+    mkdir -p "$CONFIG_DIR"
+    rm -f "$RESOLV_SAVED_LINK" "$RESOLV_SAVED_COPY"
 
-    if [ "$INIT" = systemd ]; then
-        unit=$(systemd_unit_of "$name" || say "$name.service")
-        say "Stopping and disabling $unit"
-        systemctl disable --now "$unit" || fail "could not stop $unit; stop it yourself and run this script again"
-    else
-        say "Stopping and disabling $name"
-        rc-service "$name" stop || fail "could not stop $name; stop it yourself and run this script again"
-        rc-update del "$name" 2>/dev/null || true
+    if [ -L /etc/resolv.conf ]; then
+        readlink /etc/resolv.conf >"$RESOLV_SAVED_LINK"
+    elif [ -f /etc/resolv.conf ]; then
+        cp -p /etc/resolv.conf "$RESOLV_SAVED_COPY"
     fi
 }
 
 apply_resolved_fix() {
     say "Turning off the systemd-resolved stub listener"
+    save_resolv_conf
     mkdir -p "$(dirname "$RESOLVED_DROPIN")"
     cat >"$RESOLVED_DROPIN" <<'EOF'
 [Resolve]
 DNSStubListener=no
 EOF
-
-    if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
-        cp -p /etc/resolv.conf "$RESOLV_BACKUP"
-    fi
+    RESOLVED_APPLIED=1
 
     ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
     systemctl restart systemd-resolved
@@ -996,46 +1064,72 @@ EOF
 # processes (some containers) sees our own running service as "unknown".
 foreign_port_53_owners() {
     if service_active; then
-        port_53_owners | grep -vx -e picoguard -e unknown | sort -u || true
+        port_53_owners | grep -v -e '^picoguard ' -e '^unknown ' | sort -u || true
     else
-        port_53_owners | grep -vx picoguard | sort -u || true
+        port_53_owners | grep -v '^picoguard ' | sort -u || true
     fi
+}
+
+# $1 is a "name pid" line. This script never stops another DNS server.
+fail_port_53_busy() {
+    name=${1%% *}
+    pid=${1#* }
+    unit=
+
+    if [ "$INIT" = systemd ] && [ "$pid" != - ]; then
+        unit=$(systemd_unit_of_pid "$pid")
+    fi
+
+    {
+        printf 'error: port %s is used by %s' "$DNS_PORT" "$name"
+        if [ "$pid" != - ]; then
+            printf ' (pid %s' "$pid"
+            if [ -n "$unit" ]; then
+                printf ', systemd unit %s' "$unit"
+            fi
+            printf ')'
+        fi
+        printf '.\n'
+        printf 'picoguard cannot start while it runs, and this script does not stop other DNS servers.\n'
+        printf 'Stop or reconfigure it yourself, then run this script again. For example:\n'
+        if [ "$INIT" = systemd ]; then
+            printf '  systemctl disable --now %s\n' "${unit:-$name.service}"
+        else
+            printf '  rc-service %s stop && rc-update del %s\n' "$name" "$name"
+        fi
+
+        printf 'If another program starts it (NetworkManager with dns=dnsmasq, Pi-hole, AdGuard Home),\n'
+        printf 'change that program instead. Or install now without starting: --no-start.\n'
+    } >&2
+
+    exit 1
 }
 
 ensure_port_53_free() {
     owners=$(foreign_port_53_owners)
+    others=$(printf '%s\n' "$owners" | grep -v -e '^systemd-resolve' -e '^$' | head -n 1 || true)
 
-    for name in $owners; do
-        case $name in
-            systemd-resolve*)
-                say ""
-                say "systemd-resolved listens on port 53."
-                if ! confirm "Turn off its stub listener, so picoguard can use port 53?" y; then
-                    fail "port 53 is busy. Turn off the resolved listener (docs/install.md, 'Free port 53'), or use --no-start."
-                fi
+    if [ -n "$others" ]; then
+        fail_port_53_busy "$others"
+    fi
 
-                apply_resolved_fix
-                ;;
-            unknown)
-                fail "something listens on port 53 but its name is not visible. Find it with: ss -lntup | grep :53"
-                ;;
-            *)
-                say ""
-                say "Port 53 is used by '$name'. picoguard cannot start while it runs."
-                if [ "$STOP_CONFLICTING" != 1 ] && ! confirm "Stop and disable $name now?" n; then
-                    fail "port 53 is busy. Stop and disable $name yourself (systemctl disable --now $name, or rc-service $name stop and rc-update del $name), then run this script again. Or use --no-start."
-                fi
+    if [ -z "$owners" ]; then
+        return 0
+    fi
 
-                stop_other_server "$name"
-                ;;
-        esac
-    done
+    say ""
+    say "systemd-resolved listens on port $DNS_PORT."
 
+    if ! confirm "Turn off its stub listener, so picoguard can use port 53?" y; then
+        fail "port 53 is busy. Turn off the resolved listener (docs/install.md, 'Free port 53'), or use --no-start."
+    fi
+
+    apply_resolved_fix
     sleep 1
-    owners=$(foreign_port_53_owners | tr '\n' ' ')
+    owners=$(foreign_port_53_owners | head -n 1)
 
     if [ -n "$owners" ]; then
-        fail "port 53 is still in use by: $owners"
+        fail_port_53_busy "$owners"
     fi
 }
 
@@ -1178,6 +1272,62 @@ install_binary() {
     STAGED=
 }
 
+# On an upgrade, keep what runs now, so that a failed restart can be undone.
+backup_previous() {
+    if [ ! -x "$BIN_PATH" ]; then
+        return 0
+    fi
+
+    BACKUP_DIR=$TMP/previous
+    mkdir -p "$BACKUP_DIR"
+    cp -p "$BIN_PATH" "$BACKUP_DIR/binary"
+
+    if [ -f "$SYSTEMD_UNIT" ]; then
+        cp -p "$SYSTEMD_UNIT" "$BACKUP_DIR/unit"
+    fi
+
+    if [ -f "$OPENRC_SCRIPT" ]; then
+        cp -p "$OPENRC_SCRIPT" "$BACKUP_DIR/initscript"
+    fi
+}
+
+rollback_upgrade() {
+    warn "the new version did not start or did not answer; putting $OLD_VERSION back"
+    cp -p "$BACKUP_DIR/binary" "$BIN_PATH.old.$$"
+    mv -f "$BIN_PATH.old.$$" "$BIN_PATH"
+
+    if [ -f "$BACKUP_DIR/unit" ]; then
+        cp -p "$BACKUP_DIR/unit" "$SYSTEMD_UNIT"
+    fi
+
+    if [ -f "$BACKUP_DIR/initscript" ]; then
+        cp -p "$BACKUP_DIR/initscript" "$OPENRC_SCRIPT"
+    fi
+
+    if [ -n "$BACKUP_CONFIG" ] && [ -f "$BACKUP_CONFIG" ]; then
+        cp -p "$BACKUP_CONFIG" "$CONFIG_PATH"
+        secure_config_files
+    fi
+
+    case $INIT in
+        systemd)
+            systemctl daemon-reload
+            systemctl restart picoguard || true
+            ;;
+        openrc)
+            rc-service picoguard restart || true
+            ;;
+    esac
+
+    if service_active; then
+        say "The previous version runs again."
+    else
+        warn "the previous version did not start either. Look at the log."
+    fi
+
+    fail "the upgrade failed and was rolled back"
+}
+
 service_active() {
     case $INIT in
         systemd) systemctl is-active --quiet picoguard ;;
@@ -1188,32 +1338,60 @@ service_active() {
 start_service() {
     case $INIT in
         systemd)
-            systemctl enable picoguard
-            systemctl restart picoguard
+            systemctl enable picoguard && systemctl restart picoguard
             ;;
         openrc)
-            rc-update add picoguard default
-            rc-service picoguard restart
+            rc-update add picoguard default && rc-service picoguard restart
             ;;
     esac
 }
 
-dns_answers() {
+# 0: answered, 1: no answer, 2: no dig or nslookup to ask with.
+dns_lookup() {
     if command -v dig >/dev/null 2>&1; then
-        [ -n "$(dig +time=2 +tries=1 +short @127.0.0.1 example.com 2>/dev/null)" ]
-    elif command -v nslookup >/dev/null 2>&1; then
-        nslookup example.com 127.0.0.1 >/dev/null 2>&1
-    else
-        port_53_owners | grep -qx picoguard
+        if answer=$(dig +time=2 +tries=1 +short -p "$DNS_PORT" "@$DNS_HOST" example.com 2>/dev/null) && [ -n "$answer" ]; then
+            return 0
+        fi
+
+        return 1
     fi
+
+    if command -v nslookup >/dev/null 2>&1; then
+        if [ "$DNS_PORT" = 53 ]; then
+            answer=$(nslookup example.com "$DNS_HOST" 2>&1) || answer=
+        else
+            answer=$(nslookup "-port=$DNS_PORT" example.com "$DNS_HOST" 2>&1) || answer=
+        fi
+
+        if [ "$(printf '%s\n' "$answer" | grep -ci '^address')" -ge 2 ]; then
+            return 0
+        fi
+
+        return 1
+    fi
+
+    return 2
 }
 
+# Same codes as dns_lookup; 2 also needs picoguard to hold port 53.
 wait_for_dns() {
     waited=0
 
     while [ "$waited" -lt 10 ]; do
-        if service_active && dns_answers; then
-            return 0
+        if service_active; then
+            status=0
+            dns_lookup || status=$?
+
+            case $status in
+                0)
+                    return 0
+                    ;;
+                2)
+                    if port_53_owners | grep -q -e '^picoguard ' -e '^unknown '; then
+                        return 2
+                    fi
+                    ;;
+            esac
         fi
 
         sleep 1
@@ -1221,6 +1399,24 @@ wait_for_dns() {
     done
 
     return 1
+}
+
+start_and_verify() {
+    LOOKUP=failed
+
+    if start_service; then
+        status=0
+        wait_for_dns || status=$?
+
+        case $status in
+            0) LOOKUP=ok ;;
+            2) LOOKUP=untested ;;
+        esac
+    fi
+
+    if [ "$LOOKUP" = failed ] && [ -n "$BACKUP_DIR" ]; then
+        rollback_upgrade
+    fi
 }
 
 device_addresses() {
@@ -1262,19 +1458,24 @@ report() {
         return 0
     fi
 
-    say "Waiting for picoguard to answer..."
-    if ! wait_for_dns; then
-        if ! service_active; then
-            case $INIT in
-                systemd) fail "picoguard is not running. See: journalctl -u picoguard -e" ;;
-                openrc) fail "picoguard is not running. See: rc-service picoguard status, and /var/log/messages" ;;
-            esac
-        fi
-
-        warn "picoguard runs but a test lookup did not answer yet. The lists may still be loading, or the upstream servers are not reachable."
-    else
-        say "A test lookup of example.com works."
+    if ! service_active; then
+        case $INIT in
+            systemd) fail "picoguard is not running. See: journalctl -u picoguard -e" ;;
+            openrc) fail "picoguard is not running. See: rc-service picoguard status, and /var/log/messages" ;;
+        esac
     fi
+
+    case $LOOKUP in
+        ok)
+            say "A test lookup of example.com works."
+            ;;
+        untested)
+            say "picoguard holds port 53. No lookup was tried: neither dig nor nslookup is installed."
+            ;;
+        *)
+            warn "picoguard runs but a test lookup did not answer. The lists may still be loading, or the upstream servers are not reachable."
+            ;;
+    esac
 
     port=$(configured_web_port)
     if [ -z "$port" ]; then
@@ -1295,6 +1496,23 @@ report() {
     say "Details: https://github.com/$REPO/blob/main/docs/install.md#3-point-your-network-at-picoguard"
 }
 
+# Puts /etc/resolv.conf back as save_resolv_conf found it, but only while it still is
+# what apply_resolved_fix made it.
+restore_resolv_conf() {
+    if [ "$(readlink /etc/resolv.conf 2>/dev/null)" != /run/systemd/resolve/resolv.conf ]; then
+        warn "/etc/resolv.conf was changed after the install; leaving it as it is"
+    elif [ -f "$RESOLV_SAVED_LINK" ]; then
+        ln -sf "$(cat "$RESOLV_SAVED_LINK")" /etc/resolv.conf
+    elif [ -f "$RESOLV_SAVED_COPY" ]; then
+        rm -f /etc/resolv.conf
+        cp -p "$RESOLV_SAVED_COPY" /etc/resolv.conf
+    else
+        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    fi
+
+    rm -f "$RESOLV_SAVED_LINK" "$RESOLV_SAVED_COPY"
+}
+
 undo_resolved_fix() {
     if [ ! -f "$RESOLVED_DROPIN" ]; then
         return 0
@@ -1303,12 +1521,7 @@ undo_resolved_fix() {
     say "Undoing the systemd-resolved change"
     rm -f "$RESOLVED_DROPIN"
     rmdir "$(dirname "$RESOLVED_DROPIN")" 2>/dev/null || true
-
-    if [ -f "$RESOLV_BACKUP" ]; then
-        mv -f "$RESOLV_BACKUP" /etc/resolv.conf
-    elif [ "$(readlink /etc/resolv.conf 2>/dev/null)" = /run/systemd/resolve/resolv.conf ]; then
-        ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-    fi
+    restore_resolv_conf
 
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl restart systemd-resolved || true
@@ -1339,7 +1552,7 @@ uninstall() {
     if [ "$PURGE" = 1 ]; then
         rm -rf "$CONFIG_DIR" "$STATE_DIR"
 
-        if id "$SERVICE_USER" >/dev/null 2>&1; then
+        if grep -q "^$SERVICE_USER:" /etc/passwd; then
             if command -v userdel >/dev/null 2>&1; then
                 userdel "$SERVICE_USER" 2>/dev/null || true
             else
@@ -1391,22 +1604,26 @@ main() {
     stage_binary
     stage_config
     check_config
+    read_dns_target
 
     if [ "$NO_START" != 1 ]; then
         ensure_port_53_free
     fi
 
     ensure_service_user
+    migrate_dynamic_state
+    backup_previous
     install_config
     secure_config_files
     install_service
     install_binary
 
     if [ "$NO_START" != 1 ]; then
-        start_service
+        start_and_verify
     fi
 
     report
+    INSTALL_DONE=1
 }
 
 main "$@"
