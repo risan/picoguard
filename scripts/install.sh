@@ -1857,13 +1857,12 @@ stop_update_installer() {
     esac
 }
 
-# Takes the lock the update installer takes for a whole pass, on fd 9 until this script ends,
-# so that the two never change the binary, the units or the installer's folder together.
-# Every child that can run long closes or keeps it on purpose: the installer's children keep
-# it, so it lasts as long as any of them; the services started here close it (9>&-), or
-# OpenRC's supervise-daemon would hold it until a reboot.
-# Without the folder (a first install, or an upgrade from a version without the installer) no
-# installer is running and there is nothing to wait for.
+# Takes the lock that the update installer holds for a whole pass, and keeps it on fd 9 until
+# this script ends, so that the two never change the binary, the units or the installer's
+# folder at the same time. The services this script starts are started with 9>&-: OpenRC's
+# supervise-daemon keeps the descriptors it inherits, which would hold the lock until a reboot.
+# Without the folder (a first install, or an upgrade from a version that had no installer)
+# no installer can be running.
 lock_updates() {
     if [ ! -d "$UPDATE_DIR" ]; then
         return 0
