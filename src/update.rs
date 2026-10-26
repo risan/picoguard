@@ -4,14 +4,20 @@
 //! the page: the last known result stays.
 
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep, sleep_until};
 
-use crate::lists::{Downloader, Fetch, FetchError, Limits, PIECE_QUEUE, Piece, Validators};
+use crate::config::Config;
+use crate::lists::{
+    Downloader, Fetch, FetchError, Limits, PIECE_QUEUE, Piece, Resolver, Validators,
+};
 use crate::scheduler::{jittered, unit_random};
+use crate::upstream::tls::Tls;
 
 pub const RELEASES_URL: &str = "https://api.github.com/repos/risan/picoguard/releases/latest";
 
@@ -481,6 +487,42 @@ fn outcome_of(error: &FetchError) -> Outcome {
         | FetchError::Http(_)
         | FetchError::Io(_)
         | FetchError::SinkClosed => Outcome::Failed(Failure::Network),
+    }
+}
+
+/// Starts the daily check, or nothing when it is off or when the status page, the only place
+/// that shows the result, is off. The task is never awaited: stopping picoguard drops it.
+pub fn start(
+    config: &Config,
+    url: &str,
+    resolver: Resolver,
+    tls: Arc<Tls>,
+    updates: Arc<Updates>,
+    timing: CheckTiming,
+) -> Option<JoinHandle<()>> {
+    if !config.update.check || !config.web.enabled {
+        return None;
+    }
+
+    let checker = Checker::new(Downloader::new(resolver, tls), url);
+
+    Some(tokio::spawn(run(checker, updates, timing)))
+}
+
+async fn run(mut checker: Checker, updates: Arc<Updates>, timing: CheckTiming) {
+    sleep(timing.first_delay()).await;
+    let mut previous = Outcome::UpToDate;
+
+    loop {
+        let started = Instant::now();
+        let (outcome, detail) = checker.check(&updates).await;
+
+        if let Some((level, line)) = log_line(&previous, &outcome, &detail) {
+            log::log!(level, "{line}");
+        }
+
+        previous = outcome;
+        sleep_until(started + timing.next_delay()).await;
     }
 }
 

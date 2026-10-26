@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::http::ListServer;
+use picoguard::config::{Config, UpdateConfig, WebConfig};
 use picoguard::lists::Downloader;
-use picoguard::update::{Build, Checker, Failure, Latest, Outcome, Updates};
+use picoguard::update::{Build, CheckTiming, Checker, Failure, Latest, Outcome, Updates, start};
 use picoguard::upstream::tls::Tls;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -335,4 +336,74 @@ async fn a_body_cut_short_or_too_long_without_a_length_ends_the_check() {
 
     assert_eq!(third, Outcome::Newer("99.0.0".to_string()));
     assert_eq!(shown_version(&updates).as_deref(), Some("99.0.0"));
+}
+
+fn quick_timing() -> CheckTiming {
+    CheckTiming {
+        first_min: Duration::ZERO,
+        first_max: Duration::from_millis(10),
+        every: Duration::from_millis(200),
+    }
+}
+
+fn started(config: &Config, url: &str, timing: CheckTiming) -> Option<tokio::task::JoinHandle<()>> {
+    start(
+        config,
+        url,
+        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Arc::new(Tls::with_webpki_roots()),
+        Arc::new(updates()),
+        timing,
+    )
+}
+
+#[tokio::test]
+async fn nothing_starts_when_the_check_or_the_page_is_off() {
+    let server = ListServer::start().await;
+    server.serve_typed(PATH, FIXTURE, None, JSON);
+    let switched_off = [
+        Config {
+            update: UpdateConfig { check: false },
+            ..Config::default()
+        },
+        Config {
+            web: WebConfig {
+                enabled: false,
+                ..WebConfig::default()
+            },
+            ..Config::default()
+        },
+    ];
+
+    for config in &switched_off {
+        let handle = started(config, &server.url(PATH), quick_timing());
+
+        assert!(handle.is_none());
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(server.requests(), 0);
+}
+
+#[tokio::test]
+async fn the_loop_checks_once_per_interval_and_does_not_retry_sooner() {
+    let healthy = ListServer::start().await;
+    healthy.serve_typed(PATH, FIXTURE, None, JSON);
+    let failing = ListServer::start().await;
+    failing.fail(PATH, 500);
+
+    for server in [&healthy, &failing] {
+        let handle = started(&Config::default(), &server.url(PATH), quick_timing())
+            .expect("the check is on");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle.abort();
+
+        assert!(
+            (2..=3).contains(&server.requests()),
+            "{}",
+            server.requests()
+        );
+    }
 }
