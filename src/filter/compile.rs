@@ -419,7 +419,7 @@ fn compile(
     })
 }
 
-fn blocks_a_canary(list: &Arc<CompiledList>) -> bool {
+pub(super) fn blocks_a_canary(list: &Arc<CompiledList>) -> bool {
     let engine = Engine::new(vec![Arc::clone(list)], Vec::new());
 
     CANARY_NAMES
