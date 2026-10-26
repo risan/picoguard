@@ -165,6 +165,12 @@ container address, the status page URL and the generated password.
 `--yes` takes all defaults, and `--dry-run` shows every `pct` and `pveam` command that would
 change something, without running it. `bash proxmox-lxc.sh --help` lists all flags.
 
+The script checks the binary and a downloaded `install.sh` against `SHA256SUMS` and stops when a
+checksum is missing or wrong. `--binary FILE` installs a binary you built yourself without a
+checksum check; a downloaded `install.sh` is still checked. If the install inside the container
+fails, the script leaves the container in place and prints its ID and the `pct stop` and
+`pct destroy` commands that remove it.
+
 The container is Alpine with OpenRC, so no systemd sandbox is involved. To update picoguard later,
 see "Update picoguard" below.
 

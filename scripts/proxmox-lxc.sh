@@ -31,6 +31,7 @@ DRY_RUN=0
 HAVE_TTY=0
 TMP=
 SCRIPT_DIR=
+CONTAINER_CREATED=0
 
 usage() {
     cat <<'EOF'
@@ -56,8 +57,9 @@ Container:
   --nameserver IP        DNS server of the container itself (default: the host's).
 
 picoguard (passed on to install.sh):
-  --binary FILE          Use this binary. Otherwise a picoguard-<target> file next to this script
-                         (SHA256SUMS must be there too) or the downloaded release is used.
+  --binary FILE          Use this binary, unchecked (install.sh gets it with --binary). Otherwise a
+                         picoguard-<target> file next to this script (SHA256SUMS must be there too)
+                         or the downloaded release is used. A downloaded install.sh is always checked.
   --version vX.Y.Z       Release to download (default: latest).
   --upstream NAME        cloudflare-quad9 (default), cloudflare, quad9, adguard.
   --upstream-url URL     Your own upstream server; repeat for several.
@@ -92,8 +94,15 @@ fail() {
 }
 
 cleanup() {
+    local status=$?
+
     if [ -n "$TMP" ]; then
         rm -rf "$TMP"
+    fi
+
+    if [ "$status" -ne 0 ] && [ "$CONTAINER_CREATED" = 1 ]; then
+        printf 'The container %s was created and still exists, without a working picoguard.\n' "$CTID" >&2
+        printf 'Remove it with: pct stop %s; pct destroy %s\n' "$CTID" "$CTID" >&2
     fi
 }
 
@@ -619,6 +628,10 @@ create_container() {
         --nameserver "$NAMESERVER" \
         --onboot 1 \
         --tags picoguard
+    if [ "$DRY_RUN" != 1 ]; then
+        CONTAINER_CREATED=1
+    fi
+
     run pct start "$CTID"
 }
 
@@ -642,12 +655,16 @@ wait_for_network() {
         waited=$((waited + 1))
     done
 
-    fail "container $CTID got no IPv4 address in 60 seconds. Check the bridge and the address settings; the container is left as it is."
+    fail "container $CTID got no IPv4 address in 60 seconds. Check the bridge and the address settings."
 }
 
 install_in_container() {
     local args=(--yes --web-port "$WEB_PORT" --lists "$LISTS")
     local url
+
+    if [ -n "$BINARY_FILE" ]; then
+        args+=(--binary "$STAGING_DIR/$BINARY_ASSET")
+    fi
 
     if [ "${#UPSTREAM_URLS[@]}" -gt 0 ]; then
         for url in "${UPSTREAM_URLS[@]}"; do
@@ -682,7 +699,7 @@ install_in_container() {
     INSTALL_LOG=$TMP/install.log
 
     if ! pct exec "$CTID" -- sh "$STAGING_DIR/install.sh" "${args[@]}" 2>&1 | tee "$INSTALL_LOG"; then
-        fail "install.sh failed in container $CTID (see above). The container is left as it is; remove it with: pct stop $CTID; pct destroy $CTID"
+        fail "install.sh failed in container $CTID (see above)."
     fi
 
     pct exec "$CTID" -- rm -rf "$STAGING_DIR"
