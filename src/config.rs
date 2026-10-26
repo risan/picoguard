@@ -396,7 +396,7 @@ impl Default for ListConfig {
             path: None,
             format: ListFormat::Auto,
             refresh_hours: 24,
-            max_rules: 3_000_000,
+            max_rules: 1_500_000,
             max_body_bytes: 64 * 1024 * 1024,
             slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
             allow_redirects: false,
@@ -844,6 +844,7 @@ mod tests {
                 .iter()
                 .all(|list| list.slow_rule_budget == 8 * 1024 * 1024)
         );
+        assert!(config.lists.iter().all(|list| list.max_rules == 1_500_000));
         assert_eq!(
             config.upstream.servers,
             [
