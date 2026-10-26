@@ -1,0 +1,11 @@
+# A Debian with systemd and nothing that could ask DNS (no dig, nslookup, curl), as a
+# bare Debian device has it. scripts/test-update-helper.sh runs it privileged.
+FROM debian:13
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends systemd systemd-sysv procps \
+    && rm -rf /var/lib/apt/lists/* \
+    && systemctl set-default multi-user.target
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

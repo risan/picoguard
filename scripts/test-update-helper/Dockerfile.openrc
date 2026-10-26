@@ -1,0 +1,13 @@
+# An Alpine with OpenRC as the Proxmox LXC template has it, and no nslookup, so that
+# install.sh cannot ask DNS either. The LXC's `networking` service provides `net`;
+# `testnet` stands in for it.
+FROM alpine:3.24
+
+RUN apk add --no-cache openrc \
+    && rm -f /usr/bin/nslookup /bin/nslookup /usr/sbin/nslookup
+
+COPY testnet /etc/init.d/testnet
+COPY start.sh /start.sh
+RUN chmod 0755 /etc/init.d/testnet /start.sh
+
+CMD ["/start.sh"]
