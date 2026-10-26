@@ -21,7 +21,7 @@ use crate::cache::{Cache, CacheKey, EntryToken, Memo};
 use crate::config::{Cidr, Config, is_allowed};
 use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
 use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, rcode, rtype};
-use crate::filter::engine::{BlockedAnswer, Decision, blocked_answer};
+use crate::filter::engine::{BlockedAnswer, Decision, Verdict, blocked_answer};
 use crate::policy::{Policy, PolicyView};
 use crate::stats::{Event, QueryResult, Stats, StatsSettings};
 use crate::upstream::{Answered, UpstreamError, Upstreams};
@@ -631,8 +631,9 @@ impl Pipeline {
 
         let now = Instant::now();
         let view = self.policy.view(self.policy.now());
-        if let Decision::Block { ips } = view.check_request(&query) {
-            self.write_blocked(&reply, query.question.qtype, &ips, out);
+        let request_verdict = view.check_request(&query);
+        if let Verdict::Block { ips } = &request_verdict {
+            self.write_blocked(&reply, query.question.qtype, ips, out);
 
             return Ok(Settled::Blocked(record(counted_as(
                 out,
@@ -652,6 +653,7 @@ impl Pipeline {
             .filter(|memo| !view.paused && memo.generation == view.generation);
         let decision = match remembered {
             Some(memo) => memo.decision,
+            None if request_verdict == Verdict::Allow => Decision::Pass,
             None => view.check_response(hit.parts),
         };
         let result = match &decision {
@@ -703,13 +705,18 @@ impl Pipeline {
         out: &mut Vec<u8>,
     ) -> Counted {
         let view = self.policy.view(self.policy.now());
-        if let Decision::Block { ips } = view.check_request(query) {
-            self.write_blocked(reply, query.question.qtype, &ips, out);
+        let request_verdict = view.check_request(query);
+        if let Verdict::Block { ips } = &request_verdict {
+            self.write_blocked(reply, query.question.qtype, ips, out);
 
             return Counted::of(counted_as(out, QueryResult::BlockedRequest));
         }
 
-        let decision = view.check_response(delivery.parts());
+        let decision = if request_verdict == Verdict::Allow {
+            Decision::Pass
+        } else {
+            view.check_response(delivery.parts())
+        };
         if let Some(token) = delivery.cached_as {
             self.remember(
                 &mut self.cache.lock().unwrap(),
@@ -1193,6 +1200,45 @@ mod tests {
         let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut out);
         assert_eq!(quick, Quick::Replied);
         assert_eq!(&parse(&out).answers[0].data.to_string(), "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn an_allowed_request_skips_response_filtering_on_delivery_and_on_a_cache_hit() {
+        let mut config = Config::default();
+        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
+        let pipeline = Pipeline::new(&config, policy_of("@@||ok.example^\n||9.9.9.9^\n")).unwrap();
+
+        for (name, blocked) in [("ok.example.", false), ("other.example.", true)] {
+            let spec = QuerySpec::new(name, RecordType::A);
+            let request = spec.bytes();
+            let query = Query::parse(&request).unwrap();
+            let bytes = reply_with_address(&spec, [9, 9, 9, 9]);
+            let info = ResponseInfo::parse(&bytes).unwrap();
+            let token = pipeline.cache.lock().unwrap().insert(
+                &CacheKey::new(&query),
+                &bytes,
+                &info,
+                Instant::now(),
+            );
+            let delivery = Delivery::new(
+                bytes,
+                info,
+                token,
+                0,
+                Source::Upstream(None),
+                pipeline.budget.try_charge(1).unwrap(),
+            );
+            let reply = Reply::new(&query, pipeline.udp_size, Protocol::Udp);
+            let expected = if blocked { "0.0.0.0" } else { "9.9.9.9" };
+            let mut out = Vec::new();
+
+            pipeline.deliver(&query, &reply, &delivery, &mut out);
+            assert_eq!(&parse(&out).answers[0].data.to_string(), expected, "{name}");
+
+            let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut out);
+            assert_eq!(quick, Quick::Replied);
+            assert_eq!(&parse(&out).answers[0].data.to_string(), expected, "{name}");
+        }
     }
 
     #[tokio::test]

@@ -404,6 +404,18 @@ pub enum Decision {
     },
 }
 
+/// A [`Decision`] that also says whether an allow rule matched. AdGuard Home does not filter
+/// the response to a request that an allow rule matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// An allow rule matched: an allowlist, or an `@@` rule.
+    Allow,
+    Block {
+        ips: Vec<IpAddr>,
+    },
+    NoMatch,
+}
+
 /// The reply AdGuard's default blocking mode builds for a blocked name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockedAnswer {
@@ -921,8 +933,16 @@ impl Engine {
     /// checked as `record_type`: the question type for request filtering, or the type of
     /// the answer record being checked (CNAME, A, AAAA, HTTPS).
     pub fn check(&self, input: &str, record_type: u16, input_is_ip: bool) -> Decision {
+        match self.verdict(input, record_type, input_is_ip) {
+            Verdict::Block { ips } => Decision::Block { ips },
+            Verdict::Allow | Verdict::NoMatch => Decision::Pass,
+        }
+    }
+
+    /// `check`, telling a rule that allows the input from no rule at all.
+    pub fn verdict(&self, input: &str, record_type: u16, input_is_ip: bool) -> Verdict {
         if input.is_empty() {
-            return Decision::Pass;
+            return Verdict::NoMatch;
         }
 
         let host: Cow<'_, str> = if input.chars().any(char::is_uppercase) {
@@ -938,15 +958,15 @@ impl Engine {
 
         if self.allow.class(&query).is_some() || self.allow.host_rules(&host, record_type).is_some()
         {
-            return Decision::Pass;
+            return Verdict::Allow;
         }
 
         match self.main.class(&query) {
-            Some(Class::Allow | Class::ImportantAllow) => Decision::Pass,
-            Some(Class::Block | Class::ImportantBlock) => Decision::Block { ips: Vec::new() },
+            Some(Class::Allow | Class::ImportantAllow) => Verdict::Allow,
+            Some(Class::Block | Class::ImportantBlock) => Verdict::Block { ips: Vec::new() },
             None => match self.main.host_rules(&host, record_type) {
-                Some(ips) => Decision::Block { ips },
-                None => Decision::Pass,
+                Some(ips) => Verdict::Block { ips },
+                None => Verdict::NoMatch,
             },
         }
     }
@@ -1248,6 +1268,21 @@ mod tests {
         );
         assert!(!blocked(&engine, "x.example", TYPE_A));
         assert!(!blocked(&engine, "sub.x.example", TYPE_A));
+    }
+
+    #[test]
+    fn the_verdict_tells_an_allow_rule_from_no_rule() {
+        let engine = engine(
+            &[("@@||ok.example^\n||bad.example^\n", ListFormat::Adblock)],
+            &["||listed.example^\n"],
+        );
+        let verdict = |name| engine.verdict(name, TYPE_A, false);
+        assert_eq!(verdict("ok.example"), Verdict::Allow);
+        assert_eq!(verdict("sub.ok.example"), Verdict::Allow);
+        assert_eq!(verdict("listed.example"), Verdict::Allow);
+        assert_eq!(verdict("bad.example"), Verdict::Block { ips: Vec::new() });
+        assert_eq!(verdict("other.example"), Verdict::NoMatch);
+        assert_eq!(verdict(""), Verdict::NoMatch);
     }
 
     #[test]

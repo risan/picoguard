@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::dns::build::ReplyParts;
 use crate::dns::wire::{Query, RData, Records, Section};
-use crate::filter::engine::{Decision, Engine, TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_HTTPS};
+use crate::filter::engine::{Decision, Engine, TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_HTTPS, Verdict};
 
 /// The policy at one moment.
 #[derive(Clone)]
@@ -20,15 +20,15 @@ pub struct PolicyView {
 
 impl PolicyView {
     /// Step 2: the decision for the question of a client query. While paused everything
-    /// passes.
-    pub fn check_request(&self, query: &Query<'_>) -> Decision {
+    /// passes. `Verdict::Allow` means an allow rule matched: AdGuard Home then skips step 6.
+    pub fn check_request(&self, query: &Query<'_>) -> Verdict {
         let name = &query.question.name;
         if self.paused || name.is_root() {
-            return Decision::Pass;
+            return Verdict::NoMatch;
         }
 
         self.engine
-            .check(&name.to_string(), query.question.qtype, false)
+            .verdict(&name.to_string(), query.question.qtype, false)
     }
 
     /// Step 6: the decision for an upstream reply. The records of the answer section are
@@ -282,7 +282,7 @@ mod tests {
         assert_eq!(policy.view(Instant::now()).generation, 1);
     }
 
-    fn request_decision(view: &PolicyView, name: &str, rtype: RecordType) -> Decision {
+    fn request_decision(view: &PolicyView, name: &str, rtype: RecordType) -> Verdict {
         let packet = QuerySpec::new(name, rtype).bytes();
         let query = Query::parse(&packet).unwrap();
 
@@ -297,18 +297,43 @@ mod tests {
 
         assert!(matches!(
             request_decision(&view, "x.ads.example.", RecordType::A),
-            Decision::Block { .. }
+            Verdict::Block { .. }
         ));
         assert_eq!(
             request_decision(&view, "x.ads.example.", RecordType::AAAA),
-            Decision::Pass
+            Verdict::NoMatch
         );
-        assert_eq!(request_decision(&view, ".", RecordType::A), Decision::Pass);
+        assert_eq!(
+            request_decision(&view, ".", RecordType::A),
+            Verdict::NoMatch
+        );
 
         policy.pause(Duration::from_secs(5), now);
         assert_eq!(
             request_decision(&policy.view(now), "x.ads.example.", RecordType::A),
-            Decision::Pass
+            Verdict::NoMatch
+        );
+    }
+
+    #[test]
+    fn a_request_an_allow_rule_matched_is_told_from_one_nothing_matched() {
+        let policy = Policy::with_engine(engine("@@||ok.example^\n||ads.example^\n"));
+        let now = Instant::now();
+        let view = policy.view(now);
+
+        assert_eq!(
+            request_decision(&view, "ok.example.", RecordType::A),
+            Verdict::Allow
+        );
+        assert_eq!(
+            request_decision(&view, "other.example.", RecordType::A),
+            Verdict::NoMatch
+        );
+
+        policy.pause(Duration::from_secs(5), now);
+        assert_eq!(
+            request_decision(&policy.view(now), "ok.example.", RecordType::A),
+            Verdict::NoMatch
         );
     }
 

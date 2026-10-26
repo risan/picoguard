@@ -139,6 +139,10 @@ The same order as AdGuard Home:
 2. Otherwise, among all matching rules: `$important` allow, then `$important` block, then allow
    (`@@`), then block.
 
+When a rule allows the name that was asked (an allowlist, or `@@` in a list or in `rules`), the
+answer is not checked either: a CNAME target or an answer address that a blocklist matches does
+not block it, as in AdGuard Home.
+
 Your `rules` count as one more list. So `||example.com^$important` in a list still beats
 `@@||example.com^` in `rules`, as in AdGuard Home.
 
