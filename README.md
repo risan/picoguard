@@ -36,8 +36,9 @@ Then:
 2. Open the status page at `http://<address>:8080/` and log in as `admin` with the password the
    installer printed.
 
-To update, run `install.sh` again. It keeps your config, and it puts the old version back if the
-new one does not answer ([details](docs/install.md#update-picoguard)).
+To update, click **Update** on the status page when a newer release exists, or run `install.sh`
+again. Both keep your config and put the old version back if the new one does not answer
+([details](docs/install.md#update-picoguard)).
 
 ## What it blocks
 
@@ -119,8 +120,10 @@ container) and give both addresses to your router as primary and secondary DNS.
   last good copy.
 - Status page: totals and list status for everyone on the LAN; query log, top lists and pause
   only with the password.
-- The status page shows the version and, once a day, whether a newer release exists. Turn it off
-  with `[update] check = false`.
+- The status page shows the version and, once a day, whether a newer release exists, and installs
+  it with one click: the release is checked against a built-in signature key, a small root
+  installer swaps the binary, and the old version comes back if the new one does not answer DNS.
+  Turn the check and the button off with `[update] check = false`.
 - Almost no disk writes: the query log and statistics live in memory. The only routine write is
   the last good copy of a list, only when it changed, and it can be turned off.
 - Hardened service: its own system user, port 53 as the only privilege, and a systemd sandbox.
