@@ -88,6 +88,9 @@ lists are used.
 | `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A regex is charged the memory it really holds (about 8 KB for `/track[0-9]+/`, close to 1 MB for `/(\pL\|\pN){1,50}x/`), a wildcard rule 64 bytes for each of its parts. A list over it is not used. |
 
 Downloads use `If-None-Match` and `If-Modified-Since`. A failed download keeps the last good list.
+A list in `[[lists]]` that blocks any of three made-up check names (for example because of a rule
+like `||*^` or `/./`) is refused the same way: the last good copy stays and the status page shows the
+error. Allowlists and your own `rules` are not checked.
 A new list takes effect without a restart and without dropping queries. One list refreshes at a time.
 
 Example:

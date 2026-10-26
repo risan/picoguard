@@ -522,6 +522,73 @@ async fn a_downloaded_hosts_list_blocks_but_does_not_redirect_unless_the_list_al
 }
 
 #[tokio::test]
+async fn a_refresh_that_blocks_everything_keeps_the_last_good_list() {
+    capture_warnings();
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("broad", server.url("/l.txt"))]);
+    let (mut scheduler, _) = boot(&config).await;
+    scheduler.refresh(0, &downloader()).await;
+    let policy = scheduler.policy();
+    let in_force = Arc::clone(scheduler.list(0).unwrap());
+    let generation_before = generation(&policy);
+
+    for (version, broad) in ["||*^", "/./"].into_iter().enumerate() {
+        server.serve(
+            "/l.txt",
+            &format!("||ads.example^\n{broad}\n"),
+            Some(&format!("\"broad{version}\"")),
+        );
+        scheduler.refresh(0, &downloader()).await;
+
+        assert!(
+            Arc::ptr_eq(&in_force, scheduler.list(0).unwrap()),
+            "{broad}"
+        );
+        assert!(!blocked(&policy, "www.example.org."), "{broad}");
+        assert_eq!(generation(&policy), generation_before, "{broad}");
+    }
+
+    assert_eq!(warnings_about("broad"), 1, "one warning per streak");
+}
+
+#[tokio::test]
+async fn a_local_list_that_blocks_everything_is_refused_but_an_allowlist_may_allow_everything() {
+    let dir = StateDir::new();
+    fs::write(dir.file("allow.txt"), "||*^\n").unwrap();
+    fs::write(dir.file("block.txt"), "||*^\n").unwrap();
+    fs::write(dir.file("ads.txt"), "||ads.example^\n").unwrap();
+    let mut config = config_of(
+        &dir,
+        vec![
+            path_list(dir.file("block.txt")),
+            path_list(dir.file("ads.txt")),
+        ],
+    );
+    config.allowlists = vec![path_list(dir.file("allow.txt"))];
+
+    let (scheduler, _) = boot(&config).await;
+    let policy = scheduler.policy();
+
+    assert!(scheduler.list(0).is_none(), "the list is refused");
+    assert!(scheduler.list(1).is_some());
+    assert!(!blocked(&policy, "ads.example."), "the allowlist allows it");
+}
+
+#[tokio::test]
+async fn user_rules_that_block_everything_are_kept() {
+    let dir = StateDir::new();
+    let mut config = config_of(&dir, Vec::new());
+    config.rules = vec!["||*^".to_string()];
+
+    let (scheduler, _) = boot(&config).await;
+    let policy = scheduler.policy();
+
+    assert!(blocked(&policy, "www.example.org."));
+}
+
+#[tokio::test]
 async fn a_success_ends_a_failure_streak_and_the_next_failure_warns_again() {
     capture_warnings();
     let dir = StateDir::new();

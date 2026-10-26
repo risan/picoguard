@@ -645,6 +645,7 @@ impl Entry {
             key,
             options: CompileOptions {
                 allow_redirects: list.allow_redirects || list.url.is_none(),
+                check_canaries: role == Role::Blocklist,
                 slow_rule_budget: list.slow_rule_budget,
                 ..CompileOptions::new(list.format, list.max_rules)
             },

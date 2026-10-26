@@ -11,7 +11,9 @@ use std::sync::mpsc as std_mpsc;
 use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
-use super::engine::{CompiledList, Engine, ListBuilder, MAX_HOST_GROUPS, SlowRule};
+use super::engine::{
+    CompiledList, Decision, Engine, ListBuilder, MAX_HOST_GROUPS, SlowRule, TYPE_A,
+};
 use super::parse::{ListFormat, ParseSummary, Parser, Rule};
 use super::snapshot::{self, Snapshot, SnapshotError};
 use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
@@ -19,7 +21,7 @@ use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 /// Bump on every change to compiled output (what any list text compiles to, in the parser,
 /// the compiler or the snapshot encoding), however small: snapshots written by an older
 /// compiler are then ignored and the lists compile again (plan D14).
-pub const COMPILER_VERSION: u32 = 8;
+pub const COMPILER_VERSION: u32 = 9;
 
 /// Default memory budget of the slow rules of one list. Plan section 5 leaves about 8 MB
 /// between the steady total (20 MB) and the refresh peak (28 MB). The real lists are far
@@ -34,6 +36,10 @@ pub struct CompileOptions {
     /// False answers every host rule whose IP is not a null route with `0.0.0.0`, so the
     /// list can block names but not point them at another address.
     pub allow_redirects: bool,
+    /// Refuse a list that blocks any of the `CANARY_NAMES`: no real blocklist does, so a
+    /// list that does (`||*^`, `/./`) would take the whole network down. Only for lists that
+    /// block; an allowlist or the user's own rules may say what they like.
+    pub check_canaries: bool,
     /// Bytes the slow rules and regexes of the list may cost, as `SlowRuleBudget` estimates.
     /// A list over it fails to compile or to load; it never changes what a list means, so
     /// it is not part of the fingerprint.
@@ -46,10 +52,18 @@ impl CompileOptions {
             format,
             max_rules,
             allow_redirects: true,
+            check_canaries: false,
             slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
         }
     }
 }
+
+/// Names that no real blocklist blocks.
+const CANARY_NAMES: [&str; 3] = [
+    "pg-canary-7f3a9c.com",
+    "pg-canary-b41d20.net",
+    "pg-canary-e86c5f.org",
+];
 
 /// Estimated bytes of a compiled slow rule without its matcher: measured at 430 to 800
 /// bytes for a glob rule. The matcher is charged as it reports (`Matcher::cost_bytes`).
@@ -134,6 +148,8 @@ pub enum CompileError {
     /// The list has more rules than `CompileOptions::max_rules`. A cut-off copy would drop
     /// rules the list had before, so the list is refused instead.
     OverRuleCap,
+    /// The list blocks a canary name, so it would block (nearly) everything.
+    BlocksCanary,
 }
 
 /// A compile job that is waiting for text. Send the pieces, then `Piece::End`, then await
@@ -349,9 +365,13 @@ fn compile(
     }
 
     let content_hash = hasher.digest128();
+    let list = Arc::new(builder.finish(summary.format));
+    if options.check_canaries && blocks_a_canary(&list) {
+        return Err(CompileError::BlocksCanary);
+    }
 
     Ok(Compiled {
-        list: Arc::new(builder.finish(summary.format)),
+        list,
         fingerprint: snapshot::fingerprint(
             content_hash,
             options.format,
@@ -365,6 +385,14 @@ fn compile(
     })
 }
 
+fn blocks_a_canary(list: &Arc<CompiledList>) -> bool {
+    let engine = Engine::new(vec![Arc::clone(list)], Vec::new());
+
+    CANARY_NAMES
+        .iter()
+        .any(|name| engine.check(name, TYPE_A, false) != Decision::Pass)
+}
+
 #[cfg(test)]
 mod tests {
     use std::thread::ThreadId;
@@ -372,7 +400,6 @@ mod tests {
     use xxhash_rust::xxh3::xxh3_128;
 
     use super::*;
-    use crate::filter::engine::{Decision, Engine, TYPE_A};
 
     const LIST: &str = "||ads.example^\n@@||ok.ads.example^\n0.0.0.0 host.example\n/track[0-9]+/\n";
 
@@ -381,6 +408,7 @@ mod tests {
             format,
             max_rules: 1000,
             allow_redirects: true,
+            check_canaries: false,
             slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
         }
     }
@@ -595,6 +623,36 @@ mod tests {
         assert_eq!(ips_of(&blocked_only, "bank.example"), ip("0.0.0.0"));
         assert_eq!(ips_of(&blocked_only, "local.example"), ip("127.0.0.1"));
         assert_ne!(kept.fingerprint, blocked_only.fingerprint);
+    }
+
+    #[tokio::test]
+    async fn a_list_that_blocks_a_canary_name_fails_the_job_when_canaries_are_checked() {
+        let worker = CompileWorker::spawn().unwrap();
+        let checked = CompileOptions {
+            check_canaries: true,
+            ..options(ListFormat::Adblock)
+        };
+
+        for broad in [
+            "||*^",
+            "/./",
+            "||com^",
+            "||pg-canary-b41d20.net^",
+            "*canary*",
+        ] {
+            let text = format!("||ads.example^\n{broad}\n");
+
+            let refused = compile_in_pieces(&worker, checked, text.as_bytes(), 64).await;
+            let unchecked =
+                compile_in_pieces(&worker, options(ListFormat::Adblock), text.as_bytes(), 64).await;
+
+            assert_eq!(refused.err(), Some(CompileError::BlocksCanary), "{broad}");
+            assert!(unchecked.is_ok(), "{broad}");
+        }
+
+        let ordinary = "||ads.example^\n||*.tracker.example^\n/ads[0-9]+/\n0.0.0.0 bad.example\n";
+        let accepted = compile_in_pieces(&worker, checked, ordinary.as_bytes(), 64).await;
+        assert!(accepted.is_ok());
     }
 
     #[tokio::test]
