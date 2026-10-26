@@ -61,7 +61,7 @@ Not measured yet:
 
 ## Cache memory after v0.1.0
 
-Measured on a WSL2 x86_64 box with static musl release builds (the allocator of the boards), the
+Measured on a WSL2 x86_64 box with static musl release builds (built like the release binaries), the
 v0.1.0 lists (HaGeZi Pro and TIF mini, about 420k rules) and a fake UDP upstream that answers every
 query. The cache is the default 10,000 entries. RSS is `RssAnon` after replaying 12,000 unique
 queries of the real-network file, which fills the cache and evicts a few hundred entries. Boot is
@@ -85,3 +85,17 @@ The allocator behind these numbers is the one `cargo zigbuild` links: with zig 0
 binaries call Zig's own `malloc` (`SmpAllocator`), not musl's `mallocng`. Memory after a burst of
 misses depends on that allocator, so measure again when the zig version of the release build
 changes.
+
+## Merged build, default lists (2026-10-26)
+
+The same static musl build at commit 480e34d, after the cache change (the later review fixes do not
+touch the cache), on a busy WSL2 x86_64 box with a fake UDP upstream. Medians of three runs:
+
+| Workload | Empty cache (RSS) | Full 10,000-entry cache (RSS) | Peak |
+|---|---|---|---|
+| AdGuard DNS filter + HaGeZi Pro + TIF mini, 49,389 A/AAAA queries | 10.0 MB | 15.0 MB (14.8 to 16.5) | 15.0 MB |
+| The numa comparison lists (about 450k rules), 52,137 queries | 9.8 MB | 15.8 MB (14.1 to 16.0) | 15.8 MB |
+
+Before the cache change the first workload ended at 19.3 MB. `RssFile` moved between 1.5 and 3.4 MB
+from run to run on this box, so differences under 2 MB are noise. The CPU time of these runs is not
+comparable with the numa table above, because the upstream here is a fake one on the same machine.

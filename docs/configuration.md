@@ -241,8 +241,8 @@ Memory use is roughly:
 RSS  =  6.5 MB  +  8 bytes x rules  +  cache  (about 0.6 KB per entry)
 ```
 
-Measured: 450,000 rules and an empty cache gave 10.1 MB; the same lists with a full 10,000-entry
-cache gave 16.2 MB (see [benchmarks](benchmarks.md)). During a refresh, one list is held twice for a
+Measured: 450,000 rules and an empty cache gave 9.8 MB; the same lists with a full 10,000-entry
+cache gave 15.8 MB (see [benchmarks](benchmarks.md)). During a refresh, one list is held twice for a
 short time: add about 2 MB per large list, one list at a time.
 
 Lists that use many regex or wildcard rules cost more than 8 bytes per rule. The status page

@@ -52,7 +52,7 @@ candidate list set (2026-10-26):
 |---|---|---|
 | AdGuard DNS filter only (the AdGuard Home default) | 2,225 | — |
 | HaGeZi Pro + TIF mini | 2,525, but misses 84 that AdGuard blocks | 8.2 MB |
-| **AdGuard DNS + HaGeZi Pro + TIF mini (default)** | **2,606, misses none** | **11.4 MB (19.3 MB with a full cache)** |
+| **AdGuard DNS + HaGeZi Pro + TIF mini (default)** | **2,606, misses none** | **11.4 MB (15 to 16.5 MB with a full cache)** |
 | OISD big, OISD small or StevenBlack alone | 450 to 1,135 | — |
 
 So on the same lists picoguard blocks exactly what AdGuard Home blocks. With its default lists it
@@ -74,6 +74,9 @@ real queries (x86_64 container, 2026-10-25):
 | Steady memory (RSS) | 16.2 MB | 45.3 MB |
 | Peak memory | 16.3 MB | 58.5 MB |
 | CPU for the replay | 8.4 s | 66.1 s |
+
+These are v0.1.0 figures. A later change keeps each cache entry in one allocation, which saves
+up to about 5 MB with a full cache, depending on the run.
 
 AdGuard Home v0.107.79 used 80–93 MB on two home containers with only the AdGuard DNS filter (not
 the same workload, so not a benchmark). Details and method: [docs/benchmarks.md](docs/benchmarks.md).
