@@ -5,7 +5,20 @@ edition = "2024"
 description = "DNS ad and malware blocker for 256 MB boards"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-publish = false
+repository = "https://github.com/risan/picoguard"
+homepage = "https://github.com/risan/picoguard"
+keywords = ["dns", "adblock", "dns-over-https", "blocklist", "raspberry-pi"]
+categories = ["command-line-utilities", "network-programming"]
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/dist/picoguard.toml",
+    "/dist/release-key.der",
+]
 
 [[bin]]
 name = "picoguard"
@@ -18,6 +31,7 @@ http = "1.5.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", default-features = false, features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+libc = "0.2.191"
 log = "0.4.34"
 regex-automata = { version = "0.4.18", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "unicode-case", "unicode-gencat", "unicode-script", "perf-literal"] }
 ring = { version = "0.17.14", default-features = false }

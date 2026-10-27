@@ -14,19 +14,19 @@ Pick one path. Each one asks a few questions, then prints the address to give to
 | A Proxmox VE host | `bash proxmox-lxc.sh` (on the host) | [Proxmox LXC](docs/install.md#install-in-a-proxmox-lxc) |
 | A machine that already runs Docker | `docker compose up -d --build` | [Docker](docs/install.md#run-in-docker) |
 
-The repository is private for now, so get the release files with the GitHub CLI first
-(`gh auth login` once):
+One line downloads the installer, which downloads the binary and checks it:
 
 ```sh
-gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh -p proxmox-lxc.sh
-sudo sh install.sh            # on a board or VM
-bash proxmox-lxc.sh           # or: on the Proxmox host, creates an Alpine container
+curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh   # on a board or VM
+curl -fsSL https://github.com/risan/picoguard/releases/latest/download/proxmox-lxc.sh | bash  # or: on the Proxmox host, creates an Alpine container
 ```
 
-Once the repository is public, one line is enough:
+To read a script before you run it, download it first:
 
 ```sh
-curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh
+curl -fsSLO https://github.com/risan/picoguard/releases/latest/download/install.sh
+less install.sh
+sudo sh install.sh
 ```
 
 Then:
@@ -36,8 +36,9 @@ Then:
 2. Open the status page at `http://<address>:8080/` and log in as `admin` with the password the
    installer printed.
 
-To update, run `install.sh` again. It keeps your config, and it puts the old version back if the
-new one does not answer ([details](docs/install.md#update-picoguard)).
+To update, click **Update** on the status page when a newer release exists, or run `install.sh`
+again. Both keep your config and put the old version back if the new one does not answer
+([details](docs/install.md#update-picoguard)).
 
 ## What it blocks
 
@@ -119,6 +120,10 @@ container) and give both addresses to your router as primary and secondary DNS.
   last good copy.
 - Status page: totals and list status for everyone on the LAN; query log, top lists and pause
   only with the password.
+- The status page shows the version and, once a day, whether a newer release exists, and installs
+  it with one click: the release is checked against a built-in signature key, a small root
+  installer swaps the binary, and the old version comes back if the new one does not answer DNS.
+  Turn the check and the button off with `[update] check = false`.
 - Almost no disk writes: the query log and statistics live in memory. The only routine write is
   the last good copy of a list, only when it changed, and it can be turned off.
 - Hardened service: its own system user, port 53 as the only privilege, and a systemd sandbox.
@@ -131,12 +136,15 @@ container) and give both addresses to your router as primary and secondary DNS.
 - [docs/configuration.md](docs/configuration.md): every config key, the list formats, and which
   lists fit 256 MB, 512 MB and 1 GB.
 - [docs/benchmarks.md](docs/benchmarks.md): measurements and method.
+- [docs/releasing.md](docs/releasing.md): how a release is made and signed. The release public key
+  (`dist/release-key.der`) has the SHA-256 fingerprint
+  `5724aad59c1a5c73be060aaffe293b0b56e5092b71ebb0073e19b1c4238656cf`.
 - [dist/](dist/): example config, systemd unit, OpenRC script, Docker config.
 - [tools/README.md](tools/README.md): the AdGuard Home oracle tools behind the compatibility tests.
 
 ## Status
 
-Version 0.2.0 is released (private). Measured on x86_64 so far; numbers from a real ARM board
+Version 0.2.0 is released. Measured on x86_64 so far; numbers from a real ARM board
 are still to come.
 
 ## Known differences from AdGuard Home

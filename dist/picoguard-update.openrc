@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+
+description="Install a picoguard update that the status page staged"
+
+command=/usr/local/lib/picoguard/update
+command_args="watch openrc"
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+# No `need picoguard`: OpenRC restarts the services that need a restarted one, which would
+# stop the installer in the middle of the update that restarts picoguard.
+depend() {
+    after picoguard
+    use logger
+}

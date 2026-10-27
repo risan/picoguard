@@ -1,0 +1,24 @@
+[Unit]
+Description=Install a picoguard update that the status page staged
+# No Requires, BindsTo or PartOf: restarting picoguard must not stop the installer that asks
+# for it.
+After=picoguard.service
+# Every change of the request starts a pass, and a pass is cheap. With systemd's default limit
+# (5 starts in 10 seconds) a daemon that rewrites the request over and over would put this
+# unit, and the path unit with it, out of action until the next boot.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/picoguard/update run systemd
+TimeoutStartSec=10min
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin /var/lib/picoguard-update
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+# Also runs at boot: it finishes an update that a power loss interrupted.
+WantedBy=multi-user.target

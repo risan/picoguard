@@ -81,22 +81,25 @@ Check the CPU: `uname -m` must say `x86_64`.
 your CPU, checks its checksum, asks four questions, writes the config, frees port 53, installs the
 service (systemd or OpenRC) and starts it. Run it as root on the device.
 
-While the repository is private, download the release with the GitHub CLI (`gh auth login` once),
-on the device or on another computer:
-
-```sh
-gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh
-sudo sh install.sh
-```
-
-`install.sh` uses the `picoguard-<target>` file next to it and checks it with `SHA256SUMS`, which
-must be there too. If you downloaded on another computer, copy the three files to the device first.
-
-Once the repository is public, one line is enough. It downloads the binary and checks it:
+One line downloads the installer, which downloads the binary and checks it:
 
 ```sh
 curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh
 ```
+
+To read the script before you run it, download it first. Run it on the device, or on another
+computer and copy it over:
+
+```sh
+curl -fsSLO https://github.com/risan/picoguard/releases/latest/download/install.sh
+sudo sh install.sh
+```
+
+Without internet on the device, download `install.sh`, `SHA256SUMS` and the `picoguard-<target>`
+file for your CPU (the table at the top) from the
+[releases page](https://github.com/risan/picoguard/releases), copy the three files to one
+folder on the device and run `sudo sh install.sh` there. `install.sh` uses the
+`picoguard-<target>` file next to it and checks it with `SHA256SUMS`, which must be there too.
 
 The four questions (press Enter for the default; every question also has a flag, see
 `sh install.sh --help`):
@@ -142,7 +145,8 @@ Good to know:
   old file as `picoguard.toml.bak.<time>` first.
 - `--no-start` installs everything and starts nothing.
 - `--binary FILE` installs a binary you built yourself, without a checksum check. `--version vX.Y.Z` picks a release.
-- `sh install.sh --uninstall` removes the binary, the service and the systemd-resolved change. It
+- `sh install.sh --uninstall` removes the binary, the service, the update installer with its
+  trigger and folder (see "Update picoguard") and the systemd-resolved change. It
   keeps a `memory.conf` that it did not write.
   It keeps `/etc/picoguard` and `/var/lib/picoguard` unless you add `--purge`.
 
@@ -152,13 +156,6 @@ Good to know:
 container (1 core, 128 MB RAM, 1 GB disk, start at boot), copies the binary and `install.sh` into
 it and runs `install.sh` there. It never touches another container, and it refuses a container ID
 that exists.
-
-```sh
-gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh -p proxmox-lxc.sh
-bash proxmox-lxc.sh
-```
-
-Once the repository is public:
 
 ```sh
 curl -fsSL https://github.com/risan/picoguard/releases/latest/download/proxmox-lxc.sh | bash
@@ -180,7 +177,8 @@ fails, the script leaves the container in place and prints its ID and the `pct s
 `pct destroy` commands that remove it.
 
 The container is Alpine with OpenRC, so no systemd sandbox is involved. To update picoguard later,
-see "Update picoguard" below.
+click the **Update** button on the status page when a newer release exists, or see "Update
+picoguard" below.
 
 ### Run in Docker
 
@@ -192,8 +190,6 @@ git clone https://github.com/risan/picoguard && cd picoguard
 cp dist/picoguard.docker.toml picoguard.toml
 docker compose up -d --build
 ```
-
-(While the repository is private, clone it with `gh repo clone risan/picoguard`.)
 
 - Edit `picoguard.toml` for your upstreams, lists and router, then `docker compose restart`.
   It is mounted read-only. The list copies live in the volume `picoguard-state`.
@@ -213,15 +209,79 @@ docker compose up -d --build
 
 ### Update picoguard
 
+#### From the status page
+
+When a newer release exists, the status page says "update available". If you are signed in (set
+`web.user` and `web.password`), it also shows a button, **Update to vX.Y.Z**. The button needs a
+release binary that `install.sh` installed: `install.sh` also sets up the root program that
+installs the update ("the installer" below). A manual install, a Docker image and a build from
+source show the command to run instead.
+
+What one click does:
+
+1. picoguard downloads the release binary, `SHA256SUMS` and `SHA256SUMS.sig` from GitHub into
+   `/var/lib/picoguard/update/`, through your configured upstream servers.
+2. It checks the signature of `SHA256SUMS` against the release key built into the program, and the
+   binary against its hash there.
+3. The installer, which runs as root, copies the staged files out of that folder (picoguard can
+   write there, so nothing in it is trusted), checks all of it again, and runs
+   `picoguard --check` of the new version on your config. Anything wrong ends the update here with
+   nothing installed.
+4. It keeps a copy of the current binary, puts the new one at `/usr/local/bin/picoguard` in one
+   step (the file is always the whole old or the whole new binary) and restarts the service.
+5. Within 30 seconds the old, trusted binary asks picoguard for `example.com` at the address in
+   `[server] bind` (`picoguard dns-check`). A reply of `NOERROR` or `NXDOMAIN` keeps the new
+   version. Otherwise the installer puts the previous binary back, restarts it and asks again.
+
+The page shows how it ended:
+
+| The page says | What happened |
+|---|---|
+| Updated to vX.Y.Z | The new version answers. |
+| Rolled back: *reason* | The new version did not start or did not answer within 30 seconds; the reason says which, and whether the previous version answers again. |
+| Update failed: *reason* | Nothing was installed. The reason names the step: the signature, the hash, the version, your config with the new version, a disk error, or "the installer did not answer within 10 minutes". |
+
+If the installer is stopped part way (killed, or the power fails), its next run (at boot, or when
+you start it) finishes the update first: it keeps the new version when it answers and puts the old
+one back when it does not, or reports that it was interrupted when nothing had been installed yet.
+
+What is on the device for this (`install.sh` writes and replaces all of it):
+
+| Path | What |
+|---|---|
+| `/usr/local/lib/picoguard/update` and `common.sh` | The installer and the shell functions it shares with `install.sh`. Owned by root. |
+| `/etc/systemd/system/picoguard-update.path` and `.service` | systemd: the path unit starts the installer when `/var/lib/picoguard/update/request` changes, and the service runs once at boot. |
+| `/etc/init.d/picoguard-update` | OpenRC: a root service that looks for a request every 5 seconds (two small processes, under 1 MB of memory together, and no disk writes while idle). |
+| `/var/lib/picoguard-update/` | Its lock, the answer (`result`), and while an update runs its record, the previous binary and the verified copy. Owned by root; picoguard can read `result` but cannot write in the folder or open its lock. |
+
+The service file of picoguard itself does not change: it still cannot write its binary, `/etc` or
+the installer's folder.
+
+Good to know:
+
+- **Disk writes.** One update writes about four copies of the binary (about 4 MB each): the staged
+  file, the verified copy, the backup of the old one and the new one at `/usr/local/bin`. The
+  extra files are gone when it ends. On an SD card that is nothing next to the list downloads.
+- **Only the binary changes.** A page update replaces `/usr/local/bin/picoguard`. The installer,
+  its units, the service file and your config change only when you run `install.sh`.
+- **`state.dir` must stay `/var/lib/picoguard`.** The installer watches that fixed path. With
+  another `state.dir` the page waits 10 minutes and ends with "the installer did not answer".
+- **`allow_from` must let the device ask itself.** The check asks from the device. The default
+  covers `127.0.0.0/8` and `::1`. If you narrowed `server.allow_from` so that the device's own
+  address is out, every update ends rolled back.
+- **Turn it off.** `[update] check = false` in the config: no daily check, so no "update
+  available" and no button. To also remove the trigger: on systemd,
+  `systemctl disable --now picoguard-update.path picoguard-update.service`; on OpenRC,
+  `rc-service picoguard-update stop && rc-update del picoguard-update`. `install.sh` brings the
+  trigger back the next time you run it, and `install.sh --uninstall` removes it.
+- `install.sh` and the installer never change the binary at the same moment: `install.sh` waits
+  up to 5 minutes for an update that is running, and an update that starts while `install.sh`
+  runs waits until it ends.
+
+#### With install.sh
+
 Run `install.sh` again. It downloads the latest release (or uses the files next to it), replaces
 the binary, keeps your config and restarts the service:
-
-```sh
-gh release download -R risan/picoguard -p 'picoguard-*' -p SHA256SUMS -p install.sh --clobber
-sudo sh install.sh
-```
-
-or, once the repository is public:
 
 ```sh
 curl -fsSL https://github.com/risan/picoguard/releases/latest/download/install.sh | sudo sh
@@ -237,20 +297,15 @@ or enter the container with `pct enter` and run the commands above. For Docker:
 These are the steps that `install.sh` automates. Use them when you want to see each one, or when
 your system has neither systemd nor OpenRC. Run them as root (`sudo -i`) on the device.
 
+A manual install has no **Update** button: the page offers it only when the installer of "Update
+picoguard" is set up as well, and these steps do not set it up. Run `install.sh` once over it to
+get the button, or update by hand.
+
 #### Download and check the binary
 
 `SHA256SUMS` lists the checksums of the release files. Replace `TARGET` with the name from the table at the top (for example `aarch64-unknown-linux-musl`).
 
-The repository is private for now, so a plain download needs a login. Use the GitHub CLI
-(`gh auth login` once), on the board or on another computer:
-
-```sh
-cd /tmp
-gh release download v0.2.0 -R risan/picoguard -p "picoguard-TARGET" -p SHA256SUMS
-sha256sum -c --ignore-missing SHA256SUMS
-```
-
-When the repository is public, `wget` works without a login:
+Download the two files on the board or on another computer:
 
 ```sh
 cd /tmp
@@ -260,6 +315,39 @@ sha256sum -c --ignore-missing SHA256SUMS
 ```
 
 You must see `picoguard-TARGET: OK`. If you see `FAILED`, do not use the file. Download it again.
+
+#### Check the signature
+
+Releases from v0.3.0 on also carry `SHA256SUMS.sig`, an Ed25519 signature of `SHA256SUMS` made
+with the project's release key. The checksum only shows that the files match `SHA256SUMS`; the
+signature shows that `SHA256SUMS` itself comes from the release workflow. You need OpenSSL 3.
+Take every file from the same version (here `v0.3.0`), in a new folder:
+
+```sh
+mkdir signed && cd signed
+base="https://github.com/risan/picoguard/releases/download/v0.3.0"
+wget "$base/picoguard-TARGET" "$base/SHA256SUMS" "$base/SHA256SUMS.sig"
+wget "https://raw.githubusercontent.com/risan/picoguard/main/dist/release-key.der"
+sha256sum release-key.der
+```
+
+The fingerprint must be
+
+```
+5724aad59c1a5c73be060aaffe293b0b56e5092b71ebb0073e19b1c4238656cf
+```
+
+the same as in the [README](../README.md#documentation). If it differs, stop: do not trust that
+key file. Then check the signature:
+
+```sh
+openssl pkeyutl -verify -pubin -inkey release-key.der -keyform DER \
+    -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
+```
+
+You must see `Signature Verified Successfully`. Anything else means `SHA256SUMS` is not the
+one the project signed. Do not use the files. Last, in the same folder, check the binary against
+the signed list: `sha256sum -c --ignore-missing SHA256SUMS`.
 
 You can also build the binaries yourself on another computer with `scripts/build-release.sh`
 (needs Rust, `cargo-zigbuild` and `zig`). They land in `dist/bin/<target>/picoguard`.
@@ -569,6 +657,25 @@ apt install chrony
 
 or enable `systemd-timesyncd` (`systemctl enable --now systemd-timesyncd`). Check with `date`.
 Restart picoguard once the time is right: `systemctl restart picoguard`.
+
+**The page says "the installer did not answer within 10 minutes".**
+The Update button staged the files, but nothing installed them. Check, in this order:
+- the trigger runs: `systemctl status picoguard-update.path` (systemd) or
+  `rc-service picoguard-update status` (OpenRC). If it is missing or stopped, run `install.sh`
+  again: it installs and starts it;
+- `state.dir` is `/var/lib/picoguard`; the installer does not look anywhere else;
+- the installer's log: `journalctl -u picoguard-update` (systemd) or `/var/log/messages` (OpenRC,
+  when a syslog runs). It logs one line per update, and "the installed picoguard cannot verify
+  updates" when the binary in place is too old to be updated from the page; run `install.sh`
+  then.
+
+**The page says "Rolled back".**
+The new version was installed, but it did not start or did not answer a lookup of `example.com`
+within 30 seconds, so the old version is back. The reason on the page says which. Look at
+`journalctl -u picoguard` (systemd) or `/var/log/messages` (OpenRC) for what the new version said.
+A common cause is a config that the new version accepts but that blocks the device's own lookup:
+the installer asks from the device itself, so `server.allow_from` must cover `127.0.0.0/8` (or the
+address picoguard listens on). The update stays available: fix the cause, then click again.
 
 **Check the config before a restart.**
 `picoguard --check -c /etc/picoguard/picoguard.toml`. It names the first bad key.

@@ -9,11 +9,13 @@
   color-scheme: light dark;
   --bg: #f4f6f9; --card: #fff; --text: #1b2230; --muted: #667085; --line: #e3e7ee;
   --accent: #2563eb; --blocked: #dc2626; --good: #16a34a; --warn: #b45309;
+  --on-accent: #fff;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #0f131a; --card: #171d27; --text: #e5e8ee; --muted: #8b95a7; --line: #283142;
     --accent: #6ea0ff; --blocked: #f87171; --good: #4ade80; --warn: #fbbf24;
+    --on-accent: #0f131a;
   }
 }
 * { box-sizing: border-box; }
@@ -24,8 +26,11 @@ main { max-width: 1000px; margin: 0 auto; display: grid; gap: 12px; }
 header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 h1 { font-size: 20px; margin: 0; flex: 1; }
 h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+h1 small { font-size: 13px; font-weight: 400; color: var(--muted); }
 h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; }
 section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-width: 0; }
+code { display: block; font-size: 13px; word-break: break-all; }
+#update-notes, #install-state { overflow-wrap: anywhere; }
 #state { font-size: 13px; color: var(--muted); }
 #state.bad { color: var(--blocked); }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
@@ -51,7 +56,7 @@ td.name { word-break: break-all; }
 button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line);
   background: var(--card); color: var(--text); cursor: pointer; }
 button:hover { border-color: var(--accent); }
-button.go { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.go { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 #resume { display: none; }
 .paused #resume { display: inline-block; }
 .r-blocked_request, .r-blocked_response { color: var(--blocked); }
@@ -64,9 +69,18 @@ button.go { background: var(--accent); border-color: var(--accent); color: #fff;
 <body>
 <main>
   <header>
-    <h1>picoguard</h1>
+    <h1>picoguard <small id="version"></small></h1>
     <span id="state">connecting</span>
   </header>
+
+  <section id="update" hidden>
+    <h2>Update</h2>
+    <p id="update-text"></p>
+    <p id="update-notes"></p>
+    <p id="install-state"></p>
+    <button id="install" class="go" hidden>Update</button>
+    <code id="update-how"></code>
+  </section>
 
   <section id="limited" hidden>
     <h2>Read-only</h2>
@@ -121,7 +135,17 @@ const QTYPES = { 1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16:
   28: "AAAA", 33: "SRV", 64: "SVCB", 65: "HTTPS", 255: "ANY" };
 const RESULTS = { pass: "upstream", cached: "cached", blocked_request: "blocked",
   blocked_response: "blocked (answer)", error: "error" };
+const INSTALL_TEXT = {
+  checking: () => "Checking the release...",
+  downloading: (i) => "Downloading " + (i.bytes / 1048576).toFixed(1) + " MB...",
+  verifying: () => "Verifying...",
+  waiting: () => "Installing, picoguard restarts...",
+  updated: (i) => "Updated to v" + i.version,
+  rolled_back: (i) => "Rolled back: " + i.reason,
+  failed: (i) => "Update failed: " + i.reason,
+};
 let pausedUntil = null;
+let latestVersion = null;
 
 // Names and errors come from the network: only ever set as text.
 function el(tag, text, className) {
@@ -284,6 +308,27 @@ function tick() {
     : "Blocking is on.";
 }
 
+function showUpdate(status) {
+  $("version").textContent = "v" + status.version;
+  $("update").hidden = !status.update.latest && !status.update.install;
+  $("update-text").textContent = status.update.latest ? "update available: v" + status.update.latest : "";
+  $("update-notes").textContent = status.update.notes || "";
+  $("update-notes").hidden = !status.update.notes;
+  $("update-how").textContent = status.update.how || "";
+  showInstall(status.update);
+}
+
+function showInstall(update) {
+  const install = update.install;
+  latestVersion = update.latest || null;
+  $("install-state").textContent = install ? (INSTALL_TEXT[install.state] || (() => ""))(install) : "";
+  $("install").hidden = !update.can_install;
+
+  if (update.can_install) {
+    $("install").textContent = "Update to v" + latestVersion;
+  }
+}
+
 // Without a password the server answers 403 to everything but totals and lists.
 function showLimited(note) {
   $("limited-note").textContent = note || "";
@@ -294,6 +339,7 @@ function showLimited(note) {
 async function update() {
   try {
     const status = await api("/api/status");
+    showUpdate(status);
     showLimited(status.limited);
     showCards(status.counters, status.blocked_percent);
     showChart(status.hourly);
@@ -335,6 +381,11 @@ document.querySelectorAll("button[data-minutes]").forEach((button) =>
   button.addEventListener("click", () =>
     act("/api/pause", { minutes: Number(button.dataset.minutes) })));
 $("resume").addEventListener("click", () => act("/api/resume", {}));
+$("install").addEventListener("click", () => {
+  if (confirm("Install v" + latestVersion + "? picoguard restarts.")) {
+    act("/api/update", { version: latestVersion });
+  }
+});
 $("refresh").addEventListener("click", () =>
   act("/api/lists/refresh", {}, "Refresh started; the table updates as lists finish."));
 
