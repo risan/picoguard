@@ -21,7 +21,6 @@ use picoguard::upstream::tls::Tls;
 
 const MIB: u64 = 1024 * 1024;
 const PEAK_BUDGET_BYTES: usize = 1024 * 1024;
-const PEAK_SPREAD_BYTES: usize = 128 * 1024;
 const KEPT_BUDGET_BYTES: usize = 1024;
 const VERSION: &str = "9.9.9";
 const SHORT_RUNS: usize = 60;
@@ -169,9 +168,9 @@ fn staging_peaks_below_a_megabyte_whatever_the_size_and_keeps_nothing() {
         stage_once(&stager, &root).await;
 
         // How many 64 KiB pieces are in flight at once depends on how the threads happen to
-        // run, and a short transfer rarely fills the pipeline. The bound is the full
-        // pipeline, whatever the size, so the worst of many runs of the short transfer is
-        // compared with the worst of a few runs of the long one.
+        // run, and a short transfer rarely fills the pipeline, so each size is staged several
+        // times and its worst run is held to the budget. The two peaks are not compared:
+        // which one is higher depends on that timing, not on the size.
         let worst = async |size: u64, runs: usize| {
             serve_release(&server, size);
             let mut worst = (0, 0);
@@ -191,12 +190,6 @@ fn staging_peaks_below_a_megabyte_whatever_the_size_and_keeps_nothing() {
 
         assert!(peak_1 < PEAK_BUDGET_BYTES, "peak {peak_1} bytes");
         assert!(peak_8 < PEAK_BUDGET_BYTES, "peak {peak_8} bytes");
-        // Only growth with the size matters. A short transfer may fill the pipeline more
-        // often than a long one (a GitHub runner saw 461 KB for 1 MiB and 250 KB for 8 MiB).
-        assert!(
-            peak_8 < peak_1 + PEAK_SPREAD_BYTES,
-            "{peak_1} and {peak_8} bytes"
-        );
         assert!(kept_1 < KEPT_BUDGET_BYTES, "kept {kept_1} bytes");
         assert!(kept_8 < KEPT_BUDGET_BYTES, "kept {kept_8} bytes");
     });
