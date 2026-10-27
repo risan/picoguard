@@ -245,7 +245,7 @@ What the check does:
   then once a day. It goes through your configured `[upstream]` servers like a list download and
   keeps nothing on disk.
 - It sends a plain GET whose only identifying part is picoguard's User-Agent, which holds the
-  version (`picoguard/0.3.0`), and, from the second check on, the ETag of the last answer. No
+  version (`picoguard/0.3.1`), and, from the second check on, the ETag of the last answer. No
   cookie, no token, no account.
 - A failed check is logged once at `warn` (a missing release at `info`) and changes nothing on the
   page. It never affects DNS answers.
