@@ -776,7 +776,9 @@ rollback_fails_then_recovers() {
 
     expect_result "$STAGED_ID" rolled-back "runs again"
     same_file "$B" "$REAL" || fail "$B is not the real binary"
-    [ ! -e "$I/installing" ] && [ ! -e "$I/previous" ] || fail "the record or the backup is still there"
+    if [ -e "$I/installing" ] || [ -e "$I/previous" ]; then
+        fail "the record or the backup is still there"
+    fi
 }
 
 install_files() {
