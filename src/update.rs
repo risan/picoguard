@@ -612,7 +612,7 @@ mod tests {
     fn the_running_version_parses() {
         assert!(matches!(
             parse_tag(env!("CARGO_PKG_VERSION")),
-            Tag::Release(_)
+            Tag::Release(_) | Tag::Suffixed
         ));
         assert!(parse_running(env!("CARGO_PKG_VERSION")).is_some());
     }

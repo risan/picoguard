@@ -11,7 +11,9 @@ use std::time::Duration;
 use common::http::ListServer;
 use picoguard::config::{Config, UpdateConfig, WebConfig};
 use picoguard::lists::Downloader;
-use picoguard::update::{Build, CheckTiming, Checker, Failure, Latest, Outcome, Updates, start};
+use picoguard::update::{
+    Build, CheckTiming, Checker, Failure, Latest, Outcome, Updates, parse_running, start,
+};
 use picoguard::upstream::tls::Tls;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -118,7 +120,15 @@ async fn a_304_after_an_invalid_answer_repeats_the_invalid_outcome() {
 
 #[tokio::test]
 async fn an_older_or_equal_release_clears_the_notice() {
-    for tag in ["v0.0.1", env!("CARGO_PKG_VERSION"), "v0.0.0"] {
+    let running = env!("CARGO_PKG_VERSION");
+    let mut tags = vec!["v0.0.1".to_string(), "v0.0.0".to_string()];
+    // A pre-release build is older than its own release, so only a stable build has an
+    // equal tag; build metadata is dropped because a tag with it is ignored.
+    if !running.contains('-') {
+        tags.push(parse_running(running).unwrap().to_string());
+    }
+
+    for tag in &tags {
         let (server, mut checker, updates) = with_newer_release().await;
         server.serve_typed(PATH, &answer(tag), None, JSON);
 

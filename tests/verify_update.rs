@@ -15,12 +15,15 @@ use common::release::{
 use picoguard::release::{Refusal, VerifySetup, verify_update};
 
 const OFFERED: &str = "9.9.9";
+// Fixed rather than this build's version, which a pre-release would make unusable in
+// a request.
+const RUNNING: &str = "1.0.0";
 
 fn setup() -> VerifySetup {
     VerifySetup {
         key: test_key(),
         target: Some(TARGET),
-        running: env!("CARGO_PKG_VERSION"),
+        running: RUNNING,
     }
 }
 
@@ -128,9 +131,17 @@ fn each_bad_update_is_refused_and_leaves_nothing() {
             mentions: "request",
         },
         Case {
-            name: "version-not-newer",
+            name: "version-equal",
             tweak: nothing,
-            version: env!("CARGO_PKG_VERSION"),
+            version: RUNNING,
+            after: keep,
+            request_is_valid: true,
+            mentions: "not newer",
+        },
+        Case {
+            name: "version-older",
+            tweak: nothing,
+            version: "0.9.0",
             after: keep,
             request_is_valid: true,
             mentions: "not newer",

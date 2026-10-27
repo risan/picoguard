@@ -524,24 +524,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_that_the_socket_cannot_take_now_is_dropped_not_waited_for() {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(SocketProtocol::UDP)).unwrap();
-        socket.set_send_buffer_size(1).unwrap();
-        socket.set_nonblocking(true).unwrap();
-        socket
-            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
-            .unwrap();
-        let socket = UdpSocket::from_std(socket.into()).unwrap();
+    async fn a_reply_the_socket_is_not_ready_for_is_dropped_not_waited_for() {
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        std_socket.set_nonblocking(true).unwrap();
         let receiver_that_never_reads = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let peer = receiver_that_never_reads.local_addr().unwrap();
+        // A full send buffer cannot be forced on every kernel (a GitHub runner's loopback
+        // never pushes back), but a socket the reactor has not yet seen as writable takes
+        // the same would-block path. Nothing awaits before the first send.
+        let socket = UdpSocket::from_std(std_socket).unwrap();
+
+        assert!(
+            !send_now(&socket, &[0u8; 1000], peer),
+            "a socket that is not ready drops"
+        );
+
         socket.writable().await.unwrap();
 
-        let sent: Vec<bool> = (0..100)
-            .map(|_| send_now(&socket, &[0u8; 1000], peer))
-            .collect();
-
-        assert!(sent[0], "an idle socket sends");
-        assert!(sent.contains(&false), "a full send buffer drops");
+        assert!(
+            send_now(&socket, &[0u8; 1000], peer),
+            "a ready socket sends"
+        );
+        assert!(
+            !send_now(&socket, &[0u8; 70_000], peer),
+            "a datagram the socket refuses is dropped"
+        );
     }
 
     #[test]
