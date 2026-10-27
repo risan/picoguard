@@ -3,6 +3,7 @@
 //! only this one test.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -14,9 +15,21 @@ struct CountingAllocator;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    // Only the recording thread is counted: the test harness may allocate on its own
+    // threads at any time (seen on a GitHub runner).
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn count() {
+    if COUNTING.with(Cell::get) {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        count();
 
         unsafe { System.alloc(layout) }
     }
@@ -26,7 +39,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        count();
 
         unsafe { System.realloc(pointer, layout, new_size) }
     }
@@ -73,9 +86,10 @@ fn recording_a_query_allocates_nothing_once_the_ring_is_warm() {
     record_all(&stats, &names_for(LOG_ENTRIES * 4));
     let names = names_for(5_000);
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    COUNTING.with(|counting| counting.set(true));
     record_all(&stats, &names);
-    let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    COUNTING.with(|counting| counting.set(false));
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
 
     assert_eq!(allocations, 0, "allocations while recording 5000 queries");
     assert_eq!(stats.query_log(usize::MAX).len(), LOG_ENTRIES);

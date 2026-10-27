@@ -40,4 +40,5 @@ fi
 
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+# Every failing test binary is reported in one run, not only the first.
+cargo test --locked --no-fail-fast
