@@ -54,7 +54,9 @@ Container:
   --ip CIDR|dhcp         For example 192.168.1.50/24. Default: dhcp. A fixed address is better:
                          this container becomes the DNS server of your network.
   --gateway IP           Gateway for a fixed address (default: the host's gateway).
-  --nameserver IP        DNS server of the container itself (default: the host's).
+  --nameserver "IP ..."  DNS servers of the container itself, space-separated (default: 127.0.0.1,
+                         which is picoguard, then the host's DNS server, or 1.1.1.1 when the
+                         host's is on loopback or a Tailscale address).
 
 picoguard (passed on to install.sh):
   --binary FILE          Use this binary, unchecked (install.sh gets it with --binary). Otherwise a
@@ -312,8 +314,26 @@ default_storage() {
     fi
 }
 
+# A host resolver on loopback, or on a Tailscale address (MagicDNS is 100.100.100.100 in
+# 100.64.0.0/10, or fd7a:115c:a1e0::53), is not reachable from inside the container.
 host_nameserver() {
-    awk '$1 == "nameserver" && $2 !~ /^127\./ { print $2; exit }' /etc/resolv.conf 2>/dev/null || true
+    awk '
+        $1 != "nameserver" { next }
+        { address = tolower($2) }
+        address ~ /^127\./ || address == "::1" { next }
+        address ~ /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./ || address ~ /^fd7a:115c:a1e0:/ { next }
+        { print $2; exit }
+    ' /etc/resolv.conf 2>/dev/null || true
+}
+
+# Only the container's own lookups (apk, for example) use these, never the network's. musl asks
+# both servers at once and takes the first answer, so the second one also covers the install,
+# before picoguard runs, and any time picoguard is down.
+default_nameservers() {
+    local fallback
+
+    fallback=$(host_nameserver)
+    printf '127.0.0.1 %s' "${fallback:-1.1.1.1}"
 }
 
 host_gateway() {
@@ -364,7 +384,7 @@ ask_container_settings() {
         warn "DHCP: reserve this container's address in your router, or the DNS server may move."
     fi
 
-    prompt NAMESERVER "DNS server for the container itself" "$(host_nameserver || true)"
+    prompt NAMESERVER "DNS servers for the container itself" "$(default_nameservers)"
 
     local name
 
@@ -380,10 +400,6 @@ ask_container_settings() {
 
     if [ -z "$STORAGE" ] || [ -z "$TEMPLATE_STORAGE" ]; then
         fail "no storage found for the root disk or the template. Pass --storage and --template-storage."
-    fi
-
-    if [ -z "$NAMESERVER" ]; then
-        NAMESERVER=1.1.1.1
     fi
 }
 
