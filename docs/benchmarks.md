@@ -26,7 +26,7 @@ rules, which is about 3.6 MB of rule arrays.
 
 ## Method
 
-- **Box.** Proxmox container 104, Alpine 3.24, x86_64, 1 core, 256 MB RAM, no swap. Each server ran
+- **Box.** A Proxmox container, Alpine 3.24, x86_64, 1 core, 256 MB RAM, no swap. Each server ran
   alone on port 53.
 - **Workload.** 52,137 unique (name, type) pairs from the AdGuard Home query log of a real home
   network. They were replayed by 16 parallel `dig -f` clients with

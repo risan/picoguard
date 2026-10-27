@@ -12,7 +12,7 @@ Pick one path. Each one asks a few questions, then prints the address to give to
 |---|---|---|
 | A board (TV box, Orange Pi, Raspberry Pi 2+) or any Linux VM | `sudo sh install.sh` | [install.sh](docs/install.md#install-on-a-board-or-vm-with-installsh) |
 | A Proxmox VE host | `bash proxmox-lxc.sh` (on the host) | [Proxmox LXC](docs/install.md#install-in-a-proxmox-lxc) |
-| A machine that already runs Docker | `docker compose up -d --build` | [Docker](docs/install.md#run-in-docker) |
+| A machine that already runs Docker | `docker compose up -d --build` (in a clone of this repository) | [Docker](docs/install.md#run-in-docker) |
 
 One line downloads the installer, which downloads the binary and checks it:
 
@@ -36,9 +36,10 @@ Then:
 2. Open the status page at `http://<address>:8080/` and log in as `admin` with the password the
    installer printed.
 
-To update, click **Update** on the status page when a newer release exists, or run `install.sh`
-again. Both keep your config and put the old version back if the new one does not answer
-([details](docs/install.md#update-picoguard)).
+To update, click **Update** on the status page when it shows a newer release (from v0.3.0 on), or
+run `install.sh` again. Both keep your config and put the old version back if the new one does not
+answer DNS ([details](docs/install.md#update-picoguard)). To turn the update check off, set
+`[update] check = false`.
 
 ## What it blocks
 
@@ -46,8 +47,8 @@ The default lists are the [AdGuard DNS filter](https://github.com/AdguardTeam/Ad
 (the AdGuard Home default), [HaGeZi Pro](https://github.com/hagezi/dns-blocklists) (ads, trackers,
 telemetry) and HaGeZi Threat Intelligence Feeds mini (malware, phishing, scam).
 
-We replayed 52,137 real queries of one household through AdGuard's own matching engine with each
-candidate list set (2026-10-26):
+We replayed 52,137 real DNS queries from a home network through AdGuard's own matching engine with
+each candidate list set (2026-10-26):
 
 | Lists | Names blocked | picoguard memory, empty cache |
 |---|---|---|
@@ -70,7 +71,7 @@ domains, wildcard domains, dnsmasq and RPZ. To change lists, see
 On the same lists (about 450k rules), the same 10,000-entry cache and the same replay of 52,137
 real queries (x86_64 container, 2026-10-25):
 
-| | picoguard | numa v0.25.0 |
+| | picoguard | numa v0.25.0 (another small DNS blocker) |
 |---|---|---|
 | Steady memory (RSS) | 16.2 MB | 45.3 MB |
 | Peak memory | 16.3 MB | 58.5 MB |
@@ -79,8 +80,9 @@ real queries (x86_64 container, 2026-10-25):
 These are v0.1.0 figures. A later change keeps each cache entry in one allocation, which saves
 up to about 5 MB with a full cache, depending on the run.
 
-AdGuard Home v0.107.79 used 80–93 MB on two home containers with only the AdGuard DNS filter (not
-the same workload, so not a benchmark). Details and method: [docs/benchmarks.md](docs/benchmarks.md).
+For a rough idea, AdGuard Home v0.107.79 with only the AdGuard DNS filter was seen at 80–93 MB in
+everyday use (a different workload, so not a benchmark). Details and method:
+[docs/benchmarks.md](docs/benchmarks.md).
 
 ## Replacing AdGuard Home
 
