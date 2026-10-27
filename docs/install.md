@@ -309,8 +309,8 @@ Download the two files on the board or on another computer:
 
 ```sh
 cd /tmp
-wget "https://github.com/risan/picoguard/releases/download/v0.2.0/picoguard-TARGET"
-wget "https://github.com/risan/picoguard/releases/download/v0.2.0/SHA256SUMS"
+wget "https://github.com/risan/picoguard/releases/download/v0.3.0/picoguard-TARGET"
+wget "https://github.com/risan/picoguard/releases/download/v0.3.0/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS
 ```
 
