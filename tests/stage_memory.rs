@@ -191,8 +191,10 @@ fn staging_peaks_below_a_megabyte_whatever_the_size_and_keeps_nothing() {
 
         assert!(peak_1 < PEAK_BUDGET_BYTES, "peak {peak_1} bytes");
         assert!(peak_8 < PEAK_BUDGET_BYTES, "peak {peak_8} bytes");
+        // Only growth with the size matters. A short transfer may fill the pipeline more
+        // often than a long one (a GitHub runner saw 461 KB for 1 MiB and 250 KB for 8 MiB).
         assert!(
-            peak_1.abs_diff(peak_8) < PEAK_SPREAD_BYTES,
+            peak_8 < peak_1 + PEAK_SPREAD_BYTES,
             "{peak_1} and {peak_8} bytes"
         );
         assert!(kept_1 < KEPT_BUDGET_BYTES, "kept {kept_1} bytes");
