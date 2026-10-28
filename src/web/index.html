@@ -92,6 +92,10 @@ td.name { overflow-wrap: anywhere; }
 .pause p { margin: 0 auto 0 0; flex: 1 1 12rem; font-size: 15px; }
 .paused #pause { border-color: var(--warn); }
 .paused #pause-text { color: var(--warn); font-weight: 600; }
+#pause-form { display: flex; gap: var(--s2); }
+#pause-error { flex: 1 0 100%; font-size: var(--t-sm); color: var(--blocked); }
+input { width: 6.5rem; padding: 6px var(--s3); font: inherit; color: var(--text); background: var(--card);
+  border: 1px solid var(--line); border-radius: 8px; }
 button { font: inherit; padding: 6px var(--s3); border-radius: 8px; border: 1px solid var(--line);
   background: var(--card); color: var(--text); cursor: pointer; }
 button:hover { background: var(--bg); }
@@ -145,7 +149,12 @@ button.go:hover { background: var(--accent); opacity: .9; }
         <button data-minutes="30">30 min</button>
         <button data-minutes="60">1 h</button>
         <button data-minutes="1440">1 day</button>
+        <form id="pause-form" novalidate>
+          <input id="pause-minutes" type="number" min="1" max="1440" step="1" inputmode="numeric" placeholder="Minutes" aria-label="Minutes to pause">
+          <button class="go">Pause</button>
+        </form>
         <button id="resume" class="go">Resume</button>
+        <span id="pause-error" hidden></span>
       </div>
     </section>
 
@@ -514,6 +523,18 @@ window.addEventListener("hashchange", showTab);
 document.querySelectorAll("button[data-minutes]").forEach((button) =>
   button.addEventListener("click", () =>
     act("/api/pause", { minutes: Number(button.dataset.minutes) })));
+$("pause-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const minutes = Number($("pause-minutes").value);
+  const valid = Number.isInteger(minutes) && minutes >= 1 && minutes <= 1440;
+  $("pause-error").hidden = valid;
+
+  if (valid) {
+    act("/api/pause", { minutes });
+  } else {
+    $("pause-error").textContent = "1 to 1440 minutes";
+  }
+});
 $("resume").addEventListener("click", () => act("/api/resume", {}));
 $("install").addEventListener("click", () => {
   if (confirm("Install v" + latestVersion + "? picoguard restarts.")) {

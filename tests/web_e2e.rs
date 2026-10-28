@@ -504,6 +504,28 @@ async fn the_chart_is_inline_svg_drawn_with_create_element_ns() {
     }
 }
 
+/// No browser here: the form's source is checked. `pause_takes_one_to_1440_minutes_and_nothing_else`
+/// pins the same limits on the server.
+#[tokio::test]
+async fn the_pause_form_sends_only_whole_minutes_from_1_to_1440() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "id=\"pause-form\"",
+        "novalidate",
+        "id=\"pause-minutes\"",
+        "type=\"number\"",
+        "min=\"1\"",
+        "max=\"1440\"",
+        "Number.isInteger(",
+        "\"1 to 1440 minutes\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
 /// No browser here: the button is hidden by a style rule, so the rule is what is checked.
 #[tokio::test]
 async fn the_resume_button_is_shown_only_while_blocking_is_paused() {
