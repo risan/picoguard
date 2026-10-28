@@ -392,17 +392,22 @@ async fn the_page_is_served_with_protective_headers() {
     assert_eq!(reply.header("cache-control"), Some("no-store"));
     assert_eq!(reply.header("x-content-type-options"), Some("nosniff"));
     assert_eq!(reply.header("x-frame-options"), Some("DENY"));
-    assert!(
-        reply
-            .header("content-security-policy")
-            .is_some_and(|policy| policy.contains("connect-src 'self'") && !policy.contains("http"))
+    assert_eq!(
+        reply.header("content-security-policy"),
+        Some(
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+             connect-src 'self'"
+        )
     );
     // No answer ever grants a cross-origin read.
     assert!(reply.header("access-control-allow-origin").is_none());
 }
 
-/// The page before the install button, for the growth budget.
-const PAGE_BYTES_BEFORE_INSTALL: usize = 12905;
+/// The page's ceiling for every slice of release 1.
+const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
+
+/// This slice, the redesign; a later slice raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 24 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -410,11 +415,15 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
 
     let page = site.send(get("/")).await.body;
 
-    assert!(page.len() < 15 * 1024, "{} bytes", page.len());
     assert!(
-        page.len() <= PAGE_BYTES_BEFORE_INSTALL + 1600,
-        "the install button may add 1600 bytes, not {}",
-        page.len() - PAGE_BYTES_BEFORE_INSTALL
+        page.len() <= PAGE_BUDGET_BYTES,
+        "the redesign budget is {PAGE_BUDGET_BYTES} bytes, the page has {}",
+        page.len()
+    );
+    assert!(
+        page.len() <= PAGE_HARD_CAP_BYTES,
+        "the hard cap is {PAGE_HARD_CAP_BYTES} bytes, the page has {}",
+        page.len()
     );
     for external in [
         "src=", "href=", "http://", "https://", "url(", "@import", "<link",
@@ -453,6 +462,28 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
 
     // Names come from the network: the page never builds markup from them.
     assert!(!page.contains("innerHTML") && !page.contains("insertAdjacentHTML"));
+}
+
+/// No browser here: the tab code is checked as source. A tab is a `[data-tab]` button and a
+/// `[data-panel]` panel, and no element id equals a tab name, so a fragment never scrolls.
+#[tokio::test]
+async fn the_page_has_three_tabs_kept_in_the_url_fragment() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in ["role=\"tablist\"", "aria-selected", "\"hashchange\""] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+
+    for tab in ["dashboard", "log", "lists"] {
+        assert!(page.contains(&format!("data-tab=\"{tab}\"")), "{tab}");
+        assert!(page.contains(&format!("id=\"panel-{tab}\"")), "{tab}");
+        assert!(
+            !page.contains(&format!("id=\"{tab}\"")),
+            "{tab} is a fragment target"
+        );
+    }
 }
 
 /// No browser here: the button is hidden by a style rule, so the rule is what is checked.

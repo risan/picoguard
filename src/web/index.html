@@ -7,41 +7,61 @@
 <style>
 :root {
   color-scheme: light dark;
-  --bg: #f4f6f9; --card: #fff; --text: #1b2230; --muted: #667085; --line: #e3e7ee;
-  --accent: #2563eb; --blocked: #dc2626; --good: #16a34a; --warn: #b45309;
-  --on-accent: #fff;
+  --bg: #f7f7f8; --card: #ffffff; --text: #16171a; --muted: #5f6672; --line: #e4e5e9;
+  --accent: #4f46e5; --on-accent: #ffffff; --blocked: #dc2626; --good: #15803d; --warn: #b45309;
+  --tint: #4f46e51f;
+  --t-sm: 12px; --t-md: 14px; --t-lg: 18px; --t-xl: 34px;
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f131a; --card: #171d27; --text: #e5e8ee; --muted: #8b95a7; --line: #283142;
-    --accent: #6ea0ff; --blocked: #f87171; --good: #4ade80; --warn: #fbbf24;
-    --on-accent: #0f131a;
+    --bg: #09090b; --card: #111114; --text: #ececf0; --muted: #9a9ea8; --line: #26272d;
+    --accent: #818cf8; --on-accent: #09090b; --blocked: #f87171; --good: #4ade80; --warn: #fbbf24;
+    --tint: #818cf833;
   }
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-body { margin: 0; padding: 12px; background: var(--bg); color: var(--text);
-  font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
-main { max-width: 1000px; margin: 0 auto; display: grid; gap: 12px; }
-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-h1 { font-size: 20px; margin: 0; flex: 1; }
-h2 { font-size: 13px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
-h1 small { font-size: 13px; font-weight: 400; color: var(--muted); }
-h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; }
-section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-width: 0; }
-code { display: block; font-size: 13px; word-break: break-all; }
-#update-notes, #install-state { overflow-wrap: anywhere; }
-#state { font-size: 13px; color: var(--muted); }
+body { margin: 0; background: var(--bg); color: var(--text); -webkit-text-size-adjust: 100%;
+  font: var(--t-md)/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 var(--s4); }
+header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--line); }
+header .wrap { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s1) var(--s3); padding-top: var(--s3); padding-bottom: var(--s3); }
+h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+h1 small { margin-left: var(--s1); font-size: var(--t-sm); font-weight: 400; color: var(--muted); }
+h2 { margin: 0 0 var(--s3); font-size: 13px; font-weight: 600; color: var(--muted); }
+h2 small { font-weight: 400; }
+#badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; font-size: var(--t-sm);
+  font-weight: 500; border: 1px solid var(--line); border-radius: 99px; }
+#badge:empty { display: none; }
+#badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+.paused #badge::before { background: var(--warn); }
+#state { margin-left: auto; font-size: var(--t-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
 #state.bad { color: var(--blocked); }
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
-.card b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
-.card span { font-size: 12px; color: var(--muted); }
-.columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+nav { display: flex; gap: var(--s1); margin: var(--s4) 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
+nav button { margin-bottom: -1px; padding: var(--s2) var(--s3); border: 0; border-bottom: 2px solid transparent;
+  border-radius: 0; background: none; color: var(--muted); font-weight: 500; }
+nav button:hover { color: var(--text); background: none; }
+nav button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+main { padding-bottom: var(--s5); }
+.grid { display: grid; gap: var(--s4); grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); }
+.wide { grid-column: 1 / -1; }
+section { min-width: 0; padding: var(--s4); background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: 0 1px 2px #0000000d; }
+code { display: block; font-size: 13px; word-break: break-all; }
+#update { grid-column: 1 / -1; border-color: var(--accent); }
+#update-notes, #install-state { overflow-wrap: anywhere; }
+p { margin: 0 0 var(--s2); }
+.cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--s4) var(--s3); }
+.card span { display: block; font-size: var(--t-sm); color: var(--muted); }
+.card b { display: block; font-size: var(--t-lg); font-weight: 600; font-variant-numeric: tabular-nums; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { text-align: left; font-weight: 600; color: var(--muted); }
-th, td { padding: 4px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
-td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-td.name { word-break: break-all; }
+th { text-align: left; font-weight: 500; font-size: var(--t-sm); color: var(--muted); white-space: nowrap; }
+th, td { padding: var(--s2) var(--s3) var(--s2) 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+td.num { text-align: right; padding-right: 0; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.name { overflow-wrap: anywhere; }
 .scroll { overflow-x: auto; }
 .chart { display: flex; align-items: flex-end; gap: 2px; height: 90px; }
 .bar { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px;
@@ -49,83 +69,101 @@ td.name { word-break: break-all; }
 .bar i { display: block; width: 100%; background: var(--blocked); border-radius: 2px 2px 0 0; }
 .axis { display: flex; gap: 2px; font-size: 10px; color: var(--muted); }
 .axis span { flex: 1; text-align: center; overflow: hidden; }
-.pause { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.pause p { margin: 0; flex: 1 1 100%; }
-.paused { border-color: var(--warn); }
-.paused p { color: var(--warn); font-weight: 600; }
-button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line);
+.pause { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
+.pause p { margin: 0 auto 0 0; flex: 1 1 12rem; font-size: 15px; }
+.paused #pause { border-color: var(--warn); }
+.paused #pause-text { color: var(--warn); font-weight: 600; }
+button { font: inherit; padding: 6px var(--s3); border-radius: 8px; border: 1px solid var(--line);
   background: var(--card); color: var(--text); cursor: pointer; }
-button:hover { border-color: var(--accent); }
-button.go { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button:hover { background: var(--bg); }
+button.go { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
+button.go:hover { background: var(--accent); opacity: .9; }
 #resume { display: none; }
 .paused #resume { display: inline-block; }
 .r-blocked_request, .r-blocked_response { color: var(--blocked); }
 .r-error { color: var(--warn); }
 .r-cached { color: var(--good); }
-.err { color: var(--warn); }
+.err { color: var(--warn); overflow-wrap: anywhere; }
 .empty { color: var(--muted); }
+@media (min-width: 720px) {
+  .cards { grid-template-columns: repeat(4, 1fr); }
+}
 </style>
 </head>
 <body>
-<main>
-  <header>
+<header>
+  <div class="wrap">
     <h1>picoguard <small id="version"></small></h1>
+    <span id="badge"></span>
     <span id="state">connecting</span>
-  </header>
+  </div>
+</header>
 
-  <section id="update" hidden>
-    <h2>Update</h2>
-    <p id="update-text"></p>
-    <p id="update-notes"></p>
-    <p id="install-state"></p>
-    <button id="install" class="go" hidden>Update</button>
-    <code id="update-how"></code>
-  </section>
+<main class="wrap">
+  <nav role="tablist">
+    <button role="tab" id="tab-dashboard" data-tab="dashboard" aria-controls="panel-dashboard" aria-selected="true">Dashboard</button>
+    <button role="tab" id="tab-log" data-tab="log" aria-controls="panel-log" aria-selected="false">Query log</button>
+    <button role="tab" id="tab-lists" data-tab="lists" aria-controls="panel-lists" aria-selected="false">Lists</button>
+  </nav>
 
-  <section id="limited" hidden>
-    <h2>Read-only</h2>
-    <p id="limited-note"></p>
-  </section>
+  <div class="grid" role="tabpanel" id="panel-dashboard" data-panel="dashboard" aria-labelledby="tab-dashboard">
+    <section id="update" hidden>
+      <h2>Update</h2>
+      <p id="update-text"></p>
+      <p id="update-notes"></p>
+      <p id="install-state"></p>
+      <button id="install" class="go" hidden>Update</button>
+      <code id="update-how"></code>
+    </section>
 
-  <section id="pause">
-    <h2>Blocking</h2>
-    <div class="pause">
-      <p id="pause-text">Blocking is on.</p>
-      <button data-minutes="5">Pause 5 min</button>
-      <button data-minutes="30">30 min</button>
-      <button data-minutes="60">1 h</button>
-      <button data-minutes="1440">1 day</button>
-      <button id="resume" class="go">Resume</button>
+    <section id="limited" class="wide" hidden>
+      <h2>Read-only</h2>
+      <p id="limited-note"></p>
+    </section>
+
+    <section id="pause" class="wide">
+      <div class="pause">
+        <p id="pause-text">Blocking is on.</p>
+        <button data-minutes="5">Pause 5 min</button>
+        <button data-minutes="30">30 min</button>
+        <button data-minutes="60">1 h</button>
+        <button data-minutes="1440">1 day</button>
+        <button id="resume" class="go">Resume</button>
+      </div>
+    </section>
+
+    <section class="wide">
+      <h2>Totals</h2>
+      <div class="cards" id="cards"></div>
+    </section>
+
+    <section class="wide">
+      <h2>Last 24 hours <small>(queries, blocked in red)</small></h2>
+      <div class="chart" id="chart"></div>
+      <div class="axis" id="axis"></div>
+    </section>
+
+    <div id="tops" class="grid wide">
+      <section><h2>Top domains <small id="a-queried"></small></h2><div class="scroll" id="top-queried"></div></section>
+      <section><h2>Top blocked <small id="a-blocked"></small></h2><div class="scroll" id="top-blocked"></div></section>
+      <section><h2>Top clients <small id="a-clients"></small></h2><div class="scroll" id="top-clients"></div></section>
     </div>
-  </section>
-
-  <section>
-    <h2>Totals</h2>
-    <div class="cards" id="cards"></div>
-  </section>
-
-  <section>
-    <h2>Last 24 hours <small>(queries, blocked in red)</small></h2>
-    <div class="chart" id="chart"></div>
-    <div class="axis" id="axis"></div>
-  </section>
-
-  <div class="columns" id="tops">
-    <section><h2>Top domains <small id="a-queried"></small></h2><div class="scroll" id="top-queried"></div></section>
-    <section><h2>Top blocked <small id="a-blocked"></small></h2><div class="scroll" id="top-blocked"></div></section>
-    <section><h2>Top clients <small id="a-clients"></small></h2><div class="scroll" id="top-clients"></div></section>
   </div>
 
-  <section id="log">
-    <h2>Recent queries</h2>
-    <div class="scroll" id="queries"></div>
-  </section>
+  <div class="grid" role="tabpanel" id="panel-log" data-panel="log" aria-labelledby="tab-log" hidden>
+    <section class="wide">
+      <h2>Recent queries</h2>
+      <div class="scroll" id="queries"></div>
+    </section>
+  </div>
 
-  <section>
-    <h2>Lists</h2>
-    <div class="scroll" id="lists"></div>
-    <p id="refresh-row"><button id="refresh">Refresh all lists</button> <span id="refresh-note" class="empty"></span></p>
-  </section>
+  <div class="grid" role="tabpanel" id="panel-lists" data-panel="lists" aria-labelledby="tab-lists" hidden>
+    <section class="wide">
+      <h2>Lists</h2>
+      <div class="scroll" id="list-table"></div>
+      <p id="refresh-row"><button id="refresh">Refresh all lists</button> <span id="refresh-note" class="empty"></span></p>
+    </section>
+  </div>
 </main>
 
 <script>
@@ -215,6 +253,16 @@ async function api(path, body) {
   return data;
 }
 
+// The open tab lives only in the URL fragment. An unknown or hidden tab opens the first one.
+function showTab() {
+  const tabs = [...document.querySelectorAll("[data-tab]")];
+  const open = tabs.find((tab) => tab.dataset.tab === location.hash.slice(1) && !tab.hidden) || tabs[0];
+  tabs.forEach((tab) => tab.setAttribute("aria-selected", String(tab === open)));
+  document.querySelectorAll("[data-panel]").forEach((panel) => {
+    panel.hidden = panel.dataset.panel !== open.dataset.tab;
+  });
+}
+
 function showCards(counters, percent) {
   const items = [
     ["Queries", counters.total], ["Blocked", percent + " %"],
@@ -224,7 +272,7 @@ function showCards(counters, percent) {
   ];
   $("cards").replaceChildren(...items.map(([label, value]) => {
     const card = el("div", undefined, "card");
-    card.append(el("b", typeof value === "number" ? value.toLocaleString() : value), el("span", label));
+    card.append(el("span", label), el("b", typeof value === "number" ? value.toLocaleString() : value));
 
     return card;
   }));
@@ -290,14 +338,15 @@ function showLists(lists) {
     [l.name, "name"], [l.kind], [l.format || "-"], [l.rules.toLocaleString(), "num"],
     [duration(l.age_seconds), "num"], [l.last_error || "", "err"],
   ]));
-  $("lists").replaceChildren(rows.length
+  $("list-table").replaceChildren(rows.length
     ? table(["Name", "Kind", "Format", "Rules", "Checked", "Last error"], rows)
     : el("p", "No lists configured.", "empty"));
 }
 
 function showPause(pause) {
   pausedUntil = pause.paused ? pause.until : null;
-  $("pause").classList.toggle("paused", pause.paused);
+  document.body.classList.toggle("paused", pause.paused);
+  $("badge").textContent = pause.paused ? "Paused" : "Blocking on";
   tick();
 }
 
@@ -333,7 +382,8 @@ function showInstall(update) {
 function showLimited(note) {
   $("limited-note").textContent = note || "";
   $("limited").hidden = !note;
-  ["pause", "tops", "log", "refresh-row"].forEach((id) => { $(id).hidden = Boolean(note); });
+  ["pause", "tops", "tab-log", "refresh-row"].forEach((id) => { $(id).hidden = Boolean(note); });
+  showTab();
 }
 
 async function update() {
@@ -341,6 +391,7 @@ async function update() {
     const status = await api("/api/status");
     showUpdate(status);
     showLimited(status.limited);
+    showPause(status.pause);
     showCards(status.counters, status.blocked_percent);
     showChart(status.hourly);
     showLists(status.lists);
@@ -351,7 +402,6 @@ async function update() {
       showTop("top-blocked", "a-blocked", status.top_blocked, "Domain");
       showTop("top-clients", "a-clients", status.top_clients, "Client");
       showQueries(log.entries);
-      showPause(status.pause);
     }
 
     $("state").textContent = "updated " + new Date().toLocaleTimeString();
@@ -377,6 +427,9 @@ async function act(path, body, note) {
   update();
 }
 
+document.querySelectorAll("[data-tab]").forEach((tab) =>
+  tab.addEventListener("click", () => { location.hash = tab.dataset.tab; }));
+window.addEventListener("hashchange", showTab);
 document.querySelectorAll("button[data-minutes]").forEach((button) =>
   button.addEventListener("click", () =>
     act("/api/pause", { minutes: Number(button.dataset.minutes) })));
@@ -389,6 +442,7 @@ $("install").addEventListener("click", () => {
 $("refresh").addEventListener("click", () =>
   act("/api/lists/refresh", {}, "Refresh started; the table updates as lists finish."));
 
+showTab();
 update();
 setInterval(update, 5000);
 setInterval(tick, 1000);
