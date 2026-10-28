@@ -1,6 +1,6 @@
-//! The status page and its JSON API (plan D16). One HTML page, four reads, four mutations,
-//! and sign-in and sign-out. A web page on another device of the LAN must not be able to pause blocking, so
-//! every request passes the access policy before it reaches a handler:
+//! The status page and its JSON API (plan D16). One HTML page, four reads, four mutations, and
+//! sign-in and sign-out. A web page on another device of the LAN must not be able to pause
+//! blocking, so every request passes the access policy before it reaches a handler:
 //!
 //! - a peer outside `web.allow_from` is closed before a byte is read;
 //! - `Host` must be an IP address or a configured name, which defeats DNS rebinding;
@@ -514,7 +514,7 @@ impl Web {
             }
 
             Change::Login => {
-                let auth = self.signed_in_auth()?;
+                let auth = self.required_auth()?;
                 let request = login_request(body).ok_or_else(|| {
                     Rejection::new(
                         StatusCode::BAD_REQUEST,
@@ -544,7 +544,7 @@ impl Web {
     }
 
     /// Every change needs a password, so a change handler always has one.
-    fn signed_in_auth(&self) -> Result<&Auth, Rejection> {
+    fn required_auth(&self) -> Result<&Auth, Rejection> {
         self.auth
             .as_ref()
             .ok_or_else(|| Rejection::new(StatusCode::FORBIDDEN, PASSWORD_NEEDED))
