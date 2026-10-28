@@ -67,9 +67,10 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th { text-align: left; font-weight: 500; font-size: var(--t-sm); color: var(--muted); white-space: nowrap; }
 th, td { padding: var(--s2) var(--s3) var(--s2) 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 tr:last-child td { border-bottom: 0; }
-td.num { text-align: right; padding-right: 0; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.name { overflow-wrap: anywhere; }
-#queries td { white-space: nowrap; }
+#queries td, #list-table td { white-space: nowrap; }
+#list-table td.err { min-width: 14rem; white-space: normal; }
 #queries td.name { min-width: 12rem; white-space: normal; }
 #tops table { border-collapse: separate; border-spacing: 0 2px; }
 #tops td { padding: 6px 0 6px var(--s2); border-bottom: 0; }
