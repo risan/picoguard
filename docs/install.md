@@ -113,7 +113,9 @@ The four questions (press Enter for the default; every question also has a flag,
    names and reverse lookups of your own devices keep working.
 4. **Status page.** The port (8080) and a password for the user `admin`. Press Enter and the
    script makes a random 16-character password and shows it once at the end. Type your own, or
-   `none` for no password.
+   `none` for no password. The config keeps only a hash of the password (`password_hash`), so
+   note it down; to set a new one, see [Set a new status page
+   password](#set-a-new-status-page-password).
 
 `--yes` takes every default and asks nothing (good for scripts).
 
@@ -129,8 +131,8 @@ URL. Next, [point your network at picoguard](#3-point-your-network-at-picoguard)
 Good to know:
 
 - The service runs as the system user `picoguard`. The config is
-  `/etc/picoguard/picoguard.toml`, owned by `root:picoguard` with mode `0640`, because it can hold
-  the status page password.
+  `/etc/picoguard/picoguard.toml`, owned by `root:picoguard` with mode `0640`, because it holds the
+  status page password hash: anyone who can read it can sign in.
 - When you upgrade, the script keeps the previous binary, unit, config and memory drop-in. If the
   restart fails, or the new version does not answer a test lookup, it puts them back, restarts the
   old version and says so. The test lookup goes to an address from `[server] bind` that the device
@@ -200,19 +202,43 @@ docker compose up -d --build
   `net.ipv4.ip_unprivileged_port_start=0` there.
 - The ports are published on IPv4 only (`PICOGUARD_BIND=192.168.1.53 docker compose up -d`
   picks one address). Docker's proxy turns a connection that arrives over IPv6 into one from a
-  private bridge address, and picoguard would then let it in. Set `web.user` and `web.password` in
-  `picoguard.toml` too.
+  private bridge address, and picoguard would then let it in. Set `web.user` and
+  `web.password_hash` in `picoguard.toml` too (see [Set a new status page
+  password](#set-a-new-status-page-password)). Clients that come in over IPv6 then share that one
+  address, so five wrong passwords from them hold up new sign-ins from all of them for 15 minutes;
+  sessions already signed in keep working.
 - The image builds on x86_64 and ARM64. On an ARMv7 board, use `install.sh`.
 - Host networking (`network_mode: host`) is the alternative: no NAT, and picoguard sees the real
   address of each client. See the comment in `compose.yaml`.
 - Docker's own daemon costs tens of MB of RAM. On a 256 MB board, use `install.sh` instead.
+
+### Set a new status page password
+
+This is also the way back in when the password is lost. Make a hash of the new password:
+
+```sh
+sudo picoguard --hash-password
+```
+
+Type the password at the `Password:` prompt (it is not shown). The command prints one line,
+`password_hash = "..."`. In `/etc/picoguard/picoguard.toml`, under `[web]`, replace the
+`password_hash` line (or a `password` line) with it, keep `user = "admin"`, and restart:
+
+```sh
+sudo picoguard --check -c /etc/picoguard/picoguard.toml
+sudo systemctl restart picoguard        # OpenRC: sudo rc-service picoguard restart
+```
+
+The restart signs out every browser. In Docker, make the line with
+`docker compose run --rm picoguard --hash-password`, put it in `picoguard.toml`, and run
+`docker compose restart`.
 
 ### Update picoguard
 
 #### From the status page
 
 When a newer release exists, the status page says "update available". If you are signed in (set
-`web.user` and `web.password`), it also shows a button, **Update to vX.Y.Z**. The button needs a
+`web.user` and `web.password_hash` or `web.password`), it also shows a button, **Update to vX.Y.Z**. The button needs a
 release binary that `install.sh` installed: `install.sh` also sets up the root program that
 installs the update ("the installer" below). A manual install, a Docker image and a build from
 source show the command to run instead.
@@ -359,8 +385,8 @@ install -m 0755 picoguard-TARGET /usr/local/bin/picoguard
 picoguard --version
 ```
 
-Create the system user that runs the service. The config can hold the status page password, so
-only root and this user may read it:
+Create the system user that runs the service. The config can hold the status page password or its
+hash, so only root and this user may read it:
 
 ```sh
 # Debian, Ubuntu, Armbian, Raspberry Pi OS
@@ -488,8 +514,8 @@ http://DEVICE_IP:8080/
 ```
 
 It shows totals, the share blocked and the state of each list (size, age, errors). A list shows an
-error here when its download failed. Until you set `web.user` and `web.password` (see
-`docs/configuration.md`), that is all: the top domains, the top clients, the recent queries and the
+error here when its download failed. Until you set `web.user` and `web.password_hash` or
+`web.password` (see `docs/configuration.md`), that is all: the top domains, the top clients, the recent queries and the
 pause button need the password.
 
 Logs: `journalctl -u picoguard` (systemd) or syslog (OpenRC, when a logger runs: `/var/log/messages`,
