@@ -52,6 +52,42 @@ fn check_rejects_an_invalid_value_and_names_the_field() {
     );
 }
 
+const HASH: &str = "pbkdf2-sha256$1000$000102030405060708090a0b0c0d0e0f$33a78c377ca7b6590fa1b215cc970fba516076f108ecb68af58ec95d86021701";
+
+#[test]
+fn check_rejects_a_password_and_a_password_hash_together() {
+    let path = write_config(
+        "password-and-hash.toml",
+        &format!("[web]\nuser = \"admin\"\npassword = \"s3cret\"\npassword_hash = \"{HASH}\"\n"),
+    );
+
+    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        text(&output.stderr).contains("not both"),
+        "{}",
+        text(&output.stderr)
+    );
+}
+
+#[test]
+fn check_rejects_a_malformed_password_hash() {
+    let path = write_config(
+        "malformed-hash.toml",
+        "[web]\nuser = \"admin\"\npassword_hash = \"pbkdf2-sha256$1000$00$00\"\n",
+    );
+
+    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        text(&output.stderr).contains("password_hash"),
+        "{}",
+        text(&output.stderr)
+    );
+}
+
 #[test]
 fn check_rejects_an_unknown_key() {
     let path = write_config("unknown-key.toml", "blocked_tll = 5\n");
