@@ -108,7 +108,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
                 hash_password = true;
             }
 
-            "--version" | "-h" | "--help" if hash_password => {
+            // Either order of the two flags is the same mistake.
+            "--version" | "-h" | "--help"
+                if hash_password || args.any(|rest| rest == "--hash-password") =>
+            {
                 return Err(HASH_PASSWORD_ALONE.to_string());
             }
 
@@ -616,6 +619,9 @@ mod tests {
             &["pw", "--hash-password"],
             &["--hash-password", "--check"],
             &["--hash-password", "--version"],
+            &["--version", "--hash-password"],
+            &["--hash-password", "--help"],
+            &["-h", "--hash-password"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }
