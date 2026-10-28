@@ -492,7 +492,8 @@ error here when its download failed. Until you set `web.user` and `web.password`
 `docs/configuration.md`), that is all: the top domains, the top clients, the recent queries and the
 pause button need the password.
 
-Logs: `journalctl -u picoguard` (systemd) or syslog (OpenRC, when a logger runs). The default level is
+Logs: `journalctl -u picoguard` (systemd) or syslog (OpenRC, when a logger runs: `/var/log/messages`,
+or `logread` when the log is in memory). The default level is
 `warn`, so the log is empty when all is well.
 
 ## 3. Point your network at picoguard
@@ -573,6 +574,19 @@ systemctl restart systemd-journald
 ```
 
 After a reboot the old log is gone. That is fine for a DNS box.
+
+### Alpine: syslog in memory
+
+Alpine has no journald. Its BusyBox `syslogd` writes `/var/log/messages` on the card, and
+picoguard's warnings go there. Keep the log in a 256 KB buffer in RAM instead:
+
+```sh
+echo 'SYSLOGD_OPTS="-t -C256"' > /etc/conf.d/syslog
+rc-service syslog restart
+rm -f /var/log/messages
+```
+
+Read the log with `logread`, or `logread -f` to follow it. After a reboot the old log is gone.
 
 ### No swap on the SD card
 
@@ -665,14 +679,15 @@ The Update button staged the files, but nothing installed them. Check, in this o
   again: it installs and starts it;
 - `state.dir` is `/var/lib/picoguard`; the installer does not look anywhere else;
 - the installer's log: `journalctl -u picoguard-update` (systemd) or `/var/log/messages` (OpenRC,
-  when a syslog runs). It logs one line per update, and "the installed picoguard cannot verify
-  updates" when the binary in place is too old to be updated from the page; run `install.sh`
-  then.
+  when a syslog runs; `logread` when the log is in memory). It logs one line per update, and "the
+  installed picoguard cannot verify updates" when the binary in place is too old to be updated
+  from the page; run `install.sh` then.
 
 **The page says "Rolled back".**
 The new version was installed, but it did not start or did not answer a lookup of `example.com`
 within 30 seconds, so the old version is back. The reason on the page says which. Look at
-`journalctl -u picoguard` (systemd) or `/var/log/messages` (OpenRC) for what the new version said.
+`journalctl -u picoguard` (systemd) or `/var/log/messages` (OpenRC; `logread` when the log is in
+memory) for what the new version said.
 A common cause is a config that the new version accepts but that blocks the device's own lookup:
 the installer asks from the device itself, so `server.allow_from` must cover `127.0.0.0/8` (or the
 address picoguard listens on). The update stays available: fix the cause, then click again.

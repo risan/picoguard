@@ -2164,7 +2164,7 @@ report() {
     if ! service_active; then
         case $INIT in
             systemd) fail "picoguard is not running. See: journalctl -u picoguard -e" ;;
-            openrc) fail "picoguard is not running. See: rc-service picoguard status, and /var/log/messages" ;;
+            openrc) fail "picoguard is not running. See: rc-service picoguard status, and /var/log/messages (or logread)" ;;
         esac
     fi
 
