@@ -699,6 +699,7 @@ $("logout").addEventListener("click", async () => {
       return;
     }
 
+    authEpoch++;
     $("state").textContent = error.message;
     $("state").className = "bad";
   } finally {
