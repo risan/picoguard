@@ -104,7 +104,8 @@ fn parts() -> Parts {
     }
 }
 
-fn start(parts: Parts) -> SocketAddr {
+/// Hands the config back, so the caller keeps it alive: freeing it is not memory the `Web` gave up.
+fn start(parts: Parts) -> (SocketAddr, Config) {
     let address = parts.listeners.addresses()[0];
     let web = Web::new(
         &parts.config,
@@ -117,7 +118,7 @@ fn start(parts: Parts) -> SocketAddr {
     .unwrap();
     web::spawn(parts.listeners, Arc::new(web));
 
-    address
+    (address, parts.config)
 }
 
 /// The status code, and whether a session cookie was set.
@@ -166,7 +167,7 @@ fn logins_and_failures_from_many_addresses_keep_memory_within_ten_kilobytes() {
         .unwrap();
 
     runtime.block_on(async {
-        let warm = start(parts());
+        let (warm, _warm_config) = start(parts());
         assert_eq!(login(warm, "127.0.0.1", "s3cret").await, (200, true));
         assert_eq!(login(warm, "127.0.0.1", "wrong").await, (401, false));
         assert_eq!(basic(warm, "127.0.0.1").await, 200);
@@ -175,7 +176,7 @@ fn logins_and_failures_from_many_addresses_keep_memory_within_ten_kilobytes() {
         let parts = parts();
         let before = live();
 
-        let address = start(parts);
+        let (address, _config) = start(parts);
         for host in 1..=150 {
             let from = format!("127.0.1.{host}");
             for _ in 0..4 {
