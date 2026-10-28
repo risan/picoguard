@@ -195,10 +195,10 @@ top blocked domains, top clients, recent queries and list status, and can pause 
 time and refresh the lists.
 
 Without a password the page is read-only and limited: it shows totals and list status only. The
-query log, the top lists, pause, resume and refresh answer 403 ("set web.user and web.password to
-use this"), and the page says so. picoguard logs one warning at start when no password is set.
-Every device that may open the page could otherwise read the household's queries and switch
-blocking off.
+query log, the top lists, pause, resume and refresh answer 403 ("set web.user and web.password_hash
+(or web.password) to use this"), and the page says so. picoguard logs one warning at start when no
+password is set. Every device that may open the page could otherwise read the household's queries
+and switch blocking off.
 
 | Key | Default | Meaning |
 |---|---|---|

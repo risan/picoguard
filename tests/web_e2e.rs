@@ -1301,7 +1301,7 @@ async fn a_hanging_check_holds_up_neither_dns_nor_the_page() {
     assert_eq!(github.requests(), 1);
 }
 
-const SET_A_PASSWORD: &str = "set web.user and web.password to use this";
+const SET_A_PASSWORD: &str = "set web.user and web.password_hash (or web.password) to use this";
 
 #[tokio::test]
 async fn without_a_password_the_page_shows_totals_and_lists_and_nothing_else() {

@@ -57,7 +57,7 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 const MIN_PAUSE_MINUTES: u32 = 1;
 const MAX_PAUSE_MINUTES: u32 = 24 * 60;
 const DEFAULT_QUERY_LOG_LIMIT: usize = 100;
-const PASSWORD_NEEDED: &str = "set web.user and web.password to use this";
+const PASSWORD_NEEDED: &str = "set web.user and web.password_hash (or web.password) to use this";
 
 /// Everything the handlers read or change.
 pub struct Web {
@@ -87,7 +87,8 @@ impl Web {
         if auth.is_none() {
             log::warn!(
                 "the status page has no password: it shows totals and list status only. \
-                 Set web.user and web.password for the query log, the top lists and pause."
+                 Set web.user and web.password_hash (or web.password) for the query log, the top \
+                 lists and pause."
             );
         }
 
