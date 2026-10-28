@@ -335,12 +335,15 @@ function hourOf(bucket) {
 }
 
 function chooseHour(i) {
-  chartHour = i;
+  chartHour = chartData[i].hour_start;
   markHour();
 }
 
+// The chosen hour is kept by its start time, because the buckets shift left every hour. Once it
+// has left the 24 hours, the newest hour shows again.
 function markHour() {
-  const i = chartHour === null ? chartData.length - 1 : chartHour;
+  const found = chartData.findIndex((h) => h.hour_start === chartHour);
+  const i = found < 0 ? chartData.length - 1 : found;
   const bucket = chartData[i];
   $("chart-readout").textContent = hourOf(bucket) + ":00 \u00b7 " + bucket.total.toLocaleString()
     + " queries \u00b7 " + bucket.blocked.toLocaleString() + " blocked";
