@@ -1,5 +1,5 @@
-//! The status page and its JSON API (plan D16). One HTML page, five reads and four
-//! mutations. A web page on another device of the LAN must not be able to pause blocking, so
+//! The status page and its JSON API (plan D16). One HTML page, four reads, four mutations,
+//! and sign-in and sign-out. A web page on another device of the LAN must not be able to pause blocking, so
 //! every request passes the access policy before it reaches a handler:
 //!
 //! - a peer outside `web.allow_from` is closed before a byte is read;
@@ -31,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
-use self::auth::{Attempt, Auth, Check};
+use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
 use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
 use crate::policy::Policy;
 use crate::scheduler::{ListControl, ListStatus, Role};
@@ -217,6 +217,8 @@ enum Change {
     Resume,
     RefreshLists,
     Install,
+    Login,
+    Logout,
 }
 
 enum Route {
@@ -235,13 +237,16 @@ impl Route {
             "/api/resume" => Some(Route::Change(Change::Resume)),
             "/api/lists/refresh" => Some(Route::Change(Change::RefreshLists)),
             "/api/update" => Some(Route::Change(Change::Install)),
+            "/api/login" => Some(Route::Change(Change::Login)),
+            "/api/logout" => Some(Route::Change(Change::Logout)),
             _ => None,
         }
     }
 
-    /// Open without a sign-in even when a password is set: the page shows its own form.
+    /// Open without a sign-in even when a password is set: the page shows its own form, which
+    /// posts to the sign-in.
     fn is_public(&self) -> bool {
-        matches!(self, Route::Read(Read::Page))
+        matches!(self, Route::Read(Read::Page) | Route::Change(Change::Login))
     }
 
     /// Whether the page shows this only to a signed-in user: the query log, the top lists
@@ -347,7 +352,7 @@ impl Web {
                 check_json_content_type(&head.headers)?;
                 let body = read_body(&head.headers, body).await?;
 
-                self.change(change, &body)
+                self.change(change, &body, &head.headers, peer).await
             }
         }
     }
@@ -442,7 +447,13 @@ impl Web {
         }
     }
 
-    fn change(&self, change: Change, body: &[u8]) -> Result<Response<Full<Bytes>>, Rejection> {
+    async fn change(
+        &self,
+        change: Change,
+        body: &[u8],
+        headers: &HeaderMap,
+        peer: IpAddr,
+    ) -> Result<Response<Full<Bytes>>, Rejection> {
         match change {
             Change::Pause => {
                 let request: PauseRequest = serde_json::from_slice(body).map_err(|_| {
@@ -501,7 +512,42 @@ impl Web {
                     &InstallStarted { install: "started" },
                 ))
             }
+
+            Change::Login => {
+                let auth = self.signed_in_auth()?;
+                let request = login_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"user\": \"...\", \"password\": \"...\"}",
+                    )
+                })?;
+                let attempt = Attempt::Form {
+                    user: &request.user,
+                    password: &request.password,
+                };
+
+                match auth.check(peer, attempt).await {
+                    Check::Accepted => Ok(with_cookie(
+                        json(StatusCode::OK, &Empty {}),
+                        &auth.session_cookie(unix_now()),
+                    )),
+                    Check::Refused => Err(unauthorized(headers, "wrong user or password")),
+                    Check::Limited => Err(too_many_attempts()),
+                }
+            }
+
+            Change::Logout => Ok(with_cookie(
+                json(StatusCode::OK, &Empty {}),
+                SIGNED_OUT_COOKIE,
+            )),
         }
+    }
+
+    /// Every change needs a password, so a change handler always has one.
+    fn signed_in_auth(&self) -> Result<&Auth, Rejection> {
+        self.auth
+            .as_ref()
+            .ok_or_else(|| Rejection::new(StatusCode::FORBIDDEN, PASSWORD_NEEDED))
     }
 
     /// The button is offered only to a signed-in user: the route needs the password too.
@@ -718,6 +764,34 @@ fn with_protective_headers(mut response: Response<Full<Bytes>>) -> Response<Full
             "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
         ),
     );
+
+    response
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginRequest {
+    user: String,
+    password: String,
+}
+
+/// `{"user": "...", "password": "..."}` and nothing else; like `install_version`, the first byte
+/// must open an object.
+fn login_request(body: &[u8]) -> Option<LoginRequest> {
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+
+    serde_json::from_slice(body).ok()
+}
+
+#[derive(Serialize)]
+struct Empty {}
+
+fn with_cookie(mut response: Response<Full<Bytes>>, cookie: &str) -> Response<Full<Bytes>> {
+    if let Ok(cookie) = HeaderValue::from_str(cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
 
     response
 }

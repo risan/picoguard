@@ -4,8 +4,10 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 
 use common::process::{Running, start};
+use picoguard::password::PasswordHash;
 
 struct Stopped(Running);
 
@@ -107,5 +109,94 @@ fn a_start_with_the_page_off_removes_update_leftovers() {
     }
 
     assert!(update.is_dir());
+    drop(server);
+}
+
+fn exchange(port: u16, request: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).ok()?;
+
+    Some(reply)
+}
+
+fn status_with_cookie(port: u16, token: &str) -> Option<String> {
+    exchange(
+        port,
+        &format!(
+            "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Cookie: picoguard_session={token}\r\n\r\n"
+        ),
+    )
+}
+
+/// Every file under `dir` with its size, sorted.
+fn listing(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let metadata = entry.metadata().unwrap();
+        if metadata.is_dir() {
+            files.extend(listing(&entry.path()));
+        } else {
+            files.push((entry.path(), metadata.len()));
+        }
+    }
+    files.sort();
+
+    files
+}
+
+fn hashed_config(dns_port: u16, web_port: u16, state_dir: &Path, hash: &PasswordHash) -> String {
+    config_in(dns_port, web_port, true, state_dir).replace(
+        "[web]\n",
+        &format!("[web]\nuser = \"admin\"\npassword_hash = \"{hash}\"\n"),
+    )
+}
+
+#[test]
+fn a_session_survives_a_restart_of_the_binary_without_writing_to_disk() {
+    let state = common::release::scratch("web-binary-session");
+    let web_port = free_tcp_port();
+    let hash = PasswordHash::new(b"s3cret", 1000).unwrap();
+
+    let server = Stopped(start("web-session.toml", |port| {
+        hashed_config(port, web_port, &state, &hash)
+    }));
+    let before = listing(&state);
+    let body = "{\"user\": \"admin\", \"password\": \"s3cret\"}";
+    let reply = exchange(
+        web_port,
+        &format!(
+            "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1:{web_port}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .expect("the login is answered");
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    let token = reply
+        .lines()
+        .find_map(|line| line.strip_prefix("set-cookie: picoguard_session="))
+        .and_then(|cookie| cookie.split(';').next())
+        .expect("a session cookie")
+        .to_string();
+    drop(server);
+
+    let server = Stopped(start("web-session.toml", |port| {
+        hashed_config(port, web_port, &state, &hash)
+    }));
+    let status = status_with_cookie(web_port, &token).expect("the status is served");
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    assert_eq!(listing(&state), before);
+    drop(server);
+
+    let new_hash = PasswordHash::new(b"s3cret", 1000).unwrap();
+    let server = Stopped(start("web-session.toml", |port| {
+        hashed_config(port, web_port, &state, &new_hash)
+    }));
+    let refused = status_with_cookie(web_port, &token).expect("an answer");
+    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
     drop(server);
 }
