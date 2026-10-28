@@ -58,9 +58,10 @@ code { display: block; font-size: 13px; word-break: break-all; }
 #update { grid-column: 1 / -1; border-color: var(--accent); }
 #update-notes, #install-state { overflow-wrap: anywhere; }
 p { margin: 0 0 var(--s2); }
-.cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--s4) var(--s3); }
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s4) var(--s3); }
 .card span { display: block; font-size: var(--t-sm); color: var(--muted); }
-.card b { display: block; font-size: var(--t-lg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.card b { display: block; font-size: var(--t-lg); font-weight: 600; font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere; }
 .headline { grid-column: span 2; padding-bottom: var(--s4); border-bottom: 1px solid var(--line); }
 .headline b { font-size: var(--t-xl); line-height: 1.2; letter-spacing: -.02em; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -107,7 +108,7 @@ button.go:hover { background: var(--accent); opacity: .9; }
 .err { color: var(--warn); overflow-wrap: anywhere; }
 .empty { color: var(--muted); }
 @media (min-width: 720px) {
-  .cards { grid-template-columns: repeat(6, 1fr); }
+  .cards { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .headline { grid-column: span 3; }
 }
 </style>
