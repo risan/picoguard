@@ -44,6 +44,7 @@ LISTS=
 ROUTER=
 WEB_PORT=
 WEB_PASSWORD=
+WEB_HASH_LINE=
 ASSUME_YES=0
 NO_START=0
 RECONFIGURE=0
@@ -798,10 +799,6 @@ run_wizard() {
     fi
 }
 
-toml_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
 write_config() {
     {
         cat <<EOF
@@ -838,8 +835,8 @@ EOF
 [web]
 port = $WEB_PORT
 EOF
-        if [ -n "$WEB_PASSWORD" ]; then
-            printf 'user = "admin"\npassword = "%s"\n' "$(toml_escape "$WEB_PASSWORD")"
+        if [ -n "$WEB_HASH_LINE" ]; then
+            printf 'user = "admin"\n%s\n' "$WEB_HASH_LINE"
         fi
 
         case $LISTS in
@@ -881,6 +878,13 @@ stage_config() {
     fi
 
     run_wizard
+
+    # The config keeps only a hash of the password, made by the binary that will read it.
+    if [ -n "$WEB_PASSWORD" ] &&
+        ! WEB_HASH_LINE=$(printf '%s\n' "$WEB_PASSWORD" | "$STAGED" --hash-password 2>/dev/null); then
+        fail "this picoguard cannot hash the status page password; install with --web-password none and set one later"
+    fi
+
     write_config "$TMP/picoguard.toml"
     WRITE_CONFIG=1
     CHECK_PATH=$TMP/picoguard.toml
@@ -2141,7 +2145,7 @@ configured_web_port() {
 print_web_login() {
     if [ "$PASSWORD_GENERATED" = 1 ]; then
         say ""
-        say "Status page login (shown once; it is also in $CONFIG_PATH):"
+        say "Status page login (shown once; $CONFIG_PATH keeps only a hash of the password):"
         say "  user: admin"
         say "  password: $WEB_PASSWORD"
     fi

@@ -76,8 +76,9 @@ Other:
                          something (pveam update/download, pct create/start/push/exec).
   -h, --help             Show this help.
 
-The status page gets a random password; it is printed at the end. Change it in
-/etc/picoguard/picoguard.toml inside the container.
+The status page gets a random password; it is printed at the end. To change it, run
+picoguard --hash-password inside the container and replace the password_hash line in
+/etc/picoguard/picoguard.toml.
 Environment: PICOGUARD_BASE_URL replaces https://github.com/risan/picoguard/releases.
 EOF
 }
