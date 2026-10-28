@@ -482,8 +482,8 @@ async fn the_page_is_served_with_protective_headers() {
 /// The page's ceiling for every slice of release 1.
 const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
 
-/// This slice, the redesign; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 24 * 1024;
+/// This slice, the sign-in form; a later slice raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 26 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -493,7 +493,7 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
 
     assert!(
         page.len() <= PAGE_BUDGET_BYTES,
-        "the redesign budget is {PAGE_BUDGET_BYTES} bytes, the page has {}",
+        "this slice's budget is {PAGE_BUDGET_BYTES} bytes, the page has {}",
         page.len()
     );
     assert!(
@@ -516,6 +516,8 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/resume",
         "/api/lists/refresh",
         "/api/update",
+        "/api/login",
+        "/api/logout",
         "setInterval(update, 5000)",
         "id=\"version\"",
         "id=\"update\"",
@@ -538,6 +540,31 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
 
     // Names come from the network: the page never builds markup from them.
     assert!(!page.contains("innerHTML") && !page.contains("insertAdjacentHTML"));
+}
+
+/// No browser here: the sign-in flow is checked as source, and in the build's browser check.
+#[tokio::test]
+async fn the_page_signs_in_with_its_own_form_and_never_asks_for_the_browser_prompt() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send_as_is(get("/")).await.body;
+
+    for needed in [
+        "id=\"login-form\"",
+        "id=\"login-user\"",
+        "id=\"login-password\"",
+        "type=\"password\"",
+        "autocomplete=\"current-password\"",
+        "id=\"login-note\"",
+        "id=\"logout\"",
+        "class=\"signed-out\"",
+        "\"X-Requested-With\": \"picoguard\"",
+        "authEpoch",
+        "authBusy",
+        "\"Session ended, sign in again.\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
 }
 
 /// No browser here: the tab code is checked as source. A tab is a `[data-tab]` button and a

@@ -107,22 +107,39 @@ button.go:hover { background: var(--accent); opacity: .9; }
 .paused #resume { display: inline-block; }
 .err { color: var(--warn); overflow-wrap: anywhere; }
 .empty { color: var(--muted); }
+.signed-out nav, .signed-out [data-panel], .signed-out #logout { display: none; }
+#login { max-width: 22rem; margin: var(--s5) auto; }
+#login-form { display: grid; gap: var(--s3); }
+#login label { display: grid; gap: var(--s1); font-size: var(--t-sm); color: var(--muted); }
+#login input { width: 100%; }
+#login-note { margin: var(--s3) 0 0; }
 @media (min-width: 720px) {
   .cards { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .headline { grid-column: span 3; }
 }
 </style>
 </head>
-<body>
+<body class="signed-out">
 <header>
   <div class="wrap">
     <h1>picoguard <small id="version"></small></h1>
     <span id="badge" class="badge"></span>
     <span id="state">connecting</span>
+    <button id="logout" hidden>Sign out</button>
   </div>
 </header>
 
 <main class="wrap">
+  <section id="login" class="wide" hidden>
+    <h2>Sign in</h2>
+    <form id="login-form">
+      <label>User <input id="login-user" autocomplete="username" autocapitalize="none" required></label>
+      <label>Password <input id="login-password" type="password" autocomplete="current-password" required></label>
+      <button class="go">Sign in</button>
+    </form>
+    <p id="login-note" class="err"></p>
+  </section>
+
   <nav role="tablist">
     <button role="tab" id="tab-dashboard" data-tab="dashboard" aria-controls="panel-dashboard" aria-selected="true">Dashboard</button>
     <button role="tab" id="tab-log" data-tab="log" aria-controls="panel-log" aria-selected="false">Query log</button>
@@ -218,6 +235,11 @@ let pausedUntil = null;
 let latestVersion = null;
 let chartData = [];
 let chartHour = null;
+// Moves on every change of sign-in state, so an answer from before it never acts.
+let authEpoch = 0;
+// One sign-in or sign-out at a time: a late second sign-in would store a cookie again.
+let authBusy = false;
+let signedIn = false;
 
 // Names and errors come from the network: only ever set as text.
 function el(tag, text, className) {
@@ -279,20 +301,47 @@ function duration(seconds) {
   return Math.floor(seconds / 86400) + " d " + Math.floor(seconds % 86400 / 3600) + " h";
 }
 
+// The header tells the server not to answer 401 with the browser's own sign-in prompt.
 async function api(path, body) {
-  const options = body === undefined ? {} : {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  };
+  const options = { headers: { "X-Requested-With": "picoguard" } };
+
+  if (body !== undefined) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
+
   const response = await fetch(path, options);
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(data.error || "HTTP " + response.status);
+    const error = new Error(data.error || "HTTP " + response.status);
+    error.status = response.status;
+    throw error;
   }
 
   return data;
+}
+
+function showLogin(note) {
+  authEpoch++;
+  signedIn = false;
+  document.body.classList.add("signed-out");
+  $("login").hidden = false;
+  $("logout").hidden = true;
+  $("login-note").textContent = note;
+  $("state").textContent = "signed out";
+  $("state").className = "";
+}
+
+function sessionEnded() {
+  showLogin(signedIn ? "Session ended, sign in again." : "");
+}
+
+function setBusy(busy) {
+  authBusy = busy;
+  $("logout").disabled = busy;
+  $("login-form").querySelector("button").disabled = busy;
 }
 
 // The open tab lives only in the URL fragment. An unknown or hidden tab opens the first one.
@@ -482,8 +531,22 @@ function showLimited(note) {
 }
 
 async function update() {
+  if (!$("login").hidden) {
+    return;
+  }
+
+  const epoch = authEpoch;
+
   try {
     const status = await api("/api/status");
+
+    if (epoch !== authEpoch) {
+      return;
+    }
+
+    signedIn = true;
+    document.body.classList.remove("signed-out");
+    $("logout").hidden = Boolean(status.limited);
     showUpdate(status);
     showLimited(status.limited);
     showPause(status.pause);
@@ -493,6 +556,11 @@ async function update() {
 
     if (!status.limited) {
       const log = await api("/api/querylog?limit=50");
+
+      if (epoch !== authEpoch) {
+        return;
+      }
+
       showTop("top-queried", "a-queried", status.top_queried, "Domain");
       showTop("top-blocked", "a-blocked", status.top_blocked, "Domain");
       showTop("top-clients", "a-clients", status.top_clients, "Client");
@@ -502,19 +570,45 @@ async function update() {
     $("state").textContent = "updated " + new Date().toLocaleTimeString();
     $("state").className = "";
   } catch (error) {
+    if (epoch !== authEpoch) {
+      return;
+    }
+
+    if (error.status === 401) {
+      sessionEnded();
+
+      return;
+    }
+
     $("state").textContent = "no connection: " + error.message;
     $("state").className = "bad";
   }
 }
 
 async function act(path, body, note) {
+  const epoch = authEpoch;
+
   try {
     await api(path, body);
+
+    if (epoch !== authEpoch) {
+      return;
+    }
 
     if (note) {
       $("refresh-note").textContent = note;
     }
   } catch (error) {
+    if (epoch !== authEpoch) {
+      return;
+    }
+
+    if (error.status === 401) {
+      sessionEnded();
+
+      return;
+    }
+
     $("state").textContent = error.message;
     $("state").className = "bad";
   }
@@ -548,6 +642,69 @@ $("install").addEventListener("click", () => {
 });
 $("refresh").addEventListener("click", () =>
   act("/api/lists/refresh", {}, "Refresh started; the table updates as lists finish."));
+$("login-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+
+  if (authBusy) {
+    return;
+  }
+
+  setBusy(true);
+  const epoch = ++authEpoch;
+
+  try {
+    await api("/api/login", { user: $("login-user").value, password: $("login-password").value });
+
+    if (epoch !== authEpoch) {
+      return;
+    }
+
+    authEpoch++;
+    $("login-password").value = "";
+    $("login").hidden = true;
+    update();
+  } catch (error) {
+    if (epoch !== authEpoch) {
+      return;
+    }
+
+    authEpoch++;
+    $("login-note").textContent = error.message;
+  } finally {
+    setBusy(false);
+  }
+});
+$("logout").addEventListener("click", async () => {
+  if (authBusy) {
+    return;
+  }
+
+  setBusy(true);
+  const epoch = ++authEpoch;
+
+  try {
+    await api("/api/logout", {});
+
+    if (epoch === authEpoch) {
+      showLogin("");
+    }
+  } catch (error) {
+    if (epoch !== authEpoch) {
+      return;
+    }
+
+    if (error.status === 401) {
+      showLogin("");
+
+      return;
+    }
+
+    $("state").textContent = error.message;
+    $("state").className = "bad";
+  } finally {
+    setBusy(false);
+  }
+});
 
 showTab();
 update();
