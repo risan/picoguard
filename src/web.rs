@@ -4,7 +4,9 @@
 //!
 //! - a peer outside `web.allow_from` is closed before a byte is read;
 //! - `Host` must be an IP address or a configured name, which defeats DNS rebinding;
-//! - with a password configured, `Authorization` must match, compared in constant time;
+//! - with a password configured, every route but the page and the sign-in needs a valid session
+//!   cookie or a matching `Authorization: Basic`, compared in constant time; failed password
+//!   checks are limited per address;
 //! - without a password the page is read-only and shows totals and list status only: the
 //!   query log, the top lists and every change answer 403;
 //! - a mutation must be `POST` with `Content-Type: application/json` (which a cross-site form
@@ -29,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
-use self::auth::{Credentials, base64};
+use self::auth::{Attempt, Auth, Check};
 use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
 use crate::policy::Policy;
 use crate::scheduler::{ListControl, ListStatus, Role};
@@ -66,8 +68,8 @@ pub struct Web {
     stager: Arc<Stager>,
     allow_from: Vec<Cidr>,
     hostnames: Vec<String>,
-    /// The `Authorization` credentials a client must send; `None` when no password is set.
-    credentials: Option<Credentials>,
+    /// What a client is checked against; `None` when no password is set.
+    auth: Option<Auth>,
     query_log_entries: usize,
 }
 
@@ -81,13 +83,8 @@ impl Web {
         stager: Arc<Stager>,
     ) -> Result<Web, String> {
         let web = &config.web;
-        let credentials = match (&web.user, &web.password) {
-            (Some(user), Some(password)) => Some(Credentials::new(&base64(
-                format!("{user}:{password}").as_bytes(),
-            ))?),
-            _ => None,
-        };
-        if credentials.is_none() {
+        let auth = Auth::new(web)?;
+        if auth.is_none() {
             log::warn!(
                 "the status page has no password: it shows totals and list status only. \
                  Set web.user and web.password for the query log, the top lists and pause."
@@ -102,7 +99,7 @@ impl Web {
             stager,
             allow_from: web.allow_from.clone(),
             hostnames: web.hostnames.clone(),
-            credentials,
+            auth,
             query_log_entries: config.stats.query_log_entries,
         })
     }
@@ -177,15 +174,20 @@ async fn serve(listener: TcpListener, web: Arc<Web>, connections: Arc<Semaphore>
             continue;
         };
 
-        tokio::spawn(serve_connection(stream, Arc::clone(&web), slot));
+        tokio::spawn(serve_connection(stream, peer.ip(), Arc::clone(&web), slot));
     }
 }
 
-async fn serve_connection(stream: TcpStream, web: Arc<Web>, _slot: OwnedSemaphorePermit) {
+async fn serve_connection(
+    stream: TcpStream,
+    peer: IpAddr,
+    web: Arc<Web>,
+    _slot: OwnedSemaphorePermit,
+) {
     let service = service_fn(move |request| {
         let web = Arc::clone(&web);
 
-        async move { Ok::<_, Infallible>(web.respond(request).await) }
+        async move { Ok::<_, Infallible>(web.respond(request, peer).await) }
     });
 
     let connection = http1::Builder::new()
@@ -235,6 +237,11 @@ impl Route {
             "/api/update" => Some(Route::Change(Change::Install)),
             _ => None,
         }
+    }
+
+    /// Open without a sign-in even when a password is set: the page shows its own form.
+    fn is_public(&self) -> bool {
+        matches!(self, Route::Read(Read::Page))
     }
 
     /// Whether the page shows this only to a signed-in user: the query log, the top lists
@@ -292,8 +299,8 @@ impl Rejection {
 }
 
 impl Web {
-    async fn respond(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
-        let response = match self.try_respond(request).await {
+    async fn respond(&self, request: Request<Incoming>, peer: IpAddr) -> Response<Full<Bytes>> {
+        let response = match self.try_respond(request, peer).await {
             Ok(response) => response,
             Err(rejection) => rejection.into_response(),
         };
@@ -304,14 +311,21 @@ impl Web {
     async fn try_respond(
         &self,
         request: Request<Incoming>,
+        peer: IpAddr,
     ) -> Result<Response<Full<Bytes>>, Rejection> {
         let (head, body) = request.into_parts();
         let host = self.checked_host(&head.headers)?;
-        self.check_credentials(&head.headers)?;
 
-        let route = Route::of(head.uri.path())
-            .ok_or_else(|| Rejection::new(StatusCode::NOT_FOUND, "no such page"))?;
-        if route.needs_password() && self.credentials.is_none() {
+        // An unknown path is not public, so it answers 401 before 404.
+        let route = Route::of(head.uri.path());
+        if let Some(auth) = &self.auth
+            && !route.as_ref().is_some_and(Route::is_public)
+        {
+            authenticate(auth, &head.headers, peer).await?;
+        }
+
+        let route = route.ok_or_else(|| Rejection::new(StatusCode::NOT_FOUND, "no such page"))?;
+        if route.needs_password() && self.auth.is_none() {
             return Err(Rejection::new(StatusCode::FORBIDDEN, PASSWORD_NEEDED));
         }
 
@@ -377,26 +391,6 @@ impl Web {
         is_known_name && is_port_suffix(suffix)
     }
 
-    fn check_credentials(&self, headers: &HeaderMap) -> Result<(), Rejection> {
-        let Some(expected) = &self.credentials else {
-            return Ok(());
-        };
-
-        let sent = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split_once(' '))
-            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
-            .map(|(_, credentials)| credentials.trim());
-
-        if sent.is_some_and(|sent| expected.accepts(sent)) {
-            return Ok(());
-        }
-
-        Err(Rejection::new(StatusCode::UNAUTHORIZED, "sign in")
-            .with_header(header::WWW_AUTHENTICATE, "Basic realm=\"picoguard\""))
-    }
-
     fn read(&self, read: Read, query: Option<&str>) -> Result<Response<Full<Bytes>>, Rejection> {
         match read {
             Read::Page => Ok(Response::builder()
@@ -407,7 +401,7 @@ impl Web {
             Read::Status => {
                 let snapshot = self.stats.snapshot();
                 let view = self.policy.view(Instant::now());
-                let is_open = self.credentials.is_some();
+                let is_open = self.auth.is_some();
 
                 Ok(json(
                     StatusCode::OK,
@@ -513,7 +507,7 @@ impl Web {
     /// The button is offered only to a signed-in user: the route needs the password too.
     fn update_view(&self) -> UpdateView {
         let mut view = self.updates.view();
-        view.can_install = self.credentials.is_some() && self.stager.can_install();
+        view.can_install = self.auth.is_some() && self.stager.can_install();
         view.install = self.stager.view();
 
         view
@@ -560,6 +554,61 @@ impl Web {
             .map(ListView::of)
             .collect()
     }
+}
+
+/// A valid session cookie is enough. Without one, a Basic header is a password check, and a
+/// request with neither counts nothing.
+async fn authenticate(auth: &Auth, headers: &HeaderMap, peer: IpAddr) -> Result<(), Rejection> {
+    if auth.has_session(headers, unix_now()) {
+        return Ok(());
+    }
+
+    let sent = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+        .map(|(_, credentials)| credentials.trim());
+
+    let Some(sent) = sent else {
+        return Err(unauthorized(headers, "sign in"));
+    };
+
+    match auth.check(peer, Attempt::Basic(sent)).await {
+        Check::Accepted => Ok(()),
+        Check::Refused => Err(unauthorized(headers, "sign in")),
+        Check::Limited => Err(too_many_attempts()),
+    }
+}
+
+/// A Basic challenge makes a browser show its own prompt, even for `fetch`, so the page's
+/// script, which says who it is, gets none. Clients that send credentials only after a
+/// challenge (GNU wget) still get it.
+fn unauthorized(headers: &HeaderMap, message: &'static str) -> Rejection {
+    let rejection = Rejection::new(StatusCode::UNAUTHORIZED, message);
+    let is_page = headers
+        .get("x-requested-with")
+        .is_some_and(|value| value == "picoguard");
+
+    if is_page {
+        return rejection;
+    }
+
+    rejection.with_header(header::WWW_AUTHENTICATE, "Basic realm=\"picoguard\"")
+}
+
+fn too_many_attempts() -> Rejection {
+    Rejection::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many attempts, try again later",
+    )
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Empty, or a colon and a port number.

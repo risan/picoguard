@@ -5,7 +5,7 @@
 mod common;
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -18,6 +18,7 @@ use picoguard::config::{Config, ListConfig, ListFormat};
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::Downloader;
+use picoguard::password::PasswordHash;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Scheduler, Timing};
 use picoguard::stage::{StageSetup, StageTiming, Stager};
@@ -26,7 +27,7 @@ use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 
 const ADMIN: &str = "YWRtaW46czNjcmV0";
 const WRONG_PASSWORD: &str = "YWRtaW46d3Jvbmc=";
@@ -96,6 +97,11 @@ impl Request {
         self.header("Authorization", &format!("Basic {credentials}"))
     }
 
+    /// What the page's own script sends with every call.
+    fn from_page(self) -> Request {
+        self.header("X-Requested-With", "picoguard")
+    }
+
     fn bytes(&self, default_host: SocketAddr) -> Vec<u8> {
         let mut text = format!("{} {} HTTP/1.1\r\n", self.method, self.path);
         if !self
@@ -132,9 +138,25 @@ impl Request {
 
 /// Writes `bytes` and reads until the server closes. Empty when the server sent nothing.
 async fn exchange(address: SocketAddr, bytes: &[u8]) -> Vec<u8> {
-    let Ok(mut stream) = TcpStream::connect(address).await else {
+    let Ok(stream) = TcpStream::connect(address).await else {
         return Vec::new();
     };
+
+    exchange_on(stream, bytes).await
+}
+
+/// As `exchange`, from another loopback address, so the server sees another client.
+async fn exchange_from(address: SocketAddr, from: IpAddr, bytes: &[u8]) -> Vec<u8> {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind(SocketAddr::new(from, 0)).unwrap();
+    let Ok(stream) = socket.connect(address).await else {
+        return Vec::new();
+    };
+
+    exchange_on(stream, bytes).await
+}
+
+async fn exchange_on(mut stream: TcpStream, bytes: &[u8]) -> Vec<u8> {
     let _ = stream.write_all(bytes).await;
 
     let mut received = Vec::new();
@@ -194,6 +216,21 @@ impl Site {
         parse_reply(&bytes).unwrap_or_else(|| panic!("no reply: {bytes:?}"))
     }
 
+    /// Sends the request as it is, never with the administrator's credentials.
+    async fn send_as_is(&self, request: Request) -> Reply {
+        let bytes = exchange(self.web, &request.bytes(self.web)).await;
+
+        parse_reply(&bytes).unwrap_or_else(|| panic!("no reply: {bytes:?}"))
+    }
+
+    /// As `send_as_is`, from another client address.
+    async fn send_from(&self, from: &str, request: Request) -> Reply {
+        let from: IpAddr = from.parse().unwrap();
+        let bytes = exchange_from(self.web, from, &request.bytes(self.web)).await;
+
+        parse_reply(&bytes).unwrap_or_else(|| panic!("no reply: {bytes:?}"))
+    }
+
     /// True when the server closed the connection without sending anything.
     async fn is_ignored(&self, request: Request) -> bool {
         exchange(self.web, &request.bytes(self.web))
@@ -232,6 +269,19 @@ fn with_credentials(config: &mut Config) {
 fn without_credentials(config: &mut Config) {
     config.web.user = None;
     config.web.password = None;
+}
+
+/// User `admin` with a hash of `password` instead of the plaintext.
+fn hashed_config(
+    upstream: &common::harness::FakeUpstream,
+    password: &str,
+    iterations: u32,
+) -> Config {
+    let mut config = local_config(upstream);
+    config.web.password = None;
+    config.web.password_hash = Some(PasswordHash::new(password.as_bytes(), iterations).unwrap());
+
+    config
 }
 
 /// A scheduler that refreshes nothing by itself for a day, so a refresh is always asked for.
@@ -366,7 +416,7 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
         updates,
         release,
         stager,
-        signs_in: config.web.password.is_some(),
+        signs_in: config.web.user.is_some(),
     }
 }
 
@@ -1234,68 +1284,197 @@ async fn a_get_of_a_mutation_names_the_method_that_works() {
 }
 
 #[tokio::test]
-async fn the_page_and_every_endpoint_need_the_password_when_one_is_set() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let mut config = local_config(&upstream);
-    with_credentials(&mut config);
-    let mut site = site(config).await;
-    site.signs_in = false;
-    let reads = ["/", "/api/status", "/api/querylog", "/api/lists"];
+async fn with_a_password_the_page_opens_without_a_prompt_and_the_api_needs_a_sign_in() {
+    let (site, _upstream) = plain_site().await;
+    let reads = ["/api/status", "/api/querylog", "/api/lists"];
     let changes = [
         ("/api/pause", "{\"minutes\": 5}"),
         ("/api/resume", ""),
         ("/api/lists/refresh", ""),
         ("/api/update", UPDATE_BODY),
     ];
+    let requests = || {
+        reads
+            .iter()
+            .map(|path| get(path))
+            .chain(changes.iter().map(|(path, body)| post(path, body)))
+    };
 
-    let sign_in_attempts = [
-        None,
-        Some(WRONG_PASSWORD),
-        Some(OTHER_USER),
-        Some("YWRtaW46czNjcmU="),
-        Some("YWRtaW46czNjcmV0eA=="),
-        Some(""),
+    let page = site.send_as_is(get("/")).await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("<title>picoguard"));
+    assert_eq!(page.header("www-authenticate"), None);
+
+    for request in requests() {
+        let path = request.path.clone();
+        let reply = site.send_as_is(request).await;
+
+        assert_eq!(reply.status, 401, "{path}");
+        assert_eq!(
+            reply.header("www-authenticate"),
+            Some("Basic realm=\"picoguard\""),
+            "{path}"
+        );
+        assert!(!reply.body.contains("counters"), "{path}");
+    }
+
+    for request in requests() {
+        let path = request.path.clone();
+        let reply = site.send_as_is(request.from_page()).await;
+
+        assert_eq!(reply.status, 401, "{path}");
+        assert_eq!(reply.header("www-authenticate"), None, "{path}");
+    }
+
+    let wrong_credentials = [
+        WRONG_PASSWORD,
+        OTHER_USER,
+        "YWRtaW46czNjcmU=",
+        "YWRtaW46czNjcmV0eA==",
+        "",
     ];
-    for attempt in sign_in_attempts {
-        let signed = |request: Request| match attempt {
-            Some(credentials) => request.signed_in(credentials),
-            None => request,
-        };
+    // Each request from its own address, so none of them reaches the limit.
+    for (attempt, credentials) in wrong_credentials.iter().enumerate() {
+        for (index, request) in requests().enumerate() {
+            let path = request.path.clone();
+            let from = format!("127.0.{}.{}", 10 + attempt, 1 + index);
+            let reply = site.send_from(&from, request.signed_in(credentials)).await;
 
-        for path in reads {
-            let reply = site.send(signed(get(path))).await;
-            assert_eq!(reply.status, 401, "{path} {attempt:?}");
+            assert_eq!(reply.status, 401, "{path} {credentials:?}");
             assert_eq!(
                 reply.header("www-authenticate"),
-                Some("Basic realm=\"picoguard\"")
+                Some("Basic realm=\"picoguard\""),
+                "{path} {credentials:?}"
             );
-            assert!(!reply.body.contains("counters") && !reply.body.contains("<html"));
-        }
-
-        for (path, body) in changes {
-            let reply = site.send(signed(post(path, body))).await;
-            assert_eq!(reply.status, 401, "{path} {attempt:?}");
         }
     }
 
     assert!(!site.is_paused());
 
     for path in reads {
-        let reply = site.send(get(path).signed_in(ADMIN)).await;
+        let reply = site.send_as_is(get(path).signed_in(ADMIN)).await;
         assert_eq!(reply.status, 200, "{path}");
     }
 
     let lowercase_scheme = get("/api/status").header("Authorization", &format!("basic {ADMIN}"));
-    assert_eq!(site.send(lowercase_scheme).await.status, 200);
+    assert_eq!(site.send_as_is(lowercase_scheme).await.status, 200);
 
     let paused = site
-        .send(post("/api/pause", "{\"minutes\": 5}").signed_in(ADMIN))
+        .send_as_is(post("/api/pause", "{\"minutes\": 5}").signed_in(ADMIN))
         .await;
     assert_eq!(paused.status, 200);
     assert!(site.is_paused());
-    let resumed = site.send(post("/api/resume", "").signed_in(ADMIN)).await;
+    let resumed = site
+        .send_as_is(post("/api/resume", "").signed_in(ADMIN))
+        .await;
     assert_eq!(resumed.status, 200);
     assert!(!site.is_paused());
+}
+
+const TOO_MANY_ATTEMPTS: &str = "{\"error\":\"too many attempts, try again later\"}";
+
+#[tokio::test]
+async fn wrong_basic_auth_counts_toward_the_limit_and_anonymous_requests_do_not() {
+    let (site, _upstream) = plain_site().await;
+
+    for _ in 0..10 {
+        let reply = site.send_from("127.0.0.2", get("/api/status")).await;
+        assert_eq!(reply.status, 401);
+    }
+
+    for _ in 0..5 {
+        let reply = site
+            .send_from("127.0.0.2", get("/api/status").signed_in(WRONG_PASSWORD))
+            .await;
+        assert_eq!(reply.status, 401);
+    }
+
+    let limited = site
+        .send_from("127.0.0.2", get("/api/status").signed_in(ADMIN))
+        .await;
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.body, TOO_MANY_ATTEMPTS);
+    assert_eq!(limited.header("www-authenticate"), None);
+
+    let other = site
+        .send_from("127.0.0.3", get("/api/status").signed_in(ADMIN))
+        .await;
+    assert_eq!(other.status, 200);
+}
+
+#[tokio::test]
+async fn a_password_hash_opens_the_api_with_basic_auth() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let site = site(hashed_config(&upstream, "s3cret", 1000)).await;
+
+    let wrong = site
+        .send_as_is(get("/api/status").signed_in(WRONG_PASSWORD))
+        .await;
+    assert_eq!(wrong.status, 401);
+
+    let right = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
+    assert_eq!(right.status, 200);
+    assert!(right.json().get("limited").is_none(), "{}", right.body);
+}
+
+#[tokio::test]
+async fn repeated_basic_auth_with_a_hash_does_not_pay_the_hash_each_time() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let config = hashed_config(&upstream, "s3cret", 100_000);
+    let hash = config.web.password_hash.clone().unwrap();
+    let site = site(config).await;
+    let started = Instant::now();
+    assert!(hash.verify(b"s3cret"));
+    let one = started.elapsed();
+
+    let wrong = site
+        .send_as_is(get("/api/status").signed_in(WRONG_PASSWORD))
+        .await;
+    assert_eq!(wrong.status, 401);
+    let first = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
+    assert_eq!(first.status, 200);
+    assert!(first.json().get("limited").is_none());
+
+    let started = Instant::now();
+    for _ in 0..100 {
+        let reply = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
+        assert_eq!(reply.status, 200);
+    }
+    let hundred = started.elapsed();
+
+    // Uncached, they would take `one * 100`.
+    assert!(
+        hundred < one * 10,
+        "one hash {one:?}, 100 requests {hundred:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_password_check_holds_up_neither_dns_nor_the_page() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let site = Arc::new(site(hashed_config(&upstream, "s3cret", 2_000_000)).await);
+
+    let slow = tokio::spawn({
+        let site = Arc::clone(&site);
+
+        async move {
+            site.send_from("127.0.0.2", get("/api/status").signed_in(WRONG_PASSWORD))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let answers = async {
+        ask(&site.dns, "ok.example.", RecordType::A).await;
+        site.send_as_is(get("/")).await
+    };
+    let page = tokio::time::timeout(Duration::from_secs(2), answers)
+        .await
+        .expect("DNS and the page answer while a password is hashed");
+    assert_eq!(page.status, 200);
+    assert!(!slow.is_finished(), "the hash ended before DNS was asked");
+
+    assert_eq!(slow.await.unwrap().status, 401);
 }
 
 #[tokio::test]
