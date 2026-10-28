@@ -89,7 +89,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
     let mut check = false;
     let mut hash_password = false;
     // So a password typed after the flag is never taken for something else.
-    let hash_password_alone = || "--hash-password takes no value and only -c FILE beside it";
+    const HASH_PASSWORD_ALONE: &str = "--hash-password takes no value and only -c FILE beside it";
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -109,7 +109,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             }
 
             "--version" | "-h" | "--help" if hash_password => {
-                return Err(hash_password_alone().to_string());
+                return Err(HASH_PASSWORD_ALONE.to_string());
             }
 
             "--version" => {
@@ -121,7 +121,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             }
 
             _ if hash_password => {
-                return Err(hash_password_alone().to_string());
+                return Err(HASH_PASSWORD_ALONE.to_string());
             }
 
             _ => {
@@ -131,7 +131,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
     }
 
     if hash_password && check {
-        return Err(hash_password_alone().to_string());
+        return Err(HASH_PASSWORD_ALONE.to_string());
     }
 
     if hash_password {
