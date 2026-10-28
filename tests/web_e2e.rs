@@ -486,6 +486,24 @@ async fn the_page_has_three_tabs_kept_in_the_url_fragment() {
     }
 }
 
+/// No browser here: the chart is checked as source. The SVG namespace is read from the markup,
+/// because its literal contains `http://`, which the page must never contain.
+#[tokio::test]
+async fn the_chart_is_inline_svg_drawn_with_create_element_ns() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "<svg id=\"chart\"",
+        "createElementNS(",
+        ".namespaceURI",
+        "id=\"chart-readout\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
 /// No browser here: the button is hidden by a style rule, so the rule is what is checked.
 #[tokio::test]
 async fn the_resume_button_is_shown_only_while_blocking_is_paused() {

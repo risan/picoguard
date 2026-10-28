@@ -63,12 +63,15 @@ tr:last-child td { border-bottom: 0; }
 td.num { text-align: right; padding-right: 0; font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.name { overflow-wrap: anywhere; }
 .scroll { overflow-x: auto; }
-.chart { display: flex; align-items: flex-end; gap: 2px; height: 90px; }
-.bar { flex: 1; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 1px;
-  display: flex; align-items: flex-end; }
-.bar i { display: block; width: 100%; background: var(--blocked); border-radius: 2px 2px 0 0; }
-.axis { display: flex; gap: 2px; font-size: 10px; color: var(--muted); }
-.axis span { flex: 1; text-align: center; overflow: hidden; }
+#chart-readout { margin: 0 0 var(--s2); font-size: var(--t-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
+#chart { display: block; }
+#chart text { font-size: 10px; fill: var(--muted); }
+#chart line { stroke: var(--line); }
+#chart .base { stroke: var(--muted); }
+#chart .total { fill: var(--accent); }
+#chart .blocked { fill: var(--blocked); }
+#chart .hit { fill: transparent; pointer-events: all; }
+#chart .hit.on { fill: var(--tint); }
 .pause { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
 .pause p { margin: 0 auto 0 0; flex: 1 1 12rem; font-size: 15px; }
 .paused #pause { border-color: var(--warn); }
@@ -139,8 +142,8 @@ button.go:hover { background: var(--accent); opacity: .9; }
 
     <section class="wide">
       <h2>Last 24 hours <small>(queries, blocked in red)</small></h2>
-      <div class="chart" id="chart"></div>
-      <div class="axis" id="axis"></div>
+      <p id="chart-readout"></p>
+      <svg id="chart" width="100%" height="150"></svg>
     </section>
 
     <div id="tops" class="grid wide">
@@ -182,8 +185,14 @@ const INSTALL_TEXT = {
   rolled_back: (i) => "Rolled back: " + i.reason,
   failed: (i) => "Update failed: " + i.reason,
 };
+const SVG = $("chart").namespaceURI;
+const CHART_HEIGHT = 150;
+const CHART_TOP = 18;
+const CHART_BASE = 132;
 let pausedUntil = null;
 let latestVersion = null;
+let chartData = [];
+let chartHour = null;
 
 // Names and errors come from the network: only ever set as text.
 function el(tag, text, className) {
@@ -278,21 +287,68 @@ function showCards(counters, percent) {
   }));
 }
 
-function showChart(hourly) {
-  const most = Math.max(1, ...hourly.map((h) => h.total));
-  $("chart").replaceChildren(...hourly.map((h) => {
-    const hour = new Date(h.hour_start * 1000).getHours();
-    const bar = el("div", undefined, "bar");
-    bar.style.height = (h.total / most * 100) + "%";
-    bar.title = hour + ":00  " + h.total + " queries, " + h.blocked + " blocked";
-    const blocked = el("i");
-    blocked.style.height = (h.total ? h.blocked / h.total * 100 : 0) + "%";
-    bar.append(blocked);
+function svg(tag, attributes, text) {
+  const node = document.createElementNS(SVG, tag);
+  Object.entries(attributes).forEach(([name, value]) => node.setAttribute(name, value));
 
-    return bar;
-  }));
-  $("axis").replaceChildren(...hourly.map((h, i) =>
-    el("span", i % 4 === 0 ? new Date(h.hour_start * 1000).getHours() : "")));
+  if (text !== undefined) {
+    node.textContent = text;
+  }
+
+  return node;
+}
+
+function hourOf(bucket) {
+  return new Date(bucket.hour_start * 1000).getHours();
+}
+
+function chooseHour(i) {
+  chartHour = i;
+  markHour();
+}
+
+function markHour() {
+  const i = chartHour === null ? chartData.length - 1 : chartHour;
+  const bucket = chartData[i];
+  $("chart-readout").textContent = hourOf(bucket) + ":00 \u00b7 " + bucket.total.toLocaleString()
+    + " queries \u00b7 " + bucket.blocked.toLocaleString() + " blocked";
+  $("chart").querySelectorAll("[data-i]").forEach((hit) =>
+    hit.classList.toggle("on", Number(hit.dataset.i) === i));
+}
+
+// x and width are percentages and y and height are pixels, so the bars stretch to any width
+// while the axis text keeps its size.
+function showChart(hourly) {
+  chartData = hourly;
+  const peak = Math.max(0, ...hourly.map((h) => h.total));
+  const room = CHART_BASE - CHART_TOP;
+  const slot = 100 / hourly.length;
+  const parts = [
+    svg("line", { x1: 0, x2: "100%", y1: CHART_TOP, y2: CHART_TOP }),
+    svg("line", { class: "base", x1: 0, x2: "100%", y1: CHART_BASE, y2: CHART_BASE }),
+    svg("text", { x: 0, y: CHART_TOP - 5 }, peak.toLocaleString()),
+  ];
+  hourly.forEach((h, i) => {
+    const height = h.total / Math.max(1, peak) * room;
+    const bar = { x: (i + .15) * slot + "%", width: slot * .7 + "%", rx: 2 };
+    const blockedHeight = h.total ? h.blocked / h.total * height : 0;
+    parts.push(
+      svg("rect", { ...bar, class: "total", y: CHART_BASE - height, height }),
+      svg("rect", { ...bar, class: "blocked", y: CHART_BASE - blockedHeight, height: blockedHeight }));
+
+    if (i % 4 === 0) {
+      parts.push(svg("text", { x: (i + .5) * slot + "%", y: CHART_HEIGHT - 2, "text-anchor": "middle" }, hourOf(h)));
+    }
+  });
+  hourly.forEach((h, i) => {
+    const hit = svg("rect", { class: "hit", "data-i": i, x: i * slot + "%", y: 0,
+      width: slot + "%", height: CHART_HEIGHT });
+    hit.addEventListener("pointerover", () => chooseHour(i));
+    hit.addEventListener("click", () => chooseHour(i));
+    parts.push(hit);
+  });
+  $("chart").replaceChildren(...parts);
+  markHour();
 }
 
 // A name that took over another one's slot inherited that count. If it was seen only once
