@@ -238,10 +238,10 @@ The restart signs out every browser. In Docker, make the line with
 #### From the status page
 
 When a newer release exists, the status page says "update available". If you are signed in (set
-`web.user` and `web.password_hash` or `web.password`), it also shows a button, **Update to vX.Y.Z**. The button needs a
-release binary that `install.sh` installed: `install.sh` also sets up the root program that
-installs the update ("the installer" below). A manual install, a Docker image and a build from
-source show the command to run instead.
+`web.user` and `web.password_hash` or `web.password`), it also shows a button,
+**Update to vX.Y.Z**. The button needs a release binary that `install.sh` installed: `install.sh`
+also sets up the root program that installs the update ("the installer" below). A manual install,
+a Docker image and a build from source show the command to run instead.
 
 What one click does:
 
@@ -515,8 +515,8 @@ http://DEVICE_IP:8080/
 
 It shows totals, the share blocked and the state of each list (size, age, errors). A list shows an
 error here when its download failed. Until you set `web.user` and `web.password_hash` or
-`web.password` (see `docs/configuration.md`), that is all: the top domains, the top clients, the recent queries and the
-pause button need the password.
+`web.password` (see `docs/configuration.md`), that is all: the top domains, the top clients, the
+recent queries and the pause button need the password.
 
 Logs: `journalctl -u picoguard` (systemd) or syslog (OpenRC, when a logger runs: `/var/log/messages`,
 or `logread` when the log is in memory). The default level is
