@@ -24,13 +24,12 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use ring::hmac;
-use ring::rand::SystemRandom;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
+use self::auth::{Credentials, base64};
 use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
 use crate::policy::Policy;
 use crate::scheduler::{ListControl, ListStatus, Role};
@@ -38,6 +37,8 @@ use crate::server::bind_tcp;
 use crate::stage::{Refused, Stager};
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, Stats, TopEntry};
 use crate::update::{Tag, UpdateView, Updates, parse_tag};
+
+mod auth;
 
 const PAGE: &str = include_str!("web/index.html");
 
@@ -643,49 +644,6 @@ fn method_not_allowed(allowed: &'static str) -> Rejection {
         .with_header(header::ALLOW, allowed)
 }
 
-/// The expected `Authorization` credentials, kept as an HMAC-SHA256 tag under a key drawn at
-/// startup. Tags have one size, so neither what is stored nor the comparison depends on the
-/// length of the secret, and `hmac::verify` does not stop at the first difference.
-struct Credentials {
-    key: hmac::Key,
-    tag: hmac::Tag,
-}
-
-impl Credentials {
-    fn new(credentials: &str) -> Result<Credentials, String> {
-        let key = hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new())
-            .map_err(|_| "cannot draw a random key for the web credentials".to_string())?;
-        let tag = hmac::sign(&key, credentials.as_bytes());
-
-        Ok(Credentials { key, tag })
-    }
-
-    fn accepts(&self, sent: &str) -> bool {
-        hmac::verify(&self.key, sent.as_bytes(), self.tag.as_ref()).is_ok()
-    }
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
-
-    for chunk in bytes.chunks(3) {
-        let group = chunk.iter().enumerate().fold(0u32, |group, (index, byte)| {
-            group | u32::from(*byte) << (16 - 8 * index)
-        });
-
-        for index in 0..4 {
-            if index <= chunk.len() {
-                text.push(ALPHABET[(group >> (18 - 6 * index) & 0x3f) as usize] as char);
-            } else {
-                text.push('=');
-            }
-        }
-    }
-
-    text
-}
-
 fn json<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {
     let body = serde_json::to_vec(value).unwrap_or_default();
 
@@ -967,45 +925,6 @@ mod tests {
         assert!(!check(Some("application/x-www-form-urlencoded")));
         assert!(!check(Some("multipart/form-data; boundary=x")));
         assert!(!check(Some("application/jsonp")));
-    }
-
-    #[test]
-    fn base64_matches_the_standard_vectors() {
-        for (plain, encoded) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-            ("admin:s3cret", "YWRtaW46czNjcmV0"),
-        ] {
-            assert_eq!(base64(plain.as_bytes()), encoded, "{plain}");
-        }
-    }
-
-    #[test]
-    fn credentials_are_accepted_only_when_every_byte_is_equal() {
-        let credentials = Credentials::new("abc").unwrap();
-
-        assert!(credentials.accepts("abc"));
-        assert!(!credentials.accepts("abd"));
-        assert!(!credentials.accepts("abcd"));
-        assert!(!credentials.accepts("ab"));
-        assert!(!credentials.accepts(""));
-        assert!(Credentials::new("").unwrap().accepts(""));
-    }
-
-    #[test]
-    fn what_is_kept_of_the_credentials_has_the_same_size_whatever_their_length() {
-        let short = Credentials::new("a").unwrap();
-        let long = Credentials::new(&"a".repeat(5000)).unwrap();
-
-        assert_eq!(short.tag.as_ref().len(), long.tag.as_ref().len());
-        assert_eq!(std::mem::size_of_val(&short), std::mem::size_of_val(&long));
-        assert!(!short.accepts(&"a".repeat(5000)));
-        assert!(long.accepts(&"a".repeat(5000)));
     }
 
     #[test]
