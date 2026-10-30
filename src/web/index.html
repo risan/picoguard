@@ -70,11 +70,11 @@ th { text-align: left; font-weight: 500; font-size: var(--t-sm); color: var(--mu
 th, td { padding: var(--s2) var(--s3) var(--s2) 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 tr:last-child td { border-bottom: 0; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-td.name { overflow-wrap: anywhere; }
+td.name, td.who { overflow-wrap: anywhere; }
 .ip { color: var(--muted); }
 #queries td, #list-table td { white-space: nowrap; }
 #list-table td.err { min-width: 14rem; white-space: normal; }
-#queries td.name:not(.who) { min-width: 12rem; white-space: normal; }
+#queries td.name { min-width: 12rem; white-space: normal; }
 #queries td.who { white-space: normal; }
 .bars table { border-collapse: separate; border-spacing: 0 2px; }
 .bars td { padding: 6px 0 6px var(--s2); border-bottom: 0; }
@@ -133,8 +133,7 @@ td button { padding: 1px var(--s2); font-size: var(--t-sm); }
   #queries tr::after { content: ""; flex-basis: 100%; order: -1; }
   #queries tr:first-child, #queries td:nth-child(6) { display: none; }
   #queries td { padding: 0; border: 0; font-size: var(--t-sm); color: var(--muted); }
-  #queries td.name:not(.who) { flex: 1 1 0; min-width: 0; order: -3; font-size: 13px; color: var(--text); }
-  #queries td.who { color: var(--text); }
+  #queries td.name { flex: 1 1 0; min-width: 0; order: -3; font-size: 13px; color: var(--text); }
   #queries td:nth-child(5) { order: -2; color: var(--text); }
   #queries td:last-child { margin-left: auto; }
 }
@@ -346,7 +345,7 @@ function row(cells) {
 
 // A client: its device name with the IP beside it, or the IP alone.
 function who(name, ip) {
-  const td = el("td", name ? undefined : ip, "name who");
+  const td = el("td", name ? undefined : ip, "who");
 
   if (name) {
     td.append(el("span", name), " ", el("small", ip, "ip"));
@@ -528,6 +527,7 @@ function showTop(id, noteId, top, name) {
     }
 
     const key = who(e.name, e.key);
+    key.classList.add("name");
     key.style.setProperty("--share", e.count / shown[0].count * 100 + "%");
     const tr = el("tr");
     tr.append(key, count);
