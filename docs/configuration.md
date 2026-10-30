@@ -191,14 +191,30 @@ These keep memory fixed. The defaults fit a 256 MB board; you rarely change them
 ## `[web]`
 
 The status page. With `user` and a password (`password_hash`, or `password`) set, it shows totals,
-top blocked domains, top clients, recent queries and list status, and can pause blocking for a set
-time and refresh the lists.
+top blocked domains, top clients, upstream servers, recent queries and list status, and can pause
+blocking for a set time and refresh the lists.
 
 Without a password the page is read-only and limited: it shows totals and list status only. The
-query log, the top lists, pause, resume and refresh answer 403 ("set web.user and web.password_hash
-(or web.password) to use this"), and the page says so. picoguard logs one warning at start when no
+query log, pause, resume and refresh answer 403 ("set web.user and web.password_hash (or
+web.password) to use this"), and the page says so. The top lists and the upstream servers are left
+out of `/api/status`, and the page hides them. picoguard logs one warning at start when no
 password is set. Every device that may open the page could otherwise read the household's queries
 and switch blocking off.
+
+The Upstreams card, and the `upstreams` field of `/api/status`, list every server in
+`[upstream] servers`, in that order, and then the `[local]` resolver when one is set. Each entry has
+`label` (the server as written in `[upstream] servers`, or the `[local] resolver` address), `kind`
+(`upstream` or `local`), `answered`, `failed` and `avg_ms` (`null` before the first answer).
+
+- The counts start at picoguard's start. A try that is repeated on the next server counts as a
+  failure on the first one and as an answer on the second.
+- picoguard's own lookups count too: list downloads and the update check.
+- A query that a blocking rule held back after the answer came in did reach the server and counts.
+  A cached answer and a query blocked by a request rule never reach a server and do not count.
+- `avg_ms` is the average over the answers, in milliseconds with one decimal. The time runs from
+  sending the request until the reply arrives. It includes opening a connection when one is needed,
+  and it leaves out picoguard's own wait for a free slot on that server.
+- The card is only for the signed-in page, because a DoH address can hold a private profile ID.
 
 | Key | Default | Meaning |
 |---|---|---|

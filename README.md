@@ -120,8 +120,8 @@ container) and give both addresses to your router as primary and secondary DNS.
 - Lists download on a schedule with ETag / If-Modified-Since, and a new list takes effect without
   a restart. A failed download, a list that is too big, or a list that blocks everything keeps the
   last good copy.
-- Status page: totals and list status for everyone on the LAN; query log, top lists and pause
-  only with the password.
+- Status page: totals and list status for everyone on the LAN; query log, top lists, upstream
+  servers (answers, failures, average time) and pause only with the password.
 - The status page shows the version and, once a day, whether a newer release exists, and installs
   it with one click: the release is checked against a built-in signature key, a small root
   installer swaps the binary, and the old version comes back if the new one does not answer DNS.
