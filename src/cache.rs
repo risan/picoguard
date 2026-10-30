@@ -227,6 +227,8 @@ pub struct Hit<'a> {
     pub parts: ReplyParts<'a>,
     pub age_secs: u32,
     pub memo: Option<Memo>,
+    /// Past its lifetime, served from the optimistic window.
+    pub stale: bool,
 }
 
 /// Marks "no slot" in the links of the recency list and in the free list.
@@ -275,6 +277,8 @@ pub struct Cache {
     min_ttl: u32,
     max_ttl: u32,
     max_response_size: usize,
+    /// How long past its lifetime an entry is still served, when optimism is on.
+    max_stale_secs: Option<u32>,
 }
 
 impl Cache {
@@ -292,6 +296,7 @@ impl Cache {
             min_ttl: config.min_ttl,
             max_ttl: config.max_ttl,
             max_response_size: config.max_response_size,
+            max_stale_secs: config.optimistic.then_some(config.optimistic_max_age_secs),
         }
     }
 
@@ -308,8 +313,9 @@ impl Cache {
         self.bytes
     }
 
-    /// Returns a live entry for `key` and marks it recently used. An expired
-    /// entry is removed.
+    /// Returns the entry for `key` and marks it recently used. An entry past its lifetime is
+    /// returned as stale while it is no more than `max_stale_secs` past it, and removed after
+    /// that, or at once when optimism is off.
     pub fn get(&mut self, key: &CacheKey<'_>, now: Instant) -> Option<Hit<'_>> {
         let slot = *self.index.get(&key.hash)?;
         let entry = self.entry(slot);
@@ -317,7 +323,13 @@ impl Cache {
             return None;
         }
 
-        if entry.age_secs(now) >= entry.lifetime_secs {
+        let age_secs = entry.age_secs(now);
+        let stale = age_secs >= entry.lifetime_secs;
+        if stale
+            && self
+                .max_stale_secs
+                .is_none_or(|max| age_secs - entry.lifetime_secs > max)
+        {
             self.remove(key.hash);
 
             return None;
@@ -334,9 +346,35 @@ impl Cache {
                 ttl_offsets: entry.ttl_offsets(),
                 opt_start: entry.opt_start,
             },
-            age_secs: entry.age_secs(now),
+            age_secs,
             memo: entry.memo.clone(),
+            stale,
         })
+    }
+
+    /// Removes every entry and releases the storage they used; returns how many there were.
+    /// `next_token` keeps counting, so a token from before never names a later entry.
+    pub fn clear(&mut self) -> usize {
+        let cleared = self.len();
+        self.slots = Vec::new();
+        self.index = HashMap::default();
+        self.newest = NONE;
+        self.oldest = NONE;
+        self.free = NONE;
+        self.bytes = 0;
+
+        cleared
+    }
+
+    /// Removes the entry for `key`'s question, if the cache holds one.
+    pub fn forget(&mut self, key: &CacheKey<'_>) {
+        let Some(&slot) = self.index.get(&key.hash) else {
+            return;
+        };
+
+        if self.entry(slot).matches(key) {
+            self.remove(key.hash);
+        }
     }
 
     /// Stores `reply` if it may be cached and returns the token of the new entry.
@@ -551,8 +589,20 @@ mod tests {
     use super::*;
     use crate::dns::test_util::{QuerySpec, ResponseSpec, a, cname, soa};
 
+    /// Optimism off: the tests built on this pin expiry as it was before stale answers.
     fn config() -> CacheConfig {
-        CacheConfig::default()
+        CacheConfig {
+            optimistic: false,
+            ..CacheConfig::default()
+        }
+    }
+
+    fn optimistic(max_age_secs: u32) -> CacheConfig {
+        CacheConfig {
+            optimistic: true,
+            optimistic_max_age_secs: max_age_secs,
+            ..CacheConfig::default()
+        }
     }
 
     struct Fixture {
@@ -1027,14 +1077,10 @@ mod tests {
         assert_eq!(cache.slots.len(), 3);
     }
 
-    #[test]
-    fn recency_follows_a_simple_model_through_inserts_and_gets() {
-        const CAPACITY: usize = 4;
-        let mut cache = Cache::new(&CacheConfig {
-            max_entries: CAPACITY,
-            ..config()
-        });
-        let start = Instant::now();
+    /// Runs 2000 random inserts and gets against a plain most-recent-first list of
+    /// `max_entries` names, inserting at `inserted` and looking up at `looked_up`.
+    fn assert_recency_model(cache: &mut Cache, inserted: Instant, looked_up: Instant) {
+        let capacity = cache.max_entries;
         let fixtures: Vec<Fixture> = (0..9)
             .map(|index| Fixture::new(&format!("m{index}.example.")))
             .collect();
@@ -1049,12 +1095,12 @@ mod tests {
             let fixture = &fixtures[id];
 
             if (seed >> 20) & 1 == 0 {
-                insert(&mut cache, fixture, &fixture.positive(60), start);
+                insert(cache, fixture, &fixture.positive(60), inserted);
                 model.retain(|&kept| kept != id);
                 model.insert(0, id);
-                model.truncate(CAPACITY);
+                model.truncate(capacity);
             } else {
-                let found = age_of_hit(&mut cache, fixture, start).is_some();
+                let found = age_of_hit(cache, fixture, looked_up).is_some();
 
                 assert_eq!(found, model.contains(&id), "step {step}, name {id}");
 
@@ -1066,6 +1112,28 @@ mod tests {
 
             assert_eq!(cache.len(), model.len(), "step {step}");
         }
+    }
+
+    #[test]
+    fn recency_follows_a_simple_model_through_inserts_and_gets() {
+        let mut cache = Cache::new(&CacheConfig {
+            max_entries: 4,
+            ..config()
+        });
+        let start = Instant::now();
+
+        assert_recency_model(&mut cache, start, start);
+    }
+
+    #[test]
+    fn recency_is_the_same_when_every_hit_is_stale() {
+        let mut cache = Cache::new(&CacheConfig {
+            max_entries: 4,
+            ..optimistic(1000)
+        });
+        let start = Instant::now();
+
+        assert_recency_model(&mut cache, start, start + Duration::from_secs(61));
     }
 
     fn large_positive(fixture: &Fixture, size: usize) -> Vec<u8> {
@@ -1325,6 +1393,285 @@ mod tests {
         assert_eq!(identity(&plain), identity(&same));
         assert_ne!(identity(&plain), identity(&no_rd));
         assert_ne!(identity(&plain), identity(&aaaa));
+    }
+
+    fn stale_of_hit(cache: &mut Cache, fixture: &Fixture, now: Instant) -> Option<bool> {
+        let query = fixture.query();
+
+        cache.get(&CacheKey::new(&query), now).map(|hit| hit.stale)
+    }
+
+    /// Whether the cache holds an entry for `fixture`, without touching its recency.
+    fn holds(cache: &Cache, fixture: &Fixture) -> bool {
+        let query = fixture.query();
+
+        cache.index.contains_key(&CacheKey::new(&query).hash)
+    }
+
+    fn forget(cache: &mut Cache, fixture: &Fixture) {
+        let query = fixture.query();
+
+        cache.forget(&CacheKey::new(&query));
+    }
+
+    #[test]
+    fn an_expired_entry_is_served_stale_until_its_window_ends() {
+        let mut cache = Cache::new(&optimistic(100));
+        let fixture = Fixture::new("example.com.");
+        let start = Instant::now();
+        insert(&mut cache, &fixture, &fixture.positive(60), start);
+        let query = fixture.query();
+        let key = CacheKey::new(&query);
+
+        let fresh = cache.get(&key, start + Duration::from_secs(59)).unwrap();
+        assert!(!fresh.stale);
+        assert_eq!(fresh.age_secs, 59);
+
+        for secs in [60, 160] {
+            let hit = cache.get(&key, start + Duration::from_secs(secs)).unwrap();
+
+            assert!(hit.stale, "+{secs} s");
+            assert_eq!(hit.age_secs, secs as u32);
+        }
+
+        assert!(cache.get(&key, start + Duration::from_secs(161)).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn with_optimism_off_the_window_is_ignored() {
+        let mut cache = Cache::new(&CacheConfig {
+            optimistic: false,
+            optimistic_max_age_secs: 100,
+            ..CacheConfig::default()
+        });
+        let fixture = Fixture::new("example.com.");
+        let start = Instant::now();
+        insert(&mut cache, &fixture, &fixture.positive(60), start);
+
+        assert_eq!(
+            stale_of_hit(&mut cache, &fixture, start + Duration::from_secs(60)),
+            None
+        );
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn a_stale_hit_keeps_its_token_and_memo_and_becomes_the_newest() {
+        let mut cache = Cache::new(&CacheConfig {
+            max_entries: 2,
+            ..optimistic(1000)
+        });
+        let start = Instant::now();
+        let later = start + Duration::from_secs(61);
+        let a = Fixture::new("a.example.");
+        let b = Fixture::new("b.example.");
+        let c = Fixture::new("c.example.");
+        let a_query = a.query();
+        let a_key = CacheKey::new(&a_query);
+        let a_token = insert_entry(&mut cache, &a, &a.positive(60), start).unwrap();
+        insert(&mut cache, &b, &b.positive(60), start);
+        let memo = Memo {
+            generation: 4,
+            decision: Decision::Pass,
+        };
+        cache.set_memo(&a_key, a_token, memo.clone());
+
+        let hit = cache.get(&a_key, later).unwrap();
+        assert!(hit.stale);
+        assert_eq!(hit.token, a_token);
+        assert_eq!(hit.memo, Some(memo));
+
+        insert(&mut cache, &c, &c.positive(60), later);
+
+        assert_eq!(cache.len(), 2);
+        assert!(holds(&cache, &a), "a was used last");
+        assert!(!holds(&cache, &b), "b was least recent");
+        assert!(holds(&cache, &c));
+    }
+
+    #[test]
+    fn stale_entries_count_their_bytes_exactly_until_they_go() {
+        let mut cache = Cache::new(&optimistic(100));
+        let start = Instant::now();
+        let stale_time = start + Duration::from_secs(61);
+        let fixtures: Vec<Fixture> = ["a.example.", "bb.example.", "ccc.example."]
+            .iter()
+            .map(|name| Fixture::new(name))
+            .collect();
+        let costs: Vec<usize> = fixtures
+            .iter()
+            .map(|fixture| cost_of(fixture.positive(60).len(), 1))
+            .collect();
+        let mut tokens = Vec::new();
+        for fixture in &fixtures {
+            tokens.push(insert_entry(&mut cache, fixture, &fixture.positive(60), start).unwrap());
+        }
+
+        let all: usize = costs.iter().sum();
+        assert_eq!(cache.bytes(), all);
+
+        for fixture in &fixtures {
+            assert_eq!(stale_of_hit(&mut cache, fixture, stale_time), Some(true));
+        }
+
+        assert_eq!(cache.bytes(), all);
+
+        let a_query = fixtures[0].query();
+        let a_key = CacheKey::new(&a_query);
+        cache.set_memo(&a_key, tokens[0], block_with(3));
+        assert_eq!(
+            cache.bytes(),
+            all + 3 * size_of::<IpAddr>() + MEMO_ALLOCATION_OVERHEAD
+        );
+
+        insert(
+            &mut cache,
+            &fixtures[0],
+            &fixtures[0].positive(60),
+            stale_time,
+        );
+        assert_eq!(cache.bytes(), all, "the refreshed entry drops its memo");
+        assert_eq!(cache.get(&a_key, stale_time).unwrap().memo, None);
+
+        forget(&mut cache, &fixtures[1]);
+        assert_eq!(cache.bytes(), costs[0] + costs[2]);
+
+        let past_c_window = start + Duration::from_secs(161);
+        assert_eq!(stale_of_hit(&mut cache, &fixtures[2], past_c_window), None);
+        assert_eq!(cache.bytes(), costs[0]);
+
+        let past_a_window = stale_time + Duration::from_secs(161);
+        assert_eq!(stale_of_hit(&mut cache, &fixtures[0], past_a_window), None);
+        assert_eq!(cache.bytes(), 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn stale_entries_obey_the_entry_and_byte_caps() {
+        let mut cache = Cache::new(&CacheConfig {
+            max_entries: 3,
+            ..optimistic(1000)
+        });
+        let start = Instant::now();
+        let stale_time = start + Duration::from_secs(61);
+        let old: Vec<Fixture> = (0..3)
+            .map(|index| Fixture::new(&format!("old{index}.example.")))
+            .collect();
+        let new: Vec<Fixture> = (0..3)
+            .map(|index| Fixture::new(&format!("new{index}.example.")))
+            .collect();
+        for fixture in &old {
+            insert(&mut cache, fixture, &fixture.positive(60), start);
+        }
+
+        for (index, fixture) in new.iter().enumerate() {
+            insert(&mut cache, fixture, &fixture.positive(60), stale_time);
+
+            assert_eq!(cache.len(), 3);
+            for (old_index, stale) in old.iter().enumerate() {
+                assert_eq!(holds(&cache, stale), old_index > index, "old{old_index}");
+            }
+        }
+
+        let mut capped = Cache::new(&CacheConfig {
+            max_bytes: 4000,
+            ..optimistic(1000)
+        });
+        let big: Vec<Fixture> = (0..10)
+            .map(|index| {
+                Fixture::from(QuerySpec::new(
+                    &format!("big{index}.example."),
+                    RecordType::TXT,
+                ))
+            })
+            .collect();
+        for fixture in &big[..5] {
+            assert!(insert(
+                &mut capped,
+                fixture,
+                &large_positive(fixture, 1000),
+                start
+            ));
+            assert!(capped.bytes() <= 4000, "{} bytes", capped.bytes());
+        }
+
+        for fixture in &big[5..] {
+            for earlier in &big[..5] {
+                stale_of_hit(&mut capped, earlier, stale_time);
+            }
+
+            assert!(insert(
+                &mut capped,
+                fixture,
+                &large_positive(fixture, 1000),
+                stale_time
+            ));
+            assert!(capped.bytes() <= 4000, "{} bytes", capped.bytes());
+        }
+    }
+
+    #[test]
+    fn clearing_empties_the_cache_and_releases_its_storage() {
+        let mut cache = Cache::new(&config());
+        let start = Instant::now();
+        let fixtures: Vec<Fixture> = (0..50)
+            .map(|index| Fixture::new(&format!("c{index}.example.")))
+            .collect();
+        for fixture in &fixtures {
+            insert(&mut cache, fixture, &fixture.positive(60), start);
+        }
+
+        let query = fixtures[0].query();
+        let key = CacheKey::new(&query);
+        let old_token = cache.get(&key, start).unwrap().token;
+
+        assert_eq!(cache.clear(), 50);
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+        assert_eq!(cache.slots.capacity(), 0);
+        assert_eq!(cache.index.capacity(), 0);
+        assert!(cache.get(&key, start).is_none());
+
+        let new_token = insert_entry(&mut cache, &fixtures[0], &fixtures[0].positive(60), start);
+        assert!(new_token.is_some());
+        assert_eq!(cache.len(), 1);
+
+        cache.set_memo(
+            &key,
+            old_token,
+            Memo {
+                generation: 1,
+                decision: Decision::Pass,
+            },
+        );
+        assert_eq!(cache.get(&key, start).unwrap().memo, None);
+    }
+
+    #[test]
+    fn forgetting_removes_only_the_entry_of_that_question() {
+        let mut cache = Cache::new(&config());
+        let start = Instant::now();
+        let stored = Fixture::new("example.com.");
+        insert(&mut cache, &stored, &stored.positive(60), start);
+        let other = Fixture::new("example.org.");
+        let other_query = other.query();
+        let mut colliding = CacheKey::new(&other_query);
+        let stored_query = stored.query();
+        colliding.hash = CacheKey::new(&stored_query).hash;
+
+        cache.forget(&colliding);
+        assert_eq!(cache.len(), 1, "a colliding question leaves the entry");
+
+        cache.forget(&CacheKey::new(&stored_query));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+
+        cache.forget(&CacheKey::new(&stored_query));
+        assert!(cache.is_empty());
     }
 
     /// Time to insert `measured` new names into a cache already holding
