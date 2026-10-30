@@ -1193,9 +1193,9 @@ fn reverse_address(name: &Name) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-    use hickory_proto::rr::RecordType;
-
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use hickory_proto::rr::RecordType;
 
     use super::*;
     use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse};
