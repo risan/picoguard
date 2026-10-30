@@ -56,6 +56,58 @@ fn check_rejects_an_invalid_value_and_names_the_field() {
     );
 }
 
+#[test]
+fn check_refuses_optimistic_values_outside_their_ranges() {
+    let cases = [
+        (
+            "optimistic_answer_ttl_secs = 0",
+            "cache.optimistic_answer_ttl_secs must be > 0",
+        ),
+        (
+            "optimistic_answer_ttl_secs = 3601",
+            "cache.optimistic_answer_ttl_secs must be <= 3600",
+        ),
+        (
+            "optimistic_max_age_secs = 0",
+            "cache.optimistic_max_age_secs must be > 0",
+        ),
+        (
+            "optimistic_max_age_secs = 604801",
+            "cache.optimistic_max_age_secs must be <= 604800",
+        ),
+    ];
+
+    for (index, (line, expected)) in cases.into_iter().enumerate() {
+        let path = write_config(
+            &format!("optimistic-{index}.toml"),
+            &format!("[cache]\n{line}\n"),
+        );
+
+        let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
+
+        assert_eq!(output.status.code(), Some(1), "{line}");
+        assert!(text(&output.stdout).is_empty(), "{line}");
+        assert!(
+            text(&output.stderr).contains(expected),
+            "{line}: {}",
+            text(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn check_accepts_optimistic_values_at_their_edges() {
+    let path = write_config(
+        "optimistic-edges.toml",
+        "[cache]\noptimistic_answer_ttl_secs = 3600\noptimistic_max_age_secs = 604800\n",
+    );
+
+    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout).trim(), "OK");
+}
+
 const HASH: &str = "pbkdf2-sha256$1000$000102030405060708090a0b0c0d0e0f$33a78c377ca7b6590fa1b215cc970fba516076f108ecb68af58ec95d86021701";
 
 #[test]
