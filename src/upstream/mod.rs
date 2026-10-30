@@ -454,11 +454,23 @@ impl Upstreams {
         request: &mut [u8],
         budget: &Arc<Budget>,
     ) -> Result<Answered, UpstreamError> {
+        self.query_charged_within(request, budget, self.timeout)
+            .await
+    }
+
+    /// Like `query_charged`, with `limit` in place of the configured timeout, so that both
+    /// tries end by it and each is counted on its server.
+    pub async fn query_charged_within(
+        &self,
+        request: &mut [u8],
+        budget: &Arc<Budget>,
+        limit: Duration,
+    ) -> Result<Answered, UpstreamError> {
         let started = Instant::now();
         let first = self.pick(None, random_unit());
 
         let first_attempt = self.servers[first]
-            .query(request, budget, started + self.timeout / 2)
+            .query(request, budget, started + limit / 2)
             .await;
         match first_attempt {
             Ok((reply, charge)) => {
@@ -479,7 +491,7 @@ impl Upstreams {
         let second = self.pick(Some(first), random_unit());
 
         let (reply, charge) = self.servers[second]
-            .query(request, budget, started + self.timeout)
+            .query(request, budget, started + limit)
             .await?;
 
         Ok(Answered {
@@ -1031,6 +1043,49 @@ mod tests {
         let (_, tally) = upstreams.tallies().next().unwrap();
         assert_eq!((tally.answered, tally.failed), (0, 2));
         assert_eq!(tally.average_ms(), None);
+    }
+
+    #[tokio::test]
+    async fn a_query_within_a_shorter_limit_gives_up_by_it_and_counts_each_try() {
+        let dead = dead_udp().await;
+        let upstreams = upstreams(vec![udp_url(&dead)], 5000);
+        let started = Instant::now();
+
+        let result = upstreams
+            .query_charged_within(
+                &mut query_for("example.com."),
+                &Budget::new(usize::MAX),
+                Duration::from_millis(400),
+            )
+            .await;
+
+        assert!(matches!(result, Err(UpstreamError::Timeout)));
+        assert!(started.elapsed() >= Duration::from_millis(390));
+        // The configured timeout would hold the first try alone until 2.5 s.
+        assert!(started.elapsed() < Duration::from_millis(2500));
+        assert_eq!(dead.received.load(Ordering::SeqCst), 2, "one retry");
+        let (_, tally) = upstreams.tallies().next().unwrap();
+        assert_eq!((tally.answered, tally.failed), (0, 2));
+    }
+
+    #[tokio::test]
+    async fn a_query_within_a_limit_answers_like_query_charged() {
+        let good = good_udp().await;
+        let upstreams = upstreams(vec![udp_url(&good)], 1000);
+
+        let answered = upstreams
+            .query_charged_within(
+                &mut query_for("example.com."),
+                &Budget::new(usize::MAX),
+                Duration::from_millis(1000),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(answered.server, 0);
+        assert_eq!(address_of(&answered.reply), ANSWER_MARKER);
+        let (_, tally) = upstreams.tallies().next().unwrap();
+        assert_eq!((tally.answered, tally.failed), (1, 0));
     }
 
     #[tokio::test]
