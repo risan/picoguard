@@ -39,7 +39,8 @@ h2 small { font-weight: 400; }
 #badge:empty { display: none; }
 .r-pass { --dot: var(--accent); }
 .r-cached { --dot: var(--good); }
-.r-blocked_request, .r-blocked_response { --dot: var(--blocked); }
+.r-blocked_request, .r-blocked_response, .d-blocked { --dot: var(--blocked); }
+.d-allowed { --dot: var(--good); }
 .r-error { --dot: var(--warn); }
 #state { margin-left: auto; font-size: var(--t-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
 #state.bad { color: var(--blocked); }
@@ -118,6 +119,9 @@ button.go:hover { background: var(--accent); opacity: .9; }
 td button { padding: 1px var(--s2); font-size: var(--t-sm); }
 #check-name { flex: 1 1 12rem; width: auto; min-width: 0; }
 #check-result, #config-rules { margin-top: var(--s3); overflow-wrap: anywhere; }
+#check-result { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s1) var(--s3); margin-bottom: 0; }
+#check-result dt { color: var(--muted); }
+#check-result dd { margin: 0; }
 @media (max-width: 719px) {
   #queries table { display: block; }
   #queries tr { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; padding: var(--s2) 0;
@@ -254,7 +258,7 @@ td button { padding: 1px var(--s2); font-size: var(--t-sm); }
         <input id="check-name" autocapitalize="none" placeholder="example.org" aria-label="Name to check">
         <button class="go">Check</button>
       </form>
-      <p id="check-result"></p>
+      <dl id="check-result"></dl>
     </section>
   </div>
 </main>
@@ -557,6 +561,23 @@ function showRules(data) {
     ...(data.config_rules.length ? data.config_rules.map((rule) => el("code", rule)) : [el("p", "None.", "empty")]));
 }
 
+function showExplain(data) {
+  const lines = [["Name", data.name], ["Decision", el("span", data.decision, "badge d-" + data.decision)]];
+
+  if (data.decision === "none") {
+    lines.push(["Rule", "no rule decides it"]);
+  } else {
+    lines.push(["List", data.list], ["Rule", el("code", data.rule)]);
+  }
+
+  $("check-result").replaceChildren(...lines.flatMap(([label, value]) => {
+    const dd = el("dd");
+    dd.append(value);
+
+    return [el("dt", label), dd];
+  }));
+}
+
 async function checkName() {
   const name = $("check-name").value.trim();
 
@@ -573,9 +594,7 @@ async function checkName() {
       return;
     }
 
-    $("check-result").textContent = data.name + ": " + (data.decision === "none"
-      ? "no rule decides it"
-      : data.decision + " \u00b7 " + data.list + " \u00b7 " + data.rule);
+    showExplain(data);
   } catch (error) {
     if (epoch !== authEpoch) {
       return;
