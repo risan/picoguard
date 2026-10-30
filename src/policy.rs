@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use crate::dns::build::ReplyParts;
 use crate::dns::wire::{Query, RData, Records, Section};
-use crate::filter::engine::{Decision, Engine, TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_HTTPS, Verdict};
+use crate::filter::engine::{
+    Decision, Engine, Explanation, TYPE_A, TYPE_AAAA, TYPE_CNAME, TYPE_HTTPS, Verdict,
+};
 
 /// The policy at one moment.
 #[derive(Clone)]
@@ -158,6 +160,14 @@ impl Policy {
         Arc::clone(&self.state.lock().unwrap().engine)
     }
 
+    /// Which rule of the engine in force decides `name` asked as `A`, whether or not
+    /// filtering is paused.
+    pub fn explain(&self, name: &str) -> Option<Explanation> {
+        let engine = self.engine();
+
+        engine.explain(name, TYPE_A, false)
+    }
+
     /// Puts `engine` in force and starts a new generation, so no earlier decision is reused.
     /// Returns the engine it replaces: send it to the compile worker to be dropped there,
     /// never drop it on the DNS thread (plan D20).
@@ -275,6 +285,22 @@ mod tests {
         policy.pause(Duration::from_secs(100), start);
 
         assert!(policy.view(start + Duration::from_secs(50)).paused);
+    }
+
+    #[test]
+    fn explain_ignores_pause() {
+        let policy = Policy::with_engine(engine("||ads.example^\n"));
+        let now = Instant::now();
+        policy.pause(Duration::from_secs(60), now);
+
+        let explained = policy.explain("ads.example").unwrap();
+
+        assert_eq!(
+            request_decision(&policy.view(now), "ads.example.", RecordType::A),
+            Verdict::NoMatch
+        );
+        assert!(!explained.allowed);
+        assert_eq!(explained.rule, "||ads.example^");
     }
 
     #[test]

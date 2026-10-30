@@ -21,7 +21,7 @@ use tokio::time::Instant;
 
 use crate::config::{Config, ListConfig};
 use crate::filter::compile::{CompileError, CompileOptions, CompileWorker};
-use crate::filter::engine::{CompiledList, Engine, ListBuilder};
+use crate::filter::engine::{CompiledList, Engine, ListBuilder, Side};
 use crate::filter::parse::{FastKind, ListFormat, Rule};
 use crate::filter::snapshot::{Snapshot, SnapshotStore};
 use crate::lists::{Downloader, Limits, Refresh, RefreshError, Updated, Validators, refresh_file};
@@ -121,6 +121,15 @@ pub enum RuleError {
     NoSuchRule,
     /// The task that applies the change ended without an answer.
     NotApplied,
+}
+
+/// The rule that decides a name, and the list that holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explained {
+    pub allowed: bool,
+    /// The list's name on the status page, `your rules` or `config rules`.
+    pub list: String,
+    pub rule: String,
 }
 
 /// Where a list of the engine comes from, so explain can name it.
@@ -241,6 +250,37 @@ impl ListControl {
     /// borrowed: nothing is copied out.
     pub async fn with_button_rules<R>(&self, f: impl FnOnce(&[ButtonRule]) -> R) -> R {
         f(&self.assembly.lock().await.rules)
+    }
+
+    /// Which list and rule decide `name` asked as `A`, with blocking on. The engine and the list
+    /// positions are read under the lock every swap holds, so they always match.
+    pub async fn explain(&self, name: &str) -> Option<Explained> {
+        let assembly = self.assembly.lock().await;
+        let explanation = self.policy.explain(name)?;
+        let list = match explanation.side {
+            Side::PinnedAllow | Side::PinnedBlock => "your rules".to_string(),
+            Side::Allowlists => self.list_name(assembly.allow_ids.get(explanation.list)),
+            Side::Main => self.list_name(assembly.main_ids.get(explanation.list)),
+        };
+
+        Some(Explained {
+            allowed: explanation.allowed,
+            list,
+            rule: explanation.rule,
+        })
+    }
+
+    fn list_name(&self, id: Option<&ListId>) -> String {
+        match id {
+            Some(ListId::ConfigRules) => "config rules".to_string(),
+            Some(ListId::Configured(index)) => self
+                .statuses
+                .lock()
+                .unwrap()
+                .get(*index)
+                .map_or_else(String::new, |status| status.name.clone()),
+            None => String::new(),
+        }
     }
 
     /// Blocks or allows `name` and its subdomains. One rule per name: the other action replaces

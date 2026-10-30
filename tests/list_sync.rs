@@ -21,7 +21,7 @@ use picoguard::filter::engine::Verdict;
 use picoguard::filter::snapshot::{self, SnapshotStore};
 use picoguard::lists::{Downloader, resolver_over};
 use picoguard::policy::Policy;
-use picoguard::scheduler::{Action, ButtonRule, Role, RuleError, Scheduler, Timing};
+use picoguard::scheduler::{Action, ButtonRule, Explained, Role, RuleError, Scheduler, Timing};
 use picoguard::upstream::Upstreams;
 use picoguard::upstream::tls::Tls;
 
@@ -1884,4 +1884,92 @@ async fn concurrent_changes_are_applied_one_at_a_time() {
 
     assert_eq!(page_rules(&control).await.len(), 20);
     assert_eq!(generation(&policy), before + 20);
+}
+
+fn named_path_list(name: &str, path: PathBuf) -> ListConfig {
+    ListConfig {
+        name: Some(name.to_string()),
+        format: ListFormat::Adblock,
+        ..path_list(path)
+    }
+}
+
+#[tokio::test]
+async fn explain_names_the_deciding_list_and_rule_and_ignores_pause() {
+    let dir = StateDir::new();
+    fs::write(
+        dir.file("ads.txt"),
+        "||list.example^\n/^track[0-9]+\\.example$/\n||ad*.wild.example^\n0.0.0.0 host.example\n",
+    )
+    .unwrap();
+    fs::write(dir.file("plain.txt"), "||plain.example^\n").unwrap();
+    fs::write(dir.file("mine.txt"), "||mine.example^\n").unwrap();
+    let mut config = config_of(
+        &dir,
+        vec![
+            named_path_list("Ads list", dir.file("ads.txt")),
+            path_list(dir.file("plain.txt")),
+        ],
+    );
+    config.rules = vec![
+        "||ads.example^".to_string(),
+        "@@||ok.ads.example^".to_string(),
+    ]
+    .into();
+    config.allowlists = vec![named_path_list("Mine", dir.file("mine.txt"))];
+    let (scheduler, _) = boot(&config).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    control
+        .add_button_rule("b.example", Action::Block)
+        .await
+        .unwrap();
+    control
+        .add_button_rule("a.example", Action::Allow)
+        .await
+        .unwrap();
+    let plain_path = dir.file("plain.txt").display().to_string();
+    let explained = |allowed: bool, list: &str, rule: &str| {
+        Some(Explained {
+            allowed,
+            list: list.to_string(),
+            rule: rule.to_string(),
+        })
+    };
+
+    for (name, list, rule) in [
+        ("list.example", "Ads list", "||list.example^"),
+        ("track12.example", "Ads list", "/^track[0-9]+\\.example$/"),
+        ("adx.wild.example", "Ads list", "||ad*.wild.example^"),
+        ("host.example", "Ads list", "0.0.0.0 host.example"),
+        ("plain.example", &plain_path, "||plain.example^"),
+        ("ads.example", "config rules", "||ads.example^"),
+        ("b.example", "your rules", "||b.example^$important"),
+    ] {
+        assert_eq!(
+            control.explain(name).await,
+            explained(false, list, rule),
+            "{name}"
+        );
+    }
+
+    for (name, list, rule) in [
+        ("ok.ads.example", "config rules", "@@||ok.ads.example^"),
+        ("a.example", "your rules", "@@||a.example^"),
+        ("mine.example", "Mine", "||mine.example^"),
+    ] {
+        assert_eq!(
+            control.explain(name).await,
+            explained(true, list, rule),
+            "{name}"
+        );
+    }
+
+    assert_eq!(control.explain("nothing.example").await, None);
+
+    policy.pause(Duration::from_secs(60), Instant::now());
+
+    assert_eq!(
+        control.explain("list.example").await,
+        explained(false, "Ads list", "||list.example^")
+    );
 }
