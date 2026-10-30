@@ -266,10 +266,18 @@ fn client_text(client: &str) -> String {
         return client.to_string();
     }
 
-    let escaped = client
-        .replace('\'', "\\'")
-        .replace(',', "\\,")
-        .replace('|', "\\|");
+    let mut escaped = String::new();
+    for character in client.chars() {
+        match character {
+            '\'' => escaped.push_str("\\'"),
+            '|' => escaped.push_str("\\|"),
+            // A comma is unescaped twice, by the option splitter and again by `parse_clients`,
+            // so a comma right after a backslash needs one more backslash to survive both.
+            ',' if escaped.ends_with('\\') => escaped.push_str("\\\\,"),
+            ',' => escaped.push_str("\\,"),
+            other => escaped.push(other),
+        }
+    }
 
     format!("'{escaped}'")
 }
@@ -2086,6 +2094,7 @@ mod tests {
             r"||e.example^$client=~'a\,b'|~'c\|d'",
             r"||f.example^$client=~'x\$y\,z'",
             r"||g.example^$client=~'back\\slash'",
+            r"||h.example^$client=~'a\\\,b'",
         ] {
             let rule = slow_rule(line);
             let text = rule.text();
