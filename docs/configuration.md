@@ -164,8 +164,34 @@ Your `rules` count as one more list. So `||example.com^$important` in a list sti
 | `min_ttl` | `0` | Raise shorter TTLs to this many seconds. |
 | `max_ttl` | `86400` | Lower longer TTLs to this many seconds. |
 | `max_response_size` | `4096` | Larger upstream answers are served but not cached. |
+| `optimistic` | `true` | Answer an expired cached answer at once and refresh it in the background (below). `false` turns it off. |
+| `optimistic_answer_ttl_secs` | `30` | The TTL of every record in such an answer. 1 to 3600. |
+| `optimistic_max_age_secs` | `43200` (12 h) | How long after it expires a cached answer may still be served. 1 to 604800 (7 days). |
 
 Cache cost is about 600 bytes per entry in practice (6 MB for 10,000 entries in the benchmark).
+
+### Optimistic caching
+
+With `optimistic = true`, a query whose cached answer has expired, by no more than
+`optimistic_max_age_secs`, is answered at once from the cache. Every TTL in that answer is
+`optimistic_answer_ttl_secs`, so clients ask again soon.
+
+- The same answer starts one background refresh of the question. Concurrent queries for it share
+  that one refresh, and a refresh joins a lookup already under way. The refreshed answer replaces
+  the old one; the next query gets it.
+- A failed refresh leaves the old answer in place, served until it is `optimistic_max_age_secs`
+  past its expiry. After that the query waits for the upstream as before. With the upstreams down,
+  names already cached keep resolving for up to that age.
+- At most half of the smaller of `limits.max_inflight_queries` and `limits.upstream_concurrency`
+  refreshes run at once (at least one; 16 with the defaults). They wait for no client. Under load
+  a refresh may be skipped; the next query for the name tries again.
+- A stale answer counts as cached. Refreshes are not client queries: they count on the Upstreams
+  card only, never in the totals or the query log, and a failed one logs no line of its own.
+- Block rules and pause apply to a stale answer as to a fresh one, including a rule added after
+  it was cached.
+- `min_ttl` and `max_ttl` still decide when an answer expires; optimism starts after that.
+- Stale answers stay within `max_entries` and `max_bytes`, like any other.
+- `optimistic = false` turns it off: an expired answer is a normal miss.
 
 ## `[limits]`
 
@@ -191,15 +217,15 @@ These keep memory fixed. The defaults fit a 256 MB board; you rarely change them
 ## `[web]`
 
 The status page. With `user` and a password (`password_hash`, or `password`) set, it shows totals,
-top blocked domains, top clients, upstream servers, recent queries and list status, and can pause
-blocking for a set time and refresh the lists.
+top blocked domains, top clients, upstream servers, the cache, recent queries and list status, and
+can pause blocking for a set time, refresh the lists and clear the DNS cache.
 
 Without a password the page is read-only and limited: it shows totals and list status only. The
-query log, pause, resume and refresh answer 403 ("set web.user and web.password_hash (or
-web.password) to use this"), and the page says so. The top lists and the upstream servers are left
-out of `/api/status`, and the page hides them. picoguard logs one warning at start when no
-password is set. Every device that may open the page could otherwise read the household's queries
-and switch blocking off.
+query log, pause, resume, refresh and Clear cache answer 403 ("set web.user and
+web.password_hash (or web.password) to use this"), and the page says so. The top lists, the
+upstream servers and the cache size are left out of `/api/status`, and the page hides them.
+picoguard logs one warning at start when no password is set. Every device that may open the page
+could otherwise read the household's queries and switch blocking off.
 
 The Upstreams card, and the `upstreams` field of `/api/status`, cover every server in
 `[upstream] servers` and then the `[local]` resolver when one is set. The API lists them in that
@@ -215,7 +241,15 @@ written in `[upstream] servers`, or the `[local] resolver` address), `kind` (`up
 - `avg_ms` is the average over the answers, in milliseconds with one decimal. The time runs from
   sending the request until the reply arrives. It includes opening a connection when one is needed,
   and it leaves out picoguard's own wait for a free slot on that server.
+- Background refreshes of cached answers count too.
 - The card is only for the signed-in page, because a DoH address can hold a private profile ID.
+
+The Cache card shows how many answers the cache holds and their size, from the `cache` field of
+`/api/status` (`{"entries": n, "bytes": n}`, signed-in only). Its Clear cache button asks for
+confirmation, then calls `POST /api/cache/clear`, which empties the cache, frees its memory and
+answers `{"cleared": n}` with the number of answers removed; the card shows "Cache cleared (n
+answers)". The next query for any name goes upstream. Lookups already under way are not stopped,
+and their answers are cached when they land.
 
 | Key | Default | Meaning |
 |---|---|---|
