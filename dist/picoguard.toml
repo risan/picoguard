@@ -49,7 +49,8 @@ servers = [
 # timeout_ms = 5000
 
 # [local]
-# Your router: gets reverse lookups of private addresses and the local domains.
+# Your router: gets reverse lookups of private addresses and the local domains;
+# also names your devices on the status page.
 # resolver = "192.168.1.1:53"
 # domains = ["lan", "home.arpa"]
 
