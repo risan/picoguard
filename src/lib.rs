@@ -6,6 +6,7 @@ pub mod dns_check;
 pub mod filter;
 pub mod lists;
 pub mod log;
+pub mod names;
 pub mod password;
 pub mod pipeline;
 pub mod policy;
