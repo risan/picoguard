@@ -210,6 +210,36 @@ struct Health {
     outage: Outage,
 }
 
+/// What one server has done since picoguard started. Fixed size, whatever the traffic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub answered: u64,
+    pub failed: u64,
+    pub answer_micros: u64,
+}
+
+impl Tally {
+    pub fn count_answer(&mut self, took: Duration) {
+        self.answered += 1;
+        self.answer_micros = self
+            .answer_micros
+            .saturating_add(u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
+    }
+
+    pub fn count_failure(&mut self) {
+        self.failed += 1;
+    }
+
+    /// Milliseconds with one decimal, over the answers only.
+    pub fn average_ms(&self) -> Option<f64> {
+        if self.answered == 0 {
+            return None;
+        }
+
+        Some((self.answer_micros as f64 / self.answered as f64 / 100.0).round() / 10.0)
+    }
+}
+
 struct Upstream {
     label: String,
     transport: Transport,
@@ -645,6 +675,27 @@ mod tests {
 
     fn udp_url(fake: &Fake) -> String {
         format!("udp://{}", fake.address)
+    }
+
+    #[test]
+    fn the_average_is_over_answers_only_in_milliseconds_with_one_decimal() {
+        let mut tally = Tally::default();
+
+        assert_eq!(tally.average_ms(), None);
+
+        tally.count_answer(Duration::from_millis(10));
+        tally.count_answer(Duration::from_micros(13_049));
+        tally.count_failure();
+
+        assert_eq!(tally.answered, 2);
+        assert_eq!(tally.failed, 1);
+        assert_eq!(tally.answer_micros, 23_049);
+        assert_eq!(tally.average_ms(), Some(11.5));
+    }
+
+    #[test]
+    fn a_tally_adds_a_few_bytes_per_server() {
+        assert!(std::mem::size_of::<Mutex<Tally>>() <= 64);
     }
 
     #[tokio::test]
