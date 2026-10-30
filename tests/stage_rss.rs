@@ -194,7 +194,7 @@ async fn a_list_refresh_during_an_update_download_stays_within_the_memory_limit(
         Arc::new(
             Web::new(
                 &config,
-                Arc::clone(dns.pipeline.stats()),
+                Arc::clone(&dns.pipeline),
                 Arc::clone(&policy),
                 Arc::clone(&control),
                 updates,

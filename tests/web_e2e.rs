@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use common::harness::{Running, answering_upstream, ask, config_for, start_with_policy};
+use common::harness::{
+    Running, answering_upstream, ask, config_for, fake_upstream, start_with_policy,
+};
 use common::http::ListServer;
 use common::release::{Files, TARGET, scratch, test_key};
 use hickory_proto::rr::RecordType;
@@ -426,7 +428,7 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
     );
     let web_state = Web::new(
         &config,
-        Arc::clone(dns.pipeline.stats()),
+        Arc::clone(&dns.pipeline),
         Arc::clone(&policy),
         Arc::clone(&control),
         Arc::clone(&updates),
@@ -482,8 +484,8 @@ async fn the_page_is_served_with_protective_headers() {
 /// The page's ceiling for every slice of release 1.
 const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
 
-/// This slice, the sign-in form; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 26 * 1024;
+/// This slice, the Upstreams card; a later slice raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 27 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -586,6 +588,27 @@ async fn the_page_has_three_tabs_kept_in_the_url_fragment() {
             !page.contains(&format!("id=\"{tab}\"")),
             "{tab} is a fragment target"
         );
+    }
+}
+
+/// No browser here: the Upstreams card is checked as source. The read-only view leaves the
+/// field out, so the card is hidden there with the top lists.
+#[tokio::test]
+async fn the_dashboard_has_an_upstreams_card_drawn_as_text() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "id=\"upstreams\"",
+        "id=\"upstream-table\"",
+        "showUpstreams(status.upstreams)",
+        "\"local: \"",
+        "\"\\u2014\"",
+        "th:not(:first-child)",
+        "[\"pause\", \"tops\", \"upstreams\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
     }
 }
 
@@ -733,6 +756,165 @@ async fn status_counts_the_queries_that_were_answered() {
     assert!(status["pause"]["seconds_left"].is_null());
     assert!(status["generation"].is_u64());
     assert!(status["lists"].as_array().unwrap().is_empty());
+}
+
+fn upstream_entries(status: &Value) -> &Vec<Value> {
+    status["upstreams"].as_array().unwrap()
+}
+
+#[tokio::test]
+async fn a_failed_over_query_counts_a_failure_on_the_first_server_and_an_answer_on_the_second() {
+    let dead = fake_upstream(|_| Vec::new()).await;
+    let slow = answering_upstream([9, 9, 9, 9], Duration::from_millis(80)).await;
+    let mut config = local_config(&slow);
+    config.upstream.servers = vec![
+        format!("udp://{}", dead.address),
+        format!("udp://{}", slow.address),
+    ];
+    config.upstream.timeout_ms = 1000;
+    let site = site(config).await;
+
+    // Which server goes first is a weighted draw; the dead one is the first try often enough.
+    let mut asked = 0;
+    let started = Instant::now();
+    while dead.count() == 0 {
+        assert!(asked < 40, "the dead server was never tried");
+
+        ask(&site.dns, &format!("n{asked}.example."), RecordType::A).await;
+        asked += 1;
+    }
+    let asking_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    let status = site.send(get("/api/status")).await.json();
+    let servers = upstream_entries(&status);
+
+    assert_eq!(servers[0]["label"], format!("udp://{}", dead.address));
+    assert_eq!(servers[0]["answered"], 0);
+    assert_eq!(servers[0]["failed"], 1);
+    assert!(servers[0]["avg_ms"].is_null());
+    assert_eq!(servers[1]["answered"], asked);
+    assert_eq!(servers[1]["failed"], 0);
+    let average = servers[1]["avg_ms"].as_f64().unwrap();
+    // Each try at the dead server takes at least 500 ms (half the 1000 ms timeout) of the wall
+    // time that the answered exchanges share it with, however loaded the machine is. A time that
+    // counted those tries too would not leave that much out.
+    let answered_ms = average * asked as f64;
+    assert!(average >= 80.0, "{average}");
+    assert!(
+        answered_ms < asking_ms - 400.0,
+        "{answered_ms} answered of {asking_ms}"
+    );
+}
+
+#[tokio::test]
+async fn a_query_for_a_local_name_counts_on_the_local_resolver_only() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let router = answering_upstream([192, 168, 1, 9], Duration::from_millis(20)).await;
+    let mut config = local_config(&upstream);
+    config.local.resolver = Some(router.address);
+    config.local.domains = vec!["lan".to_string()];
+    let site = site(config).await;
+
+    ask(&site.dns, "printer.lan.", RecordType::A).await;
+
+    let status = site.send(get("/api/status")).await.json();
+    let servers = upstream_entries(&status);
+
+    assert_eq!(servers[1]["kind"], "local");
+    assert_eq!(servers[1]["label"], router.address.to_string());
+    assert_eq!(servers[1]["answered"], 1);
+    assert_eq!(servers[1]["failed"], 0);
+    assert!(servers[1]["avg_ms"].as_f64().unwrap() >= 20.0);
+    assert_eq!(servers[0]["answered"], 0);
+    assert_eq!(servers[0]["failed"], 0);
+    assert!(servers[0]["avg_ms"].is_null());
+    assert_eq!(upstream.count(), 0);
+}
+
+#[tokio::test]
+async fn cache_hits_and_names_blocked_by_rule_change_no_upstream_counter() {
+    let (site, upstream) = plain_site().await;
+    ask(&site.dns, "ok.example.", RecordType::A).await;
+    ask(&site.dns, "ok.example.", RecordType::A).await;
+    ask(&site.dns, "ads.example.", RecordType::A).await;
+
+    let status = site.send(get("/api/status")).await.json();
+    let servers = upstream_entries(&status);
+
+    assert_eq!(status["counters"]["upstream"], 1);
+    assert_eq!(status["counters"]["cached"], 1);
+    assert_eq!(status["counters"]["blocked_request"], 1);
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["answered"], 1);
+    assert_eq!(servers[0]["failed"], 0);
+    assert_eq!(upstream.count(), 1);
+}
+
+#[tokio::test]
+async fn the_status_lists_every_upstream_in_config_order_then_the_local_resolver() {
+    let first = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let second = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let router = answering_upstream([192, 168, 1, 9], Duration::ZERO).await;
+    let mut config = local_config(&first);
+    config.upstream.servers = vec![
+        format!("udp://{}", first.address),
+        format!("udp://{}", second.address),
+    ];
+    config.local.resolver = Some(router.address);
+    let site = site(config).await;
+
+    let status = site.send(get("/api/status")).await.json();
+    let servers = upstream_entries(&status);
+
+    let labels: Vec<&str> = servers
+        .iter()
+        .map(|server| server["label"].as_str().unwrap())
+        .collect();
+    let kinds: Vec<&str> = servers
+        .iter()
+        .map(|server| server["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            format!("udp://{}", first.address),
+            format!("udp://{}", second.address),
+            router.address.to_string(),
+        ]
+    );
+    assert_eq!(kinds, ["upstream", "upstream", "local"]);
+    for server in servers {
+        let mut keys: Vec<&str> = server
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+
+        assert_eq!(keys, ["answered", "avg_ms", "failed", "kind", "label"]);
+        assert_eq!(server["answered"], 0);
+        assert_eq!(server["failed"], 0);
+        assert!(server["avg_ms"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn the_upstreams_show_with_a_password_and_are_left_out_without_one() {
+    let (with_password, upstream) = plain_site().await;
+    let (without_password, _other) = open_site().await;
+
+    let signed_in = with_password.send(get("/api/status")).await.json();
+    let read_only = without_password.send(get("/api/status")).await;
+
+    assert!(signed_in.get("limited").is_none());
+    assert_eq!(
+        upstream_entries(&signed_in)[0]["label"],
+        format!("udp://{}", upstream.address)
+    );
+    assert_eq!(read_only.json()["limited"], SET_A_PASSWORD);
+    assert!(read_only.json().get("upstreams").is_none());
+    assert!(!read_only.body.contains("udp://"));
 }
 
 #[tokio::test]

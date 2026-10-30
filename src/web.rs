@@ -8,7 +8,8 @@
 //!   cookie or a matching `Authorization: Basic`, compared in constant time; failed password
 //!   checks are limited per address;
 //! - without a password the page is read-only and shows totals and list status only: the
-//!   query log, the top lists and every change answer 403;
+//!   status leaves out the top lists and the upstream servers, and the query log and every
+//!   change answer 403;
 //! - a mutation must be `POST` with `Content-Type: application/json` (which a cross-site form
 //!   cannot send, and a cross-site script can only send after a CORS preflight that is never
 //!   answered), carry no `Origin` other than the page's own, and have a body of at most 1 KiB.
@@ -33,11 +34,12 @@ use tokio::time::timeout;
 
 use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
 use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
+use crate::pipeline::{Pipeline, ServerKind, ServerTally};
 use crate::policy::Policy;
 use crate::scheduler::{ListControl, ListStatus, Role};
 use crate::server::bind_tcp;
 use crate::stage::{Refused, Stager};
-use crate::stats::{Counters, HourlyBucket, QueryLogEntry, Stats, TopEntry};
+use crate::stats::{Counters, HourlyBucket, QueryLogEntry, TopEntry};
 use crate::update::{Tag, UpdateView, Updates, parse_tag};
 
 mod auth;
@@ -61,7 +63,7 @@ const PASSWORD_NEEDED: &str = "set web.user and web.password_hash (or web.passwo
 
 /// Everything the handlers read or change.
 pub struct Web {
-    stats: Arc<Stats>,
+    pipeline: Arc<Pipeline>,
     policy: Arc<Policy>,
     lists: Arc<ListControl>,
     updates: Arc<Updates>,
@@ -76,7 +78,7 @@ pub struct Web {
 impl Web {
     pub fn new(
         config: &Config,
-        stats: Arc<Stats>,
+        pipeline: Arc<Pipeline>,
         policy: Arc<Policy>,
         lists: Arc<ListControl>,
         updates: Arc<Updates>,
@@ -93,7 +95,7 @@ impl Web {
         }
 
         Ok(Web {
-            stats,
+            pipeline,
             policy,
             lists,
             updates,
@@ -405,7 +407,7 @@ impl Web {
                 .expect("static response is valid")),
 
             Read::Status => {
-                let snapshot = self.stats.snapshot();
+                let snapshot = self.pipeline.stats().snapshot();
                 let view = self.policy.view(Instant::now());
                 let is_open = self.auth.is_some();
 
@@ -421,6 +423,13 @@ impl Web {
                         top_queried: is_open.then(|| TopList::of(&snapshot.top_queried)),
                         top_blocked: is_open.then(|| TopList::of(&snapshot.top_blocked)),
                         top_clients: is_open.then(|| TopList::of(&snapshot.top_clients)),
+                        upstreams: is_open.then(|| {
+                            self.pipeline
+                                .upstream_tallies()
+                                .into_iter()
+                                .map(UpstreamView::of)
+                                .collect()
+                        }),
                         lists: self.list_views(),
                         generation: view.generation,
                         pause: self.pause_view(),
@@ -434,7 +443,7 @@ impl Web {
                 Ok(json(
                     StatusCode::OK,
                     &QueryLogView {
-                        entries: self.stats.query_log(limit),
+                        entries: self.pipeline.stats().query_log(limit),
                     },
                 ))
             }
@@ -883,6 +892,28 @@ impl ListView {
 }
 
 #[derive(Serialize)]
+struct UpstreamView {
+    label: String,
+    kind: ServerKind,
+    answered: u64,
+    failed: u64,
+    /// Milliseconds over the answers; `null` before the first one.
+    avg_ms: Option<f64>,
+}
+
+impl UpstreamView {
+    fn of(server: ServerTally) -> UpstreamView {
+        UpstreamView {
+            label: server.label,
+            kind: server.kind,
+            answered: server.tally.answered,
+            failed: server.tally.failed,
+            avg_ms: server.tally.average_ms(),
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct ListsView {
     lists: Vec<ListView>,
 }
@@ -910,6 +941,9 @@ struct StatusView<'a> {
     top_blocked: Option<TopList<'a, Box<str>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_clients: Option<TopList<'a, IpAddr>>,
+    /// Left out with the top lists: a DoH address can carry a private provider profile ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstreams: Option<Vec<UpstreamView>>,
     lists: Vec<ListView>,
     generation: u64,
     pause: PauseView,
@@ -957,7 +991,7 @@ mod tests {
 
         Web::new(
             &config,
-            Arc::new(Stats::new(Default::default())),
+            Pipeline::new(&config, Arc::clone(&policy)).unwrap(),
             policy,
             lists,
             updates,

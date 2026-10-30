@@ -9,10 +9,11 @@
 //! 7. cache insert and the client reply.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
@@ -24,7 +25,7 @@ use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, rcode, rty
 use crate::filter::engine::{BlockedAnswer, Decision, Verdict, blocked_answer};
 use crate::policy::{Policy, PolicyView};
 use crate::stats::{Event, QueryResult, Stats, StatsSettings};
-use crate::upstream::{Answered, UpstreamError, Upstreams};
+use crate::upstream::{Answered, Tally, UpstreamError, Upstreams};
 
 /// Reverse lookups of these ranges go to the local resolver.
 const PRIVATE_NETWORKS: [&str; 7] = [
@@ -270,6 +271,21 @@ impl Drop for WaitingClient {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerKind {
+    Upstream,
+    Local,
+}
+
+/// What one server has done since start, for the status page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerTally {
+    pub label: String,
+    pub kind: ServerKind,
+    pub tally: Tally,
+}
+
 pub struct Pipeline {
     udp_size: u16,
     resume_limit: Duration,
@@ -284,7 +300,7 @@ pub struct Pipeline {
     private_reverse_zones: Vec<Name>,
     private_networks: Vec<Cidr>,
     upstreams: Arc<Upstreams>,
-    local_resolver: Option<Upstreams>,
+    local_resolver: Option<(SocketAddr, Upstreams)>,
     cache: Mutex<Cache>,
     inflight: Mutex<Inflight>,
     policy: Arc<Policy>,
@@ -295,10 +311,12 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn new(config: &Config, policy: Arc<Policy>) -> Result<Arc<Pipeline>, String> {
         let upstreams = Arc::new(Upstreams::from_config(&config.upstream, &config.limits)?);
-        let local_resolver = config
-            .local
-            .resolver
-            .map(|resolver| Upstreams::plain(resolver, &config.upstream, &config.limits));
+        let local_resolver = config.local.resolver.map(|resolver| {
+            (
+                resolver,
+                Upstreams::plain(resolver, &config.upstream, &config.limits),
+            )
+        });
 
         Ok(Arc::new(Pipeline {
             udp_size: config.server.udp_size,
@@ -338,6 +356,24 @@ impl Pipeline {
     /// it.
     pub fn upstreams(&self) -> &Arc<Upstreams> {
         &self.upstreams
+    }
+
+    /// The configured servers in config order, then the local resolver when there is one.
+    pub fn upstream_tallies(&self) -> Vec<ServerTally> {
+        let servers = self.upstreams.tallies().map(|(label, tally)| ServerTally {
+            label: label.to_string(),
+            kind: ServerKind::Upstream,
+            tally,
+        });
+        let local = self.local_resolver.iter().flat_map(|(address, resolver)| {
+            resolver.tallies().map(|(_, tally)| ServerTally {
+                label: address.to_string(),
+                kind: ServerKind::Local,
+                tally,
+            })
+        });
+
+        servers.chain(local).collect()
     }
 
     /// The budget for replies held for delivery. Queued TCP replies draw on it.
@@ -919,7 +955,10 @@ impl Pipeline {
 
     async fn fetch(&self, mut request: Vec<u8>, route: Route) -> Outcome {
         let upstreams = if route == Route::Local {
-            self.local_resolver.as_ref().ok_or(Failure::Upstream)?
+            self.local_resolver
+                .as_ref()
+                .map(|(_, resolver)| resolver)
+                .ok_or(Failure::Upstream)?
         } else {
             &self.upstreams
         };
@@ -1222,6 +1261,46 @@ mod tests {
         let config = Config::default();
 
         assert!(Pipeline::new(&config, Arc::new(Policy::new())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn upstream_tallies_list_the_servers_in_config_order_then_the_local_resolver() {
+        let mut config = Config::default();
+        config.upstream.servers = vec![
+            "udp://192.0.2.1:53".to_string(),
+            "tcp://192.0.2.2:53".to_string(),
+        ];
+        config.local.resolver = Some("192.0.2.53:53".parse().unwrap());
+
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let listed: Vec<(String, ServerKind)> = pipeline
+            .upstream_tallies()
+            .into_iter()
+            .map(|server| {
+                assert_eq!(server.tally, Tally::default());
+
+                (server.label, server.kind)
+            })
+            .collect();
+
+        assert_eq!(
+            listed,
+            vec![
+                ("udp://192.0.2.1:53".to_string(), ServerKind::Upstream),
+                ("tcp://192.0.2.2:53".to_string(), ServerKind::Upstream),
+                ("192.0.2.53:53".to_string(), ServerKind::Local),
+            ]
+        );
+
+        config.local.resolver = None;
+        let without_local = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+
+        assert!(
+            without_local
+                .upstream_tallies()
+                .iter()
+                .all(|server| server.kind == ServerKind::Upstream)
+        );
     }
 
     fn policy_of(rules: &str) -> Arc<Policy> {

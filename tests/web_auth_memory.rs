@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use picoguard::config::Config;
 use picoguard::password::PasswordHash;
+use picoguard::pipeline::Pipeline;
 use picoguard::policy::Policy;
 use picoguard::scheduler::ListControl;
 use picoguard::stage::{StageSetup, StageTiming, Stager};
-use picoguard::stats::Stats;
 use picoguard::update::{Build, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
@@ -62,7 +62,7 @@ async fn settle() {
 /// Everything a `Web` needs, built before anything is measured.
 struct Parts {
     config: Config,
-    stats: Arc<Stats>,
+    pipeline: Arc<Pipeline>,
     policy: Arc<Policy>,
     lists: Arc<ListControl>,
     updates: Arc<Updates>,
@@ -92,10 +92,11 @@ fn parts() -> Parts {
         Arc::new(Tls::with_webpki_roots()),
     );
     let listeners = WebListeners::bind(&config.web).unwrap();
+    let policy = Arc::new(Policy::new());
 
     Parts {
-        stats: Arc::new(Stats::new(Default::default())),
-        policy: Arc::new(Policy::new()),
+        pipeline: Pipeline::new(&config, Arc::clone(&policy)).unwrap(),
+        policy,
         lists: Arc::new(ListControl::default()),
         updates,
         stager,
@@ -109,7 +110,7 @@ fn start(parts: Parts) -> (SocketAddr, Config) {
     let address = parts.listeners.addresses()[0];
     let web = Web::new(
         &parts.config,
-        parts.stats,
+        parts.pipeline,
         parts.policy,
         parts.lists,
         parts.updates,
