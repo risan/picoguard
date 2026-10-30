@@ -1014,7 +1014,10 @@ mod tests {
         // with the second server ends at least 500 ms before the whole query does, however
         // loaded the machine is. A time that included the first try would not.
         assert!(average >= 50.0, "{average}");
-        assert!(average < whole_query_ms - 400.0, "{average} in {whole_query_ms}");
+        assert!(
+            average < whole_query_ms - 400.0,
+            "{average} in {whole_query_ms}"
+        );
     }
 
     #[tokio::test]
