@@ -22,7 +22,7 @@ Two instances can use the same file. They do not sync with each other.
 | `blocked_ttl` | `10` | TTL in seconds of blocked answers. |
 | `refuse_any` | `true` | Answer `ANY` queries with NOTIMP. |
 | `blocked_hosts` | `["version.bind", "id.server", "hostname.bind"]` | Names answered with REFUSED. |
-| `rules` | `[]` | Your own rules, one per string: adblock syntax or hosts lines. They join the lists below as one more list. |
+| `rules` | `[]` | Your own rules, one per string: adblock syntax or hosts lines. They join the lists below as one more list. The status page shows them read-only. |
 
 `rules` example:
 
@@ -155,6 +155,16 @@ not block it, as in AdGuard Home.
 Your `rules` count as one more list. So `||example.com^$important` in a list still beats
 `@@||example.com^` in `rules`, as in AdGuard Home.
 
+Block and Allow from the status page (below, under `[web]`) take their own places:
+
+- Allow from the page works like an allowlist entry, and is asked even before the allowlists. It
+  beats every block, `$important` included, and the answer is not checked.
+- Block from the page counts as `||name^$important`. It beats `@@` in lists and in `rules`, but
+  not an `$important` allow or an allowlist.
+- No list's `$badfilter` undoes a Block or an Allow from the page.
+- An Allow from the page for a name also wins over a Block from the page for one of its
+  subdomains.
+
 ## `[cache]`
 
 | Key | Default | Meaning |
@@ -218,11 +228,13 @@ These keep memory fixed. The defaults fit a 256 MB board; you rarely change them
 
 The status page. With `user` and a password (`password_hash`, or `password`) set, it shows totals,
 top blocked domains, top clients, upstream servers, the cache, recent queries and list status, and
-can pause blocking for a set time, refresh the lists and clear the DNS cache.
+can pause blocking for a set time, refresh the lists, clear the DNS cache, block or allow a name,
+and check which rule decides a name.
 
 Without a password the page is read-only and limited: it shows totals and list status only. The
-query log, pause, resume, refresh and Clear cache answer 403 ("set web.user and
-web.password_hash (or web.password) to use this"), and the page says so. The top lists, the
+query log, pause, resume, refresh, Clear cache, `/api/rules`, `/api/rules/remove` and
+`/api/explain` answer 403 ("set web.user and web.password_hash (or web.password) to use this"),
+and the page says so. The top lists, the
 upstream servers and the cache size are left out of `/api/status`, and the page hides them.
 picoguard logs one warning at start when no password is set. Every device that may open the page
 could otherwise read the household's queries and switch blocking off.
@@ -304,6 +316,57 @@ The page is plain HTTP: the cookie and basic auth cross the network in clear tex
 web service on the same address sees the session cookie. A browser that still holds basic
 credentials from an older picoguard keeps sending them; it shows the dashboard without the form,
 and **Sign out** cannot end that until the browser forgets them.
+
+### Block, Allow and Check a name
+
+Each row of the query log has **Block** (or **Allow** when the query was blocked) and **Why**.
+Block and Allow add a rule for that name and its subdomains; the Lists tab shows them in the card
+**Your rules**, each with **Remove**, and your config `rules` read-only below them.
+
+- The rules are kept in memory only. A restart or an update clears them, and nothing is written
+  to disk. Add a rule you want to keep to `rules` in the config.
+- At most 500 names.
+- A name is trimmed, lowercased and loses one trailing dot. It must then be 1 to 253 characters in
+  at least two labels of 1 to 63 letters, digits, hyphens or underscores, none starting with a
+  hyphen. Anything else answers 400 `{"error": "not a domain name"}`.
+- One rule per name: the other action replaces the rule in its place, and the same action again
+  changes nothing. A new name past 500 answers 409
+  `{"error": "too many rules (500); remove some first"}`; replacing one at the cap works.
+- The list is in the order the names were first added.
+- A change is in force when its answer comes back. It never waits for a list download: only the
+  page's rules are rebuilt, the lists are not read again.
+- Cached answers follow the new rules at their next query.
+- While blocking is paused, a change is kept and applies when blocking is on again.
+
+Which rule decides a name, in the order of "Which rule wins" above, comes from **Check a name** on
+the Lists tab; **Why** on a log row fills it in and runs it.
+
+- The name is judged as an `A` query, with blocking on even while it is paused.
+- Among lists of equal standing, the first one is reported: your `rules`, then the lists in config
+  order.
+- Plain rules are shown in adblock form (`||name^`, `|name^`, and `||*.name^` for an RPZ
+  `*.name`). Hosts lines show as `address name`.
+- Other rules are rebuilt from the parsed rule: a regex or wildcard without modifiers shows exactly
+  as written; with modifiers, they come in a fixed order and spelling, which may differ from the
+  list (`$dnstype=AAAA,important` shows as `$important,dnstype=AAAA`).
+- A Block from the page shows as `||name^$important`, an Allow as `@@||name^`; their list is
+  `your rules`. Your config `rules` show as `config rules`, an allowlist or blocklist by its
+  name, or its URL or path when it has none.
+- A name blocked only by its answer (a CNAME target or an address, "blocked (answer)" in the
+  query log) shows `none`: only the name itself is checked.
+
+The routes, all signed-in only; the two changes follow the same `Origin`, content type and body
+rules as every other change:
+
+| Route | Body | Answer |
+|---|---|---|
+| `GET /api/rules` | | `{"rules": [{"name": "ads.example", "action": "block"}], "config_rules": ["@@\|\|good.example^"], "max": 500}` |
+| `POST /api/rules` | `{"name": "...", "action": "block"}` or `"allow"` | the same as `GET`; 400 or 409 |
+| `POST /api/rules/remove` | `{"name": "..."}` | the same as `GET`; 404 `{"error": "no such rule"}` |
+| `GET /api/explain?name=...` | | `{"name": "ads.example", "decision": "blocked", "list": "config rules", "rule": "\|\|ads.example^"}`; `decision` is `blocked`, `allowed` or `none` (then `list` and `rule` are `null`) |
+
+The name in `/api/explain` is read as sent, without percent-decoding: a domain name never needs
+it.
 
 ## `[stats]`
 
