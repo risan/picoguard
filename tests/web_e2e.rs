@@ -487,8 +487,8 @@ async fn the_page_is_served_with_protective_headers() {
 /// The page's ceiling for every slice of release 1.
 const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
 
-/// This slice, the Cache card; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 28 * 1024;
+/// This slice, Your rules and Check a name; a later slice raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 31 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -524,6 +524,9 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/login",
         "/api/logout",
         "/api/cache/clear",
+        "/api/rules",
+        "/api/rules/remove",
+        "/api/explain?name=",
         "setInterval(update, 5000)",
         "id=\"version\"",
         "id=\"update\"",
@@ -632,6 +635,58 @@ async fn the_dashboard_has_a_cache_card_with_a_confirmed_clear_button() {
         "\"Cache cleared (\"",
         "\"Clear the DNS cache?",
         "\"upstreams\", \"cache\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+#[tokio::test]
+async fn the_query_log_rows_offer_block_allow_and_why() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "data-act",
+        "\"Block\"",
+        "\"Allow\"",
+        "\"Why\"",
+        "blocked_response",
+        "\"/api/rules\"",
+        "location.hash = \"lists\"",
+        "checkName(",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+#[tokio::test]
+async fn the_lists_tab_has_your_rules_and_a_name_check() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "rules",
+        "rule-count",
+        "rule-table",
+        "config-rules",
+        "check",
+        "check-form",
+        "check-name",
+        "check-result",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "\"/api/rules/remove\"",
+        "\"/api/explain?name=\" + encodeURIComponent(",
+        "Kept in memory only",
+        "\"refresh-row\", \"rules\", \"check\"]",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
