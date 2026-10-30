@@ -484,8 +484,8 @@ async fn the_page_is_served_with_protective_headers() {
 /// The page's ceiling for every slice of release 1.
 const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
 
-/// This slice, the sign-in form; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 26 * 1024;
+/// This slice, the Upstreams card; a later slice raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 27 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -588,6 +588,27 @@ async fn the_page_has_three_tabs_kept_in_the_url_fragment() {
             !page.contains(&format!("id=\"{tab}\"")),
             "{tab} is a fragment target"
         );
+    }
+}
+
+/// No browser here: the Upstreams card is checked as source. The read-only view leaves the
+/// field out, so the card is hidden there with the top lists.
+#[tokio::test]
+async fn the_dashboard_has_an_upstreams_card_drawn_as_text() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "id=\"upstreams\"",
+        "id=\"upstream-table\"",
+        "showUpstreams(status.upstreams)",
+        "\"local: \"",
+        "\"\\u2014\"",
+        "th:not(:first-child)",
+        "[\"pause\", \"tops\", \"upstreams\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
     }
 }
 

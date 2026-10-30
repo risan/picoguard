@@ -73,13 +73,13 @@ td.name { overflow-wrap: anywhere; }
 #queries td, #list-table td { white-space: nowrap; }
 #list-table td.err { min-width: 14rem; white-space: normal; }
 #queries td.name { min-width: 12rem; white-space: normal; }
-#tops table { border-collapse: separate; border-spacing: 0 2px; }
-#tops td { padding: 6px 0 6px var(--s2); border-bottom: 0; }
-#tops td.name { border-radius: 4px;
+.bars table { border-collapse: separate; border-spacing: 0 2px; }
+.bars td { padding: 6px 0 6px var(--s2); border-bottom: 0; }
+.bars td.name { border-radius: 4px;
   background: linear-gradient(to right, var(--bar, var(--tint)) var(--share, 0%), transparent 0); }
 #top-blocked { --bar: var(--tint-bad); }
-#tops th { padding-left: var(--s2); }
-#tops td.num, #tops th:last-child { padding-right: var(--s2); text-align: right; }
+.bars th { padding-left: var(--s2); }
+.bars td.num, .bars th:not(:first-child) { padding-right: var(--s2); text-align: right; }
 .scroll { overflow-x: auto; }
 #chart-readout { margin: 0 0 var(--s2); font-size: var(--t-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
 #chart { display: block; }
@@ -188,11 +188,16 @@ button.go:hover { background: var(--accent); opacity: .9; }
       <svg id="chart" width="100%" height="150"></svg>
     </section>
 
-    <div id="tops" class="grid wide">
+    <div id="tops" class="grid wide bars">
       <section><h2>Top domains <small id="a-queried"></small></h2><div class="scroll" id="top-queried"></div></section>
       <section><h2>Top blocked <small id="a-blocked"></small></h2><div class="scroll" id="top-blocked"></div></section>
       <section><h2>Top clients <small id="a-clients"></small></h2><div class="scroll" id="top-clients"></div></section>
     </div>
+
+    <section id="upstreams" class="wide bars">
+      <h2>Upstreams <small>(since start)</small></h2>
+      <div class="scroll" id="upstream-table"></div>
+    </section>
   </div>
 
   <div class="grid" role="tabpanel" id="panel-log" data-panel="log" aria-labelledby="tab-log" hidden>
@@ -487,6 +492,22 @@ function showLists(lists) {
     : el("p", "No lists configured.", "empty"));
 }
 
+function showUpstreams(upstreams) {
+  const answeredTotal = upstreams.reduce((sum, u) => sum + u.answered, 0);
+  const rows = upstreams.slice().sort((a, b) => b.answered - a.answered || a.failed - b.failed).map((u) => {
+    const share = answeredTotal ? u.answered / answeredTotal * 100 : 0;
+    const tr = row([
+      [(u.kind === "local" ? "local: " : "") + u.label, "name"], [u.answered.toLocaleString(), "num"],
+      [share.toFixed(1) + " %", "num"], [u.failed.toLocaleString(), u.failed ? "num err" : "num"],
+      [u.avg_ms === null ? "\u2014" : u.avg_ms.toFixed(1) + " ms", "num"],
+    ]);
+    tr.firstChild.style.setProperty("--share", share + "%");
+
+    return tr;
+  });
+  $("upstream-table").replaceChildren(table(["Server", "Answered", "Share", "Failed", "Avg"], rows));
+}
+
 function showPause(pause) {
   pausedUntil = pause.paused ? pause.until : null;
   document.body.classList.toggle("paused", pause.paused);
@@ -526,7 +547,7 @@ function showInstall(update) {
 function showLimited(note) {
   $("limited-note").textContent = note || "";
   $("limited").hidden = !note;
-  ["pause", "tops", "tab-log", "refresh-row"].forEach((id) => { $(id).hidden = Boolean(note); });
+  ["pause", "tops", "upstreams", "tab-log", "refresh-row"].forEach((id) => { $(id).hidden = Boolean(note); });
   showTab();
 }
 
@@ -555,6 +576,7 @@ async function update() {
     showLists(status.lists);
 
     if (!status.limited) {
+      showUpstreams(status.upstreams);
       const log = await api("/api/querylog?limit=50");
 
       if (epoch !== authEpoch) {
