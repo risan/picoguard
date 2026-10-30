@@ -562,13 +562,6 @@ mod tests {
         response.bytes(&query)
     }
 
-    fn named(name: &str, ttl: u32) -> Option<Found> {
-        Some(Found {
-            name: name.into(),
-            ttl,
-        })
-    }
-
     #[test]
     fn reverse_names_of_ipv4_ipv6_and_mapped_addresses() {
         let v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 110, 50));
@@ -604,7 +597,7 @@ mod tests {
 
         assert_eq!(
             host_name_in(&reply(answers, rcode::NOERROR)),
-            named("risan-pc.lan", 600)
+            found("risan-pc.lan", 600)
         );
     }
 
@@ -617,7 +610,7 @@ mod tests {
 
         assert_eq!(
             host_name_in(&reply(answers, rcode::NOERROR)),
-            named("printer.lan", 900)
+            found("printer.lan", 900)
         );
     }
 
@@ -641,7 +634,7 @@ mod tests {
         );
         assert_eq!(host_name_in(&reply(a_only, rcode::NOERROR)), None);
         assert_eq!(host_name_in(cut), None);
-        assert_eq!(host_name_in(&whole), named("pc.lan", 600));
+        assert_eq!(host_name_in(&whole), found("pc.lan", 600));
     }
 
     /// A reply to the PTR question of 1.0.168.192 with one PTR answer whose RDLENGTH is
@@ -669,7 +662,7 @@ mod tests {
 
         assert_eq!(
             host_name_in(&hand_written(target.len() as u16, target)),
-            named("my-pc.lan", 600)
+            found("my-pc.lan", 600)
         );
         assert_eq!(
             host_name_in(&hand_written(target.len() as u16 - 1, target)),
@@ -681,7 +674,7 @@ mod tests {
         );
         assert_eq!(
             host_name_in(&hand_written(compressed.len() as u16, &compressed)),
-            named("my-pc.arpa", 600)
+            found("my-pc.arpa", 600)
         );
     }
 
@@ -733,7 +726,7 @@ mod tests {
         ] {
             let answer = reply(vec![ptr(OWNER, 600, &format!("{kept}."))], rcode::NOERROR);
 
-            assert_eq!(host_name_in(&answer), named(kept, 600));
+            assert_eq!(host_name_in(&answer), found(kept, 600));
         }
 
         assert_eq!(longest.len(), 253);
