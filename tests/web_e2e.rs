@@ -492,9 +492,8 @@ async fn the_page_is_served_with_protective_headers() {
 /// The page's ceiling for every slice of release 1.
 const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
 
-/// This slice, Your rules, Check a name and the stacked phone log; a later slice raises it on
-/// purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 32 * 1024;
+/// This slice, device names; a later slice raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 33 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -641,6 +640,24 @@ async fn the_dashboard_has_a_cache_card_with_a_confirmed_clear_button() {
         "\"Cache cleared (\"",
         "\"Clear the DNS cache?",
         "\"upstreams\", \"cache\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+/// No browser here: the names are checked as source, and in the build's browser check. The
+/// ban on `innerHTML` in the page test covers markup.
+#[tokio::test]
+async fn the_clients_show_their_name_beside_the_ip_as_text() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "function who(",
+        "who(e.name, e.key)",
+        "who(e.name, e.client)",
+        ".ip {",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
