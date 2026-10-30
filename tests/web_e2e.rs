@@ -776,12 +776,14 @@ async fn a_failed_over_query_counts_a_failure_on_the_first_server_and_an_answer_
 
     // Which server goes first is a weighted draw; the dead one is the first try often enough.
     let mut asked = 0;
+    let started = Instant::now();
     while dead.count() == 0 {
         assert!(asked < 40, "the dead server was never tried");
 
         ask(&site.dns, &format!("n{asked}.example."), RecordType::A).await;
         asked += 1;
     }
+    let asking_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let status = site.send(get("/api/status")).await.json();
     let servers = upstream_entries(&status);
@@ -793,9 +795,15 @@ async fn a_failed_over_query_counts_a_failure_on_the_first_server_and_an_answer_
     assert_eq!(servers[1]["answered"], asked);
     assert_eq!(servers[1]["failed"], 0);
     let average = servers[1]["avg_ms"].as_f64().unwrap();
-    // The upper bound only has to stay under the 1000 ms the dead server cost; a tighter one
-    // fails on a loaded machine.
-    assert!((80.0..900.0).contains(&average), "{average}");
+    // Each try at the dead server takes at least 500 ms (half the 1000 ms timeout) of the wall
+    // time that the answered exchanges share it with, however loaded the machine is. A time that
+    // counted those tries too would not leave that much out.
+    let answered_ms = average * asked as f64;
+    assert!(average >= 80.0, "{average}");
+    assert!(
+        answered_ms < asking_ms - 400.0,
+        "{answered_ms} answered of {asking_ms}"
+    );
 }
 
 #[tokio::test]

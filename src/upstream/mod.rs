@@ -996,10 +996,12 @@ mod tests {
         upstreams.servers[1].health.lock().unwrap().retry_at =
             Some(Instant::now() + Duration::from_secs(30));
 
+        let started = Instant::now();
         upstreams
             .query(&mut query_for("example.com."))
             .await
             .unwrap();
+        let whole_query_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         let tallies: Vec<Tally> = upstreams.tallies().map(|(_, tally)| tally).collect();
         assert_eq!(tallies[0].answered, 0);
@@ -1008,9 +1010,11 @@ mod tests {
         assert_eq!(tallies[1].answered, 1);
         assert_eq!(tallies[1].failed, 0);
         let average = tallies[1].average_ms().unwrap();
-        // The upper bound only has to stay under the 1000 ms the dead server cost; a tighter one
-        // fails on a loaded machine.
-        assert!((50.0..900.0).contains(&average), "{average}");
+        // The dead server is tried first and is given half the 1000 ms timeout, so the exchange
+        // with the second server ends at least 500 ms before the whole query does, however
+        // loaded the machine is. A time that included the first try would not.
+        assert!(average >= 50.0, "{average}");
+        assert!(average < whole_query_ms - 400.0, "{average} in {whole_query_ms}");
     }
 
     #[tokio::test]
