@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::harness::{
-    Running, answering_upstream, ask, config_for, fake_upstream, start_with_policy,
+    Running, a_record, answering_upstream, ask, config_for, fake_upstream, name, reply_to,
+    start_with_policy,
 };
 use common::http::ListServer;
 use common::release::{Files, TARGET, scratch, test_key};
@@ -22,7 +23,7 @@ use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::Downloader;
 use picoguard::password::PasswordHash;
 use picoguard::policy::Policy;
-use picoguard::scheduler::{Scheduler, Timing};
+use picoguard::scheduler::{Action, ListControl, Scheduler, Timing};
 use picoguard::stage::{StageSetup, StageTiming, Stager};
 use picoguard::update::{self, Build, CheckTiming, Latest, Updates};
 use picoguard::upstream::tls::Tls;
@@ -224,6 +225,7 @@ struct Site {
     web: SocketAddr,
     dns: Running,
     policy: Arc<Policy>,
+    control: Arc<ListControl>,
     updates: Arc<Updates>,
     /// The fake of the release downloads the stager reads.
     release: ListServer,
@@ -441,6 +443,7 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
         web: address,
         dns,
         policy,
+        control,
         updates,
         release,
         stager,
@@ -1491,7 +1494,110 @@ fn rejected_mutations() -> Vec<(&'static str, Request, u16)> {
             },
             405,
         ),
+        (
+            "a rule from another origin",
+            post("/api/rules", RULE_BODY).header("Origin", "http://evil.example"),
+            403,
+        ),
+        (
+            "a rule from a null origin",
+            post("/api/rules", RULE_BODY).header("Origin", "null"),
+            403,
+        ),
+        (
+            "a rule for a name that is not configured",
+            post("/api/rules", RULE_BODY).header("Host", "evil.example"),
+            403,
+        ),
+        (
+            "a rule as plain text",
+            post("/api/rules", RULE_BODY).header("Content-Type", "text/plain"),
+            415,
+        ),
+        (
+            "a rule without a content type",
+            Request {
+                headers: Vec::new(),
+                ..post("/api/rules", RULE_BODY)
+            },
+            415,
+        ),
+        (
+            "a rule body over 1 KiB",
+            post(
+                "/api/rules",
+                &format!(
+                    "{{\"name\": \"x.example\", \"action\": \"block\", \"padding\": \"{}\"}}",
+                    "x".repeat(1100)
+                ),
+            ),
+            413,
+        ),
+        (
+            "a put of rules",
+            Request {
+                method: "PUT",
+                ..post("/api/rules", RULE_BODY)
+            },
+            405,
+        ),
+        (
+            "a removal from another origin",
+            post("/api/rules/remove", REMOVE_BODY).header("Origin", "http://evil.example"),
+            403,
+        ),
+        (
+            "a removal from a null origin",
+            post("/api/rules/remove", REMOVE_BODY).header("Origin", "null"),
+            403,
+        ),
+        (
+            "a removal for a name that is not configured",
+            post("/api/rules/remove", REMOVE_BODY).header("Host", "evil.example"),
+            403,
+        ),
+        (
+            "a removal as plain text",
+            post("/api/rules/remove", REMOVE_BODY).header("Content-Type", "text/plain"),
+            415,
+        ),
+        (
+            "a removal without a content type",
+            Request {
+                headers: Vec::new(),
+                ..post("/api/rules/remove", REMOVE_BODY)
+            },
+            415,
+        ),
+        (
+            "a removal body over 1 KiB",
+            post(
+                "/api/rules/remove",
+                &format!(
+                    "{{\"name\": \"x.example\", \"padding\": \"{}\"}}",
+                    "x".repeat(1100)
+                ),
+            ),
+            413,
+        ),
+        ("a get of removal", get("/api/rules/remove"), 405),
+        (
+            "a put of removal",
+            Request {
+                method: "PUT",
+                ..post("/api/rules/remove", REMOVE_BODY)
+            },
+            405,
+        ),
     ]
+}
+
+const RULE_BODY: &str = "{\"name\":\"x.example\",\"action\":\"block\"}";
+const REMOVE_BODY: &str = "{\"name\":\"x.example\"}";
+
+/// True when no rule was added from the page.
+async fn no_page_rules(site: &Site) -> bool {
+    site.control.with_button_rules(<[_]>::is_empty).await
 }
 
 async fn assert_mutations_are_rejected(site: &Site, sign_in: impl Fn(Request) -> Request) {
@@ -1505,6 +1611,7 @@ async fn assert_mutations_are_rejected(site: &Site, sign_in: impl Fn(Request) ->
         assert!(!site.is_paused(), "{what} paused blocking");
         assert_nothing_was_started(site, what);
         assert_cache_kept(site, cached, what);
+        assert!(no_page_rules(site).await, "{what} added a rule");
     }
 }
 
@@ -1664,6 +1771,10 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
         ("login", login("admin", "s3cret")),
         ("logout", post("/api/logout", "{}")),
         ("clear cache", post("/api/cache/clear", "{}")),
+        ("add a rule", post("/api/rules", RULE_BODY)),
+        ("remove a rule", post("/api/rules/remove", REMOVE_BODY)),
+        ("the rules", get("/api/rules")),
+        ("explain", get("/api/explain?name=ads.example")),
     ] {
         let reply = site.send(request).await;
 
@@ -1673,6 +1784,7 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
 
     assert!(!site.is_paused());
     assert_cache_kept(&site, cached, "a forbidden change");
+    assert!(no_page_rules(&site).await);
 }
 
 #[tokio::test]
@@ -1720,6 +1832,7 @@ async fn unsafe_mutations_are_rejected_without_a_password() {
         assert!(!site.is_paused(), "{what} paused blocking");
         assert_nothing_was_started(&site, what);
         assert_cache_kept(&site, cached, what);
+        assert!(no_page_rules(&site).await, "{what} added a rule");
     }
 }
 
@@ -1752,21 +1865,38 @@ async fn a_get_of_a_mutation_names_the_method_that_works() {
 
     let reply = site.send(get("/api/pause")).await;
     let read = site.send(post("/api/status", "{}")).await;
+    let removal = site.send(get("/api/rules/remove")).await;
+    let rules = site
+        .send(Request {
+            method: "PUT",
+            ..post("/api/rules", RULE_BODY)
+        })
+        .await;
 
     assert_eq!(reply.header("allow"), Some("POST"));
     assert_eq!(read.header("allow"), Some("GET"));
+    assert_eq!(removal.header("allow"), Some("POST"));
+    assert_eq!(rules.header("allow"), Some("GET, POST"));
 }
 
 #[tokio::test]
 async fn with_a_password_the_page_opens_without_a_prompt_and_the_api_needs_a_sign_in() {
     let (site, _upstream) = plain_site().await;
-    let reads = ["/api/status", "/api/querylog", "/api/lists"];
+    let reads = [
+        "/api/status",
+        "/api/querylog",
+        "/api/lists",
+        "/api/rules",
+        "/api/explain?name=ads.example",
+    ];
     let changes = [
         ("/api/pause", "{\"minutes\": 5}"),
         ("/api/resume", ""),
         ("/api/lists/refresh", ""),
         ("/api/update", UPDATE_BODY),
         ("/api/cache/clear", "{}"),
+        ("/api/rules", RULE_BODY),
+        ("/api/rules/remove", REMOVE_BODY),
     ];
     let requests = || {
         reads
@@ -1825,6 +1955,7 @@ async fn with_a_password_the_page_opens_without_a_prompt_and_the_api_needs_a_sig
     }
 
     assert!(!site.is_paused());
+    assert!(no_page_rules(&site).await);
 
     for path in reads {
         let reply = site.send_as_is(get(path).signed_in(ADMIN)).await;
@@ -2314,7 +2445,15 @@ async fn a_peer_outside_allow_from_gets_nothing_from_reads_or_changes() {
     assert!(site.is_ignored(login("admin", "s3cret")).await);
     assert!(site.is_ignored(post("/api/logout", "{}")).await);
     assert!(site.is_ignored(post("/api/cache/clear", "{}")).await);
+    assert!(site.is_ignored(get("/api/rules")).await);
+    assert!(site.is_ignored(get("/api/explain?name=ads.example")).await);
+    assert!(site.is_ignored(post("/api/rules", RULE_BODY)).await);
+    assert!(
+        site.is_ignored(post("/api/rules/remove", REMOVE_BODY))
+            .await
+    );
     assert!(!site.is_paused());
+    assert!(no_page_rules(&site).await);
     assert_nothing_was_started(&site, "a peer outside allow_from");
 }
 
@@ -2641,4 +2780,328 @@ async fn a_hanging_download_holds_up_neither_dns_nor_the_page() {
         .expect("DNS and the page answer while the download hangs");
 
     assert_eq!(status.status, 200);
+}
+
+fn addresses(reply: &hickory_proto::op::Message) -> Vec<String> {
+    reply
+        .answers
+        .iter()
+        .map(|record| record.data.to_string())
+        .collect()
+}
+
+fn rule_body(name: &str, action: &str) -> String {
+    serde_json::json!({ "name": name, "action": action }).to_string()
+}
+
+fn remove_body(name: &str) -> String {
+    serde_json::json!({ "name": name }).to_string()
+}
+
+#[tokio::test]
+async fn a_block_answers_the_next_query_with_the_null_ip_even_from_the_cache() {
+    let (site, upstream) = plain_site().await;
+    let before = ask(&site.dns, "www.example.org.", RecordType::A).await;
+    assert_eq!(addresses(&before), ["9.9.9.9"]);
+    let asked = upstream.count();
+
+    let reply = site
+        .send(post("/api/rules", &rule_body(" Example.ORG. ", "block")))
+        .await;
+
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        reply.body,
+        "{\"rules\":[{\"name\":\"example.org\",\"action\":\"block\"}],\"config_rules\":[\"||ads.example^\"],\"max\":500}"
+    );
+    for name in ["www.example.org.", "example.org."] {
+        let after = ask(&site.dns, name, RecordType::A).await;
+        assert_eq!(addresses(&after), ["0.0.0.0"], "{name}");
+    }
+
+    assert_eq!(upstream.count(), asked, "the cached reply was judged again");
+}
+
+#[tokio::test]
+async fn an_allow_lets_a_list_blocked_name_resolve() {
+    let (site, _upstream) = plain_site().await;
+    let blocked = ask(&site.dns, "ads.example.", RecordType::A).await;
+    assert_eq!(addresses(&blocked), ["0.0.0.0"]);
+
+    let reply = site
+        .send(post("/api/rules", &rule_body("ads.example", "allow")))
+        .await;
+
+    assert_eq!(reply.status, 200);
+    let allowed = ask(&site.dns, "ads.example.", RecordType::A).await;
+    assert_eq!(addresses(&allowed), ["9.9.9.9"]);
+}
+
+#[tokio::test]
+async fn get_lists_page_rules_in_order_with_config_rules_and_remove_restores() {
+    let (site, _upstream) = plain_site().await;
+    for (name, action) in [
+        ("a.example", "block"),
+        ("b.example", "allow"),
+        ("c.example", "block"),
+    ] {
+        let reply = site
+            .send(post("/api/rules", &rule_body(name, action)))
+            .await;
+        assert_eq!(reply.status, 200, "{name}");
+    }
+
+    let listed = site.send(get("/api/rules")).await;
+
+    assert_eq!(listed.status, 200);
+    assert_eq!(
+        listed.json(),
+        serde_json::json!({
+            "rules": [
+                {"name": "a.example", "action": "block"},
+                {"name": "b.example", "action": "allow"},
+                {"name": "c.example", "action": "block"},
+            ],
+            "config_rules": ["||ads.example^"],
+            "max": 500,
+        })
+    );
+
+    let removed = site
+        .send(post("/api/rules/remove", &remove_body("b.example")))
+        .await;
+
+    assert_eq!(removed.status, 200);
+    assert_eq!(
+        removed.json()["rules"],
+        serde_json::json!([
+            {"name": "a.example", "action": "block"},
+            {"name": "c.example", "action": "block"},
+        ])
+    );
+
+    let again = site
+        .send(post("/api/rules/remove", &remove_body("b.example")))
+        .await;
+
+    assert_eq!(again.status, 404);
+    assert_eq!(again.body, "{\"error\":\"no such rule\"}");
+}
+
+#[tokio::test]
+async fn a_page_allow_beats_important_blocks_and_answer_checks() {
+    let upstream = fake_upstream(|query| {
+        let owner = query.queries[0].name().to_string();
+        let answers = if owner == "cloaked.example." {
+            vec![
+                hickory_proto::rr::Record::from_rdata(
+                    name("cloaked.example."),
+                    300,
+                    hickory_proto::rr::RData::CNAME(hickory_proto::rr::rdata::CNAME(name(
+                        "cdn.tracker.example.",
+                    ))),
+                ),
+                a_record("cdn.tracker.example.", 300, [9, 9, 9, 9]),
+            ]
+        } else {
+            vec![a_record(&owner, 300, [9, 9, 9, 9])]
+        };
+
+        vec![(Duration::ZERO, reply_to(query, answers))]
+    })
+    .await;
+    let mut config = local_config(&upstream);
+    config.rules = vec![
+        "||tracker.example^".to_string(),
+        "||imp.example^$important".to_string(),
+        "@@||cfg.example^".to_string(),
+    ]
+    .into();
+    let site = site(config).await;
+    let cloaked = ask(&site.dns, "cloaked.example.", RecordType::A).await;
+    assert_eq!(
+        addresses(&cloaked),
+        ["0.0.0.0"],
+        "blocked through its answer"
+    );
+
+    for (name, action) in [
+        ("cloaked.example", "allow"),
+        ("imp.example", "allow"),
+        ("cfg.example", "block"),
+    ] {
+        let reply = site
+            .send(post("/api/rules", &rule_body(name, action)))
+            .await;
+        assert_eq!(reply.status, 200, "{name}");
+    }
+
+    let cloaked = ask(&site.dns, "cloaked.example.", RecordType::A).await;
+    assert_eq!(addresses(&cloaked), ["cdn.tracker.example.", "9.9.9.9"]);
+    let important = ask(&site.dns, "imp.example.", RecordType::A).await;
+    assert_eq!(addresses(&important), ["9.9.9.9"]);
+    let allowed_by_config = ask(&site.dns, "cfg.example.", RecordType::A).await;
+    assert_eq!(addresses(&allowed_by_config), ["0.0.0.0"]);
+}
+
+const NOT_A_DOMAIN_NAME: &str = "{\"error\":\"not a domain name\"}";
+
+#[tokio::test]
+async fn bad_names_and_bodies_are_400_and_the_501st_name_is_409() {
+    let (site, _upstream) = plain_site().await;
+    let too_long = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "a".repeat(63),
+        "a".repeat(63),
+        "b".repeat(62)
+    );
+    let long_label = format!("{}.example", "a".repeat(64));
+
+    for bad in [
+        "a",
+        "-x.com",
+        &too_long,
+        "x..y",
+        &long_label,
+        "",
+        ".",
+        "x.com..",
+        "x.com^",
+        "x.com^$badfilter",
+        "x com",
+        "%41.com",
+        "*.x.com",
+        "ünï.com",
+    ] {
+        let added = site
+            .send(post("/api/rules", &rule_body(bad, "block")))
+            .await;
+        let removed = site
+            .send(post("/api/rules/remove", &remove_body(bad)))
+            .await;
+
+        assert_eq!(added.status, 400, "{bad:?}");
+        assert_eq!(added.body, NOT_A_DOMAIN_NAME, "{bad:?}");
+        assert_eq!(removed.status, 400, "{bad:?}");
+        assert_eq!(removed.body, NOT_A_DOMAIN_NAME, "{bad:?}");
+    }
+
+    for body in [
+        "{\"name\":\"x.com\"}",
+        "{\"name\":\"x.com\",\"action\":\"drop\"}",
+        "[\"x.com\",\"block\"]",
+        "{\"name\":\"x.com\",\"action\":\"block\",\"extra\":1}",
+    ] {
+        let reply = site.send(post("/api/rules", body)).await;
+
+        assert_eq!(reply.status, 400, "{body}");
+        assert_eq!(
+            reply.json()["error"],
+            "send {\"name\": \"...\", \"action\": \"block\" or \"allow\"}",
+            "{body}"
+        );
+    }
+
+    for body in ["[\"x.com\"]", "{\"name\":\"x.com\",\"extra\":1}", "{}"] {
+        let reply = site.send(post("/api/rules/remove", body)).await;
+
+        assert_eq!(reply.status, 400, "{body}");
+        assert_eq!(reply.json()["error"], "send {\"name\": \"...\"}", "{body}");
+    }
+
+    assert!(no_page_rules(&site).await);
+
+    for index in 0..500 {
+        site.control
+            .add_button_rule(&format!("name{index}.example"), Action::Block)
+            .await
+            .unwrap();
+    }
+
+    let full = site
+        .send(post("/api/rules", &rule_body("name500.example", "block")))
+        .await;
+    let replaced = site
+        .send(post("/api/rules", &rule_body("name1.example", "allow")))
+        .await;
+
+    assert_eq!(full.status, 409);
+    assert_eq!(
+        full.body,
+        "{\"error\":\"too many rules (500); remove some first\"}"
+    );
+    assert_eq!(replaced.status, 200);
+    assert_eq!(replaced.json()["rules"][1]["action"], "allow");
+}
+
+#[tokio::test]
+async fn explain_answers_list_and_rule_and_ignores_pause() {
+    let (site, _upstream) = plain_site().await;
+
+    let config_rule = site.send(get("/api/explain?name=Ads.Example.")).await;
+
+    assert_eq!(config_rule.status, 200);
+    assert_eq!(
+        config_rule.body,
+        "{\"name\":\"ads.example\",\"decision\":\"blocked\",\"list\":\"config rules\",\"rule\":\"||ads.example^\"}"
+    );
+
+    let added = site
+        .send(post("/api/rules", &rule_body("b.example", "block")))
+        .await;
+    assert_eq!(added.status, 200);
+    let page_rule = site.send(get("/api/explain?name=b.example")).await.json();
+
+    assert_eq!(page_rule["decision"], "blocked");
+    assert_eq!(page_rule["list"], "your rules");
+    assert_eq!(page_rule["rule"], "||b.example^$important");
+
+    let none = site
+        .send(get("/api/explain?name=other.example"))
+        .await
+        .json();
+
+    assert_eq!(
+        none,
+        serde_json::json!({
+            "name": "other.example",
+            "decision": "none",
+            "list": null,
+            "rule": null,
+        })
+    );
+
+    let paused = site.send(post("/api/pause", "{\"minutes\": 5}")).await;
+    assert_eq!(paused.status, 200);
+    let while_paused = site.send(get("/api/explain?name=ads.example")).await.json();
+
+    assert_eq!(while_paused["decision"], "blocked");
+
+    for query in ["?name=a", "?name=x%2Ecom", "", "?other=ads.example"] {
+        let reply = site.send(get(&format!("/api/explain{query}"))).await;
+
+        assert_eq!(reply.status, 400, "{query}");
+        assert_eq!(reply.body, NOT_A_DOMAIN_NAME, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn a_change_while_paused_is_kept_and_applies_on_resume() {
+    let (site, _upstream) = plain_site().await;
+    let paused = site.send(post("/api/pause", "{\"minutes\": 5}")).await;
+    assert_eq!(paused.status, 200);
+
+    let added = site
+        .send(post("/api/rules", &rule_body("b.example", "block")))
+        .await;
+
+    assert_eq!(added.status, 200);
+    let during = ask(&site.dns, "b.example.", RecordType::A).await;
+    assert_eq!(addresses(&during), ["9.9.9.9"]);
+
+    let resumed = site.send(post("/api/resume", "")).await;
+    assert_eq!(resumed.status, 200);
+    let after = ask(&site.dns, "b.example.", RecordType::A).await;
+    assert_eq!(addresses(&after), ["0.0.0.0"]);
 }

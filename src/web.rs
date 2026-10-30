@@ -1,4 +1,4 @@
-//! The status page and its JSON API (plan D16). One HTML page, four reads, five mutations, and
+//! The status page and its JSON API (plan D16). One HTML page, six reads, seven mutations, and
 //! sign-in and sign-out. A web page on another device of the LAN must not be able to pause
 //! blocking, so every request passes the access policy before it reaches a handler:
 //!
@@ -36,7 +36,9 @@ use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
 use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
 use crate::pipeline::{CacheSize, Pipeline, ServerKind, ServerTally};
 use crate::policy::Policy;
-use crate::scheduler::{ListControl, ListStatus, Role};
+use crate::scheduler::{
+    Action, ButtonRule, ListControl, ListStatus, MAX_BUTTON_RULES, Role, RuleError, normalized_name,
+};
 use crate::server::bind_tcp;
 use crate::stage::{Refused, Stager};
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, TopEntry};
@@ -60,6 +62,7 @@ const MIN_PAUSE_MINUTES: u32 = 1;
 const MAX_PAUSE_MINUTES: u32 = 24 * 60;
 const DEFAULT_QUERY_LOG_LIMIT: usize = 100;
 const PASSWORD_NEEDED: &str = "set web.user and web.password_hash (or web.password) to use this";
+const NOT_A_DOMAIN_NAME: &str = "not a domain name";
 
 /// Everything the handlers read or change.
 pub struct Web {
@@ -73,6 +76,8 @@ pub struct Web {
     /// What a client is checked against; `None` when no password is set.
     auth: Option<Auth>,
     query_log_entries: usize,
+    /// The config's `rules`, shown read-only beside the page's own.
+    config_rules: Arc<[String]>,
 }
 
 impl Web {
@@ -104,6 +109,7 @@ impl Web {
             hostnames: web.hostnames.clone(),
             auth,
             query_log_entries: config.stats.query_log_entries,
+            config_rules: Arc::clone(&config.rules),
         })
     }
 }
@@ -211,6 +217,8 @@ enum Read {
     Status,
     QueryLog,
     Lists,
+    Rules,
+    Explain,
 }
 
 /// Answered to `POST` only.
@@ -223,6 +231,8 @@ enum Change {
     Install,
     Login,
     Logout,
+    AddRule,
+    RemoveRule,
 }
 
 enum Route {
@@ -231,8 +241,13 @@ enum Route {
 }
 
 impl Route {
-    fn of(path: &str) -> Option<Route> {
+    /// `/api/rules` is the one path with a read and a change: `GET` lists, `POST` adds.
+    fn of(path: &str, method: &Method) -> Option<Route> {
         match path {
+            "/api/rules" if method == Method::POST => Some(Route::Change(Change::AddRule)),
+            "/api/rules" => Some(Route::Read(Read::Rules)),
+            "/api/rules/remove" => Some(Route::Change(Change::RemoveRule)),
+            "/api/explain" => Some(Route::Read(Read::Explain)),
             "/" => Some(Route::Read(Read::Page)),
             "/api/status" => Some(Route::Read(Read::Status)),
             "/api/querylog" => Some(Route::Read(Read::QueryLog)),
@@ -248,17 +263,26 @@ impl Route {
         }
     }
 
+    /// What a 405 names in `Allow`.
+    fn allowed_methods(&self) -> &'static str {
+        match self {
+            Route::Read(Read::Rules) | Route::Change(Change::AddRule) => "GET, POST",
+            Route::Read(_) => "GET",
+            Route::Change(_) => "POST",
+        }
+    }
+
     /// Open without a sign-in even when a password is set: the page shows its own form, which
     /// posts to the sign-in.
     fn is_public(&self) -> bool {
         matches!(self, Route::Read(Read::Page) | Route::Change(Change::Login))
     }
 
-    /// Whether the page shows this only to a signed-in user: the query log, the top lists
-    /// and every change.
+    /// Whether the page shows this only to a signed-in user: the query log, the top lists,
+    /// the page's rules, the name check and every change.
     fn needs_password(&self) -> bool {
         match self {
-            Route::Read(Read::QueryLog) | Route::Change(_) => true,
+            Route::Read(Read::QueryLog | Read::Rules | Read::Explain) | Route::Change(_) => true,
             Route::Read(Read::Page | Read::Status | Read::Lists) => false,
         }
     }
@@ -327,7 +351,7 @@ impl Web {
         let host = self.checked_host(&head.headers)?;
 
         // An unknown path is not public, so it answers 401 before 404.
-        let route = Route::of(head.uri.path());
+        let route = Route::of(head.uri.path(), &head.method);
         if let Some(auth) = &self.auth
             && !route.as_ref().is_some_and(Route::is_public)
         {
@@ -339,18 +363,19 @@ impl Web {
             return Err(Rejection::new(StatusCode::FORBIDDEN, PASSWORD_NEEDED));
         }
 
+        let allowed = route.allowed_methods();
         match route {
             Route::Read(read) => {
                 if head.method != Method::GET {
-                    return Err(method_not_allowed("GET"));
+                    return Err(method_not_allowed(allowed));
                 }
 
-                self.read(read, head.uri.query())
+                self.read(read, head.uri.query()).await
             }
 
             Route::Change(change) => {
                 if head.method != Method::POST {
-                    return Err(method_not_allowed("POST"));
+                    return Err(method_not_allowed(allowed));
                 }
 
                 check_origin(&head.headers, host)?;
@@ -401,7 +426,11 @@ impl Web {
         is_known_name && is_port_suffix(suffix)
     }
 
-    fn read(&self, read: Read, query: Option<&str>) -> Result<Response<Full<Bytes>>, Rejection> {
+    async fn read(
+        &self,
+        read: Read,
+        query: Option<&str>,
+    ) -> Result<Response<Full<Bytes>>, Rejection> {
         match read {
             Read::Page => Ok(Response::builder()
                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -457,7 +486,50 @@ impl Web {
                     lists: self.list_views(),
                 },
             )),
+
+            Read::Rules => Ok(self.rules_response().await),
+
+            Read::Explain => {
+                let name = name_param(query)
+                    .ok_or_else(|| Rejection::new(StatusCode::BAD_REQUEST, NOT_A_DOMAIN_NAME))?;
+                let explained = self.lists.explain(&name).await;
+                let decision = match &explained {
+                    Some(explained) if explained.allowed => "allowed",
+                    Some(_) => "blocked",
+                    None => "none",
+                };
+                let (list, rule) = explained
+                    .map(|explained| (explained.list, explained.rule))
+                    .unzip();
+
+                Ok(json(
+                    StatusCode::OK,
+                    &ExplainView {
+                        name,
+                        decision,
+                        list,
+                        rule,
+                    },
+                ))
+            }
         }
+    }
+
+    /// The page's rules and the config's, written while the rules are borrowed under the
+    /// lock: no copy of them is made.
+    async fn rules_response(&self) -> Response<Full<Bytes>> {
+        self.lists
+            .with_button_rules(|rules| {
+                json(
+                    StatusCode::OK,
+                    &RulesView {
+                        rules,
+                        config_rules: &self.config_rules,
+                        max: MAX_BUTTON_RULES,
+                    },
+                )
+            })
+            .await
     }
 
     async fn change(
@@ -560,6 +632,33 @@ impl Web {
                 json(StatusCode::OK, &Empty {}),
                 SIGNED_OUT_COOKIE,
             )),
+
+            Change::AddRule => {
+                let request = rule_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"name\": \"...\", \"action\": \"block\" or \"allow\"}",
+                    )
+                })?;
+                self.lists
+                    .add_button_rule(&request.name, request.action)
+                    .await
+                    .map_err(rule_rejection)?;
+
+                Ok(self.rules_response().await)
+            }
+
+            Change::RemoveRule => {
+                let request = remove_request(body).ok_or_else(|| {
+                    Rejection::new(StatusCode::BAD_REQUEST, "send {\"name\": \"...\"}")
+                })?;
+                self.lists
+                    .remove_button_rule(&request.name)
+                    .await
+                    .map_err(rule_rejection)?;
+
+                Ok(self.rules_response().await)
+            }
         }
     }
 
@@ -843,6 +942,77 @@ fn install_version(body: &[u8]) -> Option<String> {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleRequest {
+    name: String,
+    action: Action,
+}
+
+/// `{"name": "...", "action": "block" | "allow"}` and nothing else; the first byte must open an
+/// object, as for `install_version`.
+fn rule_request(body: &[u8]) -> Option<RuleRequest> {
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+
+    serde_json::from_slice(body).ok()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveRequest {
+    name: String,
+}
+
+fn remove_request(body: &[u8]) -> Option<RemoveRequest> {
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+
+    serde_json::from_slice(body).ok()
+}
+
+fn rule_rejection(error: RuleError) -> Rejection {
+    match error {
+        RuleError::NotADomainName => Rejection::new(StatusCode::BAD_REQUEST, NOT_A_DOMAIN_NAME),
+        RuleError::TooMany => Rejection::new(
+            StatusCode::CONFLICT,
+            "too many rules (500); remove some first",
+        ),
+        RuleError::NoSuchRule => Rejection::new(StatusCode::NOT_FOUND, "no such rule"),
+        RuleError::NotApplied => Rejection::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the change could not be applied",
+        ),
+    }
+}
+
+/// The `name` of the query, normalized; `None` when missing or not a domain name. The value is
+/// used as sent: a valid name never needs percent-encoding, so a `%` or `+` makes it invalid.
+fn name_param(query: Option<&str>) -> Option<String> {
+    query?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("name="))
+        .and_then(normalized_name)
+}
+
+#[derive(Serialize)]
+struct RulesView<'a> {
+    rules: &'a [ButtonRule],
+    config_rules: &'a [String],
+    max: usize,
+}
+
+#[derive(Serialize)]
+struct ExplainView {
+    name: String,
+    /// `blocked`, `allowed` or `none`.
+    decision: &'static str,
+    list: Option<String>,
+    rule: Option<String>,
+}
+
 #[derive(Serialize)]
 struct InstallStarted {
     install: &'static str,
@@ -988,6 +1158,11 @@ mod tests {
     fn web_with_names(names: &[&str]) -> Web {
         let mut config = Config::default();
         config.web.hostnames = names.iter().map(|name| name.to_string()).collect();
+
+        web_for(&config)
+    }
+
+    fn web_for(config: &Config) -> Web {
         let policy = Arc::new(Policy::new());
         let lists = Arc::new(ListControl::new(Arc::clone(&policy)));
         let updates = Arc::new(Updates::new(Build::current()));
@@ -1007,8 +1182,8 @@ mod tests {
         );
 
         Web::new(
-            &config,
-            Pipeline::new(&config, Arc::clone(&policy)).unwrap(),
+            config,
+            Pipeline::new(config, Arc::clone(&policy)).unwrap(),
             policy,
             lists,
             updates,
@@ -1056,6 +1231,21 @@ mod tests {
         ] {
             assert!(!web.is_known_host(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn config_rules_are_shared_with_the_config() {
+        let config = Config {
+            rules: (0..1000)
+                .map(|index| format!("||rule{index}.example^"))
+                .collect::<Vec<_>>()
+                .into(),
+            ..Config::default()
+        };
+
+        let web = web_for(&config);
+
+        assert!(Arc::ptr_eq(&web.config_rules, &config.rules));
     }
 
     #[test]
