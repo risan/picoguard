@@ -343,7 +343,8 @@ function row(cells) {
   return tr;
 }
 
-// A client: its device name with the IP beside it, or the IP alone.
+// A client or domain cell: the device name with the IP beside it, or the text alone
+// (a client without a name, and every domain in the top lists).
 function who(name, ip) {
   const td = el("td", name ? undefined : ip, "who");
 
