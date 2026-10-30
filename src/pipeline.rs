@@ -1198,7 +1198,7 @@ mod tests {
     use hickory_proto::rr::RecordType;
 
     use super::*;
-    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse};
+    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse, soa};
     use crate::filter::engine::{CompiledList, Engine};
     use crate::filter::parse::ListFormat;
     use crate::upstream::test_dns::{self, fake_dns};
@@ -1675,6 +1675,42 @@ mod tests {
         assert_eq!(answer_ttls(&out), [30]);
         assert_eq!(answer_addresses(&out), ["1.1.1.1"]);
         assert_eq!(counters(&pipeline).cached, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_negative_answer_carries_the_answer_ttl_in_its_soa() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("gone.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let bytes = ResponseSpec {
+            authorities: vec![soa("example.", 300, 300)],
+            rcode: rcode::NXDOMAIN,
+            ..ResponseSpec::default()
+        }
+        .bytes(&spec);
+        let info = ResponseInfo::parse(&bytes).unwrap();
+        let inserted = Instant::now()
+            .checked_sub(Duration::from_secs(301))
+            .expect("the machine has been up for minutes");
+        pipeline
+            .cache
+            .lock()
+            .unwrap()
+            .insert(&CacheKey::new(&query), &bytes, &info, inserted)
+            .unwrap();
+        let mut out = Vec::new();
+
+        let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut out);
+
+        assert_eq!(quick, Quick::Replied);
+        let reply = parse(&out);
+        assert_eq!(
+            u16::from(reply.metadata.response_code),
+            u16::from(rcode::NXDOMAIN)
+        );
+        let soa_ttls: Vec<u32> = reply.authorities.iter().map(|record| record.ttl).collect();
+        assert_eq!(soa_ttls, [30]);
     }
 
     #[tokio::test]
