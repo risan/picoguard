@@ -1,4 +1,4 @@
-//! The status page and its JSON API (plan D16). One HTML page, four reads, four mutations, and
+//! The status page and its JSON API (plan D16). One HTML page, four reads, five mutations, and
 //! sign-in and sign-out. A web page on another device of the LAN must not be able to pause
 //! blocking, so every request passes the access policy before it reaches a handler:
 //!
@@ -8,8 +8,8 @@
 //!   cookie or a matching `Authorization: Basic`, compared in constant time; failed password
 //!   checks are limited per address;
 //! - without a password the page is read-only and shows totals and list status only: the
-//!   status leaves out the top lists and the upstream servers, and the query log and every
-//!   change answer 403;
+//!   status leaves out the top lists, the upstream servers and the cache size, and the query
+//!   log and every change answer 403;
 //! - a mutation must be `POST` with `Content-Type: application/json` (which a cross-site form
 //!   cannot send, and a cross-site script can only send after a CORS preflight that is never
 //!   answered), carry no `Origin` other than the page's own, and have a body of at most 1 KiB.
@@ -34,7 +34,7 @@ use tokio::time::timeout;
 
 use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
 use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
-use crate::pipeline::{Pipeline, ServerKind, ServerTally};
+use crate::pipeline::{CacheSize, Pipeline, ServerKind, ServerTally};
 use crate::policy::Policy;
 use crate::scheduler::{ListControl, ListStatus, Role};
 use crate::server::bind_tcp;
@@ -219,6 +219,7 @@ enum Change {
     Pause,
     Resume,
     RefreshLists,
+    ClearCache,
     Install,
     Login,
     Logout,
@@ -239,6 +240,7 @@ impl Route {
             "/api/pause" => Some(Route::Change(Change::Pause)),
             "/api/resume" => Some(Route::Change(Change::Resume)),
             "/api/lists/refresh" => Some(Route::Change(Change::RefreshLists)),
+            "/api/cache/clear" => Some(Route::Change(Change::ClearCache)),
             "/api/update" => Some(Route::Change(Change::Install)),
             "/api/login" => Some(Route::Change(Change::Login)),
             "/api/logout" => Some(Route::Change(Change::Logout)),
@@ -430,6 +432,7 @@ impl Web {
                                 .map(UpstreamView::of)
                                 .collect()
                         }),
+                        cache: is_open.then(|| self.pipeline.cache_size()),
                         lists: self.list_views(),
                         generation: view.generation,
                         pause: self.pause_view(),
@@ -498,6 +501,13 @@ impl Web {
                     },
                 ))
             }
+
+            Change::ClearCache => Ok(json(
+                StatusCode::OK,
+                &ClearedView {
+                    cleared: self.pipeline.clear_cache(),
+                },
+            )),
 
             Change::Install => {
                 let version = install_version(body).ok_or_else(|| {
@@ -851,6 +861,11 @@ struct RefreshView {
     refresh: &'static str,
 }
 
+#[derive(Serialize)]
+struct ClearedView {
+    cleared: usize,
+}
+
 /// A top list is a Space-Saving summary: counts may be too high by up to `max_error`.
 #[derive(Serialize)]
 struct TopList<'a, K> {
@@ -944,6 +959,8 @@ struct StatusView<'a> {
     /// Left out with the top lists: a DoH address can carry a private provider profile ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     upstreams: Option<Vec<UpstreamView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache: Option<CacheSize>,
     lists: Vec<ListView>,
     generation: u64,
     pause: PauseView,
