@@ -2,6 +2,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -170,6 +171,13 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Reads a list of strings into one shared allocation, without serde's `rc` feature.
+fn shared_strings<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Arc<[String]>, D::Error> {
+    Ok(Vec::<String>::deserialize(deserializer)?.into())
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -177,7 +185,9 @@ pub struct Config {
     pub upstream: UpstreamConfig,
     pub local: LocalConfig,
     pub lists: Vec<ListConfig>,
-    pub rules: Vec<String>,
+    /// Shared with the status page, which shows them, so they are never copied.
+    #[serde(deserialize_with = "shared_strings")]
+    pub rules: Arc<[String]>,
     pub allowlists: Vec<ListConfig>,
     pub cache: CacheConfig,
     pub limits: LimitsConfig,
@@ -211,7 +221,7 @@ impl Default for Config {
                     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.mini.txt",
                 ),
             ],
-            rules: Vec::new(),
+            rules: Arc::from([]),
             allowlists: Vec::new(),
             cache: CacheConfig::default(),
             limits: LimitsConfig::default(),
@@ -823,6 +833,16 @@ mod tests {
     #[test]
     fn empty_config_equals_defaults() {
         assert_eq!(Config::parse("").unwrap(), Config::default());
+    }
+
+    #[test]
+    fn rules_parse_into_one_shared_list() {
+        let config = Config::parse("rules = [\"a\", \"b\"]").unwrap();
+        let without = Config::parse("").unwrap();
+
+        assert_eq!(&*config.rules, ["a", "b"]);
+        assert!(std::sync::Arc::ptr_eq(&config.rules, &config.clone().rules));
+        assert!(without.rules.is_empty());
     }
 
     #[test]

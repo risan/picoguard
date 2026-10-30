@@ -121,7 +121,9 @@ container) and give both addresses to your router as primary and secondary DNS.
   a restart. A failed download, a list that is too big, or a list that blocks everything keeps the
   last good copy.
 - Status page: totals and list status for everyone on the LAN; query log, top lists, upstream
-  servers (answers, failures, average time) and pause only with the password.
+  servers (answers, failures, average time) and pause only with the password. Block or Allow a
+  name from the query log (kept in memory until restart), and Check a name: which list and rule
+  decide it.
 - The status page shows the version and, once a day, whether a newer release exists, and installs
   it with one click: the release is checked against a built-in signature key, a small root
   installer swaps the binary, and the old version comes back if the new one does not answer DNS.

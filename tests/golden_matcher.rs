@@ -9,7 +9,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use common::{Case, Expected, Outcome, Query, load_cases, load_real};
-use picoguard::filter::engine::{BlockedAnswer, CompiledList, Decision, Engine, blocked_answer};
+use picoguard::filter::engine::{
+    BlockedAnswer, CompiledList, Decision, Engine, Verdict, blocked_answer,
+};
 use picoguard::filter::parse::{ListFormat, dns_type_code};
 
 fn compile(text: &str) -> Arc<CompiledList> {
@@ -154,4 +156,77 @@ fn real_lists_match_the_oracle() {
     );
 
     println!("golden: {} real-list queries match", real.expected.len());
+}
+
+/// Every query of `expected` explained: the explanation agrees with the verdict, and the rule
+/// it names, alone in an allowlist, matches the same query.
+fn explain_mismatches(engine: &Engine, expected: &[Expected]) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    for entry in expected {
+        let query = &entry.query;
+        let (record_type, is_ip) = (
+            type_code(&query.check_type),
+            query.input.parse::<IpAddr>().is_ok(),
+        );
+        let verdict = engine.verdict(&query.input, record_type, is_ip);
+        let explanation = engine.explain(&query.input, record_type, is_ip);
+
+        let agrees = match (&verdict, &explanation) {
+            (Verdict::Allow, Some(explained)) => explained.allowed,
+            (Verdict::Block { .. }, Some(explained)) => !explained.allowed,
+            (Verdict::NoMatch, None) => true,
+            _ => false,
+        };
+        if !agrees {
+            mismatches.push(format!("{}: {verdict:?} but {explanation:?}", query.key()));
+
+            continue;
+        }
+
+        let Some(explained) = explanation else {
+            continue;
+        };
+
+        let alone = Engine::new(Vec::new(), vec![compile(&explained.rule)]);
+        if alone.verdict(&query.input, record_type, is_ip) != Verdict::Allow {
+            mismatches.push(format!(
+                "{}: {:?} alone does not match",
+                query.key(),
+                explained.rule
+            ));
+        }
+    }
+
+    mismatches
+}
+
+#[test]
+fn explain_agrees_with_the_verdict_and_names_a_matching_rule() {
+    let mut mismatches = Vec::new();
+    let mut total = 0;
+    for case in load_cases() {
+        let engine = engine_for(&case);
+        mismatches.extend(
+            explain_mismatches(&engine, &case.expected)
+                .into_iter()
+                .map(|mismatch| format!("{}: {mismatch}", case.name)),
+        );
+        total += case.expected.len();
+    }
+
+    let real = load_real();
+    let engine = Engine::new(
+        real.lists.iter().map(|text| compile(text)).collect(),
+        Vec::new(),
+    );
+    mismatches.extend(explain_mismatches(&engine, &real.expected));
+    total += real.expected.len();
+
+    assert!(
+        mismatches.is_empty(),
+        "{} of {total} differ\n{}",
+        mismatches.len(),
+        mismatches[..mismatches.len().min(40)].join("\n")
+    );
+    println!("golden: {total} queries explained");
 }

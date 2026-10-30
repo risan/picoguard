@@ -21,7 +21,7 @@ use picoguard::filter::engine::Verdict;
 use picoguard::filter::snapshot::{self, SnapshotStore};
 use picoguard::lists::{Downloader, resolver_over};
 use picoguard::policy::Policy;
-use picoguard::scheduler::{Role, Scheduler, Timing};
+use picoguard::scheduler::{Action, ButtonRule, Explained, Role, RuleError, Scheduler, Timing};
 use picoguard::upstream::Upstreams;
 use picoguard::upstream::tls::Tls;
 
@@ -580,7 +580,7 @@ async fn a_local_list_that_blocks_everything_is_refused_but_an_allowlist_may_all
 async fn user_rules_that_block_everything_are_kept() {
     let dir = StateDir::new();
     let mut config = config_of(&dir, Vec::new());
-    config.rules = vec!["||*^".to_string()];
+    config.rules = vec!["||*^".to_string()].into();
 
     let (scheduler, _) = boot(&config).await;
     let policy = scheduler.policy();
@@ -773,7 +773,8 @@ async fn local_files_rules_and_allowlists_make_one_engine() {
     config.rules = vec![
         "||user.example^".to_string(),
         "@@||both.example^".to_string(),
-    ];
+    ]
+    .into();
     config.allowlists = vec![path_list(dir.file("allow.txt"))];
 
     let (scheduler, store) = boot(&config).await;
@@ -1405,4 +1406,570 @@ async fn the_status_of_a_list_follows_its_refreshes() {
     assert_eq!(recovered[1].rules, 1);
     assert_eq!(recovered[1].format, Some(ListFormat::Adblock));
     assert!(recovered[1].last_error.is_none());
+}
+
+fn rule(name: &str, action: Action) -> ButtonRule {
+    ButtonRule {
+        name: name.to_string(),
+        action,
+    }
+}
+
+async fn page_rules(control: &picoguard::scheduler::ListControl) -> Vec<ButtonRule> {
+    control.with_button_rules(<[ButtonRule]>::to_vec).await
+}
+
+/// Every snapshot file with its bytes, sorted by name.
+fn snapshot_contents(dir: &StateDir) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = dir
+        .snapshot_files()
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+
+            (path, bytes)
+        })
+        .collect();
+    files.sort();
+
+    files
+}
+
+/// Every file under `path`, at any depth, with its size, sorted.
+fn every_file(path: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files = Vec::new();
+    let mut dirs = vec![path.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                dirs.push(entry.path());
+            } else {
+                files.push((entry.path(), metadata.len()));
+            }
+        }
+    }
+
+    files.sort();
+
+    files
+}
+
+/// Polls `condition` every 10 ms until it holds, for `limit` at most.
+async fn eventually(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    condition()
+}
+
+#[tokio::test]
+async fn a_page_rule_changes_the_engine_and_touches_no_list() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("page-rules", server.url("/l.txt"))]);
+    let (mut scheduler, store) = boot(&config).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    scheduler.refresh(0, &downloader()).await;
+    let requests = server.requests();
+    let written = store.bytes_written();
+    let snapshots = snapshot_contents(&dir);
+    assert_eq!(snapshots.len(), 1);
+    let list = Arc::clone(scheduler.list(0).unwrap());
+    let references = Arc::strong_count(&list);
+    let before = generation(&policy);
+
+    assert_eq!(
+        control.add_button_rule("b.example", Action::Block).await,
+        Ok(())
+    );
+    assert_eq!(
+        control.add_button_rule("ads.example", Action::Allow).await,
+        Ok(())
+    );
+
+    assert_eq!(
+        page_rules(&control).await,
+        [
+            rule("b.example", Action::Block),
+            rule("ads.example", Action::Allow)
+        ]
+    );
+    assert!(blocked(&policy, "b.example."));
+    assert_eq!(decision(&policy, "ads.example."), Verdict::Allow);
+    assert_eq!(generation(&policy), before + 2);
+    assert_eq!(server.requests(), requests);
+    assert_eq!(store.bytes_written(), written);
+    assert_eq!(snapshot_contents(&dir), snapshots);
+    assert!(Arc::ptr_eq(&list, scheduler.list(0).unwrap()));
+    assert!(
+        eventually(Duration::from_secs(2), || Arc::strong_count(&list)
+            == references)
+        .await,
+        "{} references to the list, {references} before",
+        Arc::strong_count(&list)
+    );
+}
+
+#[tokio::test]
+async fn a_rule_change_during_a_slow_download_is_applied_at_once_and_both_stay() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    let list: String = (0..30)
+        .map(|index| format!("||slow{index}.example^\n"))
+        .collect();
+    server.serve_slowly(
+        "/slow.txt",
+        list.into_bytes(),
+        20,
+        Duration::from_millis(100),
+    );
+    let config = config_of(&dir, vec![url_list("slow", server.url("/slow.txt"))]);
+    let scheduler = Scheduler::boot(
+        &config,
+        CompileWorker::spawn().unwrap(),
+        Arc::new(SnapshotStore::disabled()),
+        slow_timing(),
+    )
+    .await
+    .unwrap();
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    let running = tokio::spawn(scheduler.run(downloader(), std::future::pending()));
+    assert!(eventually(Duration::from_secs(10), || server.active() == 1).await);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = Instant::now();
+    let added = control.add_button_rule("b.example", Action::Block).await;
+    let took = started.elapsed();
+
+    assert_eq!(added, Ok(()));
+    assert!(took < Duration::from_secs(1), "the change took {took:?}");
+    assert!(
+        !blocked(&policy, "slow0.example."),
+        "the download is still running"
+    );
+    assert!(blocked(&policy, "b.example."));
+    assert!(
+        eventually(Duration::from_secs(10), || blocked(
+            &policy,
+            "slow0.example."
+        ))
+        .await,
+        "the list was put in force"
+    );
+    assert!(blocked(&policy, "b.example."));
+    assert_eq!(server.requests(), 1);
+    running.abort();
+}
+
+#[tokio::test]
+async fn a_refresh_after_a_rule_change_keeps_the_rule_and_a_rule_change_keeps_the_new_list() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("both", server.url("/l.txt"))]);
+    let (mut scheduler, _) = boot(&config).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    scheduler.refresh(0, &downloader()).await;
+    control
+        .add_button_rule("b.example", Action::Block)
+        .await
+        .unwrap();
+
+    server.serve("/l.txt", V2, Some("\"v2\""));
+    scheduler.refresh(0, &downloader()).await;
+
+    assert!(blocked(&policy, "tracker.example."));
+    assert!(blocked(&policy, "b.example."));
+
+    control
+        .add_button_rule("ads.example", Action::Allow)
+        .await
+        .unwrap();
+
+    assert_eq!(decision(&policy, "ads.example."), Verdict::Allow);
+    assert!(blocked(&policy, "tracker.example."));
+    assert!(blocked(&policy, "b.example."));
+}
+
+#[tokio::test]
+async fn page_rules_follow_the_precedence_of_rule_4() {
+    let dir = StateDir::new();
+    fs::write(
+        dir.file("allow.txt"),
+        "||listed.example^\n@@||imp.example^$badfilter\n||imp.example^$badfilter\n",
+    )
+    .unwrap();
+    let mut config = config_of(&dir, Vec::new());
+    config.rules = vec![
+        "@@||cfg.example^".to_string(),
+        "@@||impallow.example^$important".to_string(),
+        "||imp.example^$important".to_string(),
+    ]
+    .into();
+    config.allowlists = vec![path_list(dir.file("allow.txt"))];
+    let (scheduler, _) = boot(&config).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    assert!(blocked(&policy, "imp.example."));
+
+    for name in ["cfg.example", "impallow.example", "listed.example"] {
+        control.add_button_rule(name, Action::Block).await.unwrap();
+    }
+
+    control
+        .add_button_rule("imp.example", Action::Allow)
+        .await
+        .unwrap();
+
+    assert!(blocked(&policy, "cfg.example."));
+    assert!(!blocked(&policy, "impallow.example."));
+    assert!(!blocked(&policy, "listed.example."));
+    assert_eq!(decision(&policy, "imp.example."), Verdict::Allow);
+}
+
+#[tokio::test]
+async fn adding_again_changes_nothing_and_a_replacement_keeps_its_place() {
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    for (name, action) in [
+        ("a.example", Action::Block),
+        ("b.example", Action::Allow),
+        ("c.example", Action::Block),
+    ] {
+        control.add_button_rule(name, action).await.unwrap();
+    }
+
+    let before = generation(&policy);
+    assert_eq!(
+        control.add_button_rule("a.example", Action::Block).await,
+        Ok(())
+    );
+    assert_eq!(generation(&policy), before);
+
+    control
+        .add_button_rule("b.example", Action::Block)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        page_rules(&control).await,
+        [
+            rule("a.example", Action::Block),
+            rule("b.example", Action::Block),
+            rule("c.example", Action::Block)
+        ]
+    );
+    assert!(blocked(&policy, "b.example."));
+}
+
+#[tokio::test]
+async fn removing_restores_the_earlier_decision_and_a_missing_name_is_refused() {
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    for name in ["a.example", "b.example", "c.example"] {
+        control.add_button_rule(name, Action::Block).await.unwrap();
+    }
+
+    assert!(blocked(&policy, "b.example."));
+
+    assert_eq!(control.remove_button_rule("b.example").await, Ok(()));
+
+    assert!(!blocked(&policy, "b.example."));
+    assert_eq!(
+        page_rules(&control).await,
+        [
+            rule("a.example", Action::Block),
+            rule("c.example", Action::Block)
+        ]
+    );
+
+    let before = generation(&policy);
+    assert_eq!(
+        control.remove_button_rule("b.example").await,
+        Err(RuleError::NoSuchRule)
+    );
+    assert_eq!(generation(&policy), before);
+}
+
+#[tokio::test]
+async fn the_cap_counts_names_and_a_replacement_is_allowed_at_it() {
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    for index in 0..500 {
+        let name = format!("name{index}.example");
+        assert_eq!(
+            control.add_button_rule(&name, Action::Block).await,
+            Ok(()),
+            "{name}"
+        );
+    }
+
+    let before = generation(&policy);
+    assert_eq!(
+        control
+            .add_button_rule("name500.example", Action::Block)
+            .await,
+        Err(RuleError::TooMany)
+    );
+    assert_eq!(generation(&policy), before);
+
+    assert_eq!(
+        control
+            .add_button_rule("name1.example", Action::Allow)
+            .await,
+        Ok(())
+    );
+    assert_eq!(generation(&policy), before + 1);
+    assert_eq!(
+        control
+            .add_button_rule("name1.example", Action::Allow)
+            .await,
+        Ok(())
+    );
+    assert_eq!(generation(&policy), before + 1);
+    assert_eq!(page_rules(&control).await.len(), 500);
+}
+
+#[tokio::test]
+async fn bad_names_are_refused_before_anything_changes() {
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    let before = generation(&policy);
+
+    assert_eq!(
+        control
+            .add_button_rule("x.com^$badfilter", Action::Block)
+            .await,
+        Err(RuleError::NotADomainName)
+    );
+    assert_eq!(
+        control.remove_button_rule("-x.com").await,
+        Err(RuleError::NotADomainName)
+    );
+    assert_eq!(generation(&policy), before);
+    assert!(page_rules(&control).await.is_empty());
+}
+
+#[tokio::test]
+async fn page_rules_are_gone_after_a_restart_and_nothing_is_written() {
+    let dir = StateDir::new();
+    fs::write(dir.file("block.txt"), "||list.example^\n").unwrap();
+    let config = config_of(&dir, vec![path_list(dir.file("block.txt"))]);
+    let (scheduler, _) = boot(&config).await;
+    let control = scheduler.control();
+    for name in ["a.example", "b.example", "c.example"] {
+        control.add_button_rule(name, Action::Block).await.unwrap();
+    }
+
+    assert!(blocked(&scheduler.policy(), "b.example."));
+    let files = every_file(dir.path());
+    drop(scheduler);
+
+    let (restarted, _) = boot(&config).await;
+
+    assert!(page_rules(&restarted.control()).await.is_empty());
+    assert!(!blocked(&restarted.policy(), "b.example."));
+    assert!(blocked(&restarted.policy(), "list.example."));
+    assert_eq!(every_file(dir.path()), files);
+}
+
+#[tokio::test]
+async fn a_rule_change_while_paused_is_kept_and_applies_on_resume() {
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    policy.pause(Duration::from_secs(60), Instant::now());
+
+    control
+        .add_button_rule("b.example", Action::Block)
+        .await
+        .unwrap();
+
+    assert!(policy.view(Instant::now()).paused);
+    assert_eq!(decision(&policy, "b.example."), Verdict::NoMatch);
+
+    policy.resume();
+
+    assert!(blocked(&policy, "b.example."));
+}
+
+#[tokio::test]
+async fn a_cancelled_change_is_still_applied_once_and_frees_the_lock() {
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+
+    let before = generation(&policy);
+    tokio::select! {
+        biased;
+
+        _ = control.add_button_rule("first-poll.example", Action::Block) => {}
+
+        () = std::future::ready(()) => {}
+    }
+
+    assert!(
+        eventually(Duration::from_secs(2), || generation(&policy) == before + 1).await,
+        "the change dropped after its first poll was applied"
+    );
+    assert!(blocked(&policy, "first-poll.example."));
+
+    let before = generation(&policy);
+    let _ = tokio::time::timeout(
+        Duration::from_millis(5),
+        control.add_button_rule("five-ms.example", Action::Block),
+    )
+    .await;
+
+    assert!(
+        eventually(Duration::from_secs(2), || generation(&policy) == before + 1).await,
+        "the change dropped after 5 ms was applied"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(generation(&policy), before + 1, "and applied once");
+
+    let rules = page_rules(&control).await;
+    assert_eq!(
+        rules,
+        [
+            rule("first-poll.example", Action::Block),
+            rule("five-ms.example", Action::Block)
+        ]
+    );
+    assert_eq!(
+        control
+            .add_button_rule("after.example", Action::Block)
+            .await,
+        Ok(())
+    );
+}
+
+#[tokio::test]
+async fn concurrent_changes_are_applied_one_at_a_time() {
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    let before = generation(&policy);
+
+    let changes: Vec<_> = (0..20)
+        .map(|index| {
+            let control = Arc::clone(&control);
+
+            tokio::spawn(async move {
+                control
+                    .add_button_rule(&format!("concurrent{index}.example"), Action::Block)
+                    .await
+            })
+        })
+        .collect();
+    for change in changes {
+        assert_eq!(change.await.unwrap(), Ok(()));
+    }
+
+    for index in 0..20 {
+        assert!(blocked(&policy, &format!("concurrent{index}.example.")));
+    }
+
+    assert_eq!(page_rules(&control).await.len(), 20);
+    assert_eq!(generation(&policy), before + 20);
+}
+
+fn named_path_list(name: &str, path: PathBuf) -> ListConfig {
+    ListConfig {
+        name: Some(name.to_string()),
+        format: ListFormat::Adblock,
+        ..path_list(path)
+    }
+}
+
+#[tokio::test]
+async fn explain_names_the_deciding_list_and_rule_and_ignores_pause() {
+    let dir = StateDir::new();
+    fs::write(
+        dir.file("ads.txt"),
+        "||list.example^\n/^track[0-9]+\\.example$/\n||ad*.wild.example^\n0.0.0.0 host.example\n",
+    )
+    .unwrap();
+    fs::write(dir.file("plain.txt"), "||plain.example^\n").unwrap();
+    fs::write(dir.file("mine.txt"), "||mine.example^\n").unwrap();
+    let mut config = config_of(
+        &dir,
+        vec![
+            named_path_list("Ads list", dir.file("ads.txt")),
+            path_list(dir.file("plain.txt")),
+        ],
+    );
+    config.rules = vec![
+        "||ads.example^".to_string(),
+        "@@||ok.ads.example^".to_string(),
+    ]
+    .into();
+    config.allowlists = vec![named_path_list("Mine", dir.file("mine.txt"))];
+    let (scheduler, _) = boot(&config).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    control
+        .add_button_rule("b.example", Action::Block)
+        .await
+        .unwrap();
+    control
+        .add_button_rule("a.example", Action::Allow)
+        .await
+        .unwrap();
+    let plain_path = dir.file("plain.txt").display().to_string();
+    let explained = |allowed: bool, list: &str, rule: &str| {
+        Some(Explained {
+            allowed,
+            list: list.to_string(),
+            rule: rule.to_string(),
+        })
+    };
+
+    for (name, list, rule) in [
+        ("list.example", "Ads list", "||list.example^"),
+        ("track12.example", "Ads list", "/^track[0-9]+\\.example$/"),
+        ("adx.wild.example", "Ads list", "||ad*.wild.example^"),
+        ("host.example", "Ads list", "0.0.0.0 host.example"),
+        ("plain.example", &plain_path, "||plain.example^"),
+        ("ads.example", "config rules", "||ads.example^"),
+        ("b.example", "your rules", "||b.example^$important"),
+    ] {
+        assert_eq!(
+            control.explain(name).await,
+            explained(false, list, rule),
+            "{name}"
+        );
+    }
+
+    for (name, list, rule) in [
+        ("ok.ads.example", "config rules", "@@||ok.ads.example^"),
+        ("a.example", "your rules", "@@||a.example^"),
+        ("mine.example", "Mine", "||mine.example^"),
+    ] {
+        assert_eq!(
+            control.explain(name).await,
+            explained(true, list, rule),
+            "{name}"
+        );
+    }
+
+    assert_eq!(control.explain("nothing.example").await, None);
+
+    policy.pause(Duration::from_secs(60), Instant::now());
+
+    assert_eq!(
+        control.explain("list.example").await,
+        explained(false, "Ads list", "||list.example^")
+    );
 }

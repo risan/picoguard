@@ -39,7 +39,8 @@ h2 small { font-weight: 400; }
 #badge:empty { display: none; }
 .r-pass { --dot: var(--accent); }
 .r-cached { --dot: var(--good); }
-.r-blocked_request, .r-blocked_response { --dot: var(--blocked); }
+.r-blocked_request, .r-blocked_response, .d-blocked { --dot: var(--blocked); }
+.d-allowed { --dot: var(--good); }
 .r-error { --dot: var(--warn); }
 #state { margin-left: auto; font-size: var(--t-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
 #state.bad { color: var(--blocked); }
@@ -115,6 +116,25 @@ button.go:hover { background: var(--accent); opacity: .9; }
 #login label { display: grid; gap: var(--s1); font-size: var(--t-sm); color: var(--muted); }
 #login input { width: 100%; }
 #login-note { margin: var(--s3) 0 0; }
+td button { padding: 1px var(--s2); font-size: var(--t-sm); }
+#check-name { flex: 1 1 12rem; width: auto; min-width: 0; }
+#check-result, #config-rules { margin-top: var(--s3); overflow-wrap: anywhere; }
+#check-result { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s1) var(--s3); margin-bottom: 0; }
+#check-result dt { color: var(--muted); }
+#check-result dd { margin: 0; }
+@media (max-width: 719px) {
+  #queries table { display: block; }
+  #queries tr { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; padding: var(--s2) 0;
+    border-bottom: 1px solid var(--line); }
+  #queries tr:last-child { border: 0; }
+  /* A full-width break between the name and result and the rest of the row. */
+  #queries tr::after { content: ""; flex-basis: 100%; order: -1; }
+  #queries tr:first-child, #queries td:nth-child(6) { display: none; }
+  #queries td { padding: 0; border: 0; font-size: var(--t-sm); color: var(--muted); }
+  #queries td.name { flex: 1 1 0; min-width: 0; order: -3; font-size: 13px; color: var(--text); }
+  #queries td:nth-child(5) { order: -2; color: var(--text); }
+  #queries td:last-child { margin-left: auto; }
+}
 @media (min-width: 720px) {
   .cards { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .headline { grid-column: span 3; }
@@ -223,6 +243,22 @@ button.go:hover { background: var(--accent); opacity: .9; }
       <h2>Lists</h2>
       <div class="scroll" id="list-table"></div>
       <p id="refresh-row"><button id="refresh">Refresh all lists</button> <span id="refresh-note" class="empty"></span></p>
+    </section>
+
+    <section id="rules" class="wide">
+      <h2>Your rules <small id="rule-count"></small></h2>
+      <p class="empty">Kept in memory only: a restart or an update clears them.</p>
+      <div class="scroll" id="rule-table"></div>
+      <div id="config-rules"></div>
+    </section>
+
+    <section id="check" class="wide">
+      <h2>Check a name</h2>
+      <form id="check-form" class="actions">
+        <input id="check-name" autocapitalize="none" placeholder="example.org" aria-label="Name to check">
+        <button class="go">Check</button>
+      </form>
+      <dl id="check-result"></dl>
     </section>
   </div>
 </main>
@@ -479,18 +515,99 @@ function showTop(id, noteId, top, name) {
   $(id).replaceChildren(rows.length ? table([name, "Queries"], rows) : el("p", "Nothing yet.", "empty"));
 }
 
+// A button that a delegated listener reads by its data-act and data-name.
+function actButton(text, action, name) {
+  const button = el("button", text);
+  button.dataset.act = action;
+  button.dataset.name = name;
+
+  return button;
+}
+
 function showQueries(entries) {
   const rows = entries.map((e) => {
     const time = new Date(e.time * 1000).toLocaleTimeString();
     const result = RESULTS[e.result] || e.result;
     const ms = e.latency_us < 1000 ? "<1" : Math.round(e.latency_us / 1000);
-
-    return row([[time], [e.client], [e.qname, "name"], [QTYPES[e.qtype] || e.qtype],
+    const blocked = e.result === "blocked_request" || e.result === "blocked_response";
+    const tr = row([[time], [e.client], [e.qname, "name"], [QTYPES[e.qtype] || e.qtype],
       [result, "", "r-" + e.result], [e.upstream === null ? "" : "#" + e.upstream], [ms + " ms", "num"]]);
+    const buttons = el("td");
+    buttons.append(blocked ? actButton("Allow", "allow", e.qname) : actButton("Block", "block", e.qname),
+      " ", actButton("Why", "why", e.qname));
+    tr.append(buttons);
+
+    return tr;
   });
   $("queries").replaceChildren(rows.length
-    ? table(["Time", "Client", "Name", "Type", "Result", "Via", "Time taken"], rows)
+    ? table(["Time", "Client", "Name", "Type", "Result", "Via", "Time taken", ""], rows)
     : el("p", "No queries yet.", "empty"));
+}
+
+function showRules(data) {
+  $("rule-count").textContent = data.rules.length + " of " + data.max;
+  const rows = data.rules.map((r) => {
+    const tr = row([[r.name, "name"], [r.action]]);
+    const remove = el("td");
+    remove.append(actButton("Remove", "remove", r.name));
+    tr.append(remove);
+
+    return tr;
+  });
+  $("rule-table").replaceChildren(rows.length
+    ? table(["Name", "Action", ""], rows)
+    : el("p", "None yet: use Block or Allow in the query log.", "empty"));
+  $("config-rules").replaceChildren(el("h2", "Config rules (read-only)"),
+    ...(data.config_rules.length ? data.config_rules.map((rule) => el("code", rule)) : [el("p", "None.", "empty")]));
+}
+
+function showExplain(data) {
+  const lines = [["Name", data.name], ["Decision", el("span", data.decision, "badge d-" + data.decision)]];
+
+  if (data.decision === "none") {
+    lines.push(["Rule", "no rule decides it"]);
+  } else {
+    lines.push(["List", data.list], ["Rule", el("code", data.rule)]);
+  }
+
+  $("check-result").replaceChildren(...lines.flatMap(([label, value]) => {
+    const dd = el("dd");
+    dd.append(value);
+
+    return [el("dt", label), dd];
+  }));
+}
+
+async function checkName() {
+  const name = $("check-name").value.trim();
+
+  if (!name) {
+    return;
+  }
+
+  const epoch = authEpoch;
+
+  try {
+    const data = await api("/api/explain?name=" + encodeURIComponent(name));
+
+    if (epoch !== authEpoch) {
+      return;
+    }
+
+    showExplain(data);
+  } catch (error) {
+    if (epoch !== authEpoch) {
+      return;
+    }
+
+    if (error.status === 401) {
+      sessionEnded();
+
+      return;
+    }
+
+    $("check-result").textContent = error.message;
+  }
 }
 
 function showLists(lists) {
@@ -563,7 +680,7 @@ function showInstall(update) {
 function showLimited(note) {
   $("limited-note").textContent = note || "";
   $("limited").hidden = !note;
-  ["pause", "tops", "upstreams", "cache", "tab-log", "refresh-row"].forEach((id) => { $(id).hidden = Boolean(note); });
+  ["pause", "tops", "upstreams", "cache", "tab-log", "refresh-row", "rules", "check"].forEach((id) => { $(id).hidden = Boolean(note); });
   showTab();
 }
 
@@ -595,6 +712,7 @@ async function update() {
       showUpstreams(status.upstreams);
       showCache(status.cache);
       const log = await api("/api/querylog?limit=50");
+      const rules = await api("/api/rules");
 
       if (epoch !== authEpoch) {
         return;
@@ -604,6 +722,7 @@ async function update() {
       showTop("top-blocked", "a-blocked", status.top_blocked, "Domain");
       showTop("top-clients", "a-clients", status.top_clients, "Client");
       showQueries(log.entries);
+      showRules(rules);
     }
 
     $("state").textContent = "updated " + new Date().toLocaleTimeString();
@@ -689,6 +808,34 @@ $("clear-cache").addEventListener("click", () => {
       $("cache-note").textContent = "Cache cleared (" + data.cleared.toLocaleString() + " answers)";
     });
   }
+});
+$("queries").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-act]");
+
+  if (!button) {
+    return;
+  }
+
+  const name = button.dataset.name;
+
+  if (button.dataset.act === "why") {
+    $("check-name").value = name;
+    location.hash = "lists";
+    checkName();
+  } else {
+    act("/api/rules", { name, action: button.dataset.act }, showRules);
+  }
+});
+$("rule-table").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-act]");
+
+  if (button) {
+    act("/api/rules/remove", { name: button.dataset.name }, showRules);
+  }
+});
+$("check-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  checkName();
 });
 $("login-form").addEventListener("submit", async (event) => {
   event.preventDefault();

@@ -96,8 +96,8 @@ fn parts() -> Parts {
 
     Parts {
         pipeline: Pipeline::new(&config, Arc::clone(&policy)).unwrap(),
+        lists: Arc::new(ListControl::new(Arc::clone(&policy))),
         policy,
-        lists: Arc::new(ListControl::default()),
         updates,
         stager,
         listeners,
