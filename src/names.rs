@@ -1,10 +1,14 @@
 //! Device names: the PTR name the `[local]` resolver gives each private client address shown on
 //! the signed-in page, kept in a small fixed-size table.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::budget::Budget;
+use crate::config::{LimitsConfig, UpstreamConfig};
 use crate::dns::wire::{CLASS_IN, Header, Name, Records, Section, rcode, read_name, rtype};
+use crate::upstream::{Tally, Upstreams};
 
 /// The most addresses the table keeps.
 pub const MAX_NAMES: usize = 256;
@@ -185,6 +189,82 @@ fn name_len(name: &Option<Box<str>>) -> usize {
     name.as_ref().map_or(0, |name| name.len())
 }
 
+/// Looks up the names of client addresses through the `[local]` resolver, in a pool and a
+/// budget of their own: a stalled lookup never holds an exchange slot or reply bytes a client
+/// query needs.
+pub(crate) struct DeviceNames {
+    table: Mutex<NameTable>,
+    resolver: Upstreams,
+    budget: Arc<Budget>,
+}
+
+impl DeviceNames {
+    pub(crate) fn new(
+        resolver: SocketAddr,
+        upstream: &UpstreamConfig,
+        limits: &LimitsConfig,
+    ) -> Arc<DeviceNames> {
+        // A configured `upstream_concurrency` of 1 would otherwise let one lookup at a time
+        // reach the router.
+        let names_limits = LimitsConfig {
+            upstream_concurrency: MAX_LOOKUPS,
+            upstream_reply_max: NAME_REPLY_MAX,
+            ..limits.clone()
+        };
+
+        Arc::new(DeviceNames {
+            table: Mutex::new(NameTable::new(MAX_LOOKUPS)),
+            resolver: Upstreams::plain(resolver, upstream, &names_limits),
+            budget: Budget::new(MAX_LOOKUPS * NAME_REPLY_MAX),
+        })
+    }
+
+    /// What the lookups have done, for the `[local]` entry of the Upstreams card.
+    pub(crate) fn tally(&self) -> Tally {
+        self.resolver
+            .tallies()
+            .map(|(_, tally)| tally)
+            .next()
+            .unwrap_or_default()
+    }
+
+    /// The name known for `address`, if any. Starts its lookup in the background when one is
+    /// due, and never waits for it. Must be called on the runtime.
+    pub(crate) fn name_of(self: &Arc<Self>, address: IpAddr) -> Option<Box<str>> {
+        let shown = self.table.lock().unwrap().shown(address, Instant::now());
+        if shown.look_up {
+            tokio::spawn(Arc::clone(self).look_up(address));
+        }
+
+        shown.name
+    }
+
+    async fn look_up(self: Arc<Self>, address: IpAddr) {
+        let mut request = ptr_query(address);
+        let found = self
+            .resolver
+            .query_charged_within(&mut request, &self.budget, LOOKUP_TIMEOUT)
+            .await
+            .ok()
+            .and_then(|answered| host_name_in(&answered.reply));
+
+        self.table
+            .lock()
+            .unwrap()
+            .settle(address, found, Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lookups_in_flight(&self) -> usize {
+        self.table.lock().unwrap().in_flight
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.budget.used()
+    }
+}
+
 /// The name a PTR lookup of `address` asks for, of its canonical form, so that a mapped IPv4
 /// address is asked under `in-addr.arpa`.
 pub(crate) fn reverse_name(address: IpAddr) -> Name {
@@ -262,6 +342,7 @@ fn is_host_name(name: &Name) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::{Duration, Instant};
 
@@ -269,8 +350,10 @@ mod tests {
     use hickory_proto::rr::{Name as HickoryName, RData, Record, RecordType};
 
     use super::*;
+    use crate::config::{LimitsConfig, UpstreamConfig};
     use crate::dns::test_util::{QuerySpec, ResponseSpec, a, cname, name, ptr, soa};
     use crate::dns::wire::{Query, rcode, rtype};
+    use crate::upstream::test_dns::{FakeRouter, fake_router};
 
     fn address(number: u32) -> IpAddr {
         IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + number))
@@ -654,5 +737,120 @@ mod tests {
         }
 
         assert_eq!(longest.len(), 253);
+    }
+
+    fn lan_address(number: u32) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(0xC0A8_0100 + number))
+    }
+
+    fn names_for(router: &FakeRouter, limits: &LimitsConfig) -> Arc<DeviceNames> {
+        DeviceNames::new(router.address, &UpstreamConfig::default(), limits)
+    }
+
+    /// Polls `done` every 10 ms; false when it is still not true after `limit`.
+    async fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let started = Instant::now();
+
+        while !done() {
+            if started.elapsed() > limit {
+                return false;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        true
+    }
+
+    #[tokio::test]
+    async fn the_names_pool_takes_four_slots_whatever_the_limits() {
+        let router = fake_router(&[], true).await;
+        let limits = LimitsConfig {
+            upstream_concurrency: 1,
+            ..LimitsConfig::default()
+        };
+        let names = names_for(&router, &limits);
+        let started = Instant::now();
+
+        for number in 0..4 {
+            assert_eq!(names.name_of(lan_address(number)), None);
+        }
+
+        assert!(wait_until(Duration::from_secs(3), || router.asked().len() >= 4).await);
+        // With one slot, a second lookup could not be sent before the first try of the first
+        // one ended at 1 s.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn twenty_addresses_send_four_lookups_and_repeats_send_none() {
+        let router = fake_router(&[], true).await;
+        let names = names_for(&router, &LimitsConfig::default());
+
+        for number in 0..20 {
+            assert_eq!(names.name_of(lan_address(number)), None);
+        }
+
+        for _ in 0..10 {
+            assert_eq!(names.name_of(lan_address(0)), None);
+        }
+
+        assert!(wait_until(Duration::from_secs(3), || router.asked().len() >= 4).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // A second try asks the same name again, so the names asked are counted, not the
+        // questions.
+        let asked: HashSet<String> = router.asked().into_iter().collect();
+        assert_eq!(asked.len(), 4, "{asked:?}");
+        assert!(asked.contains(&reverse_name(lan_address(0)).to_string()));
+        assert_eq!(names.lookups_in_flight(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_gives_up_after_two_seconds_and_counts_each_try_on_the_resolver() {
+        let router = fake_router(&[], true).await;
+        let names = names_for(&router, &LimitsConfig::default());
+        let started = Instant::now();
+
+        assert_eq!(names.name_of(lan_address(1)), None);
+
+        assert!(wait_until(Duration::from_secs(6), || names.lookups_in_flight() == 0).await);
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(1900), "{took:?}");
+        // The configured 5 s timeout would give up at 5 s.
+        assert!(took < Duration::from_secs(4), "{took:?}");
+        assert_eq!(router.asked().len(), 2, "one retry");
+        assert_eq!((names.tally().answered, names.tally().failed), (0, 2));
+
+        assert_eq!(names.name_of(lan_address(1)), None);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(router.asked().len(), 2, "no name is kept for 5 minutes");
+        assert_eq!(names.lookups_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_found_name_shows_on_a_later_call_and_counts_as_an_answer() {
+        let owner = reverse_name(lan_address(1)).to_string();
+        let router = fake_router(&[(&owner, "Risan-PC.lan.", 600)], false).await;
+        let names = names_for(&router, &LimitsConfig::default());
+
+        assert_eq!(names.name_of(lan_address(1)), None);
+
+        let mut shown = None;
+        let appeared = wait_until(Duration::from_secs(5), || {
+            shown = names.name_of(lan_address(1));
+
+            shown.is_some()
+        })
+        .await;
+        assert!(appeared);
+        assert_eq!(shown.as_deref(), Some("risan-pc.lan"));
+        assert_eq!((names.tally().answered, names.tally().failed), (1, 0));
+        assert_eq!(router.asked(), [owner]);
     }
 }

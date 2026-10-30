@@ -4,10 +4,12 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use hickory_proto::rr::RecordType;
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::rdata::{A, PTR};
+use hickory_proto::rr::{RData, Record, RecordType};
 use tokio::net::UdpSocket;
 
-use crate::dns::test_util::QuerySpec;
+use crate::dns::test_util::{QuerySpec, name};
 use crate::dns::wire::{self, flags, rtype};
 
 pub const ANSWER_MARKER: [u8; 4] = [192, 0, 2, 1];
@@ -97,4 +99,75 @@ pub async fn fake_dns(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>) -> FakeDns {
         queries,
         v4,
     }
+}
+
+/// A router as the `[local]` resolver: it answers every A question at once with 192.168.1.9,
+/// and records every PTR question's name, lowercased without its trailing dot.
+pub struct FakeRouter {
+    pub address: SocketAddr,
+    pub asked: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeRouter {
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+/// A PTR question named in `ptr_answers` (owner, target, TTL) gets one PTR record, any other
+/// NXDOMAIN. With `ptr_silent`, no PTR question is answered.
+pub async fn fake_router(ptr_answers: &[(&str, &str, u32)], ptr_silent: bool) -> FakeRouter {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&asked);
+    let answers: Vec<(String, String, u32)> = ptr_answers
+        .iter()
+        .map(|(owner, target, ttl)| (bare(owner), target.to_string(), *ttl))
+        .collect();
+
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 512];
+        while let Ok((length, peer)) = socket.recv_from(&mut buffer).await {
+            let Ok(query) = Message::from_vec(&buffer[..length]) else {
+                continue;
+            };
+
+            let question = query.queries[0].clone();
+            let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            reply.metadata.recursion_desired = query.metadata.recursion_desired;
+            reply.metadata.recursion_available = true;
+            reply.add_query(question.clone());
+
+            if question.query_type() == RecordType::PTR {
+                let owner = bare(&question.name().to_string());
+                recorded.lock().unwrap().push(owner.clone());
+                if ptr_silent {
+                    continue;
+                }
+
+                match answers.iter().find(|(known, _, _)| *known == owner) {
+                    Some((_, target, ttl)) => {
+                        let data = RData::PTR(PTR(name(target)));
+                        reply.add_answer(Record::from_rdata(question.name().clone(), *ttl, data));
+                    }
+
+                    None => {
+                        reply.metadata.response_code = ResponseCode::NXDomain;
+                    }
+                }
+            } else {
+                let data = RData::A(A(Ipv4Addr::new(192, 168, 1, 9)));
+                reply.add_answer(Record::from_rdata(question.name().clone(), 60, data));
+            }
+
+            let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
+        }
+    });
+
+    FakeRouter { address, asked }
+}
+
+fn bare(owner: &str) -> String {
+    owner.trim_end_matches('.').to_ascii_lowercase()
 }
