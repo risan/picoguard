@@ -680,6 +680,26 @@ async fn compile_user_rules(
     Ok(Some(Arc::new(list)))
 }
 
+/// A name for a rule from the status page, or `None` when it is not a domain name: trimmed,
+/// lowercased and without one trailing dot, 1 to 253 characters in at least two labels of 1
+/// to 63 letters, digits, hyphens or underscores, none starting with a hyphen. Such a name is
+/// exactly what a plain `||name^` rule holds, so no `^`, `$` or `*` can reach a page rule.
+pub fn normalized_name(text: &str) -> Option<String> {
+    let lowered = text.trim().to_ascii_lowercase();
+    let name = lowered.strip_suffix('.').unwrap_or(&lowered);
+    let is_label = |label: &str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+    };
+    let valid =
+        (1..=253).contains(&name.len()) && name.contains('.') && name.split('.').all(is_label);
+
+    valid.then(|| name.to_string())
+}
+
 pub(crate) fn unit_random() -> f64 {
     (random_u64() >> 11) as f64 / (1u64 << 53) as f64
 }
@@ -717,5 +737,71 @@ mod tests {
         );
         assert!(waits.iter().any(|wait| *wait < day.mul_f64(0.95)));
         assert!(waits.iter().any(|wait| *wait > day.mul_f64(1.05)));
+    }
+
+    /// A name of `length` characters in labels of 63 and one shorter last label.
+    fn long_name(length: usize) -> String {
+        let mut name = String::new();
+        while name.len() + 64 < length {
+            name.push_str(&"a".repeat(63));
+            name.push('.');
+        }
+
+        let rest = length - name.len();
+        name.push_str(&"b".repeat(rest));
+
+        name
+    }
+
+    #[test]
+    fn names_are_trimmed_lowercased_and_lose_one_trailing_dot() {
+        assert_eq!(
+            normalized_name(" Example.ORG. ").as_deref(),
+            Some("example.org")
+        );
+        assert_eq!(
+            normalized_name("a_b.example").as_deref(),
+            Some("a_b.example")
+        );
+        assert_eq!(normalized_name("1.2.3.4").as_deref(), Some("1.2.3.4"));
+    }
+
+    #[test]
+    fn names_outside_rule_5_are_refused() {
+        let too_long = long_name(254);
+        let long_label = format!("{}.example", "a".repeat(64));
+        assert_eq!(too_long.len(), 254);
+
+        for bad in [
+            "a",
+            "-x.com",
+            &too_long,
+            "x..y",
+            &long_label,
+            "",
+            ".",
+            "x.com..",
+            "x.com^",
+            "x.com^$badfilter",
+            "x com",
+            "%41.com",
+            "*.x.com",
+            "ünï.com",
+        ] {
+            assert_eq!(normalized_name(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_longest_name_is_accepted() {
+        let longest = long_name(253);
+        assert_eq!(longest.len(), 253);
+        assert!(longest.split('.').take(3).all(|label| label.len() == 63));
+
+        assert_eq!(normalized_name(&longest).as_ref(), Some(&longest));
+        assert_eq!(
+            normalized_name(&format!("{longest}.")).as_ref(),
+            Some(&longest)
+        );
     }
 }
