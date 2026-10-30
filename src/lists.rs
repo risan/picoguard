@@ -2697,6 +2697,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn own_lookups_count_on_the_upstream_they_went_to() {
+        let dns = fake_dns(
+            vec!["192.0.2.7".parse().unwrap()],
+            vec!["2001:db8::7".parse().unwrap()],
+        )
+        .await;
+        let upstreams = Arc::new(Upstreams::plain(
+            dns.address,
+            &UpstreamConfig::default(),
+            &LimitsConfig::default(),
+        ));
+        let resolver = resolver_over(Arc::clone(&upstreams));
+
+        resolver("lists.example".to_string()).await.unwrap();
+
+        let (_, tally) = upstreams.tallies().next().unwrap();
+        assert_eq!((tally.answered, tally.failed), (2, 0));
+    }
+
+    #[tokio::test]
     async fn a_name_without_addresses_or_a_dead_pool_is_an_error() {
         let dns = fake_dns(Vec::new(), Vec::new()).await;
         let config = UpstreamConfig {

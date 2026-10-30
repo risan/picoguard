@@ -246,6 +246,7 @@ struct Upstream {
     /// Caps the requests in flight to this server.
     limiter: Semaphore,
     health: Mutex<Health>,
+    tally: Mutex<Tally>,
     /// How long the first failure of a run keeps the server out of the pick; it doubles for
     /// each failure after that. A field so that a test can make it longer than the test.
     first_backoff: Duration,
@@ -263,6 +264,7 @@ impl Upstream {
                 retry_at: None,
                 outage: Outage::default(),
             }),
+            tally: Mutex::new(Tally::default()),
             first_backoff: FIRST_BACKOFF,
         }
     }
@@ -274,17 +276,21 @@ impl Upstream {
         deadline: Instant,
     ) -> Result<Charged, UpstreamError> {
         let started = Instant::now();
-        let result = self.send(request, budget, deadline).await;
+        let (result, exchange_time) = self.send(request, budget, deadline).await;
 
         match &result {
             Ok(_) => {
+                self.tally.lock().unwrap().count_answer(exchange_time);
                 self.record_success(started.elapsed());
             }
 
             // Our own limit says nothing about the server.
-            Err(UpstreamError::BudgetExhausted) => {}
+            Err(UpstreamError::BudgetExhausted) => {
+                self.tally.lock().unwrap().count_failure();
+            }
 
             Err(error) => {
+                self.tally.lock().unwrap().count_failure();
                 self.record_failure(error);
             }
         }
@@ -292,25 +298,30 @@ impl Upstream {
         result
     }
 
+    /// The result, and how long the exchange took from the moment this try held one of the
+    /// server's slots. It is zero when no slot came free.
     async fn send(
         &self,
         request: &mut [u8],
         budget: &Arc<Budget>,
         deadline: Instant,
-    ) -> Result<Charged, UpstreamError> {
+    ) -> (Result<Charged, UpstreamError>, Duration) {
         let Ok(acquired) = timeout_at(deadline, self.limiter.acquire()).await else {
-            return Err(UpstreamError::Timeout);
+            return (Err(UpstreamError::Timeout), Duration::ZERO);
         };
 
-        let _permit = acquired.map_err(|_| UpstreamError::Closed)?;
+        let Ok(_permit) = acquired else {
+            return (Err(UpstreamError::Closed), Duration::ZERO);
+        };
 
+        let sent = Instant::now();
         let Ok(result) =
             timeout_at(deadline, self.transport.query(request, budget, deadline)).await
         else {
-            return Err(UpstreamError::Timeout);
+            return (Err(UpstreamError::Timeout), sent.elapsed());
         };
 
-        result
+        (result, sent.elapsed())
     }
 
     fn record_success(&self, elapsed: Duration) {
@@ -416,6 +427,13 @@ impl Upstreams {
             servers: vec![Upstream::new(format!("udp://{server}"), transport, limits)],
             timeout,
         }
+    }
+
+    /// Each server's label as configured, with what it has done since start, in config order.
+    pub fn tallies(&self) -> impl Iterator<Item = (&str, Tally)> + '_ {
+        self.servers
+            .iter()
+            .map(|server| (server.label.as_str(), *server.tally.lock().unwrap()))
     }
 
     /// Like `query_charged`, without a limit on the bytes held.
@@ -873,6 +891,8 @@ mod tests {
 
         assert_eq!(address_of(&reply), ANSWER_MARKER);
         assert!(!Header::parse(&reply).unwrap().truncated());
+        let (_, tally) = upstreams.tallies().next().unwrap();
+        assert_eq!((tally.answered, tally.failed), (1, 0));
     }
 
     /// Answers framed queries on every accepted connection. With `limit`,
@@ -960,6 +980,148 @@ mod tests {
         );
         assert_eq!(upstreams.servers[0].health.lock().unwrap().failures, 0);
         assert_eq!(tiny.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failover_counts_a_failure_on_the_first_server_and_an_answer_on_the_second() {
+        let dead = dead_udp().await;
+        let slow = fake_udp(|request| {
+            vec![(
+                Duration::from_millis(50),
+                answer(request, ANSWER_MARKER, false),
+            )]
+        })
+        .await;
+        let upstreams = upstreams(vec![udp_url(&dead), udp_url(&slow)], 1000);
+        upstreams.servers[1].health.lock().unwrap().retry_at =
+            Some(Instant::now() + Duration::from_secs(30));
+
+        upstreams
+            .query(&mut query_for("example.com."))
+            .await
+            .unwrap();
+
+        let tallies: Vec<Tally> = upstreams.tallies().map(|(_, tally)| tally).collect();
+        assert_eq!(tallies[0].answered, 0);
+        assert_eq!(tallies[0].failed, 1);
+        assert_eq!(tallies[0].average_ms(), None);
+        assert_eq!(tallies[1].answered, 1);
+        assert_eq!(tallies[1].failed, 0);
+        let average = tallies[1].average_ms().unwrap();
+        assert!((50.0..250.0).contains(&average), "{average}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_only_times_out_counts_each_try_as_a_failure() {
+        let dead = dead_udp().await;
+        let upstreams = upstreams(vec![udp_url(&dead)], 400);
+
+        let result = upstreams.query(&mut query_for("example.com.")).await;
+
+        assert!(matches!(result, Err(UpstreamError::Timeout)));
+        let (_, tally) = upstreams.tallies().next().unwrap();
+        assert_eq!((tally.answered, tally.failed), (0, 2));
+        assert_eq!(tally.average_ms(), None);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_free_slot_is_not_part_of_the_response_time() {
+        let server = fake_udp(|request| {
+            vec![(
+                Duration::from_millis(200),
+                answer(request, ANSWER_MARKER, false),
+            )]
+        })
+        .await;
+        let config = UpstreamConfig {
+            servers: vec![udp_url(&server)],
+            timeout_ms: 2000,
+            ..UpstreamConfig::default()
+        };
+        let limits = LimitsConfig {
+            upstream_concurrency: 1,
+            ..LimitsConfig::default()
+        };
+        let upstreams = Arc::new(Upstreams::from_config(&config, &limits).unwrap());
+
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let upstreams = Arc::clone(&upstreams);
+            tasks.push(tokio::spawn(async move {
+                upstreams.query(&mut query_for("example.com.")).await
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        let both_done_after = started.elapsed();
+
+        let (_, tally) = upstreams.tallies().next().unwrap();
+        assert_eq!(tally.answered, 2);
+        assert!(tally.average_ms().unwrap() >= 200.0);
+        // The second query waits for the first. With that wait counted, the two times would add
+        // up to 1.5 times the whole run; left out, they add up to less than the whole run.
+        assert!(
+            u128::from(tally.answer_micros) * 5 < both_done_after.as_micros() * 6,
+            "{tally:?} against {both_done_after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_budget_cannot_hold_counts_as_a_failure_without_blaming_the_server() {
+        let udp = good_udp().await;
+        let over_udp = upstreams(vec![udp_url(&udp)], 1000);
+
+        let result = over_udp
+            .query_charged(&mut query_for("example.com."), &Budget::new(10))
+            .await;
+
+        assert!(matches!(result, Err(UpstreamError::BudgetExhausted)));
+        let (_, tally) = over_udp.tallies().next().unwrap();
+        assert_eq!((tally.answered, tally.failed), (0, 1));
+        assert_eq!(over_udp.servers[0].health.lock().unwrap().failures, 0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve_tcp(listener, Arc::new(AtomicUsize::new(0)), None));
+        let over_tcp = upstreams(vec![format!("tcp://{address}")], 1000);
+
+        let fits = over_tcp
+            .query_charged(&mut query_for("example.com."), &Budget::new(10_000))
+            .await;
+        drop(fits);
+        let result = over_tcp
+            .query_charged(&mut query_for("example.com."), &Budget::new(10))
+            .await;
+
+        assert!(matches!(result, Err(UpstreamError::BudgetExhausted)));
+        let (_, tally) = over_tcp.tallies().next().unwrap();
+        assert_eq!((tally.answered, tally.failed), (1, 1));
+        assert_eq!(over_tcp.servers[0].health.lock().unwrap().failures, 0);
+    }
+
+    #[test]
+    fn fresh_servers_list_their_labels_in_config_order_with_nothing_counted() {
+        let upstreams = upstreams(
+            vec![
+                "udp://192.0.2.1:53".to_string(),
+                "tcp://192.0.2.2:53".to_string(),
+            ],
+            1000,
+        );
+
+        let listed: Vec<(&str, Tally)> = upstreams.tallies().collect();
+
+        assert_eq!(
+            listed,
+            vec![
+                ("udp://192.0.2.1:53", Tally::default()),
+                ("tcp://192.0.2.2:53", Tally::default()),
+            ]
+        );
     }
 
     #[tokio::test]
