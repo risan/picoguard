@@ -6,6 +6,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::filter::compile::DEFAULT_SLOW_RULE_BUDGET;
+use crate::password::PasswordHash;
 use crate::upstream::Upstreams;
 
 const UPSTREAM_SCHEMES: [&str; 4] = ["https://", "tls://", "udp://", "tcp://"];
@@ -607,6 +608,7 @@ pub struct WebConfig {
     pub hostnames: Vec<String>,
     pub user: Option<String>,
     pub password: Option<String>,
+    pub password_hash: Option<PasswordHash>,
 }
 
 impl Default for WebConfig {
@@ -619,6 +621,7 @@ impl Default for WebConfig {
             hostnames: Vec::new(),
             user: None,
             password: None,
+            password_hash: None,
         }
     }
 }
@@ -627,26 +630,39 @@ impl WebConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         validate_listen("web", &self.bind, &self.allow_from)?;
 
-        match (&self.user, &self.password) {
-            (Some(_), None) => {
-                return invalid("web.password must be set when web.user is set");
+        if self.password.is_some() && self.password_hash.is_some() {
+            return invalid("set web.password or web.password_hash, not both");
+        }
+
+        match (&self.user, &self.password, &self.password_hash) {
+            (Some(_), None, None) => {
+                return invalid(
+                    "web.password or web.password_hash must be set when web.user is set",
+                );
             }
 
-            (None, Some(_)) => {
+            (None, Some(_), _) => {
                 return invalid("web.user must be set when web.password is set");
             }
 
-            (Some(user), Some(password)) => {
+            (None, None, Some(_)) => {
+                return invalid("web.user must be set when web.password_hash is set");
+            }
+
+            (Some(user), password, _) => {
                 if user.is_empty() || user.contains(':') {
                     return invalid("web.user must not be empty or contain ':'");
                 }
 
-                if password.is_empty() {
+                if password
+                    .as_ref()
+                    .is_some_and(|password| password.is_empty())
+                {
                     return invalid("web.password must not be empty");
                 }
             }
 
-            (None, None) => {}
+            (None, None, None) => {}
         }
 
         Ok(())
@@ -1090,6 +1106,28 @@ mod tests {
         assert!(Config::parse("[cache").is_err());
     }
 
+    const HASH: &str = "pbkdf2-sha256$1000$000102030405060708090a0b0c0d0e0f$33a78c377ca7b6590fa1b215cc970fba516076f108ecb68af58ec95d86021701";
+
+    #[test]
+    fn a_password_hash_is_accepted_instead_of_a_password() {
+        let config = Config::parse(&format!(
+            "[web]\nuser = \"admin\"\npassword_hash = \"{HASH}\""
+        ))
+        .unwrap();
+
+        assert!(config.web.password.is_none());
+        assert!(config.web.password_hash.unwrap().verify(b"s3cret"));
+    }
+
+    #[test]
+    fn a_malformed_password_hash_is_rejected_with_its_line() {
+        let message =
+            error_of("[web]\nuser = \"admin\"\npassword_hash = \"pbkdf2-sha256$1000$xx$yy\"");
+
+        assert!(message.contains("password_hash"), "{message}");
+        assert!(message.contains("picoguard --hash-password"), "{message}");
+    }
+
     #[test]
     fn invalid_values_are_rejected_with_the_field_name() {
         let cases = [
@@ -1219,7 +1257,19 @@ mod tests {
             ),
             (
                 "[web]\nuser = \"admin\"",
-                "web.password must be set when web.user is set",
+                "web.password or web.password_hash must be set when web.user is set",
+            ),
+            (
+                "[web]\nuser = \"admin\"\npassword = \"secret\"\npassword_hash = \"pbkdf2-sha256$1000$000102030405060708090a0b0c0d0e0f$33a78c377ca7b6590fa1b215cc970fba516076f108ecb68af58ec95d86021701\"",
+                "set web.password or web.password_hash, not both",
+            ),
+            (
+                "[web]\npassword_hash = \"pbkdf2-sha256$1000$000102030405060708090a0b0c0d0e0f$33a78c377ca7b6590fa1b215cc970fba516076f108ecb68af58ec95d86021701\"",
+                "web.user must be set when web.password_hash is set",
+            ),
+            (
+                "[web]\nuser = \"a:b\"\npassword_hash = \"pbkdf2-sha256$1000$000102030405060708090a0b0c0d0e0f$33a78c377ca7b6590fa1b215cc970fba516076f108ecb68af58ec95d86021701\"",
+                "web.user must not be empty or contain ':'",
             ),
             (
                 "[web]\npassword = \"secret\"",

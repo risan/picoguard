@@ -190,14 +190,15 @@ These keep memory fixed. The defaults fit a 256 MB board; you rarely change them
 
 ## `[web]`
 
-The status page. With `user` and `password` set, it shows totals, top blocked domains, top clients,
-recent queries and list status, and can pause blocking for a set time and refresh the lists.
+The status page. With `user` and a password (`password_hash`, or `password`) set, it shows totals,
+top blocked domains, top clients, recent queries and list status, and can pause blocking for a set
+time and refresh the lists.
 
 Without a password the page is read-only and limited: it shows totals and list status only. The
-query log, the top lists, pause, resume and refresh answer 403 ("set web.user and web.password to
-use this"), and the page says so. picoguard logs one warning at start when no password is set.
-Every device that may open the page could otherwise read the household's queries and switch
-blocking off.
+query log, the top lists, pause, resume and refresh answer 403 ("set web.user and web.password_hash
+(or web.password) to use this"), and the page says so. picoguard logs one warning at start when no
+password is set. Every device that may open the page could otherwise read the household's queries
+and switch blocking off.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -206,10 +207,52 @@ blocking off.
 | `port` | `8080` | HTTP port. |
 | `allow_from` | same as `server.allow_from` | Only these networks may open the page. Others are disconnected. |
 | `hostnames` | `[]` | Host names the page answers to, besides IP addresses. Add the name you type in the browser, for example `["orangepi.lan"]`. |
-| `user`, `password` | not set | Set both to require basic auth on every request and to unlock the full page. Neither can be empty; the user cannot contain `:`. |
+| `user`, `password` | not set | Set `user` and one of `password` or `password_hash` to require a sign-in and to unlock the full page. Neither can be empty; the user cannot contain `:`. |
+| `password_hash` | not set | The password as a salted hash, instead of `password` (not both). Make one with `picoguard --hash-password`. |
 
-Basic auth is sent in clear text over HTTP. Use it with `allow_from` on a trusted LAN, not across
-the internet.
+### Signing in
+
+With a password set, the page opens with its own sign-in form; the browser never shows its
+password prompt. A right user and password sets a session cookie (`HttpOnly`, `SameSite=Strict`)
+that lasts 30 days:
+
+- A restart of picoguard keeps every session; nothing about them is written to disk.
+- A new `user`, `password` or `password_hash` ends every session at the next start.
+- **Sign out** ends the session in that browser only. A copy of the cookie taken elsewhere stays
+  valid until it expires.
+- A clock moved back keeps sessions longer by that much.
+
+Scripts keep using basic auth on `/api/*`, for example
+`curl -u admin:PASSWORD http://192.168.1.53:8080/api/status`. With a hash, the first right answer
+pays the hash, and the same credentials after it are checked in microseconds.
+
+Wrong passwords are limited per client address. After 5 failed password checks within 15 minutes,
+sign-ins and basic auth from that address answer 429 ("too many attempts, try again later") until
+15 minutes after its last failure. A right password clears the address. picoguard tracks 64
+addresses; when the table is full, the one with the oldest last failure is dropped.
+
+Make a hash with `picoguard --hash-password`. It reads the password from standard input (it asks
+without echo on a terminal) and prints a line to paste into `[web]`:
+
+```sh
+$ picoguard --hash-password
+Password:
+password_hash = "pbkdf2-sha256$600000$..."
+```
+
+The hash is PBKDF2-HMAC-SHA256 with 600,000 iterations and a random salt. Each wrong password pays
+the full hash, one at a time: about 0.1 s on a desktop and about 1 to 2 s on an ARMv7 board. A right
+sign-in pays it once a month per browser.
+
+Prefer `password_hash`. With a plaintext `password` the config holds the password itself, and a
+captured session cookie can be checked against guesses quickly. Either way, anyone who can read the
+config can sign in, so keep it `0640 root:picoguard` as `install.sh` writes it.
+
+The page is plain HTTP: the cookie and basic auth cross the network in clear text. Use them with
+`allow_from` on a trusted LAN, not across the internet. Cookies do not tell ports apart, so another
+web service on the same address sees the session cookie. A browser that still holds basic
+credentials from an older picoguard keeps sending them; it shows the dashboard without the form,
+and **Sign out** cannot end that until the browser forgets them.
 
 ## `[stats]`
 
@@ -232,8 +275,8 @@ Statistics and the query log live in memory only and are lost on restart.
 The status page shows the running version. About once a day, picoguard also asks GitHub whether
 a newer release exists, and the page says "update available" with a short summary of the release
 notes and the command that updates your kind of build. A release binary installed with
-`install.sh`, shown to a signed-in user (`web.user` and `web.password`), also gets an **Update**
-button that installs it ([how it works](install.md#from-the-status-page)).
+`install.sh`, shown to a signed-in user (`web.user` and `web.password` or `web.password_hash`),
+also gets an **Update** button that installs it ([how it works](install.md#from-the-status-page)).
 
 | Key | Default | Meaning |
 |---|---|---|

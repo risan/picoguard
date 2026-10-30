@@ -29,9 +29,12 @@ servers = [
 [web]
 bind = ["0.0.0.0", "::"]
 port = 8080
-# Set both. Without a password the status page is read-only, and anyone who can
-# reach it sees the query log.
+# Set user and a password. Without a password the status page is read-only, and
+# anyone who can reach it sees the query log. Prefer password_hash, the line that
+# `docker compose run --rm picoguard --hash-password` prints, to a plaintext
+# password; set one of the two.
 # user = "admin"
+# password_hash = "pbkdf2-sha256$600000$..."
 # password = "change-me"
 
 [state]

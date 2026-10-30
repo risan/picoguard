@@ -1,10 +1,12 @@
-//! The status page and its JSON API (plan D16). One HTML page, five reads and four
-//! mutations. A web page on another device of the LAN must not be able to pause blocking, so
-//! every request passes the access policy before it reaches a handler:
+//! The status page and its JSON API (plan D16). One HTML page, four reads, four mutations, and
+//! sign-in and sign-out. A web page on another device of the LAN must not be able to pause
+//! blocking, so every request passes the access policy before it reaches a handler:
 //!
 //! - a peer outside `web.allow_from` is closed before a byte is read;
 //! - `Host` must be an IP address or a configured name, which defeats DNS rebinding;
-//! - with a password configured, `Authorization` must match, compared in constant time;
+//! - with a password configured, every route but the page and the sign-in needs a valid session
+//!   cookie or a matching `Authorization: Basic`, compared in constant time; failed password
+//!   checks are limited per address;
 //! - without a password the page is read-only and shows totals and list status only: the
 //!   query log, the top lists and every change answer 403;
 //! - a mutation must be `POST` with `Content-Type: application/json` (which a cross-site form
@@ -24,13 +26,12 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use ring::hmac;
-use ring::rand::SystemRandom;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
+use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
 use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
 use crate::policy::Policy;
 use crate::scheduler::{ListControl, ListStatus, Role};
@@ -38,6 +39,8 @@ use crate::server::bind_tcp;
 use crate::stage::{Refused, Stager};
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, Stats, TopEntry};
 use crate::update::{Tag, UpdateView, Updates, parse_tag};
+
+mod auth;
 
 const PAGE: &str = include_str!("web/index.html");
 
@@ -54,7 +57,7 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 const MIN_PAUSE_MINUTES: u32 = 1;
 const MAX_PAUSE_MINUTES: u32 = 24 * 60;
 const DEFAULT_QUERY_LOG_LIMIT: usize = 100;
-const PASSWORD_NEEDED: &str = "set web.user and web.password to use this";
+const PASSWORD_NEEDED: &str = "set web.user and web.password_hash (or web.password) to use this";
 
 /// Everything the handlers read or change.
 pub struct Web {
@@ -65,8 +68,8 @@ pub struct Web {
     stager: Arc<Stager>,
     allow_from: Vec<Cidr>,
     hostnames: Vec<String>,
-    /// The `Authorization` credentials a client must send; `None` when no password is set.
-    credentials: Option<Credentials>,
+    /// What a client is checked against; `None` when no password is set.
+    auth: Option<Auth>,
     query_log_entries: usize,
 }
 
@@ -80,16 +83,12 @@ impl Web {
         stager: Arc<Stager>,
     ) -> Result<Web, String> {
         let web = &config.web;
-        let credentials = match (&web.user, &web.password) {
-            (Some(user), Some(password)) => Some(Credentials::new(&base64(
-                format!("{user}:{password}").as_bytes(),
-            ))?),
-            _ => None,
-        };
-        if credentials.is_none() {
+        let auth = Auth::new(web)?;
+        if auth.is_none() {
             log::warn!(
                 "the status page has no password: it shows totals and list status only. \
-                 Set web.user and web.password for the query log, the top lists and pause."
+                 Set web.user and web.password_hash (or web.password) for the query log, the top \
+                 lists and pause."
             );
         }
 
@@ -101,7 +100,7 @@ impl Web {
             stager,
             allow_from: web.allow_from.clone(),
             hostnames: web.hostnames.clone(),
-            credentials,
+            auth,
             query_log_entries: config.stats.query_log_entries,
         })
     }
@@ -176,15 +175,20 @@ async fn serve(listener: TcpListener, web: Arc<Web>, connections: Arc<Semaphore>
             continue;
         };
 
-        tokio::spawn(serve_connection(stream, Arc::clone(&web), slot));
+        tokio::spawn(serve_connection(stream, peer.ip(), Arc::clone(&web), slot));
     }
 }
 
-async fn serve_connection(stream: TcpStream, web: Arc<Web>, _slot: OwnedSemaphorePermit) {
+async fn serve_connection(
+    stream: TcpStream,
+    peer: IpAddr,
+    web: Arc<Web>,
+    _slot: OwnedSemaphorePermit,
+) {
     let service = service_fn(move |request| {
         let web = Arc::clone(&web);
 
-        async move { Ok::<_, Infallible>(web.respond(request).await) }
+        async move { Ok::<_, Infallible>(web.respond(request, peer).await) }
     });
 
     let connection = http1::Builder::new()
@@ -214,6 +218,8 @@ enum Change {
     Resume,
     RefreshLists,
     Install,
+    Login,
+    Logout,
 }
 
 enum Route {
@@ -232,8 +238,16 @@ impl Route {
             "/api/resume" => Some(Route::Change(Change::Resume)),
             "/api/lists/refresh" => Some(Route::Change(Change::RefreshLists)),
             "/api/update" => Some(Route::Change(Change::Install)),
+            "/api/login" => Some(Route::Change(Change::Login)),
+            "/api/logout" => Some(Route::Change(Change::Logout)),
             _ => None,
         }
+    }
+
+    /// Open without a sign-in even when a password is set: the page shows its own form, which
+    /// posts to the sign-in.
+    fn is_public(&self) -> bool {
+        matches!(self, Route::Read(Read::Page) | Route::Change(Change::Login))
     }
 
     /// Whether the page shows this only to a signed-in user: the query log, the top lists
@@ -291,8 +305,8 @@ impl Rejection {
 }
 
 impl Web {
-    async fn respond(&self, request: Request<Incoming>) -> Response<Full<Bytes>> {
-        let response = match self.try_respond(request).await {
+    async fn respond(&self, request: Request<Incoming>, peer: IpAddr) -> Response<Full<Bytes>> {
+        let response = match self.try_respond(request, peer).await {
             Ok(response) => response,
             Err(rejection) => rejection.into_response(),
         };
@@ -303,14 +317,21 @@ impl Web {
     async fn try_respond(
         &self,
         request: Request<Incoming>,
+        peer: IpAddr,
     ) -> Result<Response<Full<Bytes>>, Rejection> {
         let (head, body) = request.into_parts();
         let host = self.checked_host(&head.headers)?;
-        self.check_credentials(&head.headers)?;
 
-        let route = Route::of(head.uri.path())
-            .ok_or_else(|| Rejection::new(StatusCode::NOT_FOUND, "no such page"))?;
-        if route.needs_password() && self.credentials.is_none() {
+        // An unknown path is not public, so it answers 401 before 404.
+        let route = Route::of(head.uri.path());
+        if let Some(auth) = &self.auth
+            && !route.as_ref().is_some_and(Route::is_public)
+        {
+            authenticate(auth, &head.headers, peer).await?;
+        }
+
+        let route = route.ok_or_else(|| Rejection::new(StatusCode::NOT_FOUND, "no such page"))?;
+        if route.needs_password() && self.auth.is_none() {
             return Err(Rejection::new(StatusCode::FORBIDDEN, PASSWORD_NEEDED));
         }
 
@@ -332,7 +353,7 @@ impl Web {
                 check_json_content_type(&head.headers)?;
                 let body = read_body(&head.headers, body).await?;
 
-                self.change(change, &body)
+                self.change(change, &body, &head.headers, peer).await
             }
         }
     }
@@ -376,26 +397,6 @@ impl Web {
         is_known_name && is_port_suffix(suffix)
     }
 
-    fn check_credentials(&self, headers: &HeaderMap) -> Result<(), Rejection> {
-        let Some(expected) = &self.credentials else {
-            return Ok(());
-        };
-
-        let sent = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split_once(' '))
-            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
-            .map(|(_, credentials)| credentials.trim());
-
-        if sent.is_some_and(|sent| expected.accepts(sent)) {
-            return Ok(());
-        }
-
-        Err(Rejection::new(StatusCode::UNAUTHORIZED, "sign in")
-            .with_header(header::WWW_AUTHENTICATE, "Basic realm=\"picoguard\""))
-    }
-
     fn read(&self, read: Read, query: Option<&str>) -> Result<Response<Full<Bytes>>, Rejection> {
         match read {
             Read::Page => Ok(Response::builder()
@@ -406,7 +407,7 @@ impl Web {
             Read::Status => {
                 let snapshot = self.stats.snapshot();
                 let view = self.policy.view(Instant::now());
-                let is_open = self.credentials.is_some();
+                let is_open = self.auth.is_some();
 
                 Ok(json(
                     StatusCode::OK,
@@ -447,7 +448,13 @@ impl Web {
         }
     }
 
-    fn change(&self, change: Change, body: &[u8]) -> Result<Response<Full<Bytes>>, Rejection> {
+    async fn change(
+        &self,
+        change: Change,
+        body: &[u8],
+        headers: &HeaderMap,
+        peer: IpAddr,
+    ) -> Result<Response<Full<Bytes>>, Rejection> {
         match change {
             Change::Pause => {
                 let request: PauseRequest = serde_json::from_slice(body).map_err(|_| {
@@ -506,13 +513,48 @@ impl Web {
                     &InstallStarted { install: "started" },
                 ))
             }
+
+            Change::Login => {
+                let auth = self.required_auth()?;
+                let request = login_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"user\": \"...\", \"password\": \"...\"}",
+                    )
+                })?;
+                let attempt = Attempt::Form {
+                    user: &request.user,
+                    password: &request.password,
+                };
+
+                match auth.check(peer, attempt).await {
+                    Check::Accepted => Ok(with_cookie(
+                        json(StatusCode::OK, &Empty {}),
+                        &auth.session_cookie(unix_now()),
+                    )),
+                    Check::Refused => Err(unauthorized(headers, "wrong user or password")),
+                    Check::Limited => Err(too_many_attempts()),
+                }
+            }
+
+            Change::Logout => Ok(with_cookie(
+                json(StatusCode::OK, &Empty {}),
+                SIGNED_OUT_COOKIE,
+            )),
         }
+    }
+
+    /// Every change needs a password, so a change handler always has one.
+    fn required_auth(&self) -> Result<&Auth, Rejection> {
+        self.auth
+            .as_ref()
+            .ok_or_else(|| Rejection::new(StatusCode::FORBIDDEN, PASSWORD_NEEDED))
     }
 
     /// The button is offered only to a signed-in user: the route needs the password too.
     fn update_view(&self) -> UpdateView {
         let mut view = self.updates.view();
-        view.can_install = self.credentials.is_some() && self.stager.can_install();
+        view.can_install = self.auth.is_some() && self.stager.can_install();
         view.install = self.stager.view();
 
         view
@@ -559,6 +601,61 @@ impl Web {
             .map(ListView::of)
             .collect()
     }
+}
+
+/// A valid session cookie is enough. Without one, a Basic header is a password check, and a
+/// request with neither counts nothing.
+async fn authenticate(auth: &Auth, headers: &HeaderMap, peer: IpAddr) -> Result<(), Rejection> {
+    if auth.has_session(headers, unix_now()) {
+        return Ok(());
+    }
+
+    let sent = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+        .map(|(_, credentials)| credentials.trim());
+
+    let Some(sent) = sent else {
+        return Err(unauthorized(headers, "sign in"));
+    };
+
+    match auth.check(peer, Attempt::Basic(sent)).await {
+        Check::Accepted => Ok(()),
+        Check::Refused => Err(unauthorized(headers, "sign in")),
+        Check::Limited => Err(too_many_attempts()),
+    }
+}
+
+/// A Basic challenge makes a browser show its own prompt, even for `fetch`, so the page's
+/// script, which says who it is, gets none. Clients that send credentials only after a
+/// challenge (GNU wget) still get it.
+fn unauthorized(headers: &HeaderMap, message: &'static str) -> Rejection {
+    let rejection = Rejection::new(StatusCode::UNAUTHORIZED, message);
+    let is_page = headers
+        .get("x-requested-with")
+        .is_some_and(|value| value == "picoguard");
+
+    if is_page {
+        return rejection;
+    }
+
+    rejection.with_header(header::WWW_AUTHENTICATE, "Basic realm=\"picoguard\"")
+}
+
+fn too_many_attempts() -> Rejection {
+    Rejection::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many attempts, try again later",
+    )
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Empty, or a colon and a port number.
@@ -643,49 +740,6 @@ fn method_not_allowed(allowed: &'static str) -> Rejection {
         .with_header(header::ALLOW, allowed)
 }
 
-/// The expected `Authorization` credentials, kept as an HMAC-SHA256 tag under a key drawn at
-/// startup. Tags have one size, so neither what is stored nor the comparison depends on the
-/// length of the secret, and `hmac::verify` does not stop at the first difference.
-struct Credentials {
-    key: hmac::Key,
-    tag: hmac::Tag,
-}
-
-impl Credentials {
-    fn new(credentials: &str) -> Result<Credentials, String> {
-        let key = hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new())
-            .map_err(|_| "cannot draw a random key for the web credentials".to_string())?;
-        let tag = hmac::sign(&key, credentials.as_bytes());
-
-        Ok(Credentials { key, tag })
-    }
-
-    fn accepts(&self, sent: &str) -> bool {
-        hmac::verify(&self.key, sent.as_bytes(), self.tag.as_ref()).is_ok()
-    }
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
-
-    for chunk in bytes.chunks(3) {
-        let group = chunk.iter().enumerate().fold(0u32, |group, (index, byte)| {
-            group | u32::from(*byte) << (16 - 8 * index)
-        });
-
-        for index in 0..4 {
-            if index <= chunk.len() {
-                text.push(ALPHABET[(group >> (18 - 6 * index) & 0x3f) as usize] as char);
-            } else {
-                text.push('=');
-            }
-        }
-    }
-
-    text
-}
-
 fn json<T: Serialize>(status: StatusCode, value: &T) -> Response<Full<Bytes>> {
     let body = serde_json::to_vec(value).unwrap_or_default();
 
@@ -711,6 +765,34 @@ fn with_protective_headers(mut response: Response<Full<Bytes>>) -> Response<Full
             "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
         ),
     );
+
+    response
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginRequest {
+    user: String,
+    password: String,
+}
+
+/// `{"user": "...", "password": "..."}` and nothing else; like `install_version`, the first byte
+/// must open an object.
+fn login_request(body: &[u8]) -> Option<LoginRequest> {
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+
+    serde_json::from_slice(body).ok()
+}
+
+#[derive(Serialize)]
+struct Empty {}
+
+fn with_cookie(mut response: Response<Full<Bytes>>, cookie: &str) -> Response<Full<Bytes>> {
+    if let Ok(cookie) = HeaderValue::from_str(cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
 
     response
 }
@@ -967,45 +1049,6 @@ mod tests {
         assert!(!check(Some("application/x-www-form-urlencoded")));
         assert!(!check(Some("multipart/form-data; boundary=x")));
         assert!(!check(Some("application/jsonp")));
-    }
-
-    #[test]
-    fn base64_matches_the_standard_vectors() {
-        for (plain, encoded) in [
-            ("", ""),
-            ("f", "Zg=="),
-            ("fo", "Zm8="),
-            ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="),
-            ("fooba", "Zm9vYmE="),
-            ("foobar", "Zm9vYmFy"),
-            ("admin:s3cret", "YWRtaW46czNjcmV0"),
-        ] {
-            assert_eq!(base64(plain.as_bytes()), encoded, "{plain}");
-        }
-    }
-
-    #[test]
-    fn credentials_are_accepted_only_when_every_byte_is_equal() {
-        let credentials = Credentials::new("abc").unwrap();
-
-        assert!(credentials.accepts("abc"));
-        assert!(!credentials.accepts("abd"));
-        assert!(!credentials.accepts("abcd"));
-        assert!(!credentials.accepts("ab"));
-        assert!(!credentials.accepts(""));
-        assert!(Credentials::new("").unwrap().accepts(""));
-    }
-
-    #[test]
-    fn what_is_kept_of_the_credentials_has_the_same_size_whatever_their_length() {
-        let short = Credentials::new("a").unwrap();
-        let long = Credentials::new(&"a".repeat(5000)).unwrap();
-
-        assert_eq!(short.tag.as_ref().len(), long.tag.as_ref().len());
-        assert_eq!(std::mem::size_of_val(&short), std::mem::size_of_val(&long));
-        assert!(!short.accepts(&"a".repeat(5000)));
-        assert!(long.accepts(&"a".repeat(5000)));
     }
 
     #[test]

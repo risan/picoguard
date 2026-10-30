@@ -58,7 +58,7 @@ group_cases() {
             fi
             ;;
         removal) echo "rollback_with_older_installer uninstall uninstall_purge" ;;
-        fresh) echo "install_no_start rollback_without_installer" ;;
+        fresh) echo "install_no_start install_with_password rollback_without_installer" ;;
     esac
 }
 
@@ -314,6 +314,25 @@ api_status() {
             ;;
         openrc) wget -qO- http://127.0.0.1:8080/api/status ;;
     esac
+}
+
+# web_login PASSWORD: signs in as admin; 0 only for a 200 that sets the session cookie.
+web_login() {
+    body="{\"user\": \"admin\", \"password\": \"$1\"}"
+
+    case $INIT in
+        systemd)
+            reply=$(BODY=$body bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf "POST /api/login HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: %s\r\n\r\n%s" "${#BODY}" "$BODY" >&3 && cat <&3') ||
+                return 1
+            ;;
+        openrc)
+            reply=$(wget -S -O /dev/null --header 'Content-Type: application/json' --post-data "$body" \
+                http://127.0.0.1:8080/api/login 2>&1) || return 1
+            ;;
+    esac
+
+    printf '%s\n' "$reply" | grep -q 'HTTP/1\.[01] 200' || return 1
+    printf '%s\n' "$reply" | grep -qi 'set-cookie: picoguard_session='
 }
 
 install_state() {
@@ -896,6 +915,47 @@ install_no_start() {
             esac
             ;;
     esac
+}
+
+# A new install with a generated password: the config keeps only its hash, and the password
+# shown once signs in. A second run keeps the config as it is.
+install_with_password() {
+    out=$(sh "$FIXTURES/install.sh" --yes --binary "$FIXTURES/picoguard" 2>&1) ||
+        fail "install.sh failed: $out"
+    printf '%s\n' "$out" | sed 's/^  password: .*/  password: (hidden)/'
+
+    [ "$(printf '%s\n' "$out" | grep -c '^  password: ')" = 1 ] || fail "the password is not shown exactly once"
+    password=$(printf '%s\n' "$out" | sed -n 's/^  password: //p')
+    [ -n "$password" ] || fail "the shown password is empty"
+
+    grep -qx 'user = "admin"' "$CONFIG" || fail "the config has no user line"
+    grep -q '^password_hash = "pbkdf2-sha256\$600000\$' "$CONFIG" || fail "the config has no password_hash line"
+
+    if grep -q '^password = ' "$CONFIG"; then
+        fail "the config has a plaintext password line"
+    fi
+
+    if grep -qF "$password" "$CONFIG"; then
+        fail "the config contains the shown password"
+    fi
+
+    wait_for 30 web_login "$password" || fail "the shown password does not sign in"
+
+    if web_login wrong-password; then
+        fail "a wrong password signs in"
+    fi
+
+    before=$(cksum <"$CONFIG")
+    out=$(sh "$FIXTURES/install.sh" --yes --binary "$FIXTURES/picoguard" 2>&1) ||
+        fail "the second install.sh run failed: $out"
+
+    case $out in
+        *"Keeping the existing config"*) ;;
+        *) fail "the second run does not say it keeps the config" ;;
+    esac
+
+    [ "$(cksum <"$CONFIG")" = "$before" ] || fail "the second run changed the config"
+    wait_for 30 web_login "$password" || fail "the password does not sign in after the second run"
 }
 
 # ---- OpenRC: what the polling watcher costs and how it starts ----

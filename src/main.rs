@@ -1,7 +1,8 @@
+use std::io::{BufRead, IsTerminal, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use picoguard::config::Config;
@@ -9,6 +10,7 @@ use picoguard::dns_check;
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::{Downloader, resolver_over};
+use picoguard::password::{DEFAULT_ITERATIONS, PasswordHash};
 use picoguard::pipeline::Pipeline;
 use picoguard::release::{self, Refusal, VerifySetup};
 use picoguard::scheduler::{Scheduler, Timing};
@@ -37,6 +39,7 @@ Options:
   -c, --config FILE  Config file (default: /etc/picoguard/picoguard.toml)
       --check        Load and validate the config, print OK or the error, then exit
       --version      Print the version
+      --hash-password  Read a password from standard input; print a password_hash line for [web]
   -h, --help         Print this help
 
 verify-update copies a staged update into the new directory INTO_DIR and checks it. It is
@@ -51,6 +54,7 @@ enum Command {
     Check { config_path: PathBuf },
     Version,
     Help,
+    HashPassword,
     VerifyUpdate { staged: PathBuf, into: PathBuf },
     DnsCheck { target: SocketAddr },
 }
@@ -83,6 +87,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
 
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut check = false;
+    let mut hash_password = false;
+    // So a password typed after the flag is never taken for something else.
+    const HASH_PASSWORD_ALONE: &str = "--hash-password takes no value and only -c FILE beside it";
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -97,6 +104,17 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
                 check = true;
             }
 
+            "--hash-password" => {
+                hash_password = true;
+            }
+
+            // Either order of the two flags is the same mistake.
+            "--version" | "-h" | "--help"
+                if hash_password || args.any(|rest| rest == "--hash-password") =>
+            {
+                return Err(HASH_PASSWORD_ALONE.to_string());
+            }
+
             "--version" => {
                 return Ok(Command::Version);
             }
@@ -105,10 +123,22 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
                 return Ok(Command::Help);
             }
 
+            _ if hash_password => {
+                return Err(HASH_PASSWORD_ALONE.to_string());
+            }
+
             _ => {
                 return Err(format!("unknown argument {arg}"));
             }
         }
+    }
+
+    if hash_password && check {
+        return Err(HASH_PASSWORD_ALONE.to_string());
+    }
+
+    if hash_password {
+        return Ok(Command::HashPassword);
     }
 
     if check {
@@ -150,6 +180,8 @@ fn main() -> ExitCode {
 
             ExitCode::SUCCESS
         }
+
+        Ok(Command::HashPassword) => hash_password(),
 
         Ok(Command::VerifyUpdate { staged, into }) => verify(&staged, &into),
 
@@ -203,6 +235,103 @@ fn verify(staged: &Path, into: &Path) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The first line of `input`, without its `\n` or `\r\n`.
+fn read_password(input: &mut impl BufRead) -> Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+    input
+        .read_until(b'\n', &mut line)
+        .map_err(|error| format!("cannot read the password: {error}"))?;
+
+    if line.ends_with(b"\n") {
+        line.pop();
+        if line.ends_with(b"\r") {
+            line.pop();
+        }
+    }
+
+    if line.is_empty() {
+        return Err("the password must not be empty".to_string());
+    }
+
+    Ok(line)
+}
+
+fn hash_password() -> ExitCode {
+    let stdin = std::io::stdin();
+    let echo_off = stdin.is_terminal().then(EchoOff::start).flatten();
+    let password = read_password(&mut stdin.lock());
+    drop(echo_off);
+
+    let hash = password.and_then(|password| PasswordHash::new(&password, DEFAULT_ITERATIONS));
+
+    match hash {
+        Ok(hash) => {
+            println!("password_hash = \"{hash}\"");
+
+            ExitCode::SUCCESS
+        }
+
+        Err(message) => {
+            eprintln!("{message}");
+
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The terminal settings to put back, also from a signal handler.
+static SAVED_TERMINAL: OnceLock<libc::termios> = OnceLock::new();
+
+/// Prompts on a terminal and stops it echoing what is typed until dropped. `None` when the
+/// terminal settings cannot be read; the password is then read with echo.
+struct EchoOff;
+
+impl EchoOff {
+    fn start() -> Option<EchoOff> {
+        eprint!("Password: ");
+        let _ = std::io::stderr().flush();
+
+        let mut settings: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut settings) } != 0 {
+            return None;
+        }
+
+        let saved = *SAVED_TERMINAL.get_or_init(|| settings);
+        // The handler only calls tcsetattr and _exit, both async-signal-safe, so Ctrl-C at
+        // the prompt never leaves the terminal without echo.
+        let handler = restore_terminal_and_exit as extern "C" fn(libc::c_int);
+        unsafe {
+            libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+        }
+
+        let mut silent = saved;
+        silent.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &silent) };
+
+        Some(EchoOff)
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if let Some(saved) = SAVED_TERMINAL.get() {
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved) };
+        }
+
+        // The Enter that ended the line was not echoed.
+        eprintln!();
+    }
+}
+
+extern "C" fn restore_terminal_and_exit(_signal: libc::c_int) {
+    if let Some(saved) = SAVED_TERMINAL.get() {
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved) };
+    }
+
+    unsafe { libc::_exit(130) };
 }
 
 fn check(config_path: &Path) -> ExitCode {
@@ -475,6 +604,50 @@ mod tests {
             parse(&["--config"]),
             Err("--config needs a file argument".to_string())
         );
+    }
+
+    #[test]
+    fn hash_password_takes_no_value_and_only_a_config_beside_it() {
+        assert_eq!(parse(&["--hash-password"]), Ok(Command::HashPassword));
+        assert_eq!(
+            parse(&["-c", "/x", "--hash-password"]),
+            Ok(Command::HashPassword)
+        );
+
+        for args in [
+            &["--hash-password", "pw"][..],
+            &["pw", "--hash-password"],
+            &["--hash-password", "--check"],
+            &["--hash-password", "--version"],
+            &["--version", "--hash-password"],
+            &["--hash-password", "--help"],
+            &["-h", "--hash-password"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn the_password_is_the_first_line_without_its_line_ending() {
+        for input in ["pw\n", "pw\r\n", "pw", "pw\nmore\n"] {
+            assert_eq!(
+                read_password(&mut input.as_bytes()),
+                Ok(b"pw".to_vec()),
+                "{input:?}"
+            );
+        }
+
+        assert_eq!(
+            read_password(&mut " pw \n".as_bytes()),
+            Ok(b" pw ".to_vec())
+        );
+    }
+
+    #[test]
+    fn an_empty_password_is_refused() {
+        for input in ["", "\n", "\r\n"] {
+            assert!(read_password(&mut input.as_bytes()).is_err(), "{input:?}");
+        }
     }
 
     #[test]

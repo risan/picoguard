@@ -5,7 +5,7 @@
 mod common;
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -18,6 +18,7 @@ use picoguard::config::{Config, ListConfig, ListFormat};
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::Downloader;
+use picoguard::password::PasswordHash;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Scheduler, Timing};
 use picoguard::stage::{StageSetup, StageTiming, Stager};
@@ -26,7 +27,7 @@ use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 
 const ADMIN: &str = "YWRtaW46czNjcmV0";
 const WRONG_PASSWORD: &str = "YWRtaW46d3Jvbmc=";
@@ -49,6 +50,15 @@ impl Reply {
     fn json(&self) -> Value {
         serde_json::from_str(&self.body).unwrap_or_else(|error| panic!("{error}: {}", self.body))
     }
+
+    /// The `picoguard_session` value this reply sets.
+    fn session(&self) -> Option<String> {
+        let cookie = self
+            .header("set-cookie")?
+            .strip_prefix("picoguard_session=")?;
+
+        Some(cookie.split(';').next()?.to_string())
+    }
 }
 
 /// A request written by hand, so a test can send what a browser never would.
@@ -66,6 +76,13 @@ fn get(path: &str) -> Request {
         headers: Vec::new(),
         body: Vec::new(),
     }
+}
+
+fn login(user: &str, password: &str) -> Request {
+    post(
+        "/api/login",
+        &serde_json::json!({ "user": user, "password": password }).to_string(),
+    )
 }
 
 fn post(path: &str, body: &str) -> Request {
@@ -94,6 +111,21 @@ impl Request {
 
     fn signed_in(self, credentials: &str) -> Request {
         self.header("Authorization", &format!("Basic {credentials}"))
+    }
+
+    /// What the page's own script sends with every call.
+    fn by_page(self) -> Request {
+        self.header("X-Requested-With", "picoguard")
+    }
+
+    /// Only the cookie: a pass can never come from basic auth.
+    fn with_session(self, token: &str) -> Request {
+        assert!(
+            !self.is_signed_in(),
+            "a cookie-only request carries basic auth"
+        );
+
+        self.header("Cookie", &format!("picoguard_session={token}"))
     }
 
     fn bytes(&self, default_host: SocketAddr) -> Vec<u8> {
@@ -132,9 +164,25 @@ impl Request {
 
 /// Writes `bytes` and reads until the server closes. Empty when the server sent nothing.
 async fn exchange(address: SocketAddr, bytes: &[u8]) -> Vec<u8> {
-    let Ok(mut stream) = TcpStream::connect(address).await else {
+    let Ok(stream) = TcpStream::connect(address).await else {
         return Vec::new();
     };
+
+    exchange_on(stream, bytes).await
+}
+
+/// As `exchange`, from another loopback address, so the server sees another client.
+async fn exchange_from(address: SocketAddr, from: IpAddr, bytes: &[u8]) -> Vec<u8> {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind(SocketAddr::new(from, 0)).unwrap();
+    let Ok(stream) = socket.connect(address).await else {
+        return Vec::new();
+    };
+
+    exchange_on(stream, bytes).await
+}
+
+async fn exchange_on(mut stream: TcpStream, bytes: &[u8]) -> Vec<u8> {
     let _ = stream.write_all(bytes).await;
 
     let mut received = Vec::new();
@@ -194,6 +242,21 @@ impl Site {
         parse_reply(&bytes).unwrap_or_else(|| panic!("no reply: {bytes:?}"))
     }
 
+    /// Sends the request as it is, never with the administrator's credentials.
+    async fn send_as_is(&self, request: Request) -> Reply {
+        let bytes = exchange(self.web, &request.bytes(self.web)).await;
+
+        parse_reply(&bytes).unwrap_or_else(|| panic!("no reply: {bytes:?}"))
+    }
+
+    /// As `send_as_is`, from another client address.
+    async fn send_from(&self, from: &str, request: Request) -> Reply {
+        let from: IpAddr = from.parse().unwrap();
+        let bytes = exchange_from(self.web, from, &request.bytes(self.web)).await;
+
+        parse_reply(&bytes).unwrap_or_else(|| panic!("no reply: {bytes:?}"))
+    }
+
     /// True when the server closed the connection without sending anything.
     async fn is_ignored(&self, request: Request) -> bool {
         exchange(self.web, &request.bytes(self.web))
@@ -232,6 +295,19 @@ fn with_credentials(config: &mut Config) {
 fn without_credentials(config: &mut Config) {
     config.web.user = None;
     config.web.password = None;
+}
+
+/// User `admin` with a hash of `password` instead of the plaintext.
+fn hashed_config(
+    upstream: &common::harness::FakeUpstream,
+    password: &str,
+    iterations: u32,
+) -> Config {
+    let mut config = local_config(upstream);
+    config.web.password = None;
+    config.web.password_hash = Some(PasswordHash::new(password.as_bytes(), iterations).unwrap());
+
+    config
 }
 
 /// A scheduler that refreshes nothing by itself for a day, so a refresh is always asked for.
@@ -366,7 +442,7 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
         updates,
         release,
         stager,
-        signs_in: config.web.password.is_some(),
+        signs_in: config.web.user.is_some(),
     }
 }
 
@@ -406,8 +482,8 @@ async fn the_page_is_served_with_protective_headers() {
 /// The page's ceiling for every slice of release 1.
 const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
 
-/// This slice, the redesign; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 24 * 1024;
+/// This slice, the sign-in form; a later slice raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 26 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -417,7 +493,7 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
 
     assert!(
         page.len() <= PAGE_BUDGET_BYTES,
-        "the redesign budget is {PAGE_BUDGET_BYTES} bytes, the page has {}",
+        "this slice's budget is {PAGE_BUDGET_BYTES} bytes, the page has {}",
         page.len()
     );
     assert!(
@@ -440,6 +516,8 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/resume",
         "/api/lists/refresh",
         "/api/update",
+        "/api/login",
+        "/api/logout",
         "setInterval(update, 5000)",
         "id=\"version\"",
         "id=\"update\"",
@@ -462,6 +540,31 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
 
     // Names come from the network: the page never builds markup from them.
     assert!(!page.contains("innerHTML") && !page.contains("insertAdjacentHTML"));
+}
+
+/// No browser here: the sign-in flow is checked as source, and in the build's browser check.
+#[tokio::test]
+async fn the_page_signs_in_with_its_own_form_and_never_asks_for_the_browser_prompt() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send_as_is(get("/")).await.body;
+
+    for needed in [
+        "id=\"login-form\"",
+        "id=\"login-user\"",
+        "id=\"login-password\"",
+        "type=\"password\"",
+        "autocomplete=\"current-password\"",
+        "id=\"login-note\"",
+        "id=\"logout\"",
+        "class=\"signed-out\"",
+        "\"X-Requested-With\": \"picoguard\"",
+        "authEpoch",
+        "authBusy",
+        "\"Session ended, sign in again.\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
 }
 
 /// No browser here: the tab code is checked as source. A tab is a `[data-tab]` button and a
@@ -1003,19 +1106,108 @@ fn rejected_mutations() -> Vec<(&'static str, Request, u16)> {
         ),
         ("a post of a read", post("/api/status", "{}"), 405),
         ("a post of the page", post("/", "{}"), 405),
+        (
+            "a login from another origin",
+            login("admin", "s3cret").header("Origin", "http://evil.example"),
+            403,
+        ),
+        (
+            "a login from a null origin",
+            login("admin", "s3cret").header("Origin", "null"),
+            403,
+        ),
+        (
+            "a login for a name that is not configured",
+            login("admin", "s3cret").header("Host", "evil.example"),
+            403,
+        ),
+        (
+            "a login as plain text",
+            login("admin", "s3cret").header("Content-Type", "text/plain"),
+            415,
+        ),
+        (
+            "a login without a content type",
+            Request {
+                headers: Vec::new(),
+                ..login("admin", "s3cret")
+            },
+            415,
+        ),
+        (
+            "a login body over 1 KiB",
+            post(
+                "/api/login",
+                &format!(
+                    "{{\"user\": \"admin\", \"password\": \"s3cret\", \"padding\": \"{}\"}}",
+                    "x".repeat(1100)
+                ),
+            ),
+            413,
+        ),
+        (
+            "a get of login",
+            Request {
+                method: "GET",
+                ..login("admin", "s3cret")
+            },
+            405,
+        ),
+        (
+            "a put of login",
+            Request {
+                method: "PUT",
+                ..login("admin", "s3cret")
+            },
+            405,
+        ),
+        (
+            "a logout from another origin",
+            post("/api/logout", "{}").header("Origin", "http://evil.example"),
+            403,
+        ),
+        (
+            "a logout from a null origin",
+            post("/api/logout", "{}").header("Origin", "null"),
+            403,
+        ),
+        (
+            "a logout for a name that is not configured",
+            post("/api/logout", "{}").header("Host", "evil.example"),
+            403,
+        ),
+        (
+            "a logout as plain text",
+            post("/api/logout", "{}").header("Content-Type", "text/plain"),
+            415,
+        ),
+        (
+            "a logout without a content type",
+            Request {
+                headers: Vec::new(),
+                ..post("/api/logout", "{}")
+            },
+            415,
+        ),
+        ("a logout body over 1 KiB", post("/api/logout", &big), 413),
+        ("a get of logout", get("/api/logout"), 405),
+        (
+            "a put of logout",
+            Request {
+                method: "PUT",
+                ..post("/api/logout", "{}")
+            },
+            405,
+        ),
     ]
 }
 
-async fn assert_mutations_are_rejected(site: &Site, credentials: Option<&str>) {
+async fn assert_mutations_are_rejected(site: &Site, sign_in: impl Fn(Request) -> Request) {
     for (what, request, status) in rejected_mutations() {
-        let request = match credentials {
-            Some(credentials) => request.signed_in(credentials),
-            None => request,
-        };
-
-        let reply = site.send(request).await;
+        let reply = site.send_as_is(sign_in(request)).await;
 
         assert_eq!(reply.status, status, "{what}");
+        assert_eq!(reply.header("set-cookie"), None, "{what} set a cookie");
         assert!(!site.is_paused(), "{what} paused blocking");
         assert_nothing_was_started(site, what);
     }
@@ -1109,7 +1301,7 @@ async fn a_hanging_check_holds_up_neither_dns_nor_the_page() {
     assert_eq!(github.requests(), 1);
 }
 
-const SET_A_PASSWORD: &str = "set web.user and web.password to use this";
+const SET_A_PASSWORD: &str = "set web.user and web.password_hash (or web.password) to use this";
 
 #[tokio::test]
 async fn without_a_password_the_page_shows_totals_and_lists_and_nothing_else() {
@@ -1156,6 +1348,8 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
         ("refresh", post("/api/lists/refresh", "")),
         ("update", post("/api/update", UPDATE_BODY)),
         ("a get of pause", get("/api/pause")),
+        ("login", login("admin", "s3cret")),
+        ("logout", post("/api/logout", "{}")),
     ] {
         let reply = site.send(request).await;
 
@@ -1219,7 +1413,20 @@ async fn unsafe_mutations_are_rejected_with_a_password_and_valid_credentials() {
     with_credentials(&mut config);
     let site = full_site(config).await;
 
-    assert_mutations_are_rejected(&site, Some(ADMIN)).await;
+    assert_mutations_are_rejected(&site, |request| request.signed_in(ADMIN)).await;
+}
+
+#[tokio::test]
+async fn unsafe_mutations_are_rejected_with_a_session_cookie() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let site = full_site(local_config(&upstream)).await;
+    let token = site
+        .send_as_is(login("admin", "s3cret"))
+        .await
+        .session()
+        .unwrap();
+
+    assert_mutations_are_rejected(&site, |request| request.with_session(&token)).await;
 }
 
 #[tokio::test]
@@ -1234,68 +1441,454 @@ async fn a_get_of_a_mutation_names_the_method_that_works() {
 }
 
 #[tokio::test]
-async fn the_page_and_every_endpoint_need_the_password_when_one_is_set() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let mut config = local_config(&upstream);
-    with_credentials(&mut config);
-    let mut site = site(config).await;
-    site.signs_in = false;
-    let reads = ["/", "/api/status", "/api/querylog", "/api/lists"];
+async fn with_a_password_the_page_opens_without_a_prompt_and_the_api_needs_a_sign_in() {
+    let (site, _upstream) = plain_site().await;
+    let reads = ["/api/status", "/api/querylog", "/api/lists"];
     let changes = [
         ("/api/pause", "{\"minutes\": 5}"),
         ("/api/resume", ""),
         ("/api/lists/refresh", ""),
         ("/api/update", UPDATE_BODY),
     ];
+    let requests = || {
+        reads
+            .iter()
+            .map(|path| get(path))
+            .chain(changes.iter().map(|(path, body)| post(path, body)))
+    };
 
-    let sign_in_attempts = [
-        None,
-        Some(WRONG_PASSWORD),
-        Some(OTHER_USER),
-        Some("YWRtaW46czNjcmU="),
-        Some("YWRtaW46czNjcmV0eA=="),
-        Some(""),
+    let page = site.send_as_is(get("/")).await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("<title>picoguard"));
+    assert_eq!(page.header("www-authenticate"), None);
+
+    for request in requests() {
+        let path = request.path.clone();
+        let reply = site.send_as_is(request).await;
+
+        assert_eq!(reply.status, 401, "{path}");
+        assert_eq!(
+            reply.header("www-authenticate"),
+            Some("Basic realm=\"picoguard\""),
+            "{path}"
+        );
+        assert!(!reply.body.contains("counters"), "{path}");
+    }
+
+    for request in requests() {
+        let path = request.path.clone();
+        let reply = site.send_as_is(request.by_page()).await;
+
+        assert_eq!(reply.status, 401, "{path}");
+        assert_eq!(reply.header("www-authenticate"), None, "{path}");
+    }
+
+    let wrong_credentials = [
+        WRONG_PASSWORD,
+        OTHER_USER,
+        "YWRtaW46czNjcmU=",
+        "YWRtaW46czNjcmV0eA==",
+        "",
     ];
-    for attempt in sign_in_attempts {
-        let signed = |request: Request| match attempt {
-            Some(credentials) => request.signed_in(credentials),
-            None => request,
-        };
+    // Each request from its own address, so none of them reaches the limit.
+    for (attempt, credentials) in wrong_credentials.iter().enumerate() {
+        for (index, request) in requests().enumerate() {
+            let path = request.path.clone();
+            let from = format!("127.0.{}.{}", 10 + attempt, 1 + index);
+            let reply = site.send_from(&from, request.signed_in(credentials)).await;
 
-        for path in reads {
-            let reply = site.send(signed(get(path))).await;
-            assert_eq!(reply.status, 401, "{path} {attempt:?}");
+            assert_eq!(reply.status, 401, "{path} {credentials:?}");
             assert_eq!(
                 reply.header("www-authenticate"),
-                Some("Basic realm=\"picoguard\"")
+                Some("Basic realm=\"picoguard\""),
+                "{path} {credentials:?}"
             );
-            assert!(!reply.body.contains("counters") && !reply.body.contains("<html"));
-        }
-
-        for (path, body) in changes {
-            let reply = site.send(signed(post(path, body))).await;
-            assert_eq!(reply.status, 401, "{path} {attempt:?}");
         }
     }
 
     assert!(!site.is_paused());
 
     for path in reads {
-        let reply = site.send(get(path).signed_in(ADMIN)).await;
+        let reply = site.send_as_is(get(path).signed_in(ADMIN)).await;
         assert_eq!(reply.status, 200, "{path}");
     }
 
     let lowercase_scheme = get("/api/status").header("Authorization", &format!("basic {ADMIN}"));
-    assert_eq!(site.send(lowercase_scheme).await.status, 200);
+    assert_eq!(site.send_as_is(lowercase_scheme).await.status, 200);
 
     let paused = site
-        .send(post("/api/pause", "{\"minutes\": 5}").signed_in(ADMIN))
+        .send_as_is(post("/api/pause", "{\"minutes\": 5}").signed_in(ADMIN))
         .await;
     assert_eq!(paused.status, 200);
     assert!(site.is_paused());
-    let resumed = site.send(post("/api/resume", "").signed_in(ADMIN)).await;
+    let resumed = site
+        .send_as_is(post("/api/resume", "").signed_in(ADMIN))
+        .await;
     assert_eq!(resumed.status, 200);
     assert!(!site.is_paused());
+}
+
+const TOO_MANY_ATTEMPTS: &str = "{\"error\":\"too many attempts, try again later\"}";
+
+#[tokio::test]
+async fn wrong_basic_auth_counts_toward_the_limit_and_anonymous_requests_do_not() {
+    let (site, _upstream) = plain_site().await;
+
+    for _ in 0..10 {
+        let reply = site.send_from("127.0.0.2", get("/api/status")).await;
+        assert_eq!(reply.status, 401);
+    }
+
+    for _ in 0..5 {
+        let reply = site
+            .send_from("127.0.0.2", get("/api/status").signed_in(WRONG_PASSWORD))
+            .await;
+        assert_eq!(reply.status, 401);
+    }
+
+    let limited = site
+        .send_from("127.0.0.2", get("/api/status").signed_in(ADMIN))
+        .await;
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.body, TOO_MANY_ATTEMPTS);
+    assert_eq!(limited.header("www-authenticate"), None);
+
+    let other = site
+        .send_from("127.0.0.3", get("/api/status").signed_in(ADMIN))
+        .await;
+    assert_eq!(other.status, 200);
+}
+
+#[tokio::test]
+async fn a_password_hash_opens_the_api_with_basic_auth() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let site = site(hashed_config(&upstream, "s3cret", 1000)).await;
+
+    let wrong = site
+        .send_as_is(get("/api/status").signed_in(WRONG_PASSWORD))
+        .await;
+    assert_eq!(wrong.status, 401);
+
+    let right = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
+    assert_eq!(right.status, 200);
+    assert!(right.json().get("limited").is_none(), "{}", right.body);
+}
+
+#[tokio::test]
+async fn repeated_basic_auth_with_a_hash_does_not_pay_the_hash_each_time() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let config = hashed_config(&upstream, "s3cret", 100_000);
+    let hash = config.web.password_hash.clone().unwrap();
+    let site = site(config).await;
+    let started = Instant::now();
+    assert!(hash.verify(b"s3cret"));
+    let one = started.elapsed();
+
+    let wrong = site
+        .send_as_is(get("/api/status").signed_in(WRONG_PASSWORD))
+        .await;
+    assert_eq!(wrong.status, 401);
+    let first = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
+    assert_eq!(first.status, 200);
+    assert!(first.json().get("limited").is_none());
+
+    let started = Instant::now();
+    for _ in 0..100 {
+        let reply = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
+        assert_eq!(reply.status, 200);
+    }
+    let hundred = started.elapsed();
+
+    // Uncached, they would take `one * 100`.
+    assert!(
+        hundred < one * 10,
+        "one hash {one:?}, 100 requests {hundred:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_slow_password_check_holds_up_neither_dns_nor_the_page() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let site = Arc::new(site(hashed_config(&upstream, "s3cret", 2_000_000)).await);
+
+    let slow = tokio::spawn({
+        let site = Arc::clone(&site);
+
+        async move {
+            site.send_from("127.0.0.2", get("/api/status").signed_in(WRONG_PASSWORD))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let answers = async {
+        ask(&site.dns, "ok.example.", RecordType::A).await;
+        site.send_as_is(get("/")).await
+    };
+    let page = tokio::time::timeout(Duration::from_secs(2), answers)
+        .await
+        .expect("DNS and the page answer while a password is hashed");
+    assert_eq!(page.status, 200);
+    assert!(!slow.is_finished(), "the hash ended before DNS was asked");
+
+    assert_eq!(slow.await.unwrap().status, 401);
+}
+
+const WRONG_USER_OR_PASSWORD: &str = "{\"error\":\"wrong user or password\"}";
+const SIGNED_OUT: &str = "picoguard_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict";
+
+#[tokio::test]
+async fn signing_in_sets_a_strict_http_only_cookie_that_opens_the_api() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+
+    for config in [
+        local_config(&upstream),
+        hashed_config(&upstream, "s3cret", 1000),
+    ] {
+        let site = site(config).await;
+        ask(&site.dns, "ads.example.", RecordType::A).await;
+
+        let reply = site.send_as_is(login("admin", "s3cret")).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert_eq!(reply.body, "{}");
+        let cookie = reply.header("set-cookie").unwrap();
+        assert!(cookie.starts_with("picoguard_session="), "{cookie}");
+        for attribute in [
+            "; Max-Age=2592000",
+            "; Path=/",
+            "; HttpOnly",
+            "; SameSite=Strict",
+        ] {
+            assert!(cookie.contains(attribute), "{cookie} lacks {attribute}");
+        }
+        let token = reply.session().unwrap();
+
+        let status = site
+            .send_as_is(get("/api/status").with_session(&token))
+            .await;
+        assert_eq!(status.status, 200);
+        assert!(status.json().get("top_queried").is_some());
+
+        let paused = site
+            .send_as_is(post("/api/pause", "{\"minutes\": 5}").with_session(&token))
+            .await;
+        assert_eq!(paused.status, 200);
+        assert!(site.is_paused());
+
+        let spaced = post(
+            "/api/login",
+            " \n {\"user\": \"admin\", \"password\": \"s3cret\"}",
+        );
+        let reply = site.send_as_is(spaced).await;
+        assert_eq!(reply.status, 200);
+        assert!(reply.session().is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_wrong_user_and_a_wrong_password_get_the_same_answer() {
+    let (site, _upstream) = plain_site().await;
+    let attempts = [("other", "s3cret"), ("admin", "wrong"), ("other", "wrong")];
+
+    for (index, (user, password)) in attempts.into_iter().enumerate() {
+        let from = format!("127.0.1.{}", 1 + index);
+        let reply = site.send_from(&from, login(user, password)).await;
+        assert_eq!(reply.status, 401);
+        assert_eq!(reply.body, WRONG_USER_OR_PASSWORD);
+        assert_eq!(reply.header("set-cookie"), None);
+        assert_eq!(
+            reply.header("www-authenticate"),
+            Some("Basic realm=\"picoguard\"")
+        );
+
+        let from = format!("127.0.2.{}", 1 + index);
+        let reply = site.send_from(&from, login(user, password).by_page()).await;
+        assert_eq!(reply.status, 401);
+        assert_eq!(reply.body, WRONG_USER_OR_PASSWORD);
+        assert_eq!(reply.header("set-cookie"), None);
+        assert_eq!(reply.header("www-authenticate"), None);
+    }
+}
+
+/// `token` with the character at `index` changed to another digit.
+fn changed_at(token: &str, index: usize) -> String {
+    let mut bytes = token.as_bytes().to_vec();
+    bytes[index] = if bytes[index] == b'1' { b'2' } else { b'1' };
+
+    String::from_utf8(bytes).unwrap()
+}
+
+#[tokio::test]
+async fn a_changed_or_foreign_cookie_is_treated_as_none() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let site = site(local_config(&upstream)).await;
+    let mut other_config = local_config(&upstream);
+    other_config.web.password = Some("other".to_string());
+    let other = self::site(other_config).await;
+    let token = site
+        .send_as_is(login("admin", "s3cret"))
+        .await
+        .session()
+        .unwrap();
+    let foreign = other
+        .send_as_is(login("admin", "other"))
+        .await
+        .session()
+        .unwrap();
+
+    for bad in [
+        changed_at(&token, 0),
+        changed_at(&token, token.len() - 1),
+        format!("{token}0"),
+        foreign,
+    ] {
+        let reply = site.send_as_is(get("/api/status").with_session(&bad)).await;
+        assert_eq!(reply.status, 401, "{bad}");
+    }
+
+    assert_eq!(site.send_as_is(get("/")).await.status, 200);
+    let good = site
+        .send_as_is(get("/api/status").with_session(&token))
+        .await;
+    assert_eq!(good.status, 200);
+}
+
+async fn status_with(site: &Site, token: &str) -> u16 {
+    site.send_as_is(get("/api/status").with_session(token))
+        .await
+        .status
+}
+
+#[tokio::test]
+async fn a_cookie_outlives_a_restart_and_ends_with_a_new_password_user_or_hash() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let config = local_config(&upstream);
+    let first = site(config.clone()).await;
+    let token = first
+        .send_as_is(login("admin", "s3cret"))
+        .await
+        .session()
+        .unwrap();
+
+    let restarted = site(config.clone()).await;
+    assert_eq!(status_with(&restarted, &token).await, 200);
+
+    let mut new_password = config.clone();
+    new_password.web.password = Some("changed".to_string());
+    assert_eq!(status_with(&site(new_password).await, &token).await, 401);
+
+    let mut new_user = config.clone();
+    new_user.web.user = Some("other".to_string());
+    assert_eq!(status_with(&site(new_user).await, &token).await, 401);
+
+    let hash_a = hashed_config(&upstream, "s3cret", 1000);
+    let hash_b = hashed_config(&upstream, "s3cret", 1000);
+    let token = site(hash_a.clone())
+        .await
+        .send_as_is(login("admin", "s3cret"))
+        .await
+        .session()
+        .unwrap();
+    assert_eq!(status_with(&site(hash_a).await, &token).await, 200);
+    assert_eq!(status_with(&site(hash_b).await, &token).await, 401);
+}
+
+#[tokio::test]
+async fn signing_out_clears_the_cookie_and_needs_a_sign_in() {
+    let (site, _upstream) = plain_site().await;
+    let token = site
+        .send_as_is(login("admin", "s3cret"))
+        .await
+        .session()
+        .unwrap();
+
+    let reply = site
+        .send_as_is(post("/api/logout", "{}").with_session(&token))
+        .await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body, "{}");
+    assert_eq!(reply.header("set-cookie"), Some(SIGNED_OUT));
+
+    let anonymous = site.send_as_is(post("/api/logout", "{}")).await;
+    assert_eq!(anonymous.status, 401);
+
+    // A copy of the token stays valid until it expires (documented).
+    assert_eq!(status_with(&site, &token).await, 200);
+}
+
+#[tokio::test]
+async fn failed_form_logins_count_with_basic_auth_and_lock_one_address() {
+    let (site, _upstream) = plain_site().await;
+
+    for _ in 0..5 {
+        let reply = site.send_from("127.0.0.2", login("admin", "wrong")).await;
+        assert_eq!(reply.status, 401);
+    }
+    let limited = site.send_from("127.0.0.2", login("admin", "s3cret")).await;
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.body, TOO_MANY_ATTEMPTS);
+    assert_eq!(limited.header("set-cookie"), None);
+
+    let elsewhere = site.send_from("127.0.0.3", login("admin", "s3cret")).await;
+    assert_eq!(elsewhere.status, 200);
+    let token = elsewhere.session().unwrap();
+
+    for _ in 0..3 {
+        let reply = site
+            .send_from("127.0.0.4", get("/api/status").signed_in(WRONG_PASSWORD))
+            .await;
+        assert_eq!(reply.status, 401);
+    }
+    for _ in 0..2 {
+        let reply = site.send_from("127.0.0.4", login("admin", "wrong")).await;
+        assert_eq!(reply.status, 401);
+    }
+    let mixed = site.send_from("127.0.0.4", login("admin", "s3cret")).await;
+    assert_eq!(mixed.status, 429);
+
+    // A cookie is not a password check.
+    let with_cookie = site
+        .send_from("127.0.0.2", get("/api/status").with_session(&token))
+        .await;
+    assert_eq!(with_cookie.status, 200);
+
+    let malformed = [
+        "{\"user\": \"admin\"}",
+        "{\"user\": \"admin\", \"password\": \"wrong\", \"extra\": 1}",
+        "[\"admin\", \"s3cret\"]",
+        "not json",
+    ];
+    for body in malformed.iter().cycle().take(6) {
+        let reply = site.send_from("127.0.0.5", post("/api/login", body)).await;
+        assert_eq!(reply.status, 400, "{body}");
+    }
+    let after = site.send_from("127.0.0.5", login("admin", "s3cret")).await;
+    assert_eq!(after.status, 200);
+}
+
+#[tokio::test]
+async fn either_a_valid_cookie_or_valid_basic_auth_is_enough() {
+    let (site, _upstream) = plain_site().await;
+    let token = site
+        .send_as_is(login("admin", "s3cret"))
+        .await
+        .session()
+        .unwrap();
+
+    for _ in 0..6 {
+        let both = get("/api/status")
+            .signed_in(WRONG_PASSWORD)
+            .header("Cookie", &format!("picoguard_session={token}"));
+        assert_eq!(site.send_from("127.0.0.6", both).await.status, 200);
+    }
+    let reply = site.send_from("127.0.0.6", login("admin", "s3cret")).await;
+    assert_eq!(reply.status, 200, "the basic header was never checked");
+
+    let tampered = get("/api/status").signed_in(ADMIN).header(
+        "Cookie",
+        &format!("picoguard_session={}", changed_at(&token, 0)),
+    );
+    assert_eq!(site.send_as_is(tampered).await.status, 200);
 }
 
 #[tokio::test]
@@ -1400,6 +1993,8 @@ async fn a_peer_outside_allow_from_gets_nothing_from_reads_or_changes() {
     assert!(site.is_ignored(post("/api/resume", "")).await);
     assert!(site.is_ignored(post("/api/lists/refresh", "")).await);
     assert!(site.is_ignored(post("/api/update", UPDATE_BODY)).await);
+    assert!(site.is_ignored(login("admin", "s3cret")).await);
+    assert!(site.is_ignored(post("/api/logout", "{}")).await);
     assert!(!site.is_paused());
     assert_nothing_was_started(&site, "a peer outside allow_from");
 }

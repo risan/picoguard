@@ -1,10 +1,14 @@
 mod common;
 
+use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use common::process::{start, write_config};
+use picoguard::password::PasswordHash;
+use regex::Regex;
 
 fn picoguard(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_picoguard"))
@@ -47,6 +51,42 @@ fn check_rejects_an_invalid_value_and_names_the_field() {
     assert!(text(&output.stdout).is_empty());
     assert!(
         text(&output.stderr).contains("cache.max_entries must be > 0"),
+        "{}",
+        text(&output.stderr)
+    );
+}
+
+const HASH: &str = "pbkdf2-sha256$1000$000102030405060708090a0b0c0d0e0f$33a78c377ca7b6590fa1b215cc970fba516076f108ecb68af58ec95d86021701";
+
+#[test]
+fn check_rejects_a_password_and_a_password_hash_together() {
+    let path = write_config(
+        "password-and-hash.toml",
+        &format!("[web]\nuser = \"admin\"\npassword = \"s3cret\"\npassword_hash = \"{HASH}\"\n"),
+    );
+
+    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        text(&output.stderr).contains("not both"),
+        "{}",
+        text(&output.stderr)
+    );
+}
+
+#[test]
+fn check_rejects_a_malformed_password_hash() {
+    let path = write_config(
+        "malformed-hash.toml",
+        "[web]\nuser = \"admin\"\npassword_hash = \"pbkdf2-sha256$1000$00$00\"\n",
+    );
+
+    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        text(&output.stderr).contains("password_hash"),
         "{}",
         text(&output.stderr)
     );
@@ -252,9 +292,73 @@ fn help_lists_the_options() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = text(&output.stdout);
-    for option in ["--config", "--check", "--version", "--help", "dns-check"] {
+    for option in [
+        "--config",
+        "--check",
+        "--version",
+        "--help",
+        "--hash-password",
+        "dns-check",
+    ] {
         assert!(stdout.contains(option), "{stdout}");
     }
+}
+
+fn hash_password_with(input: &str, args: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_picoguard"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("picoguard binary should start");
+    // A usage error exits before it reads, which closes the pipe under this write.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn hash_password_prints_one_config_line_that_verifies() {
+    let line =
+        Regex::new(r#"^password_hash = "(pbkdf2-sha256\$600000\$[0-9a-f]{32}\$[0-9a-f]{64})"\n$"#)
+            .unwrap();
+    let mut hashes = Vec::new();
+
+    for _ in 0..2 {
+        let output = hash_password_with("pw\n", &["--hash-password"]);
+
+        assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
+        let stdout = text(&output.stdout);
+        let captures = line.captures(&stdout).expect(&stdout);
+        let hash = PasswordHash::from_str(&captures[1]).unwrap();
+        assert!(hash.verify(b"pw"));
+        assert!(!hash.verify(b"px"));
+        hashes.push(hash);
+    }
+
+    assert_ne!(hashes[0], hashes[1]);
+}
+
+#[test]
+fn hash_password_refuses_an_empty_password() {
+    let output = hash_password_with("\n", &["--hash-password"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(text(&output.stdout).is_empty());
+    assert!(
+        text(&output.stderr).contains("must not be empty"),
+        "{}",
+        text(&output.stderr)
+    );
+}
+
+#[test]
+fn hash_password_with_an_argument_is_a_usage_error() {
+    let output = hash_password_with("pw\n", &["--hash-password", "pw"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stdout).is_empty());
 }
 
 #[test]

@@ -113,9 +113,12 @@ format = "adblock"
 # ]
 # Host names the status page answers to, besides IP addresses.
 # hostnames = []
-# Set both to require basic auth and to unlock the query log, the top lists and
-# pause. Without them the page shows totals and list status only.
+# Set user and a password to require a sign-in and to unlock the query log, the
+# top lists and pause. Without them the page shows totals and list status only.
+# Prefer password_hash, the line that `picoguard --hash-password` prints, to a
+# plaintext password; set one of the two.
 # user = "admin"
+# password_hash = "pbkdf2-sha256$600000$..."
 # password = "change-me"
 
 # [stats]
