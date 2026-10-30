@@ -126,7 +126,8 @@ pub struct Finished(Option<Counted>);
 
 #[derive(Debug, Clone, Copy)]
 enum Source {
-    Cache,
+    /// A cache hit; `stale` when it was served from the optimistic window.
+    Cache { stale: bool },
     /// The upstream that gave the reply. `None` for the local resolver.
     Upstream(Option<u8>),
 }
@@ -134,7 +135,7 @@ enum Source {
 impl Source {
     fn server(self) -> Option<u8> {
         match self {
-            Source::Cache => None,
+            Source::Cache { .. } => None,
             Source::Upstream(server) => server,
         }
     }
@@ -183,6 +184,10 @@ impl Delivery {
         let waited = u32::try_from(self.received.elapsed().as_secs()).unwrap_or(u32::MAX);
 
         self.age_secs_when_received.saturating_add(waited)
+    }
+
+    fn is_stale(&self) -> bool {
+        matches!(self.source, Source::Cache { stale: true })
     }
 
     fn parts(&self) -> ReplyParts<'_> {
@@ -292,6 +297,7 @@ pub struct Pipeline {
     refuse_any: bool,
     cache_min_ttl: u32,
     cache_max_ttl: u32,
+    optimistic_answer_ttl: u32,
     blocked_ttl: u32,
     max_inflight_queries: usize,
     max_waiting_clients: usize,
@@ -324,6 +330,7 @@ impl Pipeline {
             refuse_any: config.refuse_any,
             cache_min_ttl: config.cache.min_ttl,
             cache_max_ttl: config.cache.max_ttl,
+            optimistic_answer_ttl: config.cache.optimistic_answer_ttl_secs,
             blocked_ttl: config.blocked_ttl,
             max_inflight_queries: config.limits.max_inflight_queries,
             max_waiting_clients: config.limits.max_waiting_clients,
@@ -711,7 +718,7 @@ impl Pipeline {
         };
         let result = match &decision {
             Decision::Pass => {
-                reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs), out);
+                reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs, hit.stale), out);
 
                 QueryResult::Cached
             }
@@ -742,7 +749,7 @@ impl Pipeline {
             info,
             Some(hit.token),
             hit.age_secs,
-            Source::Cache,
+            Source::Cache { stale: hit.stale },
             charge,
         )))
     }
@@ -782,10 +789,11 @@ impl Pipeline {
 
         let result = match decision {
             Decision::Pass => {
-                reply.from_upstream(delivery.parts(), self.ttl_rule(delivery.age_secs()), out);
+                let ttl_rule = self.ttl_rule(delivery.age_secs(), delivery.is_stale());
+                reply.from_upstream(delivery.parts(), ttl_rule, out);
 
                 match delivery.source {
-                    Source::Cache => QueryResult::Cached,
+                    Source::Cache { .. } => QueryResult::Cached,
                     Source::Upstream(_) => QueryResult::Pass,
                 }
             }
@@ -832,7 +840,17 @@ impl Pipeline {
         }
     }
 
-    fn ttl_rule(&self, age: u32) -> TtlRule {
+    /// A stale answer carries the optimistic answer TTL in every record, the SOA of a
+    /// negative answer included; a fresh one is clamped and aged.
+    fn ttl_rule(&self, age: u32, stale: bool) -> TtlRule {
+        if stale {
+            return TtlRule {
+                min: self.optimistic_answer_ttl,
+                max: self.optimistic_answer_ttl,
+                age: 0,
+            };
+        }
+
         TtlRule {
             min: self.cache_min_ttl,
             max: self.cache_max_ttl,
@@ -1303,13 +1321,14 @@ mod tests {
         );
     }
 
-    fn policy_of(rules: &str) -> Arc<Policy> {
+    fn engine_with(rules: &str) -> Arc<Engine> {
         let (list, _) = CompiledList::from_text(ListFormat::Adblock, rules);
 
-        Arc::new(Policy::with_engine(Arc::new(Engine::new(
-            vec![Arc::new(list)],
-            Vec::new(),
-        ))))
+        Arc::new(Engine::new(vec![Arc::new(list)], Vec::new()))
+    }
+
+    fn policy_of(rules: &str) -> Arc<Policy> {
+        Arc::new(Policy::with_engine(engine_with(rules)))
     }
 
     fn reply_with_address(spec: &QuerySpec, address: [u8; 4]) -> Vec<u8> {
@@ -1461,5 +1480,173 @@ mod tests {
         assert_eq!(quick, Quick::Replied);
         assert_eq!(parse(&out).answers.len(), 200);
         assert_eq!(pipeline.cache.lock().unwrap().bytes(), bytes_without_memo);
+    }
+
+    fn offline_config() -> Config {
+        let mut config = Config::default();
+        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
+
+        config
+    }
+
+    /// Caches an A reply for `spec` as if it had been received `age_secs` ago.
+    fn insert_aged(
+        pipeline: &Pipeline,
+        spec: &QuerySpec,
+        address: [u8; 4],
+        ttl: u32,
+        age_secs: u64,
+    ) -> Option<EntryToken> {
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let bytes = ResponseSpec {
+            answers: vec![a(&spec.name, ttl, address.into())],
+            ..ResponseSpec::default()
+        }
+        .bytes(spec);
+        let info = ResponseInfo::parse(&bytes).unwrap();
+        let inserted = Instant::now()
+            .checked_sub(Duration::from_secs(age_secs))
+            .expect("the machine has been up for minutes");
+
+        pipeline
+            .cache
+            .lock()
+            .unwrap()
+            .insert(&CacheKey::new(&query), &bytes, &info, inserted)
+    }
+
+    fn answer_ttls(out: &[u8]) -> Vec<u32> {
+        parse(out).answers.iter().map(|record| record.ttl).collect()
+    }
+
+    fn answer_addresses(out: &[u8]) -> Vec<String> {
+        parse(out)
+            .answers
+            .iter()
+            .map(|record| record.data.to_string())
+            .collect()
+    }
+
+    fn counters(pipeline: &Pipeline) -> crate::stats::Counters {
+        pipeline.stats().snapshot().counters
+    }
+
+    #[tokio::test]
+    async fn a_stale_hit_is_answered_at_once_with_the_answer_ttl() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        let fresh = QuerySpec::new("fresh.example.", RecordType::A);
+        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 301).unwrap();
+        insert_aged(&pipeline, &fresh, [2, 2, 2, 2], 300, 10).unwrap();
+        let mut out = Vec::new();
+
+        let quick = pipeline.answer_quickly(&stale.bytes(), Protocol::Udp, CLIENT, &mut out);
+        assert_eq!(quick, Quick::Replied);
+        assert_eq!(answer_ttls(&out), [30]);
+        assert_eq!(answer_addresses(&out), ["1.1.1.1"]);
+
+        let quick = pipeline.answer_quickly(&fresh.bytes(), Protocol::Udp, CLIENT, &mut out);
+        assert_eq!(quick, Quick::Replied);
+        assert_eq!(answer_ttls(&out), [290]);
+        assert_eq!(answer_addresses(&out), ["2.2.2.2"]);
+
+        let counters = counters(&pipeline);
+        assert_eq!(counters.total, 2);
+        assert_eq!(counters.cached, 2);
+        assert_eq!(counters.upstream, 0);
+    }
+
+    #[tokio::test]
+    async fn a_stale_hit_over_tcp_is_delivered_with_the_answer_ttl() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        let prepared = pipeline
+            .prepare(stale.bytes(), Protocol::Tcp, CLIENT)
+            .await
+            .unwrap();
+        let finished = pipeline.finish(&prepared, &mut out).await.unwrap();
+        pipeline.count(&prepared, finished);
+
+        assert_eq!(answer_ttls(&out), [30]);
+        assert_eq!(answer_addresses(&out), ["1.1.1.1"]);
+        assert_eq!(counters(&pipeline).cached, 1);
+    }
+
+    #[tokio::test]
+    async fn past_its_window_an_expired_entry_needs_the_upstream() {
+        let mut config = offline_config();
+        config.cache.optimistic_max_age_secs = 10;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 311).unwrap();
+        let mut out = Vec::new();
+
+        let quick = pipeline.answer_quickly(&stale.bytes(), Protocol::Udp, CLIENT, &mut out);
+
+        assert_eq!(quick, Quick::NeedsUpstream);
+        assert!(pipeline.cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_optimism_off_an_expired_entry_needs_the_upstream() {
+        let mut config = offline_config();
+        config.cache.optimistic = false;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        let quick = pipeline.answer_quickly(&stale.bytes(), Protocol::Udp, CLIENT, &mut out);
+
+        assert_eq!(quick, Quick::NeedsUpstream);
+        assert!(pipeline.cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_answer_takes_the_decision_of_the_policy_of_now() {
+        let policy = Arc::new(Policy::new());
+        let pipeline = Pipeline::new(&offline_config(), Arc::clone(&policy)).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        let request = stale.bytes();
+        let token = insert_aged(&pipeline, &stale, [9, 9, 9, 9], 300, 301).unwrap();
+        let query = Query::parse(&request).unwrap();
+        pipeline.cache.lock().unwrap().set_memo(
+            &CacheKey::new(&query),
+            token,
+            Memo {
+                generation: 0,
+                decision: Decision::Pass,
+            },
+        );
+        let mut out = Vec::new();
+        let ask = |out: &mut Vec<u8>| {
+            let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, out);
+            assert_eq!(quick, Quick::Replied);
+        };
+
+        policy.swap_engine(engine_with("||9.9.9.9^\n"));
+        ask(&mut out);
+        assert_eq!(answer_addresses(&out), ["0.0.0.0"]);
+        assert_eq!(answer_ttls(&out), [pipeline.blocked_ttl]);
+        assert_eq!(counters(&pipeline).blocked_response, 1);
+
+        policy.pause(Duration::from_secs(60), policy.now());
+        ask(&mut out);
+        assert_eq!(answer_addresses(&out), ["9.9.9.9"]);
+        assert_eq!(answer_ttls(&out), [30]);
+
+        policy.resume();
+        ask(&mut out);
+        assert_eq!(answer_addresses(&out), ["0.0.0.0"]);
+        assert_eq!(counters(&pipeline).blocked_response, 2);
+
+        policy.swap_engine(engine_with("||stale.example^\n"));
+        ask(&mut out);
+        assert_eq!(answer_ttls(&out), [pipeline.blocked_ttl]);
+        assert_eq!(counters(&pipeline).blocked_request, 1);
     }
 }
