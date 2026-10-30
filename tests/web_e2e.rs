@@ -487,8 +487,9 @@ async fn the_page_is_served_with_protective_headers() {
 /// The page's ceiling for every slice of release 1.
 const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
 
-/// This slice, Your rules and Check a name; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 31 * 1024;
+/// This slice, Your rules, Check a name and the stacked phone log; a later slice raises it on
+/// purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 32 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {

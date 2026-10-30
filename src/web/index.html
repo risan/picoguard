@@ -118,6 +118,19 @@ button.go:hover { background: var(--accent); opacity: .9; }
 td button { padding: 1px var(--s2); font-size: var(--t-sm); }
 #check-name { flex: 1 1 12rem; width: auto; min-width: 0; }
 #check-result, #config-rules { margin-top: var(--s3); overflow-wrap: anywhere; }
+@media (max-width: 719px) {
+  #queries table { display: block; }
+  #queries tr { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; padding: var(--s2) 0;
+    border-bottom: 1px solid var(--line); }
+  #queries tr:last-child { border: 0; }
+  /* A full-width break between the name and result and the rest of the row. */
+  #queries tr::after { content: ""; flex-basis: 100%; order: -1; }
+  #queries tr:first-child, #queries td:nth-child(6) { display: none; }
+  #queries td { padding: 0; border: 0; font-size: var(--t-sm); color: var(--muted); }
+  #queries td.name { flex: 1 1 0; min-width: 0; order: -3; font-size: 13px; color: var(--text); }
+  #queries td:nth-child(5) { order: -2; color: var(--text); }
+  #queries td:last-child { margin-left: auto; }
+}
 @media (min-width: 720px) {
   .cards { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .headline { grid-column: span 3; }
