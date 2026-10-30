@@ -924,18 +924,46 @@ impl RuleSet {
 
 // ---- The engine ----
 
-/// The decision engine: the main lists (user rules included) and the allowlists, which
-/// form a separate engine that is asked first (plan 4.5).
-pub struct Engine {
+/// The rule sets of the configured lists. Engines that differ only in their pinned sets share
+/// one copy.
+struct ListSets {
     main: RuleSet,
     allow: RuleSet,
+}
+
+/// The decision engine: the main lists (user rules included) and the allowlists, which
+/// form a separate engine that is asked first (plan 4.5), and the two pinned sets of the rules
+/// added from the status page. Any `pinned_allow` match allows, before everything else; any
+/// `pinned_block` match counts as an `$important` block. Each pinned set has its own
+/// `$badfilter` index, so no list can disable them.
+pub struct Engine {
+    lists: Arc<ListSets>,
+    pinned_block: RuleSet,
+    pinned_allow: RuleSet,
 }
 
 impl Engine {
     pub fn new(main: Vec<Arc<CompiledList>>, allow: Vec<Arc<CompiledList>>) -> Engine {
         Engine {
-            main: RuleSet::new(main),
-            allow: RuleSet::new(allow),
+            lists: Arc::new(ListSets {
+                main: RuleSet::new(main),
+                allow: RuleSet::new(allow),
+            }),
+            pinned_block: RuleSet::new(Vec::new()),
+            pinned_allow: RuleSet::new(Vec::new()),
+        }
+    }
+
+    /// This engine's lists with other pinned sets. The list rule sets are shared, not rebuilt.
+    pub fn with_pinned(
+        &self,
+        block: Vec<Arc<CompiledList>>,
+        allow: Vec<Arc<CompiledList>>,
+    ) -> Engine {
+        Engine {
+            lists: Arc::clone(&self.lists),
+            pinned_block: RuleSet::new(block),
+            pinned_allow: RuleSet::new(allow),
         }
     }
 
@@ -966,15 +994,25 @@ impl Engine {
             is_ip: input_is_ip,
         };
 
-        if self.allow.class(&query).is_some() || self.allow.host_rules(&host, record_type).is_some()
+        if self.pinned_allow.class(&query).is_some() {
+            return Verdict::Allow;
+        }
+
+        let lists = &*self.lists;
+        if lists.allow.class(&query).is_some()
+            || lists.allow.host_rules(&host, record_type).is_some()
         {
             return Verdict::Allow;
         }
 
-        match self.main.class(&query) {
+        let pinned_block = self
+            .pinned_block
+            .class(&query)
+            .map(|_| Class::ImportantBlock);
+        match lists.main.class(&query).max(pinned_block) {
             Some(Class::Allow | Class::ImportantAllow) => Verdict::Allow,
             Some(Class::Block | Class::ImportantBlock) => Verdict::Block { ips: Vec::new() },
-            None => match self.main.host_rules(&host, record_type) {
+            None => match lists.main.host_rules(&host, record_type) {
                 Some(ips) => Verdict::Block { ips },
                 None => Verdict::NoMatch,
             },
@@ -1450,13 +1488,128 @@ mod tests {
         assert!(!blocked(&engine, "b.example", TYPE_A));
     }
 
+    /// A page list as the scheduler builds it: one plain rule per name, no text parsed.
+    fn page_list(names: &[&str], kind: FastKind) -> Vec<Arc<CompiledList>> {
+        if names.is_empty() {
+            return Vec::new();
+        }
+
+        let mut builder = ListBuilder::new();
+        for name in names {
+            builder.add(Rule::Fast { kind, name });
+        }
+
+        vec![Arc::new(builder.finish(ListFormat::Adblock))]
+    }
+
+    fn pinned(main: &[&str], allow: &[&str], block: &[&str], page_allow: &[&str]) -> Engine {
+        let main: Vec<(&str, ListFormat)> = main
+            .iter()
+            .map(|text| (*text, ListFormat::Adblock))
+            .collect();
+
+        engine(&main, allow).with_pinned(
+            page_list(block, FastKind::SubBlock),
+            page_list(page_allow, FastKind::SubAllow),
+        )
+    }
+
+    fn null_block() -> Verdict {
+        Verdict::Block { ips: Vec::new() }
+    }
+
+    #[test]
+    fn a_pinned_block_beats_allows_but_not_important_allows_or_allowlists() {
+        let engine = pinned(
+            &["@@||a.example^\n@@||b.example^$important\n"],
+            &["||e.example^\n"],
+            &["a.example", "b.example", "d.example", "e.example"],
+            &[],
+        );
+        let verdict = |name| engine.verdict(name, TYPE_A, false);
+
+        assert_eq!(verdict("a.example"), null_block());
+        assert_eq!(verdict("sub.a.example"), null_block());
+        assert_eq!(verdict("d.example"), null_block());
+        assert_eq!(verdict("b.example"), Verdict::Allow);
+        assert_eq!(verdict("e.example"), Verdict::Allow);
+        assert_eq!(verdict("other.example"), Verdict::NoMatch);
+    }
+
+    #[test]
+    fn a_pinned_allow_beats_every_block() {
+        let engine = pinned(
+            &["||x.example^$important\n||x.example^\n"],
+            &[],
+            &["y.example"],
+            &["x.example", "y.example"],
+        );
+
+        for name in ["x.example", "sub.x.example", "y.example", "sub.y.example"] {
+            assert_eq!(
+                engine.verdict(name, TYPE_A, false),
+                Verdict::Allow,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_list_badfilter_reaches_the_pinned_sets() {
+        let engine = pinned(
+            &["||x.example^$important,badfilter\n||x.example^$badfilter\n||y.example^$important\n"],
+            &["@@||y.example^$badfilter\n||y.example^$badfilter\n"],
+            &["x.example"],
+            &["y.example"],
+        );
+
+        assert_eq!(engine.verdict("x.example", TYPE_A, false), null_block());
+        assert_eq!(engine.verdict("y.example", TYPE_A, false), Verdict::Allow);
+    }
+
+    #[test]
+    fn a_pinned_block_answers_with_the_null_ip_over_host_rules() {
+        let engine = pinned(&["1.2.3.4 h.example\n"], &[], &["h.example"], &[]);
+
+        assert_eq!(engine.verdict("h.example", TYPE_A, false), null_block());
+    }
+
+    #[test]
+    fn the_pinned_sets_also_check_answer_names_and_addresses() {
+        let engine = pinned(&[], &[], &["cdn.example", "1.2.3.4"], &[]);
+
+        assert!(matches!(
+            engine.check("x.cdn.example", TYPE_CNAME, false),
+            Decision::Block { .. }
+        ));
+        assert!(matches!(
+            engine.check("1.2.3.4", TYPE_A, true),
+            Decision::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn with_pinned_shares_the_list_rule_sets() {
+        let engine = adblock("||ads.example^\n/tr[a-z]{2}k/\n");
+        let changed = engine.with_pinned(
+            page_list(&["b.example"], FastKind::SubBlock),
+            page_list(&["a.example"], FastKind::SubAllow),
+        );
+
+        assert!(Arc::ptr_eq(&engine.lists, &changed.lists));
+        assert!(blocked(&changed, "ads.example", TYPE_A));
+        assert!(blocked(&changed, "b.example", TYPE_A));
+        assert!(!blocked(&engine, "b.example", TYPE_A));
+    }
+
     fn candidates(engine: &Engine, host: &str) -> usize {
         let mut count = 0;
         let url = format!("http://{host}");
-        engine
-            .main
-            .slow_index
-            .for_each_candidate(&engine.main.lists, &url, &mut |_| count += 1);
+        engine.lists.main.slow_index.for_each_candidate(
+            &engine.lists.main.lists,
+            &url,
+            &mut |_| count += 1,
+        );
 
         count
     }
@@ -1470,7 +1623,7 @@ mod tests {
 
         rules.push_str("/^sh[a-z]rt/\n*$denyallow=ok.example\n");
         let engine = adblock(&rules);
-        assert_eq!(engine.main.lists[0].slow_rule_count(), 502);
+        assert_eq!(engine.lists.main.lists[0].slow_rule_count(), 502);
         // The regex has a one-letter shortcut and the `*` rule none: both are always tried.
         assert_eq!(candidates(&engine, "clean.example"), 2);
         assert!(candidates(&engine, "t0123.example") <= 12);
@@ -1485,7 +1638,7 @@ mod tests {
     fn indexed_slow_rules_decide_like_a_scan_of_every_rule() {
         let rules = "||ads.\n.banner.\n/tr[a-z]{2}k/\n||x.example^$dnstype=A\n@@||good.ads.example^$important\n|lone\n*.cdn.\nping^\n";
         let engine = adblock(rules);
-        let list = &engine.main.lists[0];
+        let list = &engine.lists.main.lists[0];
         for host in [
             "ads.example",
             "good.ads.example",
@@ -1514,7 +1667,7 @@ mod tests {
             });
             let expected = scanned && !important_allow;
             let decided = !matches!(
-                engine.main.class(&query),
+                engine.lists.main.class(&query),
                 None | Some(Class::Allow | Class::ImportantAllow)
             );
             assert_eq!(decided, expected, "{host}");
