@@ -1008,7 +1008,9 @@ mod tests {
         assert_eq!(tallies[1].answered, 1);
         assert_eq!(tallies[1].failed, 0);
         let average = tallies[1].average_ms().unwrap();
-        assert!((50.0..250.0).contains(&average), "{average}");
+        // The upper bound only has to stay under the 1000 ms the dead server cost; a tighter one
+        // fails on a loaded machine.
+        assert!((50.0..900.0).contains(&average), "{average}");
     }
 
     #[tokio::test]

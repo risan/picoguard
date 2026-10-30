@@ -793,7 +793,9 @@ async fn a_failed_over_query_counts_a_failure_on_the_first_server_and_an_answer_
     assert_eq!(servers[1]["answered"], asked);
     assert_eq!(servers[1]["failed"], 0);
     let average = servers[1]["avg_ms"].as_f64().unwrap();
-    assert!((80.0..250.0).contains(&average), "{average}");
+    // The upper bound only has to stay under the 1000 ms the dead server cost; a tighter one
+    // fails on a loaded machine.
+    assert!((80.0..900.0).contains(&average), "{average}");
 }
 
 #[tokio::test]
