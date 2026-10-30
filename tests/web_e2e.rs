@@ -281,7 +281,7 @@ fn no_dns() -> Downloader {
 fn local_config(upstream: &common::harness::FakeUpstream) -> Config {
     let mut config = config_for(upstream);
     config.lists = Vec::new();
-    config.rules = vec!["||ads.example^".to_string()];
+    config.rules = vec!["||ads.example^".to_string()].into();
     config.web.bind = vec!["127.0.0.1".parse().unwrap()];
     config.web.port = 0;
     with_credentials(&mut config);

@@ -4,20 +4,25 @@
 //! worker, assembles the next engine there, swaps it into the policy and waits for the
 //! snapshot to be written before the next refresh starts, so at most the current and one
 //! new copy are in memory (D13). Any failure keeps the copy in force.
+//!
+//! The rules added from the status page live in [`ListControl`], in memory only. A change
+//! rebuilds only those rules and keeps the engine's list rule sets. Every swap after boot, a
+//! refresh's or a rule change's, holds one lock there, so each builds on the other's latest
+//! result.
 
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Serialize;
-use tokio::sync::Notify;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::time::Instant;
 
 use crate::config::{Config, ListConfig};
-use crate::filter::compile::{CompileOptions, CompileWorker};
-use crate::filter::engine::CompiledList;
-use crate::filter::parse::ListFormat;
+use crate::filter::compile::{CompileError, CompileOptions, CompileWorker};
+use crate::filter::engine::{CompiledList, Engine, ListBuilder};
+use crate::filter::parse::{FastKind, ListFormat, Rule};
 use crate::filter::snapshot::{Snapshot, SnapshotStore};
 use crate::lists::{Downloader, Limits, Refresh, RefreshError, Updated, Validators, refresh_file};
 use crate::policy::Policy;
@@ -87,14 +92,140 @@ pub struct ListStatus {
     pub last_error: Option<String>,
 }
 
-/// The scheduler seen from outside: what the lists look like, and a way to ask for a refresh.
+/// The most rules the status page may add.
+pub const MAX_BUTTON_RULES: usize = 500;
+
+/// The most rule changes that may wait or run at once. A change runs as a task of its own, so
+/// a client that goes away does not cancel it; this bounds those tasks whatever the request
+/// rate.
+pub const MAX_PENDING_CHANGES: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    Block,
+    Allow,
+}
+
+/// A rule added from the status page: the name and its subdomains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ButtonRule {
+    pub name: String,
+    pub action: Action,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleError {
+    NotADomainName,
+    TooMany,
+    NoSuchRule,
+    /// The task that applies the change ended without an answer.
+    NotApplied,
+}
+
+/// Where a list of the engine comes from, so explain can name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListId {
+    ConfigRules,
+    /// The entry at this index: blocklists, then allowlists, as in `statuses`.
+    Configured(usize),
+}
+
+/// A list for the engine and where it comes from.
+type InForce = (ListId, Arc<CompiledList>);
+
+/// What every swap after boot reads and writes under one lock.
 #[derive(Default)]
+struct Assembly {
+    /// The list of each engine position, as the scheduler last put the lists in force.
+    main_ids: Vec<ListId>,
+    allow_ids: Vec<ListId>,
+    /// In the order first added.
+    rules: Vec<ButtonRule>,
+    /// The page lists in force; `None` for a side without rules.
+    block: Option<Arc<CompiledList>>,
+    allow: Option<Arc<CompiledList>>,
+}
+
+enum Edit {
+    Add(String, Action),
+    Remove(String),
+}
+
+impl Assembly {
+    /// The rules after `edit`, or `None` when it changes nothing.
+    fn edited(&self, edit: &Edit) -> Result<Option<Vec<ButtonRule>>, RuleError> {
+        match edit {
+            Edit::Add(name, action) => {
+                match self.rules.iter().position(|rule| rule.name == *name) {
+                    Some(at) if self.rules[at].action == *action => Ok(None),
+
+                    Some(at) => {
+                        let mut rules = self.rules.clone();
+                        rules[at].action = *action;
+
+                        Ok(Some(rules))
+                    }
+
+                    None if self.rules.len() >= MAX_BUTTON_RULES => Err(RuleError::TooMany),
+
+                    None => {
+                        let mut rules = Vec::with_capacity(self.rules.len() + 1);
+                        rules.extend_from_slice(&self.rules);
+                        rules.push(ButtonRule {
+                            name: name.clone(),
+                            action: *action,
+                        });
+
+                        Ok(Some(rules))
+                    }
+                }
+            }
+
+            Edit::Remove(name) => {
+                let at = self
+                    .rules
+                    .iter()
+                    .position(|rule| rule.name == *name)
+                    .ok_or(RuleError::NoSuchRule)?;
+                let mut rules = self.rules.clone();
+                rules.remove(at);
+
+                Ok(Some(rules))
+            }
+        }
+    }
+
+    fn page_lists(&self) -> (Vec<Arc<CompiledList>>, Vec<Arc<CompiledList>>) {
+        (
+            self.block.iter().cloned().collect(),
+            self.allow.iter().cloned().collect(),
+        )
+    }
+}
+
+/// The scheduler seen from outside: what the lists look like, a way to ask for a refresh, and
+/// the rules added from the status page, which it also puts in force.
 pub struct ListControl {
     statuses: Mutex<Vec<ListStatus>>,
     refresh_requested: Notify,
+    policy: Arc<Policy>,
+    assembly: tokio::sync::Mutex<Assembly>,
+    pending: Arc<Semaphore>,
 }
 
 impl ListControl {
+    /// A control without lists or rules, swapping engines into `policy`.
+    pub fn new(policy: Arc<Policy>) -> ListControl {
+        ListControl {
+            statuses: Mutex::new(Vec::new()),
+            refresh_requested: Notify::new(),
+            policy,
+            assembly: tokio::sync::Mutex::new(Assembly::default()),
+            pending: Arc::new(Semaphore::new(MAX_PENDING_CHANGES)),
+        }
+    }
+
     /// Blocklists first, then allowlists, in config order.
     pub fn statuses(&self) -> Vec<ListStatus> {
         self.statuses.lock().unwrap().clone()
@@ -105,6 +236,146 @@ impl ListControl {
     pub fn refresh_all(&self) {
         self.refresh_requested.notify_one();
     }
+
+    /// Calls `f` with the rules from the status page, in the order added. The rules are only
+    /// borrowed: nothing is copied out.
+    pub async fn with_button_rules<R>(&self, f: impl FnOnce(&[ButtonRule]) -> R) -> R {
+        f(&self.assembly.lock().await.rules)
+    }
+
+    /// Blocks or allows `name` and its subdomains. One rule per name: the other action replaces
+    /// the rule in its place; the same again changes nothing. In force when this returns.
+    pub async fn add_button_rule(
+        self: &Arc<Self>,
+        name: &str,
+        action: Action,
+    ) -> Result<(), RuleError> {
+        let name = normalized_name(name).ok_or(RuleError::NotADomainName)?;
+
+        self.change(Edit::Add(name, action)).await
+    }
+
+    pub async fn remove_button_rule(self: &Arc<Self>, name: &str) -> Result<(), RuleError> {
+        let name = normalized_name(name).ok_or(RuleError::NotADomainName)?;
+
+        self.change(Edit::Remove(name)).await
+    }
+
+    /// Waiting for a permit holds nothing and can be cancelled. Once the change is spawned it
+    /// runs to its end, whether or not its caller still waits, so a change sent is applied
+    /// once and no build is ever dropped half done on the runtime thread.
+    async fn change(self: &Arc<Self>, edit: Edit) -> Result<(), RuleError> {
+        let permit = Arc::clone(&self.pending)
+            .acquire_owned()
+            .await
+            .map_err(|_| RuleError::NotApplied)?;
+        let (answer, answered) = oneshot::channel();
+        let control = Arc::clone(self);
+        tokio::spawn(async move {
+            control.apply(edit, answer).await;
+            drop(permit);
+        });
+
+        answered.await.unwrap_or(Err(RuleError::NotApplied))
+    }
+
+    /// Holds the lock from the check until the replaced engine and lists are freed, so changes
+    /// never stack more than one extra copy of the page rules.
+    async fn apply(&self, edit: Edit, answer: oneshot::Sender<Result<(), RuleError>>) {
+        let mut assembly = self.assembly.lock().await;
+        let rules = match assembly.edited(&edit) {
+            Ok(Some(rules)) => rules,
+
+            Ok(None) => {
+                let _ = answer.send(Ok(()));
+
+                return;
+            }
+
+            Err(error) => {
+                let _ = answer.send(Err(error));
+
+                return;
+            }
+        };
+
+        let current = self.policy.engine();
+        let built = tokio::task::spawn_blocking(move || {
+            let block = page_list(&rules, Action::Block);
+            let allow = page_list(&rules, Action::Allow);
+            let engine = current.with_pinned(
+                block.iter().cloned().collect(),
+                allow.iter().cloned().collect(),
+            );
+            drop(current);
+
+            (rules, block, allow, engine)
+        })
+        .await;
+        let Ok((rules, block, allow, engine)) = built else {
+            let _ = answer.send(Err(RuleError::NotApplied));
+
+            return;
+        };
+
+        let old_engine = self.policy.swap_engine(Arc::new(engine));
+        let old_rules = std::mem::replace(&mut assembly.rules, rules);
+        let old_block = std::mem::replace(&mut assembly.block, block);
+        let old_allow = std::mem::replace(&mut assembly.allow, allow);
+        let _ = answer.send(Ok(()));
+
+        drop_off_runtime((old_engine, old_rules, old_block, old_allow)).await;
+    }
+
+    /// Puts the lists of a refresh in force with the page rules in force, and swaps the engine
+    /// in. Assembling runs on the compile worker, which is idle once the list has compiled.
+    async fn put_in_force(
+        &self,
+        main: Vec<InForce>,
+        allow: Vec<InForce>,
+        worker: &CompileWorker,
+    ) -> Result<(), CompileError> {
+        let mut assembly = self.assembly.lock().await;
+        let (main_ids, main): (Vec<ListId>, Vec<Arc<CompiledList>>) = main.into_iter().unzip();
+        let (allow_ids, allow): (Vec<ListId>, Vec<Arc<CompiledList>>) = allow.into_iter().unzip();
+        let (page_block, page_allow) = assembly.page_lists();
+        let engine = worker
+            .run(move || Engine::new(main, allow).with_pinned(page_block, page_allow))
+            .await?;
+
+        let old_engine = self.policy.swap_engine(Arc::new(engine));
+        worker.discard(old_engine);
+        assembly.main_ids = main_ids;
+        assembly.allow_ids = allow_ids;
+
+        Ok(())
+    }
+}
+
+/// The page list of one action: a plain `||name^` or `@@||name^` per rule, built without
+/// parsing any text. `None` when no rule has that action.
+fn page_list(rules: &[ButtonRule], action: Action) -> Option<Arc<CompiledList>> {
+    let kind = match action {
+        Action::Block => FastKind::SubBlock,
+        Action::Allow => FastKind::SubAllow,
+    };
+    let mut builder = ListBuilder::new();
+    let mut any = false;
+    for rule in rules.iter().filter(|rule| rule.action == action) {
+        builder.add(Rule::Fast {
+            kind,
+            name: &rule.name,
+        });
+        any = true;
+    }
+
+    any.then(|| Arc::new(builder.finish(ListFormat::Adblock)))
+}
+
+/// Drops `garbage` on tokio's blocking pool and waits until it is gone: an engine must never
+/// be dropped on the DNS thread (plan D20).
+async fn drop_off_runtime<T: Send + 'static>(garbage: T) {
+    let _ = tokio::task::spawn_blocking(move || drop(garbage)).await;
 }
 
 enum Source {
@@ -177,9 +448,10 @@ impl Scheduler {
             .filter_map(|(role, list)| Entry::new(role, list, &timing))
             .collect();
 
+        let placeholder = Arc::new(Policy::new());
         let mut scheduler = Scheduler {
-            policy: Arc::new(Policy::new()),
-            control: Arc::new(ListControl::default()),
+            control: Arc::new(ListControl::new(Arc::clone(&placeholder))),
+            policy: placeholder,
             worker,
             store,
             timing,
@@ -191,15 +463,23 @@ impl Scheduler {
             scheduler.load_at_boot(index).await;
         }
 
-        scheduler.publish_all();
-
         let (main, allow) = scheduler.lists_in_force(None);
+        let (main_ids, main): (Vec<ListId>, Vec<Arc<CompiledList>>) = main.into_iter().unzip();
+        let (allow_ids, allow): (Vec<ListId>, Vec<Arc<CompiledList>>) = allow.into_iter().unzip();
         let engine = scheduler
             .worker
             .assemble(main, allow)
             .await
             .map_err(|error| format!("cannot build the filter: {error:?}"))?;
+
+        // The first engine is generation 0, so the policy is made with it, not swapped.
         scheduler.policy = Arc::new(Policy::with_engine(Arc::new(engine)));
+        let mut control = ListControl::new(scheduler.policy());
+        let assembly = control.assembly.get_mut();
+        assembly.main_ids = main_ids;
+        assembly.allow_ids = allow_ids;
+        scheduler.control = Arc::new(control);
+        scheduler.publish_all();
 
         Ok(scheduler)
     }
@@ -412,18 +692,11 @@ impl Scheduler {
         } = *updated;
         let new_list = Arc::clone(&compiled.list);
         let (main, allow) = self.lists_in_force(Some((index, Arc::clone(&new_list))));
-        let engine = match self.worker.assemble(main, allow).await {
-            Ok(engine) => engine,
+        if let Err(error) = self.control.put_in_force(main, allow, &self.worker).await {
+            self.worker.discard(compiled);
 
-            Err(error) => {
-                self.worker.discard(compiled);
-
-                return Err(format!("cannot build the filter: {error:?}"));
-            }
-        };
-
-        let old_engine = self.policy.swap_engine(Arc::new(engine));
-        self.worker.discard(old_engine);
+            return Err(format!("cannot build the filter: {error:?}"));
+        }
 
         let entry = &mut self.entries[index];
         log::info!(
@@ -494,13 +767,18 @@ impl Scheduler {
         self.save(index, pending.snapshot, pending.failures).await;
     }
 
-    /// The lists for the next engine: the user rules first, then every list in force in
-    /// config order, with `replacing` standing in for the list at its index.
+    /// The lists for the next engine, each with where it comes from: the user rules first,
+    /// then every list in force in config order, with `replacing` standing in for the list at
+    /// its index.
     fn lists_in_force(
         &self,
         replacing: Option<(usize, Arc<CompiledList>)>,
-    ) -> (Vec<Arc<CompiledList>>, Vec<Arc<CompiledList>>) {
-        let mut main: Vec<Arc<CompiledList>> = self.user_rules.iter().cloned().collect();
+    ) -> (Vec<InForce>, Vec<InForce>) {
+        let mut main: Vec<InForce> = self
+            .user_rules
+            .iter()
+            .map(|rules| (ListId::ConfigRules, Arc::clone(rules)))
+            .collect();
         let mut allow = Vec::new();
 
         for (index, entry) in self.entries.iter().enumerate() {
@@ -512,9 +790,10 @@ impl Scheduler {
                 continue;
             };
 
+            let id = ListId::Configured(index);
             match entry.role {
-                Role::Blocklist => main.push(list),
-                Role::Allowlist => allow.push(list),
+                Role::Blocklist => main.push((id, list)),
+                Role::Allowlist => allow.push((id, list)),
             }
         }
 
@@ -737,6 +1016,70 @@ mod tests {
         );
         assert!(waits.iter().any(|wait| *wait < day.mul_f64(0.95)));
         assert!(waits.iter().any(|wait| *wait > day.mul_f64(1.05)));
+    }
+
+    struct RecordsDropThread(std::sync::mpsc::Sender<std::thread::ThreadId>);
+
+    impl Drop for RecordsDropThread {
+        fn drop(&mut self) {
+            let _ = self.0.send(std::thread::current().id());
+        }
+    }
+
+    #[tokio::test]
+    async fn garbage_is_dropped_off_the_runtime_thread() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        drop_off_runtime(RecordsDropThread(sender)).await;
+
+        let dropped_on = receiver
+            .try_recv()
+            .expect("dropped by the time the call returns");
+        assert_ne!(dropped_on, std::thread::current().id());
+    }
+
+    #[tokio::test]
+    async fn waiting_changes_are_bounded_and_cancellable() {
+        let control = Arc::new(ListControl::new(Arc::new(Policy::new())));
+        let held = control.assembly.lock().await;
+
+        for index in 0..50 {
+            let name = format!("waiting-{index}.example");
+            tokio::select! {
+                biased;
+
+                _ = control.add_button_rule(&name, Action::Block) => {
+                    panic!("a change finished while the lock was held");
+                }
+
+                () = std::future::ready(()) => {}
+            }
+        }
+
+        assert!(Arc::strong_count(&control) <= 1 + MAX_PENDING_CHANGES);
+        assert_eq!(control.pending.available_permits(), 0);
+
+        drop(held);
+        let mut in_force = 0;
+        for _ in 0..200 {
+            in_force = control.with_button_rules(<[ButtonRule]>::len).await;
+            if in_force == MAX_PENDING_CHANGES
+                && control.pending.available_permits() == MAX_PENDING_CHANGES
+            {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(in_force, MAX_PENDING_CHANGES);
+        assert_eq!(control.pending.available_permits(), MAX_PENDING_CHANGES);
+        assert_eq!(
+            control
+                .add_button_rule("later.example", Action::Block)
+                .await,
+            Ok(())
+        );
     }
 
     /// A name of `length` characters in labels of 63 and one shorter last label.

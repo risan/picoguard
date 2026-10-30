@@ -152,6 +152,12 @@ impl Policy {
         }
     }
 
+    /// The engine in force, for a change that builds on it. Drop the clone off the DNS thread
+    /// once it may be the last one.
+    pub(crate) fn engine(&self) -> Arc<Engine> {
+        Arc::clone(&self.state.lock().unwrap().engine)
+    }
+
     /// Puts `engine` in force and starts a new generation, so no earlier decision is reused.
     /// Returns the engine it replaces: send it to the compile worker to be dropped there,
     /// never drop it on the DNS thread (plan D20).

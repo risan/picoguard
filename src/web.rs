@@ -989,7 +989,7 @@ mod tests {
         let mut config = Config::default();
         config.web.hostnames = names.iter().map(|name| name.to_string()).collect();
         let policy = Arc::new(Policy::new());
-        let lists = Arc::new(ListControl::default());
+        let lists = Arc::new(ListControl::new(Arc::clone(&policy)));
         let updates = Arc::new(Updates::new(Build::current()));
         let stager = Stager::new(
             StageSetup {
