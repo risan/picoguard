@@ -4,6 +4,8 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+use crate::dns::wire::{CLASS_IN, Header, Name, Records, Section, rcode, read_name, rtype};
+
 /// The most addresses the table keeps.
 pub const MAX_NAMES: usize = 256;
 /// The most name bytes the table keeps across all addresses: 256 names of 253 bytes would
@@ -183,12 +185,92 @@ fn name_len(name: &Option<Box<str>>) -> usize {
     name.as_ref().map_or(0, |name| name.len())
 }
 
+/// The name a PTR lookup of `address` asks for, of its canonical form, so that a mapped IPv4
+/// address is asked under `in-addr.arpa`.
+pub(crate) fn reverse_name(address: IpAddr) -> Name {
+    let text = match address.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [first, second, third, fourth] = v4.octets();
+
+            format!("{fourth}.{third}.{second}.{first}.in-addr.arpa")
+        }
+
+        IpAddr::V6(v6) => {
+            let nibbles: String = v6
+                .octets()
+                .iter()
+                .rev()
+                .map(|byte| format!("{:x}.{:x}.", byte & 0xF, byte >> 4))
+                .collect();
+
+            format!("{nibbles}ip6.arpa")
+        }
+    };
+
+    Name::from_text(&text).expect("a reverse name is at most 73 bytes of short labels")
+}
+
+/// A PTR question for `address`, with recursion desired, built like the list hosts' lookups.
+fn ptr_query(address: IpAddr) -> Vec<u8> {
+    let mut request = vec![0, 0, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+    request.extend_from_slice(reverse_name(address).as_wire());
+    request.extend_from_slice(&rtype::PTR.to_be_bytes());
+    request.extend_from_slice(&CLASS_IN.to_be_bytes());
+
+    request
+}
+
+/// The target of the first PTR record of a NOERROR answer, when it is a host name. Records
+/// before it, such as the CNAME of a classless delegation (RFC 2317), are passed over.
+fn host_name_in(reply: &[u8]) -> Option<Found> {
+    if Header::parse(reply).ok()?.rcode() != rcode::NOERROR {
+        return None;
+    }
+
+    let record = Records::new(reply)
+        .ok()?
+        .map_while(Result::ok)
+        .take_while(|record| record.section == Section::Answer)
+        .find(|record| record.rtype == rtype::PTR && record.class == CLASS_IN)?;
+    let (target, end) = read_name(reply, record.rdata.start).ok()?;
+    if end != record.rdata.end || !is_host_name(&target) {
+        return None;
+    }
+
+    Some(Found {
+        name: target.to_string().into(),
+        ttl: record.ttl,
+    })
+}
+
+/// Host-name syntax (RFC 1123 §2.1) with `_` allowed, as routers put it in DHCP names: every
+/// label is letters, digits, hyphens and underscores, and does not start or end with a
+/// hyphen. Names read from the wire are lowercased already. No byte that passes needs an
+/// escape, so the name's text is exactly its labels joined by dots.
+fn is_host_name(name: &Name) -> bool {
+    let is_name_byte = |byte: &u8| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
+    };
+
+    !name.is_root()
+        && name.labels().all(|label| {
+            label.iter().all(is_name_byte)
+                && label.first() != Some(&b'-')
+                && label.last() != Some(&b'-')
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::{Duration, Instant};
 
+    use hickory_proto::rr::rdata::PTR;
+    use hickory_proto::rr::{Name as HickoryName, RData, Record, RecordType};
+
     use super::*;
+    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, cname, name, ptr, soa};
+    use crate::dns::wire::{Query, rcode, rtype};
 
     fn address(number: u32) -> IpAddr {
         IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + number))
@@ -382,5 +464,195 @@ mod tests {
             shown(Some(&long_name(99)), false)
         );
         assert_eq!(table.shown(address(0), t0), shown(None, true));
+    }
+
+    const OWNER: &str = "50.110.168.192.in-addr.arpa.";
+
+    fn reply(answers: Vec<Record>, rcode: u8) -> Vec<u8> {
+        let query = QuerySpec::new(OWNER, RecordType::PTR);
+        let response = ResponseSpec {
+            answers,
+            rcode,
+            ..ResponseSpec::default()
+        };
+
+        response.bytes(&query)
+    }
+
+    fn named(name: &str, ttl: u32) -> Option<Found> {
+        Some(Found {
+            name: name.into(),
+            ttl,
+        })
+    }
+
+    #[test]
+    fn reverse_names_of_ipv4_ipv6_and_mapped_addresses() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 168, 110, 50));
+        let v6 = IpAddr::V6("fd00::1".parse::<Ipv6Addr>().unwrap());
+        let mapped = IpAddr::V6("::ffff:192.168.1.6".parse::<Ipv6Addr>().unwrap());
+        let v6_reverse = format!("1.{}d.f.ip6.arpa", "0.".repeat(29));
+
+        assert_eq!(reverse_name(v4).to_string(), "50.110.168.192.in-addr.arpa");
+        assert_eq!(reverse_name(v6).to_string(), v6_reverse);
+        assert_eq!(reverse_name(v6).labels().count(), 34);
+        assert_eq!(reverse_name(mapped).to_string(), "6.1.168.192.in-addr.arpa");
+    }
+
+    #[test]
+    fn the_ptr_query_asks_one_ptr_question_with_recursion_desired() {
+        let address = IpAddr::V4(Ipv4Addr::new(192, 168, 110, 50));
+        let request = ptr_query(address);
+
+        let query = Query::parse(&request).unwrap();
+
+        assert_eq!(query.question.qtype, rtype::PTR);
+        assert_eq!(query.question.qclass, CLASS_IN);
+        assert!(query.header.recursion_desired());
+        assert_eq!(query.question.name, reverse_name(address));
+    }
+
+    #[test]
+    fn the_first_ptr_target_is_lowercased_without_its_trailing_dot() {
+        let answers = vec![
+            ptr(OWNER, 600, "Risan-PC.LAN."),
+            ptr(OWNER, 60, "other.lan."),
+        ];
+
+        assert_eq!(
+            host_name_in(&reply(answers, rcode::NOERROR)),
+            named("risan-pc.lan", 600)
+        );
+    }
+
+    #[test]
+    fn a_cname_before_the_ptr_is_passed_over() {
+        let answers = vec![
+            cname(OWNER, 60, "50.0-127.110.168.192.in-addr.arpa."),
+            ptr("50.0-127.110.168.192.in-addr.arpa.", 900, "printer.lan."),
+        ];
+
+        assert_eq!(
+            host_name_in(&reply(answers, rcode::NOERROR)),
+            named("printer.lan", 900)
+        );
+    }
+
+    #[test]
+    fn nxdomain_servfail_no_ptr_and_malformed_replies_give_no_name() {
+        let nxdomain = ResponseSpec {
+            authorities: vec![soa("168.192.in-addr.arpa.", 300, 300)],
+            rcode: rcode::NXDOMAIN,
+            ..ResponseSpec::default()
+        }
+        .bytes(&QuerySpec::new(OWNER, RecordType::PTR));
+        let a_only = vec![a(OWNER, 600, Ipv4Addr::new(192, 0, 2, 1))];
+        let whole = reply(vec![ptr(OWNER, 600, "pc.lan.")], rcode::NOERROR);
+        let cut = &whole[..whole.len() - 3];
+
+        assert_eq!(host_name_in(&nxdomain), None);
+        assert_eq!(host_name_in(&reply(Vec::new(), rcode::NOERROR)), None);
+        assert_eq!(
+            host_name_in(&reply(vec![ptr(OWNER, 600, "pc.lan.")], rcode::SERVFAIL)),
+            None
+        );
+        assert_eq!(host_name_in(&reply(a_only, rcode::NOERROR)), None);
+        assert_eq!(host_name_in(cut), None);
+        assert_eq!(host_name_in(&whole), named("pc.lan", 600));
+    }
+
+    /// A reply to the PTR question of 1.0.168.192 with one PTR answer whose RDLENGTH is
+    /// `rdlength` and whose RDATA is `rdata`.
+    fn hand_written(rdlength: u16, rdata: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        bytes.extend_from_slice(b"\x011\x010\x03168\x03192\x07in-addr\x04arpa\x00\x00\x0c\x00\x01");
+        bytes.extend_from_slice(&[0xC0, 0x0C, 0, 12, 0, 1, 0, 0, 2, 88]);
+        bytes.extend_from_slice(&rdlength.to_be_bytes());
+        bytes.extend_from_slice(rdata);
+
+        bytes
+    }
+
+    #[test]
+    fn a_ptr_target_must_end_exactly_at_its_rdata_end() {
+        let target = b"\x05my-pc\x03lan\x00";
+        let mut with_junk = target.to_vec();
+        with_junk.extend_from_slice(&[0xAB, 0xCD]);
+        let arpa_at = hand_written(0, &[])
+            .windows(5)
+            .position(|window| window == b"\x04arpa")
+            .unwrap() as u8;
+        let compressed = [b"\x05my-pc".as_slice(), &[0xC0, arpa_at]].concat();
+
+        assert_eq!(
+            host_name_in(&hand_written(target.len() as u16, target)),
+            named("my-pc.lan", 600)
+        );
+        assert_eq!(
+            host_name_in(&hand_written(target.len() as u16 - 1, target)),
+            None
+        );
+        assert_eq!(
+            host_name_in(&hand_written(with_junk.len() as u16, &with_junk)),
+            None
+        );
+        assert_eq!(
+            host_name_in(&hand_written(compressed.len() as u16, &compressed)),
+            named("my-pc.arpa", 600)
+        );
+    }
+
+    fn ptr_to_labels(labels: &[&[u8]]) -> Vec<u8> {
+        let target = HickoryName::from_labels(labels.iter().copied()).unwrap();
+        let record = Record::from_rdata(name(OWNER), 600, RData::PTR(PTR(target)));
+
+        reply(vec![record], rcode::NOERROR)
+    }
+
+    #[test]
+    fn a_target_that_is_not_a_host_name_gives_no_name() {
+        let refused: [&[&[u8]]; 10] = [
+            &[b"<b>", b"lan"],
+            &[b"a b", b"lan"],
+            &[b"x\x07y", b"lan"],
+            &[b"caf\xC3\xA9", b"lan"],
+            &[b"a.b", b"lan"],
+            &[b"a/b", b"lan"],
+            &[b"\"q\"", b"lan"],
+            &[b"-pc", b"lan"],
+            &[b"pc-", b"lan"],
+            &[b"---", b"lan"],
+        ];
+
+        for labels in refused {
+            assert_eq!(host_name_in(&ptr_to_labels(labels)), None, "{labels:?}");
+        }
+
+        assert_eq!(host_name_in(&ptr_to_labels(&[])), None, "the root");
+    }
+
+    #[test]
+    fn letters_digits_hyphens_and_underscores_make_a_host_name() {
+        let longest = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+
+        for kept in [
+            "my-pc-2.lan",
+            "2nd-floor.lan",
+            "xn--caf-dma.lan",
+            "my_pc.lan",
+            &longest,
+        ] {
+            let answer = reply(vec![ptr(OWNER, 600, &format!("{kept}."))], rcode::NOERROR);
+
+            assert_eq!(host_name_in(&answer), named(kept, 600));
+        }
+
+        assert_eq!(longest.len(), 253);
     }
 }

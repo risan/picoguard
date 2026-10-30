@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::svcb::{IpHint, SVCB, SvcParamKey, SvcParamValue};
-use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, SOA, TXT};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, PTR, SOA, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
 pub fn name(text: &str) -> Name {
@@ -63,6 +63,10 @@ pub fn aaaa(owner: &str, ttl: u32, ip: Ipv6Addr) -> Record {
 
 pub fn cname(owner: &str, ttl: u32, target: &str) -> Record {
     Record::from_rdata(name(owner), ttl, RData::CNAME(CNAME(name(target))))
+}
+
+pub fn ptr(owner: &str, ttl: u32, target: &str) -> Record {
+    Record::from_rdata(name(owner), ttl, RData::PTR(PTR(name(target))))
 }
 
 pub fn soa(owner: &str, ttl: u32, minimum: u32) -> Record {
