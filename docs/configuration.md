@@ -201,13 +201,14 @@ out of `/api/status`, and the page hides them. picoguard logs one warning at sta
 password is set. Every device that may open the page could otherwise read the household's queries
 and switch blocking off.
 
-The Upstreams card, and the `upstreams` field of `/api/status`, list every server in
-`[upstream] servers`, in that order, and then the `[local]` resolver when one is set. Each entry has
-`label` (the server as written in `[upstream] servers`, or the `[local] resolver` address), `kind`
-(`upstream` or `local`), `answered`, `failed` and `avg_ms` (`null` before the first answer).
+The Upstreams card, and the `upstreams` field of `/api/status`, cover every server in
+`[upstream] servers` and then the `[local]` resolver when one is set. The API lists them in that
+order; the card sorts them by answered count, highest first. Each entry has `label` (the server as
+written in `[upstream] servers`, or the `[local] resolver` address), `kind` (`upstream` or `local`),
+`answered`, `failed` and `avg_ms` (`null` before the first answer).
 
 - The counts start at picoguard's start. A try that is repeated on the next server counts as a
-  failure on the first one and as an answer on the second.
+  failure on the first one, and the repeat counts on the second as its own answer or failure.
 - picoguard's own lookups count too: list downloads and the update check.
 - A query that a blocking rule held back after the answer came in did reach the server and counts.
   A cached answer and a query blocked by a request rule never reach a server and do not count.
