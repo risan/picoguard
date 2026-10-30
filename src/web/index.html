@@ -92,8 +92,8 @@ td.name { overflow-wrap: anywhere; }
 #chart .blocked { fill: var(--blocked); }
 #chart .hit { fill: transparent; pointer-events: all; }
 #chart .hit.on { fill: var(--tint); }
-.pause { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
-.pause p { margin: 0 auto 0 0; flex: 1 1 12rem; font-size: 15px; }
+.actions { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
+.actions p { margin: 0 auto 0 0; flex: 1 1 12rem; font-size: 15px; }
 .paused #pause { border-color: var(--warn); }
 .paused #pause-text { color: var(--warn); font-weight: 600; }
 #pause-form { display: flex; gap: var(--s2); }
@@ -164,7 +164,7 @@ button.go:hover { background: var(--accent); opacity: .9; }
     </section>
 
     <section id="pause" class="wide">
-      <div class="pause">
+      <div class="actions">
         <p id="pause-text">Blocking is on.</p>
         <button data-minutes="5">Pause 5 min</button>
         <button data-minutes="30">30 min</button>
@@ -199,6 +199,15 @@ button.go:hover { background: var(--accent); opacity: .9; }
     <section id="upstreams" class="wide bars">
       <h2>Upstreams <small>(since start)</small></h2>
       <div class="scroll" id="upstream-table"></div>
+    </section>
+
+    <section id="cache" class="wide">
+      <h2>Cache</h2>
+      <div class="actions">
+        <p id="cache-size"></p>
+        <button id="clear-cache">Clear cache</button>
+        <span id="cache-note" class="empty"></span>
+      </div>
     </section>
   </div>
 
@@ -510,6 +519,11 @@ function showUpstreams(upstreams) {
   $("upstream-table").replaceChildren(table(["Server", "Answered", "Share", "Failed", "Avg"], rows));
 }
 
+function showCache(cache) {
+  $("cache-size").textContent = cache.entries.toLocaleString() + " answers \u00b7 " +
+    Math.round(cache.bytes / 1024).toLocaleString() + " KB";
+}
+
 function showPause(pause) {
   pausedUntil = pause.paused ? pause.until : null;
   document.body.classList.toggle("paused", pause.paused);
@@ -549,7 +563,7 @@ function showInstall(update) {
 function showLimited(note) {
   $("limited-note").textContent = note || "";
   $("limited").hidden = !note;
-  ["pause", "tops", "upstreams", "tab-log", "refresh-row"].forEach((id) => { $(id).hidden = Boolean(note); });
+  ["pause", "tops", "upstreams", "cache", "tab-log", "refresh-row"].forEach((id) => { $(id).hidden = Boolean(note); });
   showTab();
 }
 
@@ -579,6 +593,7 @@ async function update() {
 
     if (!status.limited) {
       showUpstreams(status.upstreams);
+      showCache(status.cache);
       const log = await api("/api/querylog?limit=50");
 
       if (epoch !== authEpoch) {
@@ -609,18 +624,18 @@ async function update() {
   }
 }
 
-async function act(path, body, note) {
+async function act(path, body, done) {
   const epoch = authEpoch;
 
   try {
-    await api(path, body);
+    const data = await api(path, body);
 
     if (epoch !== authEpoch) {
       return;
     }
 
-    if (note) {
-      $("refresh-note").textContent = note;
+    if (done) {
+      done(data);
     }
   } catch (error) {
     if (epoch !== authEpoch) {
@@ -665,7 +680,16 @@ $("install").addEventListener("click", () => {
   }
 });
 $("refresh").addEventListener("click", () =>
-  act("/api/lists/refresh", {}, "Refresh started; the table updates as lists finish."));
+  act("/api/lists/refresh", {}, () => {
+    $("refresh-note").textContent = "Refresh started; the table updates as lists finish.";
+  }));
+$("clear-cache").addEventListener("click", () => {
+  if (confirm("Clear the DNS cache? Answers are fetched again as they are asked for.")) {
+    act("/api/cache/clear", {}, (data) => {
+      $("cache-note").textContent = "Cache cleared (" + data.cleared.toLocaleString() + " answers)";
+    });
+  }
+});
 $("login-form").addEventListener("submit", async (event) => {
   event.preventDefault();
 

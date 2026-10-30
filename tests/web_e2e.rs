@@ -484,8 +484,8 @@ async fn the_page_is_served_with_protective_headers() {
 /// The page's ceiling for every slice of release 1.
 const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
 
-/// This slice, the Upstreams card; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 27 * 1024;
+/// This slice, the Cache card; a later slice raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 28 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -520,6 +520,7 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/update",
         "/api/login",
         "/api/logout",
+        "/api/cache/clear",
         "setInterval(update, 5000)",
         "id=\"version\"",
         "id=\"update\"",
@@ -607,6 +608,27 @@ async fn the_dashboard_has_an_upstreams_card_drawn_as_text() {
         "\"\\u2014\"",
         "th:not(:first-child)",
         "[\"pause\", \"tops\", \"upstreams\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+#[tokio::test]
+async fn the_dashboard_has_a_cache_card_with_a_confirmed_clear_button() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "id=\"cache\"",
+        "id=\"cache-size\"",
+        "id=\"clear-cache\"",
+        "id=\"cache-note\"",
+        "\"/api/cache/clear\"",
+        "showCache(status.cache)",
+        "\"Cache cleared (\"",
+        "\"Clear the DNS cache?",
+        "\"upstreams\", \"cache\"",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
