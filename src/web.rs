@@ -453,7 +453,17 @@ impl Web {
                         limited: (!is_open).then_some(PASSWORD_NEEDED),
                         top_queried: is_open.then(|| TopList::of(&snapshot.top_queried)),
                         top_blocked: is_open.then(|| TopList::of(&snapshot.top_blocked)),
-                        top_clients: is_open.then(|| TopList::of(&snapshot.top_clients)),
+                        top_clients: is_open.then(|| ClientList {
+                            approximate: true,
+                            entries: snapshot
+                                .top_clients
+                                .iter()
+                                .map(|entry| ClientView {
+                                    entry,
+                                    name: self.pipeline.device_name(entry.key),
+                                })
+                                .collect(),
+                        }),
                         upstreams: is_open.then(|| {
                             self.pipeline
                                 .upstream_tallies()
@@ -475,7 +485,16 @@ impl Web {
                 Ok(json(
                     StatusCode::OK,
                     &QueryLogView {
-                        entries: self.pipeline.stats().query_log(limit),
+                        entries: self
+                            .pipeline
+                            .stats()
+                            .query_log(limit)
+                            .into_iter()
+                            .map(|entry| LogEntryView {
+                                name: self.pipeline.device_name(entry.client),
+                                entry,
+                            })
+                            .collect(),
                     },
                 ))
             }
@@ -1052,6 +1071,27 @@ impl<'a, K> TopList<'a, K> {
     }
 }
 
+/// The top clients, each with its device name: a `TopList` of clients plus `name`.
+#[derive(Serialize)]
+struct ClientList<'a> {
+    approximate: bool,
+    entries: Vec<ClientView<'a>>,
+}
+
+#[derive(Serialize)]
+struct ClientView<'a> {
+    #[serde(flatten)]
+    entry: &'a TopEntry<IpAddr>,
+    name: Option<Box<str>>,
+}
+
+#[derive(Serialize)]
+struct LogEntryView {
+    #[serde(flatten)]
+    entry: QueryLogEntry,
+    name: Option<Box<str>>,
+}
+
 #[derive(Serialize)]
 struct ListView {
     name: String,
@@ -1105,7 +1145,7 @@ struct ListsView {
 
 #[derive(Serialize)]
 struct QueryLogView {
-    entries: Vec<QueryLogEntry>,
+    entries: Vec<LogEntryView>,
 }
 
 #[derive(Serialize)]
@@ -1125,7 +1165,7 @@ struct StatusView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_blocked: Option<TopList<'a, Box<str>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    top_clients: Option<TopList<'a, IpAddr>>,
+    top_clients: Option<ClientList<'a>>,
     /// Left out with the top lists: a DoH address can carry a private provider profile ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     upstreams: Option<Vec<UpstreamView>>,

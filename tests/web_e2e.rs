@@ -4,10 +4,11 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::harness::{
@@ -16,8 +17,11 @@ use common::harness::{
 };
 use common::http::ListServer;
 use common::release::{Files, TARGET, scratch, test_key};
-use hickory_proto::rr::RecordType;
+use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::rdata::PTR;
+use hickory_proto::rr::{RData, Record, RecordType};
 use picoguard::config::{Config, ListConfig, ListFormat};
+use picoguard::dns::wire::Name;
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::Downloader;
@@ -25,6 +29,7 @@ use picoguard::password::PasswordHash;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ListControl, Scheduler, Timing};
 use picoguard::stage::{StageSetup, StageTiming, Stager};
+use picoguard::stats::{Event, QueryResult};
 use picoguard::update::{self, Build, CheckTiming, Latest, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
@@ -1082,6 +1087,379 @@ async fn the_query_log_is_newest_first_and_never_longer_than_the_ring() {
         let reply = site.send(get(&format!("/api/querylog?limit={bad}"))).await;
         assert_eq!(reply.status, 400, "limit={bad}");
     }
+}
+
+/// Records a query from `client` straight into the site's stats: the names code sees only the
+/// addresses the views show, however they got there.
+fn record_client(site: &Site, client: &str, qname: &str) {
+    let qname = Name::from_text(qname).unwrap();
+    site.dns.pipeline.stats().record(&Event {
+        client: client.parse().unwrap(),
+        qname: &qname,
+        qtype: 1,
+        result: QueryResult::Pass,
+        upstream: Some(0),
+        latency: Duration::from_micros(500),
+    });
+}
+
+/// A router that answers the PTR questions in `answers` (owner, target, TTL) and NXDOMAIN to
+/// anything else.
+async fn router(answers: &[(&str, &str, u32)]) -> common::harness::FakeUpstream {
+    let answers: Vec<(String, String, u32)> = answers
+        .iter()
+        .map(|(owner, target, ttl)| (owner.to_string(), target.to_string(), *ttl))
+        .collect();
+
+    fake_upstream(move |query| {
+        let owner = query.queries[0].name().to_string();
+        let mut reply = reply_to(query, Vec::new());
+        match answers.iter().find(|(known, _, _)| *known == owner) {
+            Some((_, target, ttl)) => {
+                let data = RData::PTR(PTR(name(target)));
+                reply.add_answer(Record::from_rdata(name(&owner), *ttl, data));
+            }
+
+            None => {
+                reply.metadata.response_code = ResponseCode::NXDomain;
+            }
+        }
+
+        vec![(Duration::ZERO, reply)]
+    })
+    .await
+}
+
+fn client_entry<'a>(status: &'a Value, client: &str) -> &'a Value {
+    status["top_clients"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == client)
+        .unwrap_or_else(|| panic!("{client} is not a top client: {status}"))
+}
+
+fn log_entries<'a>(log: &'a Value, client: &str) -> Vec<&'a Value> {
+    let entries: Vec<&Value> = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["client"] == client)
+        .collect();
+    assert!(!entries.is_empty(), "{client} is not in the log: {log}");
+
+    entries
+}
+
+fn keys_of(entry: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = entry
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+
+    keys
+}
+
+/// Every top client and every log entry carries `name`, and it is null.
+fn assert_every_name_is_null(status: &Value, log: &Value) {
+    let clients = status["top_clients"]["entries"].as_array().unwrap();
+    let entries = log["entries"].as_array().unwrap();
+    for entry in clients.iter().chain(entries) {
+        assert_eq!(entry.get("name"), Some(&Value::Null), "{entry}");
+    }
+}
+
+async fn status_and_log(site: &Site) -> (Value, Value) {
+    let status = site.send(get("/api/status")).await.json();
+    let log = site.send(get("/api/querylog")).await.json();
+
+    (status, log)
+}
+
+fn local_entry(status: &Value) -> &Value {
+    upstream_entries(status)
+        .iter()
+        .find(|server| server["kind"] == "local")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_private_client_gets_its_router_name_on_a_later_poll() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let router = router(&[("50.110.168.192.in-addr.arpa.", "Risan-PC.lan.", 600)]).await;
+    let mut config = local_config(&upstream);
+    config.local.resolver = Some(router.address);
+    let site = site(config).await;
+    record_client(&site, "192.168.110.50", "a.example.");
+    record_client(&site, "192.168.110.50", "b.example.");
+    record_client(&site, "192.168.110.51", "c.example.");
+    ask(&site.dns, "ok.example.", RecordType::A).await;
+
+    let first = site.send(get("/api/status")).await.json();
+    let named = client_entry(&first, "192.168.110.50");
+
+    assert!(named["name"].is_null());
+    assert_eq!(keys_of(named), ["count", "key", "max_error", "name"]);
+
+    let started = Instant::now();
+    let status = loop {
+        let status = site.send(get("/api/status")).await.json();
+        if client_entry(&status, "192.168.110.50")["name"] == "risan-pc.lan" {
+            break status;
+        }
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no name: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    assert!(client_entry(&status, "192.168.110.51")["name"].is_null());
+    assert!(client_entry(&status, "127.0.0.1")["name"].is_null());
+
+    let log = site.send(get("/api/querylog")).await.json();
+    for entry in log_entries(&log, "192.168.110.50") {
+        assert_eq!(entry["name"], "risan-pc.lan");
+    }
+
+    for client in ["192.168.110.51", "127.0.0.1"] {
+        for entry in log_entries(&log, client) {
+            assert!(entry["name"].is_null(), "{entry}");
+        }
+    }
+
+    let entries = log["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    for entry in entries {
+        assert_eq!(
+            keys_of(entry),
+            [
+                "client",
+                "latency_us",
+                "name",
+                "qname",
+                "qtype",
+                "result",
+                "time",
+                "upstream"
+            ]
+        );
+    }
+
+    let status = site.send(get("/api/status")).await.json();
+    assert_eq!(router.count(), 2);
+    assert_eq!(local_entry(&status)["answered"], 2);
+    assert_eq!(status["counters"]["total"], 4);
+}
+
+#[tokio::test]
+async fn without_a_local_resolver_names_are_null_and_nothing_is_looked_up() {
+    let (site, upstream) = plain_site().await;
+    record_client(&site, "192.168.110.50", "a.example.");
+
+    for _ in 0..2 {
+        let (status, log) = status_and_log(&site).await;
+
+        assert_eq!(client_entry(&status, "192.168.110.50")["count"], 1);
+        assert_every_name_is_null(&status, &log);
+    }
+
+    assert_eq!(upstream.count(), 0);
+}
+
+#[tokio::test]
+async fn loopback_and_public_clients_are_never_looked_up() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let router = fake_upstream(|query| {
+        let owner = query.queries[0].name().clone();
+        let data = RData::PTR(PTR(name("any.lan.")));
+
+        vec![(
+            Duration::ZERO,
+            reply_to(query, vec![Record::from_rdata(owner, 600, data)]),
+        )]
+    })
+    .await;
+    let mut config = local_config(&upstream);
+    config.local.resolver = Some(router.address);
+    let site = site(config).await;
+    for client in ["8.8.8.8", "2001:db8::1", "::ffff:8.8.8.8", "::1"] {
+        record_client(&site, client, "a.example.");
+    }
+
+    ask(&site.dns, "ok.example.", RecordType::A).await;
+
+    for _ in 0..3 {
+        let (status, log) = status_and_log(&site).await;
+
+        assert_eq!(
+            status["top_clients"]["entries"].as_array().unwrap().len(),
+            5
+        );
+        assert_every_name_is_null(&status, &log);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(router.count(), 0);
+}
+
+#[tokio::test]
+async fn ten_polls_of_one_client_send_one_lookup() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let router = router(&[]).await;
+    let mut config = local_config(&upstream);
+    config.local.resolver = Some(router.address);
+    let site = site(config).await;
+    record_client(&site, "192.168.110.50", "a.example.");
+
+    for _ in 0..10 {
+        let (status, log) = status_and_log(&site).await;
+
+        assert_every_name_is_null(&status, &log);
+    }
+
+    let started = Instant::now();
+    while router.count() == 0 {
+        assert!(started.elapsed() < Duration::from_secs(3), "no lookup");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(router.count(), 1);
+}
+
+#[tokio::test]
+async fn a_router_silent_to_lookups_holds_up_neither_dns_nor_the_page() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let ptr_asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let asked = Arc::clone(&ptr_asked);
+    let router = fake_upstream(move |query| {
+        let question = &query.queries[0];
+        if question.query_type() == RecordType::PTR {
+            asked.lock().unwrap().push(question.name().to_string());
+
+            return Vec::new();
+        }
+
+        let owner = question.name().to_string();
+
+        vec![(
+            Duration::ZERO,
+            reply_to(query, vec![a_record(&owner, 300, [192, 168, 1, 9])]),
+        )]
+    })
+    .await;
+    let distinct_names = || {
+        ptr_asked
+            .lock()
+            .unwrap()
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+    };
+    let mut config = local_config(&upstream);
+    config.local.resolver = Some(router.address);
+    config.local.domains = vec!["lan".to_string()];
+    config.limits.upstream_concurrency = 1;
+    let site = site(config).await;
+    for number in 0..20 {
+        record_client(&site, &format!("192.168.1.{}", 100 + number), "a.example.");
+    }
+
+    let t0 = Instant::now();
+    let status = site.send(get("/api/status")).await.json();
+
+    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    let clients = status["top_clients"]["entries"].as_array().unwrap();
+    assert_eq!(clients.len(), 20);
+    assert!(clients.iter().all(|client| client["name"].is_null()));
+
+    while distinct_names() < 4 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "4 lookups within 1 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The client pool has one slot; the lookups hold four of their own.
+    let asked_at = Instant::now();
+    let answer = ask(&site.dns, "printer.lan.", RecordType::A).await;
+    assert!(
+        asked_at.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        asked_at.elapsed()
+    );
+    assert_eq!(answer.answers[0].data.to_string(), "192.168.1.9");
+
+    site.send(get("/api/status")).await;
+    // A second try asks the same name again; only names count here.
+    assert_eq!(
+        distinct_names(),
+        4,
+        "the cap holds while four are in flight"
+    );
+
+    let started = Instant::now();
+    let local = loop {
+        let status = site.send(get("/api/status")).await.json();
+        let local = local_entry(&status).clone();
+        if local["failed"].as_u64().unwrap() >= 8 {
+            break local;
+        }
+
+        assert!(started.elapsed() < Duration::from_secs(6), "{local}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // Two tries for each of the first four; the next four have not failed yet.
+    assert_eq!(local["failed"], 8);
+    assert_eq!(local["answered"], 1);
+    assert!(
+        t0.elapsed() >= Duration::from_millis(1900),
+        "{:?}",
+        t0.elapsed()
+    );
+
+    // The first four gave up and freed their slots, so a poll starts the next four.
+    site.send(get("/api/status")).await;
+    let started = Instant::now();
+    while distinct_names() < 8 {
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{}",
+            distinct_names()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(distinct_names(), 8);
+    let status = site.send(get("/api/status")).await.json();
+    assert_eq!(status["counters"]["total"], 21);
+}
+
+#[tokio::test]
+async fn without_a_password_no_lookup_starts() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let router = router(&[]).await;
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    config.local.resolver = Some(router.address);
+    let site = site(config).await;
+    record_client(&site, "192.168.110.50", "a.example.");
+
+    for _ in 0..2 {
+        let status = site.send(get("/api/status")).await.json();
+
+        assert!(status.get("top_clients").is_none());
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(router.count(), 0);
 }
 
 #[tokio::test]
