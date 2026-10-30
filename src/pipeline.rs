@@ -303,6 +303,13 @@ pub struct ServerTally {
     pub tally: Tally,
 }
 
+/// How many answers the cache holds and the bytes counted against its limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CacheSize {
+    pub entries: usize,
+    pub bytes: usize,
+}
+
 pub struct Pipeline {
     udp_size: u16,
     resume_limit: Duration,
@@ -402,6 +409,21 @@ impl Pipeline {
         });
 
         servers.chain(local).collect()
+    }
+
+    pub fn cache_size(&self) -> CacheSize {
+        let cache = self.cache.lock().unwrap();
+
+        CacheSize {
+            entries: cache.len(),
+            bytes: cache.bytes(),
+        }
+    }
+
+    /// Empties the cache and returns how many answers it held. Lookups in flight are not
+    /// cancelled: their answers are cached when they land.
+    pub fn clear_cache(&self) -> usize {
+        self.cache.lock().unwrap().clear()
     }
 
     /// The budget for replies held for delivery. Queued TCP replies draw on it.
@@ -2023,5 +2045,35 @@ mod tests {
 
         assert_eq!(answer_addresses(&out), ["0.0.0.0"]);
         assert_eq!(inflight_counts(&pipeline), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn clearing_the_cache_reports_what_it_removed_and_the_next_query_needs_the_upstream() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let specs: Vec<QuerySpec> = ["a.example.", "b.example.", "c.example."]
+            .iter()
+            .map(|name| QuerySpec::new(name, RecordType::A))
+            .collect();
+        insert_aged(&pipeline, &specs[0], [1, 1, 1, 1], 300, 301).unwrap();
+        insert_aged(&pipeline, &specs[1], [1, 1, 1, 1], 300, 10).unwrap();
+        insert_aged(&pipeline, &specs[2], [1, 1, 1, 1], 300, 0).unwrap();
+        let bytes = pipeline.cache.lock().unwrap().bytes();
+
+        assert_eq!(pipeline.cache_size(), CacheSize { entries: 3, bytes });
+
+        assert_eq!(pipeline.clear_cache(), 3);
+        assert_eq!(
+            pipeline.cache_size(),
+            CacheSize {
+                entries: 0,
+                bytes: 0
+            }
+        );
+
+        let mut out = Vec::new();
+        assert_eq!(
+            ask_quickly(&pipeline, &specs[0], &mut out),
+            Quick::NeedsUpstream
+        );
     }
 }
