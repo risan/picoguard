@@ -1124,6 +1124,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_change_cut_off_at_shutdown_changes_nothing_and_frees_its_permit() {
+        let policy = Arc::new(Policy::new());
+        let control = Arc::new(ListControl::new(Arc::clone(&policy)));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let holder = Arc::clone(&control);
+            tokio::spawn(async move {
+                let _held = holder.assembly.lock().await;
+                std::future::pending::<()>().await;
+            });
+            while control.assembly.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+
+            let changer = Arc::clone(&control);
+            tokio::spawn(
+                async move { changer.add_button_rule("cut.example", Action::Block).await },
+            );
+            while control.pending.available_permits() == MAX_PENDING_CHANGES {
+                tokio::task::yield_now().await;
+            }
+        });
+        drop(runtime);
+
+        assert_eq!(policy.view(std::time::Instant::now()).generation, 0);
+        assert!(control.assembly.try_lock().unwrap().rules.is_empty());
+        assert_eq!(control.pending.available_permits(), MAX_PENDING_CHANGES);
+    }
+
     /// A name of `length` characters in labels of 63 and one shorter last label.
     fn long_name(length: usize) -> String {
         let mut name = String::new();
