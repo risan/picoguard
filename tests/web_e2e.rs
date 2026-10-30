@@ -484,8 +484,8 @@ async fn the_page_is_served_with_protective_headers() {
 /// The page's ceiling for every slice of release 1.
 const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
 
-/// This slice, the Upstreams card; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 27 * 1024;
+/// This slice, the Cache card; a later slice raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 28 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -520,6 +520,7 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/update",
         "/api/login",
         "/api/logout",
+        "/api/cache/clear",
         "setInterval(update, 5000)",
         "id=\"version\"",
         "id=\"update\"",
@@ -607,6 +608,27 @@ async fn the_dashboard_has_an_upstreams_card_drawn_as_text() {
         "\"\\u2014\"",
         "th:not(:first-child)",
         "[\"pause\", \"tops\", \"upstreams\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+#[tokio::test]
+async fn the_dashboard_has_a_cache_card_with_a_confirmed_clear_button() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "id=\"cache\"",
+        "id=\"cache-size\"",
+        "id=\"clear-cache\"",
+        "id=\"cache-note\"",
+        "\"/api/cache/clear\"",
+        "showCache(status.cache)",
+        "\"Cache cleared (\"",
+        "\"Clear the DNS cache?",
+        "\"upstreams\", \"cache\"",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
@@ -897,6 +919,52 @@ async fn the_status_lists_every_upstream_in_config_order_then_the_local_resolver
         assert_eq!(server["failed"], 0);
         assert!(server["avg_ms"].is_null());
     }
+}
+
+#[tokio::test]
+async fn clearing_the_cache_empties_it_and_the_next_query_goes_upstream() {
+    let (site, upstream) = plain_site().await;
+    ask(&site.dns, "ok.example.", RecordType::A).await;
+    ask(&site.dns, "other.example.", RecordType::A).await;
+
+    let status = site.send(get("/api/status")).await.json();
+    assert_eq!(status["cache"]["entries"], 2);
+    assert!(status["cache"]["bytes"].as_u64().unwrap() > 0);
+    let upstream_before = status["counters"]["upstream"].as_u64().unwrap();
+
+    let cleared = site.send(post("/api/cache/clear", "{}")).await;
+    assert_eq!(cleared.status, 200);
+    assert_eq!(cleared.body, "{\"cleared\":2}");
+
+    let status = site.send(get("/api/status")).await.json();
+    assert_eq!(
+        status["cache"],
+        serde_json::json!({"entries": 0, "bytes": 0})
+    );
+
+    ask(&site.dns, "ok.example.", RecordType::A).await;
+    assert_eq!(upstream.count(), 3);
+    let status = site.send(get("/api/status")).await.json();
+    assert_eq!(status["counters"]["upstream"], upstream_before + 1);
+}
+
+#[tokio::test]
+async fn the_cache_size_is_shown_only_when_signed_in() {
+    let (with_password, _upstream) = plain_site().await;
+    let (without_password, _other) = open_site().await;
+
+    let signed_in = with_password.send(get("/api/status")).await.json();
+    let read_only = without_password.send(get("/api/status")).await.json();
+
+    let mut keys: Vec<&str> = signed_in["cache"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["bytes", "entries"]);
+    assert!(read_only.get("cache").is_none());
 }
 
 #[tokio::test]
@@ -1381,10 +1449,54 @@ fn rejected_mutations() -> Vec<(&'static str, Request, u16)> {
             },
             405,
         ),
+        (
+            "a cache clear from another origin",
+            post("/api/cache/clear", "{}").header("Origin", "http://evil.example"),
+            403,
+        ),
+        (
+            "a cache clear from a null origin",
+            post("/api/cache/clear", "{}").header("Origin", "null"),
+            403,
+        ),
+        (
+            "a cache clear to a name that is not configured",
+            post("/api/cache/clear", "{}").header("Host", "evil.example"),
+            403,
+        ),
+        (
+            "a cache clear as plain text",
+            post("/api/cache/clear", "{}").header("Content-Type", "text/plain"),
+            415,
+        ),
+        (
+            "a cache clear without a content type",
+            Request {
+                headers: Vec::new(),
+                ..post("/api/cache/clear", "{}")
+            },
+            415,
+        ),
+        (
+            "a cache clear body over 1 KiB",
+            post("/api/cache/clear", &big),
+            413,
+        ),
+        ("a get of cache clear", get("/api/cache/clear"), 405),
+        (
+            "a put of cache clear",
+            Request {
+                method: "PUT",
+                ..post("/api/cache/clear", "{}")
+            },
+            405,
+        ),
     ]
 }
 
 async fn assert_mutations_are_rejected(site: &Site, sign_in: impl Fn(Request) -> Request) {
+    let cached = cache_one_answer(site).await;
+
     for (what, request, status) in rejected_mutations() {
         let reply = site.send_as_is(sign_in(request)).await;
 
@@ -1392,7 +1504,25 @@ async fn assert_mutations_are_rejected(site: &Site, sign_in: impl Fn(Request) ->
         assert_eq!(reply.header("set-cookie"), None, "{what} set a cookie");
         assert!(!site.is_paused(), "{what} paused blocking");
         assert_nothing_was_started(site, what);
+        assert_cache_kept(site, cached, what);
     }
+}
+
+/// Asks a name the upstream answers, so the cache holds an entry a clear would remove.
+/// Returns how many entries the cache holds then.
+async fn cache_one_answer(site: &Site) -> usize {
+    ask(&site.dns, "kept.example.", RecordType::A).await;
+    let entries = site.dns.pipeline.cache_size().entries;
+    assert!(entries >= 1);
+
+    entries
+}
+
+fn assert_cache_kept(site: &Site, entries: usize, what: &str) {
+    assert!(
+        site.dns.pipeline.cache_size().entries >= entries,
+        "{what} cleared the cache"
+    );
 }
 
 /// A rejected request never reaches the release fake and never starts an update.
@@ -1512,6 +1642,7 @@ async fn without_a_password_the_page_shows_totals_and_lists_and_nothing_else() {
 async fn without_a_password_the_log_and_every_change_are_forbidden() {
     let (site, _upstream) = open_site().await;
     ask(&site.dns, "ads.example.", RecordType::A).await;
+    let cached = cache_one_answer(&site).await;
 
     let log = site.send(get("/api/querylog")).await;
     assert_eq!(log.status, 403);
@@ -1532,6 +1663,7 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
         ("a get of pause", get("/api/pause")),
         ("login", login("admin", "s3cret")),
         ("logout", post("/api/logout", "{}")),
+        ("clear cache", post("/api/cache/clear", "{}")),
     ] {
         let reply = site.send(request).await;
 
@@ -1540,6 +1672,7 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
     }
 
     assert!(!site.is_paused());
+    assert_cache_kept(&site, cached, "a forbidden change");
 }
 
 #[tokio::test]
@@ -1571,6 +1704,7 @@ async fn unsafe_mutations_are_rejected_without_a_password() {
     let mut config = local_config(&upstream);
     without_credentials(&mut config);
     let site = full_site(config).await;
+    let cached = cache_one_answer(&site).await;
 
     for (what, request, _) in rejected_mutations() {
         let target = request.path.clone();
@@ -1585,6 +1719,7 @@ async fn unsafe_mutations_are_rejected_without_a_password() {
         assert_eq!(reply.status, expected, "{what}");
         assert!(!site.is_paused(), "{what} paused blocking");
         assert_nothing_was_started(&site, what);
+        assert_cache_kept(&site, cached, what);
     }
 }
 
@@ -1631,6 +1766,7 @@ async fn with_a_password_the_page_opens_without_a_prompt_and_the_api_needs_a_sig
         ("/api/resume", ""),
         ("/api/lists/refresh", ""),
         ("/api/update", UPDATE_BODY),
+        ("/api/cache/clear", "{}"),
     ];
     let requests = || {
         reads
@@ -2177,6 +2313,7 @@ async fn a_peer_outside_allow_from_gets_nothing_from_reads_or_changes() {
     assert!(site.is_ignored(post("/api/update", UPDATE_BODY)).await);
     assert!(site.is_ignored(login("admin", "s3cret")).await);
     assert!(site.is_ignored(post("/api/logout", "{}")).await);
+    assert!(site.is_ignored(post("/api/cache/clear", "{}")).await);
     assert!(!site.is_paused());
     assert_nothing_was_started(&site, "a peer outside allow_from");
 }

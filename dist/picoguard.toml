@@ -85,6 +85,10 @@ format = "adblock"
 # max_ttl = 86400
 # Larger upstream answers are served but not cached.
 # max_response_size = 4096
+# Answer an expired answer at once with a short TTL and refresh it in the background.
+# optimistic = true
+# optimistic_answer_ttl_secs = 30
+# optimistic_max_age_secs = 43200
 
 # [limits]
 # h2_stream_window = 65536

@@ -21,7 +21,7 @@ use crate::budget::{Budget, Charge};
 use crate::cache::{Cache, CacheKey, EntryToken, Memo};
 use crate::config::{Cidr, Config, is_allowed};
 use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
-use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, rcode, rtype};
+use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, flags, rcode, rtype};
 use crate::filter::engine::{BlockedAnswer, Decision, Verdict, blocked_answer};
 use crate::policy::{Policy, PolicyView};
 use crate::stats::{Event, QueryResult, Stats, StatsSettings};
@@ -126,7 +126,8 @@ pub struct Finished(Option<Counted>);
 
 #[derive(Debug, Clone, Copy)]
 enum Source {
-    Cache,
+    /// A cache hit; `stale` when it was served from the optimistic window.
+    Cache { stale: bool },
     /// The upstream that gave the reply. `None` for the local resolver.
     Upstream(Option<u8>),
 }
@@ -134,7 +135,7 @@ enum Source {
 impl Source {
     fn server(self) -> Option<u8> {
         match self {
-            Source::Cache => None,
+            Source::Cache { .. } => None,
             Source::Upstream(server) => server,
         }
     }
@@ -183,6 +184,10 @@ impl Delivery {
         let waited = u32::try_from(self.received.elapsed().as_secs()).unwrap_or(u32::MAX);
 
         self.age_secs_when_received.saturating_add(waited)
+    }
+
+    fn is_stale(&self) -> bool {
+        matches!(self.source, Source::Cache { stale: true })
     }
 
     fn parts(&self) -> ReplyParts<'_> {
@@ -259,6 +264,8 @@ struct Inflight {
     queries: HashMap<Vec<u8>, Vec<oneshot::Sender<Outcome>>>,
     /// Clients waiting for an upstream reply, coalesced ones included.
     waiting: usize,
+    /// Background refreshes of stale entries, each in `queries` with no waiter of its own.
+    refreshing: usize,
 }
 
 struct WaitingClient {
@@ -268,6 +275,16 @@ struct WaitingClient {
 impl Drop for WaitingClient {
     fn drop(&mut self) {
         self.pipeline.inflight.lock().unwrap().waiting -= 1;
+    }
+}
+
+struct RefreshSlot {
+    pipeline: Arc<Pipeline>,
+}
+
+impl Drop for RefreshSlot {
+    fn drop(&mut self) {
+        self.pipeline.inflight.lock().unwrap().refreshing -= 1;
     }
 }
 
@@ -286,15 +303,24 @@ pub struct ServerTally {
     pub tally: Tally,
 }
 
+/// How many answers the cache holds and the bytes counted against its limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CacheSize {
+    pub entries: usize,
+    pub bytes: usize,
+}
+
 pub struct Pipeline {
     udp_size: u16,
     resume_limit: Duration,
     refuse_any: bool,
     cache_min_ttl: u32,
     cache_max_ttl: u32,
+    optimistic_answer_ttl: u32,
     blocked_ttl: u32,
     max_inflight_queries: usize,
     max_waiting_clients: usize,
+    max_refreshes: usize,
     blocked_hosts: Vec<Name>,
     local_domains: Vec<Name>,
     private_reverse_zones: Vec<Name>,
@@ -317,6 +343,13 @@ impl Pipeline {
                 Upstreams::plain(resolver, &config.upstream, &config.limits),
             )
         });
+        // A refresh holds a question slot and, while it waits, one exchange slot of a server.
+        // Refreshes take at most half of the smaller pool, so client misses keep the other
+        // half; at least one may run, so a single-slot setup still refreshes.
+        let refresh_slots = config
+            .limits
+            .max_inflight_queries
+            .min(config.limits.upstream_concurrency);
 
         Ok(Arc::new(Pipeline {
             udp_size: config.server.udp_size,
@@ -324,9 +357,11 @@ impl Pipeline {
             refuse_any: config.refuse_any,
             cache_min_ttl: config.cache.min_ttl,
             cache_max_ttl: config.cache.max_ttl,
+            optimistic_answer_ttl: config.cache.optimistic_answer_ttl_secs,
             blocked_ttl: config.blocked_ttl,
             max_inflight_queries: config.limits.max_inflight_queries,
             max_waiting_clients: config.limits.max_waiting_clients,
+            max_refreshes: (refresh_slots / 2).max(1),
             blocked_hosts: parse_names("blocked_hosts", &config.blocked_hosts)?,
             local_domains: parse_names("local.domains", &config.local.domains)?,
             private_reverse_zones: private_reverse_zones(),
@@ -376,6 +411,21 @@ impl Pipeline {
         servers.chain(local).collect()
     }
 
+    pub fn cache_size(&self) -> CacheSize {
+        let cache = self.cache.lock().unwrap();
+
+        CacheSize {
+            entries: cache.len(),
+            bytes: cache.bytes(),
+        }
+    }
+
+    /// Empties the cache and returns how many answers it held. Lookups in flight are not
+    /// cancelled: their answers are cached when they land.
+    pub fn clear_cache(&self) -> usize {
+        self.cache.lock().unwrap().clear()
+    }
+
     /// The budget for replies held for delivery. Queued TCP replies draw on it.
     pub fn budget(&self) -> &Arc<Budget> {
         &self.budget
@@ -384,7 +434,7 @@ impl Pipeline {
     /// Steps 1 to 3 and 6: everything that needs no waiting. A cache hit is
     /// answered here, so a UDP listener can reply without spawning a task.
     pub fn answer_quickly(
-        &self,
+        self: &Arc<Pipeline>,
         request: &[u8],
         protocol: Protocol,
         client: IpAddr,
@@ -637,9 +687,9 @@ impl Pipeline {
 
     /// Steps 1 to 3 and 6. `Err` says what is left to do: nothing (`Replied` is a
     /// header-only answer to a malformed query), or the upstream. The query is recorded
-    /// when `asker` is given.
+    /// when `asker` is given. A stale cache hit is answered and starts a background refresh.
     fn settle(
-        &self,
+        self: &Arc<Pipeline>,
         request: &[u8],
         protocol: Protocol,
         asker: Option<&Asker>,
@@ -701,6 +751,7 @@ impl Pipeline {
         };
 
         let token = hit.token;
+        let stale = hit.stale;
         let remembered = hit
             .memo
             .filter(|memo| !view.paused && memo.generation == view.generation);
@@ -711,7 +762,7 @@ impl Pipeline {
         };
         let result = match &decision {
             Decision::Pass => {
-                reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs), out);
+                reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs, hit.stale), out);
 
                 QueryResult::Cached
             }
@@ -724,6 +775,12 @@ impl Pipeline {
         };
 
         self.remember(&mut cache, &key, token, &view, &decision);
+        // The inflight lock is never taken while the cache lock is held.
+        drop(cache);
+
+        if stale {
+            self.refresh(&query);
+        }
 
         Ok(Settled::Cached(record(counted_as(out, result))))
     }
@@ -742,7 +799,7 @@ impl Pipeline {
             info,
             Some(hit.token),
             hit.age_secs,
-            Source::Cache,
+            Source::Cache { stale: hit.stale },
             charge,
         )))
     }
@@ -782,10 +839,11 @@ impl Pipeline {
 
         let result = match decision {
             Decision::Pass => {
-                reply.from_upstream(delivery.parts(), self.ttl_rule(delivery.age_secs()), out);
+                let ttl_rule = self.ttl_rule(delivery.age_secs(), delivery.is_stale());
+                reply.from_upstream(delivery.parts(), ttl_rule, out);
 
                 match delivery.source {
-                    Source::Cache => QueryResult::Cached,
+                    Source::Cache { .. } => QueryResult::Cached,
                     Source::Upstream(_) => QueryResult::Pass,
                 }
             }
@@ -832,7 +890,17 @@ impl Pipeline {
         }
     }
 
-    fn ttl_rule(&self, age: u32) -> TtlRule {
+    /// A stale answer carries the optimistic answer TTL in every record, the SOA of a
+    /// negative answer included; a fresh one is clamped and aged.
+    fn ttl_rule(&self, age: u32, stale: bool) -> TtlRule {
+        if stale {
+            return TtlRule {
+                min: self.optimistic_answer_ttl,
+                max: self.optimistic_answer_ttl,
+                age: 0,
+            };
+        }
+
         TtlRule {
             min: self.cache_min_ttl,
             max: self.cache_max_ttl,
@@ -935,6 +1003,40 @@ impl Pipeline {
         ))
     }
 
+    /// Starts a background lookup that replaces the stale entry of `query`, unless one is in
+    /// flight for the question already (its answer replaces the entry), or the refresh limit,
+    /// the question slots or the pending-bytes budget are used up. A skipped refresh is tried
+    /// again on the next stale hit. No client waits on it and it is not recorded.
+    fn refresh(self: &Arc<Pipeline>, query: &Query<'_>) {
+        let identity = CacheKey::new(query).identity();
+        let mut inflight = self.inflight.lock().unwrap();
+
+        if inflight.queries.contains_key(&identity)
+            || inflight.refreshing >= self.max_refreshes
+            || inflight.queries.len() >= self.max_inflight_queries
+            || self.budget.is_exhausted()
+        {
+            return;
+        }
+
+        inflight.queries.insert(identity.clone(), Vec::new());
+        inflight.refreshing += 1;
+        drop(inflight);
+
+        let slot = RefreshSlot {
+            pipeline: Arc::clone(self),
+        };
+        let resolve = Arc::clone(self).resolve(
+            identity,
+            build::upstream_query(query, self.udp_size),
+            self.route_of(&query.question.name),
+        );
+        tokio::spawn(async move {
+            resolve.await;
+            drop(slot);
+        });
+    }
+
     /// Steps 5 and 7 for one question, then wakes everyone waiting for it.
     /// `request` is the normalized upstream query, the only copy of the
     /// question that is kept while waiting.
@@ -981,12 +1083,16 @@ impl Pipeline {
         info.cap_soa_ttls(&mut bytes);
 
         let query = Query::parse(&request).map_err(|_| Failure::Upstream)?;
-        let cached_as = self.cache.lock().unwrap().insert(
-            &CacheKey::new(&query),
-            &bytes,
-            &info,
-            Instant::now(),
-        );
+        let key = CacheKey::new(&query);
+        let mut cache = self.cache.lock().unwrap();
+        let cached_as = cache.insert(&key, &bytes, &info, Instant::now());
+        // A final answer the cache refuses (TTL 0, no SOA, too big) is what the upstream says
+        // now, so a stale entry for the question is no longer the best answer.
+        if cached_as.is_none() && is_final_answer(&info) {
+            cache.forget(&key);
+        }
+
+        drop(cache);
 
         let source = Source::Upstream(if route == Route::Default {
             u8::try_from(server).ok()
@@ -998,6 +1104,16 @@ impl Pipeline {
             bytes, info, cached_as, 0, source, charge,
         )))
     }
+}
+
+/// An answer that settles the question: NOERROR or NXDOMAIN, not truncated, with no extended
+/// rcode.
+fn is_final_answer(info: &ResponseInfo) -> bool {
+    let header = &info.header;
+
+    matches!(header.rcode(), rcode::NOERROR | rcode::NXDOMAIN)
+        && header.flags & flags::TC == 0
+        && info.extended_rcode == 0
 }
 
 /// A SERVFAIL is an error, whatever built it: the upstream, a rebuild that failed, or a
@@ -1077,12 +1193,15 @@ fn reverse_address(name: &Name) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use hickory_proto::rr::RecordType;
 
     use super::*;
-    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse};
+    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse, soa};
     use crate::filter::engine::{CompiledList, Engine};
     use crate::filter::parse::ListFormat;
+    use crate::upstream::test_dns::{self, fake_dns};
 
     const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
 
@@ -1303,13 +1422,14 @@ mod tests {
         );
     }
 
-    fn policy_of(rules: &str) -> Arc<Policy> {
+    fn engine_with(rules: &str) -> Arc<Engine> {
         let (list, _) = CompiledList::from_text(ListFormat::Adblock, rules);
 
-        Arc::new(Policy::with_engine(Arc::new(Engine::new(
-            vec![Arc::new(list)],
-            Vec::new(),
-        ))))
+        Arc::new(Engine::new(vec![Arc::new(list)], Vec::new()))
+    }
+
+    fn policy_of(rules: &str) -> Arc<Policy> {
+        Arc::new(Policy::with_engine(engine_with(rules)))
     }
 
     fn reply_with_address(spec: &QuerySpec, address: [u8; 4]) -> Vec<u8> {
@@ -1461,5 +1581,535 @@ mod tests {
         assert_eq!(quick, Quick::Replied);
         assert_eq!(parse(&out).answers.len(), 200);
         assert_eq!(pipeline.cache.lock().unwrap().bytes(), bytes_without_memo);
+    }
+
+    fn offline_config() -> Config {
+        let mut config = Config::default();
+        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
+
+        config
+    }
+
+    /// Caches an A reply for `spec` as if it had been received `age_secs` ago.
+    fn insert_aged(
+        pipeline: &Pipeline,
+        spec: &QuerySpec,
+        address: [u8; 4],
+        ttl: u32,
+        age_secs: u64,
+    ) -> Option<EntryToken> {
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let bytes = ResponseSpec {
+            answers: vec![a(&spec.name, ttl, address.into())],
+            ..ResponseSpec::default()
+        }
+        .bytes(spec);
+        let info = ResponseInfo::parse(&bytes).unwrap();
+        let inserted = Instant::now()
+            .checked_sub(Duration::from_secs(age_secs))
+            .expect("the machine has been up for minutes");
+
+        pipeline
+            .cache
+            .lock()
+            .unwrap()
+            .insert(&CacheKey::new(&query), &bytes, &info, inserted)
+    }
+
+    fn answer_ttls(out: &[u8]) -> Vec<u32> {
+        parse(out).answers.iter().map(|record| record.ttl).collect()
+    }
+
+    fn answer_addresses(out: &[u8]) -> Vec<String> {
+        parse(out)
+            .answers
+            .iter()
+            .map(|record| record.data.to_string())
+            .collect()
+    }
+
+    fn counters(pipeline: &Pipeline) -> crate::stats::Counters {
+        pipeline.stats().snapshot().counters
+    }
+
+    #[tokio::test]
+    async fn a_stale_hit_is_answered_at_once_with_the_answer_ttl() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        let fresh = QuerySpec::new("fresh.example.", RecordType::A);
+        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 301).unwrap();
+        insert_aged(&pipeline, &fresh, [2, 2, 2, 2], 300, 10).unwrap();
+        let mut out = Vec::new();
+
+        let quick = pipeline.answer_quickly(&stale.bytes(), Protocol::Udp, CLIENT, &mut out);
+        assert_eq!(quick, Quick::Replied);
+        assert_eq!(answer_ttls(&out), [30]);
+        assert_eq!(answer_addresses(&out), ["1.1.1.1"]);
+
+        let quick = pipeline.answer_quickly(&fresh.bytes(), Protocol::Udp, CLIENT, &mut out);
+        assert_eq!(quick, Quick::Replied);
+        assert_eq!(answer_ttls(&out), [290]);
+        assert_eq!(answer_addresses(&out), ["2.2.2.2"]);
+
+        let counters = counters(&pipeline);
+        assert_eq!(counters.total, 2);
+        assert_eq!(counters.cached, 2);
+        assert_eq!(counters.upstream, 0);
+    }
+
+    #[tokio::test]
+    async fn a_stale_hit_over_tcp_is_delivered_with_the_answer_ttl() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        let prepared = pipeline
+            .prepare(stale.bytes(), Protocol::Tcp, CLIENT)
+            .await
+            .unwrap();
+        let finished = pipeline.finish(&prepared, &mut out).await.unwrap();
+        pipeline.count(&prepared, finished);
+
+        assert_eq!(answer_ttls(&out), [30]);
+        assert_eq!(answer_addresses(&out), ["1.1.1.1"]);
+        assert_eq!(counters(&pipeline).cached, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_negative_answer_carries_the_answer_ttl_in_its_soa() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("gone.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let bytes = ResponseSpec {
+            authorities: vec![soa("example.", 300, 300)],
+            rcode: rcode::NXDOMAIN,
+            ..ResponseSpec::default()
+        }
+        .bytes(&spec);
+        let info = ResponseInfo::parse(&bytes).unwrap();
+        let inserted = Instant::now()
+            .checked_sub(Duration::from_secs(301))
+            .expect("the machine has been up for minutes");
+        pipeline
+            .cache
+            .lock()
+            .unwrap()
+            .insert(&CacheKey::new(&query), &bytes, &info, inserted)
+            .unwrap();
+        let mut out = Vec::new();
+
+        let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut out);
+
+        assert_eq!(quick, Quick::Replied);
+        let reply = parse(&out);
+        assert_eq!(
+            u16::from(reply.metadata.response_code),
+            u16::from(rcode::NXDOMAIN)
+        );
+        let soa_ttls: Vec<u32> = reply.authorities.iter().map(|record| record.ttl).collect();
+        assert_eq!(soa_ttls, [30]);
+    }
+
+    #[tokio::test]
+    async fn past_its_window_an_expired_entry_needs_the_upstream() {
+        let mut config = offline_config();
+        config.cache.optimistic_max_age_secs = 10;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 311).unwrap();
+        let mut out = Vec::new();
+
+        let quick = pipeline.answer_quickly(&stale.bytes(), Protocol::Udp, CLIENT, &mut out);
+
+        assert_eq!(quick, Quick::NeedsUpstream);
+        assert!(pipeline.cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_optimism_off_an_expired_entry_needs_the_upstream() {
+        let mut config = offline_config();
+        config.cache.optimistic = false;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        let quick = pipeline.answer_quickly(&stale.bytes(), Protocol::Udp, CLIENT, &mut out);
+
+        assert_eq!(quick, Quick::NeedsUpstream);
+        assert!(pipeline.cache.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_answer_takes_the_decision_of_the_policy_of_now() {
+        let policy = Arc::new(Policy::new());
+        let pipeline = Pipeline::new(&offline_config(), Arc::clone(&policy)).unwrap();
+        let stale = QuerySpec::new("stale.example.", RecordType::A);
+        let request = stale.bytes();
+        let token = insert_aged(&pipeline, &stale, [9, 9, 9, 9], 300, 301).unwrap();
+        let query = Query::parse(&request).unwrap();
+        pipeline.cache.lock().unwrap().set_memo(
+            &CacheKey::new(&query),
+            token,
+            Memo {
+                generation: 0,
+                decision: Decision::Pass,
+            },
+        );
+        let mut out = Vec::new();
+        let ask = |out: &mut Vec<u8>| {
+            let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, out);
+            assert_eq!(quick, Quick::Replied);
+        };
+
+        policy.swap_engine(engine_with("||9.9.9.9^\n"));
+        ask(&mut out);
+        assert_eq!(answer_addresses(&out), ["0.0.0.0"]);
+        assert_eq!(answer_ttls(&out), [pipeline.blocked_ttl]);
+        assert_eq!(counters(&pipeline).blocked_response, 1);
+
+        policy.pause(Duration::from_secs(60), policy.now());
+        ask(&mut out);
+        assert_eq!(answer_addresses(&out), ["9.9.9.9"]);
+        assert_eq!(answer_ttls(&out), [30]);
+
+        policy.resume();
+        ask(&mut out);
+        assert_eq!(answer_addresses(&out), ["0.0.0.0"]);
+        assert_eq!(counters(&pipeline).blocked_response, 2);
+
+        policy.swap_engine(engine_with("||stale.example^\n"));
+        ask(&mut out);
+        assert_eq!(answer_ttls(&out), [pipeline.blocked_ttl]);
+        assert_eq!(counters(&pipeline).blocked_request, 1);
+    }
+
+    fn config_for_upstream(address: SocketAddr) -> Config {
+        let mut config = Config::default();
+        config.upstream.servers = vec![format!("udp://{address}")];
+
+        config
+    }
+
+    fn inflight_counts(pipeline: &Pipeline) -> (usize, usize, usize) {
+        let inflight = pipeline.inflight.lock().unwrap();
+
+        (
+            inflight.queries.len(),
+            inflight.refreshing,
+            inflight.waiting,
+        )
+    }
+
+    /// Polls until no lookup is in flight and no refresh holds a slot, for at most 3 s.
+    async fn wait_for_refreshes(pipeline: &Pipeline) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+
+        while inflight_counts(pipeline).0 > 0 || inflight_counts(pipeline).1 > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the refresh did not end within 3 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn ask_quickly(pipeline: &Arc<Pipeline>, spec: &QuerySpec, out: &mut Vec<u8>) -> Quick {
+        pipeline.answer_quickly(&spec.bytes(), Protocol::Udp, CLIENT, out)
+    }
+
+    fn first_tally(pipeline: &Pipeline) -> Tally {
+        pipeline.upstream_tallies()[0].tally
+    }
+
+    #[tokio::test]
+    async fn twenty_stale_hits_start_one_refresh_that_waits_for_no_client() {
+        let fake = fake_dns(vec![Ipv4Addr::new(2, 2, 2, 2)], vec![]).await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(fake.address), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        for _ in 0..20 {
+            assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+            assert_eq!(answer_addresses(&out), ["1.1.1.1"]);
+            assert_eq!(answer_ttls(&out), [30]);
+        }
+
+        assert_eq!(inflight_counts(&pipeline), (1, 1, 0));
+
+        wait_for_refreshes(&pipeline).await;
+        assert_eq!(fake.queries.load(Ordering::SeqCst), 1);
+
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+        assert_eq!(answer_addresses(&out), ["2.2.2.2"]);
+        assert_eq!(answer_ttls(&out), [60]);
+        assert_eq!(fake.queries.load(Ordering::SeqCst), 1);
+
+        let counters = counters(&pipeline);
+        assert_eq!(counters.total, 21);
+        assert_eq!(counters.cached, 21);
+        assert_eq!(counters.upstream, 0);
+        assert_eq!(pipeline.stats().query_log(1000).len(), 21);
+        assert_eq!(first_tally(&pipeline).answered, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_hit_joins_a_lookup_in_flight_for_its_question() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let config = config_for_upstream(silent.local_addr().unwrap());
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("stale.example.", RecordType::A);
+        let request = spec.bytes();
+        let _lookup = pipeline
+            .join_or_start(&Query::parse(&request).unwrap())
+            .unwrap();
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+        assert_eq!(answer_ttls(&out), [30]);
+
+        let (queries, refreshing, _) = inflight_counts(&pipeline);
+        assert_eq!(queries, 1);
+        assert_eq!(refreshing, 0);
+    }
+
+    #[tokio::test]
+    async fn a_client_miss_joins_a_refresh_in_flight() {
+        let fake = fake_dns(vec![Ipv4Addr::new(2, 2, 2, 2)], vec![]).await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(fake.address), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("stale.example.", RecordType::A);
+        let request = spec.bytes();
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+
+        // Stands in for an eviction while the refresh runs.
+        pipeline
+            .cache
+            .lock()
+            .unwrap()
+            .forget(&CacheKey::new(&Query::parse(&request).unwrap()));
+
+        assert!(
+            pipeline
+                .answer(request, Protocol::Udp, CLIENT, &mut out)
+                .await
+        );
+        assert_eq!(answer_addresses(&out), ["2.2.2.2"]);
+        assert_eq!(fake.queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refreshes_take_at_most_half_of_the_question_slots() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut config = config_for_upstream(silent.local_addr().unwrap());
+        config.limits.max_inflight_queries = 4;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let mut out = Vec::new();
+
+        for index in 0..5 {
+            let spec = QuerySpec::new(&format!("stale{index}.example."), RecordType::A);
+            insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 301).unwrap();
+
+            assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+            assert_eq!(answer_ttls(&out), [30]);
+        }
+
+        let (queries, refreshing, _) = inflight_counts(&pipeline);
+        assert_eq!(refreshing, 2);
+        assert_eq!(queries, 2);
+
+        let client_lookup = |name: &str| {
+            let request = QuerySpec::new(name, RecordType::A).bytes();
+
+            pipeline.join_or_start(&Query::parse(&request).unwrap())
+        };
+        let _first = client_lookup("new0.example.").unwrap();
+        let _second = client_lookup("new1.example.").unwrap();
+        assert!(matches!(
+            client_lookup("new2.example."),
+            Err(Failure::Overloaded)
+        ));
+    }
+
+    /// An upstream that never answers names starting with `stale` and answers any other A
+    /// question at once with 3.3.3.3. Returns its address and how many `stale` queries it got.
+    async fn deaf_to_stale_names() -> (SocketAddr, Arc<AtomicUsize>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let stale_received = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&stale_received);
+
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 512];
+            while let Ok((length, peer)) = socket.recv_from(&mut buffer).await {
+                let query = &buffer[..length];
+                if query.get(13..18) == Some(&b"stale"[..]) {
+                    counter.fetch_add(1, Ordering::SeqCst);
+
+                    continue;
+                }
+
+                let reply = test_dns::answer(query, [3, 3, 3, 3], false);
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        });
+
+        (address, stale_received)
+    }
+
+    #[tokio::test]
+    async fn refreshes_leave_half_of_a_servers_slots_to_a_cold_query() {
+        let (address, stale_received) = deaf_to_stale_names().await;
+        let mut config = config_for_upstream(address);
+        config.limits.upstream_concurrency = 4;
+        config.upstream.timeout_ms = 4000;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let mut out = Vec::new();
+
+        for index in 0..5 {
+            let spec = QuerySpec::new(&format!("stale{index}.example."), RecordType::A);
+            insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 301).unwrap();
+
+            assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while inflight_counts(&pipeline).1 != 2 || stale_received.load(Ordering::SeqCst) != 2 {
+            assert!(
+                Instant::now() < deadline,
+                "two refreshes never held a server slot: {:?}, {} received",
+                inflight_counts(&pipeline),
+                stale_received.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let cold = QuerySpec::new("cold.example.", RecordType::A).bytes();
+        let asked = Instant::now();
+        assert!(pipeline.answer(cold, Protocol::Udp, CLIENT, &mut out).await);
+        let took = asked.elapsed();
+
+        assert_eq!(answer_addresses(&out), ["3.3.3.3"]);
+        // Without a free slot, the first try would give up waiting for one at half the
+        // timeout; anything below that means the query found a slot.
+        assert!(took < Duration::from_millis(2000), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_single_slot_setup_still_refreshes() {
+        let fake = fake_dns(vec![Ipv4Addr::new(2, 2, 2, 2)], vec![]).await;
+        let mut config = config_for_upstream(fake.address);
+        config.limits.max_inflight_queries = 1;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let first = QuerySpec::new("first.example.", RecordType::A);
+        let second = QuerySpec::new("second.example.", RecordType::A);
+        insert_aged(&pipeline, &first, [1, 1, 1, 1], 300, 301).unwrap();
+        insert_aged(&pipeline, &second, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        assert_eq!(ask_quickly(&pipeline, &first, &mut out), Quick::Replied);
+        assert_eq!(inflight_counts(&pipeline).1, 1);
+
+        assert_eq!(ask_quickly(&pipeline, &second, &mut out), Quick::Replied);
+        assert_eq!(inflight_counts(&pipeline).0, 1);
+
+        wait_for_refreshes(&pipeline).await;
+        assert_eq!(ask_quickly(&pipeline, &first, &mut out), Quick::Replied);
+        assert_eq!(answer_addresses(&out), ["2.2.2.2"]);
+        assert_eq!(answer_ttls(&out), [60]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_stale_entry_and_is_no_client_error() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut config = config_for_upstream(silent.local_addr().unwrap());
+        config.upstream.timeout_ms = 200;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+        wait_for_refreshes(&pipeline).await;
+        assert_eq!(pipeline.cache.lock().unwrap().len(), 1);
+
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+        assert_eq!(answer_ttls(&out), [30]);
+        assert_eq!(inflight_counts(&pipeline).1, 1);
+
+        assert_eq!(counters(&pipeline).errors, 0);
+        assert!(first_tally(&pipeline).failed >= 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_cache_cannot_keep_drops_the_stale_entry() {
+        let fake = fake_dns(vec![Ipv4Addr::new(2, 2, 2, 2)], vec![]).await;
+        fake.set_v4(vec![]);
+        let pipeline =
+            Pipeline::new(&config_for_upstream(fake.address), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+        wait_for_refreshes(&pipeline).await;
+
+        assert_eq!(fake.queries.load(Ordering::SeqCst), 1);
+        assert!(pipeline.cache.lock().unwrap().is_empty());
+        assert_eq!(
+            ask_quickly(&pipeline, &spec, &mut out),
+            Quick::NeedsUpstream
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_blocked_by_its_request_starts_no_refresh() {
+        let pipeline = Pipeline::new(&offline_config(), policy_of("||x.example^\n")).unwrap();
+        let spec = QuerySpec::new("x.example.", RecordType::A);
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+
+        assert_eq!(answer_addresses(&out), ["0.0.0.0"]);
+        assert_eq!(inflight_counts(&pipeline), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn clearing_the_cache_reports_what_it_removed_and_the_next_query_needs_the_upstream() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let specs: Vec<QuerySpec> = ["a.example.", "b.example.", "c.example."]
+            .iter()
+            .map(|name| QuerySpec::new(name, RecordType::A))
+            .collect();
+        insert_aged(&pipeline, &specs[0], [1, 1, 1, 1], 300, 301).unwrap();
+        insert_aged(&pipeline, &specs[1], [1, 1, 1, 1], 300, 10).unwrap();
+        insert_aged(&pipeline, &specs[2], [1, 1, 1, 1], 300, 0).unwrap();
+        let bytes = pipeline.cache.lock().unwrap().bytes();
+
+        assert_eq!(pipeline.cache_size(), CacheSize { entries: 3, bytes });
+
+        assert_eq!(pipeline.clear_cache(), 3);
+        assert_eq!(
+            pipeline.cache_size(),
+            CacheSize {
+                entries: 0,
+                bytes: 0
+            }
+        );
+
+        let mut out = Vec::new();
+        assert_eq!(
+            ask_quickly(&pipeline, &specs[0], &mut out),
+            Quick::NeedsUpstream
+        );
     }
 }

@@ -16,6 +16,8 @@ const MAX_UDP_SIZE: u16 = 4096;
 const MAX_H2_WINDOW: u32 = (1 << 31) - 1;
 const MAX_QUERY_LOG_ENTRIES: usize = 100_000;
 const MAX_TOP_K: usize = 1000;
+const MAX_OPTIMISTIC_ANSWER_TTL_SECS: usize = 3600;
+const MAX_OPTIMISTIC_MAX_AGE_SECS: usize = 604_800;
 
 /// Networks that may talk to picoguard: loopback, private ranges, CGNAT
 /// (which covers Tailscale) and link-local.
@@ -495,6 +497,9 @@ pub struct CacheConfig {
     pub min_ttl: u32,
     pub max_ttl: u32,
     pub max_response_size: usize,
+    pub optimistic: bool,
+    pub optimistic_answer_ttl_secs: u32,
+    pub optimistic_max_age_secs: u32,
 }
 
 impl Default for CacheConfig {
@@ -505,6 +510,9 @@ impl Default for CacheConfig {
             min_ttl: 0,
             max_ttl: 86_400,
             max_response_size: 4096,
+            optimistic: true,
+            optimistic_answer_ttl_secs: 30,
+            optimistic_max_age_secs: 43_200,
         }
     }
 }
@@ -524,7 +532,18 @@ impl CacheConfig {
             return invalid("cache.max_response_size must be <= 65535");
         }
 
-        Ok(())
+        // Checked with optimism off too, so turning it on later never reveals a bad value.
+        in_range(
+            "cache.optimistic_answer_ttl_secs",
+            self.optimistic_answer_ttl_secs as usize,
+            MAX_OPTIMISTIC_ANSWER_TTL_SECS,
+        )?;
+
+        in_range(
+            "cache.optimistic_max_age_secs",
+            self.optimistic_max_age_secs as usize,
+            MAX_OPTIMISTIC_MAX_AGE_SECS,
+        )
     }
 }
 
@@ -997,6 +1016,9 @@ mod tests {
             min_ttl = 10
             max_ttl = 3600
             max_response_size = 1232
+            optimistic = false
+            optimistic_answer_ttl_secs = 5
+            optimistic_max_age_secs = 600
 
             [web]
             enabled = false
@@ -1038,6 +1060,9 @@ mod tests {
         assert_eq!(config.stats.top_k, 20);
         assert_eq!(config.allowlists.len(), 1);
         assert_eq!(config.cache.max_ttl, 3600);
+        assert!(!config.cache.optimistic);
+        assert_eq!(config.cache.optimistic_answer_ttl_secs, 5);
+        assert_eq!(config.cache.optimistic_max_age_secs, 600);
         assert_eq!(config.web.user.as_deref(), Some("admin"));
         assert!(!config.state.persist_lists);
         assert_eq!(config.log.level, LogLevel::Debug);
@@ -1066,6 +1091,29 @@ mod tests {
         let message = error_of("[cache]\nmax_entires = 5");
 
         assert!(message.contains("max_entires"), "{message}");
+    }
+
+    #[test]
+    fn optimistic_caching_is_on_by_default() {
+        let cache = CacheConfig::default();
+
+        assert!(cache.optimistic);
+        assert_eq!(cache.optimistic_answer_ttl_secs, 30);
+        assert_eq!(cache.optimistic_max_age_secs, 43_200);
+    }
+
+    #[test]
+    fn the_optimistic_limits_accept_their_edges() {
+        for (answer_ttl, max_age) in [(1, 1), (3600, 604_800)] {
+            let text = format!(
+                "[cache]\noptimistic_answer_ttl_secs = {answer_ttl}\noptimistic_max_age_secs = {max_age}"
+            );
+
+            let cache = Config::parse(&text).unwrap().cache;
+
+            assert_eq!(cache.optimistic_answer_ttl_secs, answer_ttl);
+            assert_eq!(cache.optimistic_max_age_secs, max_age);
+        }
     }
 
     #[test]
@@ -1198,6 +1246,26 @@ mod tests {
             (
                 "[cache]\nmax_response_size = 70000",
                 "cache.max_response_size must be <= 65535",
+            ),
+            (
+                "[cache]\noptimistic_answer_ttl_secs = 0",
+                "cache.optimistic_answer_ttl_secs must be > 0",
+            ),
+            (
+                "[cache]\noptimistic_answer_ttl_secs = 3601",
+                "cache.optimistic_answer_ttl_secs must be <= 3600",
+            ),
+            (
+                "[cache]\noptimistic_max_age_secs = 0",
+                "cache.optimistic_max_age_secs must be > 0",
+            ),
+            (
+                "[cache]\noptimistic_max_age_secs = 604801",
+                "cache.optimistic_max_age_secs must be <= 604800",
+            ),
+            (
+                "[cache]\noptimistic = false\noptimistic_answer_ttl_secs = 0",
+                "cache.optimistic_answer_ttl_secs must be > 0",
             ),
             (
                 "[limits]\nh2_stream_window = 0",
