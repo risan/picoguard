@@ -476,6 +476,30 @@ enum Class {
     ImportantAllow,
 }
 
+/// One of the `for_each_*_candidate` walks of [`super::pattern`].
+type CandidateWalk = fn(&str, &mut dyn FnMut(&str));
+
+fn class_of(rule: &NetworkRule) -> Class {
+    match (rule.whitelist, rule.important) {
+        (true, true) => Class::ImportantAllow,
+        (false, true) => Class::ImportantBlock,
+        (true, false) => Class::Allow,
+        (false, false) => Class::Block,
+    }
+}
+
+/// A plain rule in adblock form; an RPZ `*.d` is `||*.d^`.
+fn fast_text(kind: usize, name: &str) -> String {
+    match kind {
+        SUB_BLOCK => format!("||{name}^"),
+        EXACT_BLOCK => format!("|{name}^"),
+        SUB_ALLOW => format!("@@||{name}^"),
+        EXACT_ALLOW => format!("@@|{name}^"),
+        STRICT_BLOCK => format!("||*.{name}^"),
+        _ => format!("@@||*.{name}^"),
+    }
+}
+
 struct Query<'a> {
     host: &'a str,
     record_type: u16,
@@ -687,16 +711,17 @@ impl SlowIndex {
         index
     }
 
-    /// Calls `f` for every slow rule whose shortcut starts with some window of `url`, and for
-    /// the rules without a usable shortcut. A rule may be offered more than once.
+    /// Calls `f` with the list position and the rule of every slow rule whose shortcut starts
+    /// with some window of `url`, and of the rules without a usable shortcut. A rule may be
+    /// offered more than once.
     fn for_each_candidate<'a>(
         &self,
         lists: &'a [Arc<CompiledList>],
         url: &str,
-        f: &mut dyn FnMut(&'a SlowRule),
+        f: &mut dyn FnMut(usize, &'a SlowRule),
     ) {
         for &(list, rule) in &self.always {
-            f(&lists[list as usize].slow[rule as usize]);
+            f(list as usize, &lists[list as usize].slow[rule as usize]);
         }
 
         if self.keyed.is_empty() {
@@ -711,7 +736,7 @@ impl SlowIndex {
                     break;
                 }
 
-                f(&lists[list as usize].slow[rule as usize]);
+                f(list as usize, &lists[list as usize].slow[rule as usize]);
             }
         }
     }
@@ -859,31 +884,100 @@ impl RuleSet {
 
         let url = format!("http://{}", query.host);
         self.slow_index
-            .for_each_candidate(&self.lists, &url, &mut |slow| {
-                let rule = &slow.rule;
-                let allowed = conditions_hold(
-                    &rule.dns_permitted,
-                    &rule.dns_restricted,
-                    &rule.denyallow,
-                    query,
-                );
-                if rule.badfilter
-                    || !allowed
-                    || !slow.matcher.is_match(query.host, &url)
-                    || self.slow_disabled(slow, query)
-                {
-                    return;
+            .for_each_candidate(&self.lists, &url, &mut |_, slow| {
+                if self.slow_matches(slow, query, &url) {
+                    note(class_of(&slow.rule));
                 }
-
-                note(match (rule.whitelist, rule.important) {
-                    (true, true) => Class::ImportantAllow,
-                    (false, true) => Class::ImportantBlock,
-                    (true, false) => Class::Allow,
-                    (false, false) => Class::Block,
-                });
             });
 
         best.get()
+    }
+
+    /// Whether `slow` decides `query`: no badfilter itself, its conditions hold, its pattern
+    /// matches and no badfilter disables it.
+    fn slow_matches(&self, slow: &SlowRule, query: &Query<'_>, url: &str) -> bool {
+        let rule = &slow.rule;
+        let allowed = conditions_hold(
+            &rule.dns_permitted,
+            &rule.dns_restricted,
+            &rule.denyallow,
+            query,
+        );
+
+        !rule.badfilter
+            && allowed
+            && slow.matcher.is_match(query.host, url)
+            && !self.slow_disabled(slow, query)
+    }
+
+    /// The list position and text of a rule of `class` that matches `query`, in the first
+    /// list that holds one. Plain rules are rebuilt from the candidate that hit; slow rules
+    /// come through the index like a check, so no other slow rule is looked at.
+    fn find(&self, query: &Query<'_>, class: Class) -> Option<(usize, String)> {
+        let mut best: Option<(usize, String)> = None;
+        let kinds = match class {
+            Class::Block => [SUB_BLOCK, EXACT_BLOCK, STRICT_BLOCK],
+            Class::Allow => [SUB_ALLOW, EXACT_ALLOW, STRICT_ALLOW],
+            Class::ImportantBlock | Class::ImportantAllow => [FAST_KINDS; 3],
+        };
+
+        for kind in kinds {
+            let candidates: CandidateWalk = match kind {
+                SUB_BLOCK | SUB_ALLOW => for_each_suffix_candidate,
+                EXACT_BLOCK | EXACT_ALLOW => for_each_exact_candidate,
+                STRICT_BLOCK | STRICT_ALLOW => for_each_strict_suffix_candidate,
+                _ => continue,
+            };
+
+            candidates(query.host, &mut |candidate| {
+                let name = hash(candidate);
+                if !self.fast_hit(kind, name, query) {
+                    return;
+                }
+
+                let first = self
+                    .lists
+                    .iter()
+                    .position(|list| contains_hash(&list.fast[kind], name));
+                if let Some(list) = first
+                    && best.as_ref().is_none_or(|(at, _)| list < *at)
+                {
+                    best = Some((list, fast_text(kind, candidate)));
+                }
+            });
+        }
+
+        if self.has_slow {
+            let url = format!("http://{}", query.host);
+            let mut slow_best: Option<(usize, &SlowRule)> = None;
+            self.slow_index
+                .for_each_candidate(&self.lists, &url, &mut |list, slow| {
+                    let earlier = slow_best.is_none_or(|(at, _)| list < at)
+                        && best.as_ref().is_none_or(|(at, _)| list < *at);
+                    if earlier
+                        && class_of(&slow.rule) == class
+                        && self.slow_matches(slow, query, &url)
+                    {
+                        slow_best = Some((list, slow));
+                    }
+                });
+
+            if let Some((list, slow)) = slow_best {
+                best = Some((list, slow.rule.text()));
+            }
+        }
+
+        best
+    }
+
+    /// The first list with a host rule for `host`, and the first address it gives the name.
+    fn host_rule(&self, host: &str) -> Option<(usize, IpAddr)> {
+        let name = hash(host);
+
+        self.lists
+            .iter()
+            .enumerate()
+            .find_map(|(at, list)| list.hosts.ips_of(name).next().map(|ip| (at, *ip)))
     }
 
     /// The answer IPs of the host rules that match `host`, or `None` without a match. Only
@@ -983,11 +1077,7 @@ impl Engine {
             return Verdict::NoMatch;
         }
 
-        let host: Cow<'_, str> = if input.chars().any(char::is_uppercase) {
-            Cow::Owned(input.to_lowercase())
-        } else {
-            Cow::Borrowed(input)
-        };
+        let host = lowercase(input);
         let query = Query {
             host: &host,
             record_type,
@@ -1017,6 +1107,110 @@ impl Engine {
                 None => Verdict::NoMatch,
             },
         }
+    }
+
+    /// Which rule decides `input`, step by step as `verdict` decides: the rule in the first
+    /// list, in engine order, that holds a matching rule of the deciding class. `None` when no
+    /// rule matches. Nothing is kept for it: plain rules are rebuilt from the name that hit,
+    /// slow rules from their parsed form.
+    pub fn explain(&self, input: &str, record_type: u16, input_is_ip: bool) -> Option<Explanation> {
+        if input.is_empty() {
+            return None;
+        }
+
+        let host = lowercase(input);
+        let query = Query {
+            host: &host,
+            record_type,
+            is_ip: input_is_ip,
+        };
+        let found = |allowed: bool, side: Side, found: Option<(usize, String)>| {
+            found.map(|(list, rule)| Explanation {
+                allowed,
+                side,
+                list,
+                rule,
+            })
+        };
+        let host_rule = |allowed: bool, side: Side, (list, ip): (usize, IpAddr)| Explanation {
+            allowed,
+            side,
+            list,
+            rule: format!("{ip} {host}"),
+        };
+
+        if let Some(class) = self.pinned_allow.class(&query) {
+            return found(
+                true,
+                Side::PinnedAllow,
+                self.pinned_allow.find(&query, class),
+            );
+        }
+
+        let lists = &*self.lists;
+        if let Some(class) = lists.allow.class(&query) {
+            return found(true, Side::Allowlists, lists.allow.find(&query, class));
+        }
+
+        if let Some(rule) = lists.allow.host_rule(&host) {
+            return Some(host_rule(true, Side::Allowlists, rule));
+        }
+
+        let main = lists.main.class(&query);
+        let pinned_block_decides = main.is_none_or(|class| class <= Class::ImportantBlock)
+            && self.pinned_block.class(&query).is_some();
+        if pinned_block_decides {
+            let (list, rule) = self.pinned_block.find(&query, Class::Block)?;
+
+            return Some(Explanation {
+                allowed: false,
+                side: Side::PinnedBlock,
+                list,
+                rule: format!("{rule}$important"),
+            });
+        }
+
+        match main {
+            Some(class) => {
+                let allowed = matches!(class, Class::Allow | Class::ImportantAllow);
+
+                found(allowed, Side::Main, lists.main.find(&query, class))
+            }
+            None => lists
+                .main
+                .host_rule(&host)
+                .map(|rule| host_rule(false, Side::Main, rule)),
+        }
+    }
+}
+
+/// Which rule set decided, in the order `verdict` asks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// Allows from the status page.
+    PinnedAllow,
+    Allowlists,
+    /// Blocks from the status page.
+    PinnedBlock,
+    /// The user's `rules` and the blocklists.
+    Main,
+}
+
+/// The rule that decides a name, from [`Engine::explain`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explanation {
+    pub allowed: bool,
+    pub side: Side,
+    /// The position of the deciding list within its side.
+    pub list: usize,
+    pub rule: String,
+}
+
+fn lowercase(input: &str) -> Cow<'_, str> {
+    if input.chars().any(char::is_uppercase) {
+        Cow::Owned(input.to_lowercase())
+    } else {
+        Cow::Borrowed(input)
     }
 }
 
@@ -1608,10 +1802,176 @@ mod tests {
         engine.lists.main.slow_index.for_each_candidate(
             &engine.lists.main.lists,
             &url,
-            &mut |_| count += 1,
+            &mut |_, _| count += 1,
         );
 
         count
+    }
+
+    fn explained(allowed: bool, side: Side, list: usize, rule: &str) -> Option<Explanation> {
+        Some(Explanation {
+            allowed,
+            side,
+            list,
+            rule: rule.to_string(),
+        })
+    }
+
+    #[test]
+    fn explain_reports_the_first_list_with_a_rule_of_the_deciding_class() {
+        let engine = engine(
+            &[
+                ("@@||ok.ads.example^\n", ListFormat::Adblock),
+                ("||ads.example^\n||dup.example^\n", ListFormat::Adblock),
+                (
+                    "||dup.example^\n||x.example^$important\n@@||x.example^\n",
+                    ListFormat::Adblock,
+                ),
+                (
+                    "/^track[0-9]+\\.example$/\n||ad*.wild.example^\n0.0.0.0 host.example\n",
+                    ListFormat::Adblock,
+                ),
+            ],
+            &[],
+        );
+        let explain = |name| engine.explain(name, TYPE_A, false);
+
+        assert_eq!(
+            explain("sub.ads.example"),
+            explained(false, Side::Main, 1, "||ads.example^")
+        );
+        assert_eq!(
+            explain("ok.ads.example"),
+            explained(true, Side::Main, 0, "@@||ok.ads.example^")
+        );
+        assert_eq!(
+            explain("dup.example"),
+            explained(false, Side::Main, 1, "||dup.example^")
+        );
+        assert_eq!(
+            explain("x.example"),
+            explained(false, Side::Main, 2, "||x.example^$important")
+        );
+        assert_eq!(
+            explain("track12.example"),
+            explained(false, Side::Main, 3, "/^track[0-9]+\\.example$/")
+        );
+        assert_eq!(
+            explain("adx.wild.example"),
+            explained(false, Side::Main, 3, "||ad*.wild.example^")
+        );
+        assert_eq!(
+            explain("host.example"),
+            explained(false, Side::Main, 3, "0.0.0.0 host.example")
+        );
+        assert_eq!(explain("other.example"), None);
+    }
+
+    #[test]
+    fn explain_rebuilds_every_plain_rule_kind() {
+        let engine = engine(
+            &[
+                (
+                    "a.example CNAME .\n*.b.example CNAME .\nc.example CNAME rpz-passthru.\n*.d.example CNAME rpz-passthru.\ne.example CNAME .\n*.e.example CNAME .\n",
+                    ListFormat::Rpz,
+                ),
+                (
+                    "|f.example^\n@@|g.example^\n||g.example^\n",
+                    ListFormat::Adblock,
+                ),
+            ],
+            &[],
+        );
+        let explain = |name| engine.explain(name, TYPE_A, false);
+
+        assert_eq!(
+            explain("a.example"),
+            explained(false, Side::Main, 0, "|a.example^")
+        );
+        assert_eq!(
+            explain("x.b.example"),
+            explained(false, Side::Main, 0, "||*.b.example^")
+        );
+        assert_eq!(
+            explain("c.example"),
+            explained(true, Side::Main, 0, "@@|c.example^")
+        );
+        assert_eq!(
+            explain("x.d.example"),
+            explained(true, Side::Main, 0, "@@||*.d.example^")
+        );
+        assert_eq!(
+            explain("x.e.example"),
+            explained(false, Side::Main, 0, "||e.example^")
+        );
+        assert_eq!(
+            explain("f.example"),
+            explained(false, Side::Main, 1, "|f.example^")
+        );
+        assert_eq!(
+            explain("g.example"),
+            explained(true, Side::Main, 1, "@@|g.example^")
+        );
+    }
+
+    #[test]
+    fn explain_follows_badfilter_and_conditions() {
+        let disabled = adblock("||x.example^\n||x.example^$badfilter\n");
+        let for_aaaa = adblock("||y.example^\n||y.example^$badfilter,dnstype=AAAA\n");
+        let only_aaaa = adblock("||z.example^$dnstype=AAAA\n");
+
+        assert_eq!(disabled.explain("x.example", TYPE_A, false), None);
+        assert_eq!(
+            for_aaaa.explain("y.example", TYPE_A, false),
+            explained(false, Side::Main, 0, "||y.example^")
+        );
+        assert_eq!(for_aaaa.explain("y.example", TYPE_AAAA, false), None);
+        assert_eq!(only_aaaa.explain("z.example", TYPE_A, false), None);
+    }
+
+    #[test]
+    fn find_is_offered_no_unrelated_slow_rule() {
+        let unrelated: String = (0..20_000)
+            .map(|number| format!("||unrelated-{number:05}*.invalid^\n"))
+            .collect();
+        let engine = engine(
+            &[
+                (&unrelated, ListFormat::Adblock),
+                ("||target.example^\n", ListFormat::Adblock),
+            ],
+            &[],
+        );
+
+        assert_eq!(candidates(&engine, "target.example"), 0);
+        assert_eq!(
+            engine.explain("target.example", TYPE_A, false),
+            explained(false, Side::Main, 1, "||target.example^")
+        );
+    }
+
+    #[test]
+    fn explain_tells_the_allowlists_and_the_pinned_sets_apart() {
+        let listed = pinned(&[], &["||mine.example^\n"], &[], &[]);
+        let both = pinned(&[], &["||mine.example^\n"], &[], &["mine.example"]);
+        let page_block = pinned(&["@@||b.example^\n"], &[], &["b.example"], &[]);
+        let important_allow = pinned(&["@@||b.example^$important\n"], &[], &["b.example"], &[]);
+
+        assert_eq!(
+            listed.explain("mine.example", TYPE_A, false),
+            explained(true, Side::Allowlists, 0, "||mine.example^")
+        );
+        assert_eq!(
+            both.explain("mine.example", TYPE_A, false),
+            explained(true, Side::PinnedAllow, 0, "@@||mine.example^")
+        );
+        assert_eq!(
+            page_block.explain("b.example", TYPE_A, false),
+            explained(false, Side::PinnedBlock, 0, "||b.example^$important")
+        );
+        assert_eq!(
+            important_allow.explain("b.example", TYPE_A, false),
+            explained(true, Side::Main, 0, "@@||b.example^$important")
+        );
     }
 
     #[test]

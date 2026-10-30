@@ -181,6 +181,97 @@ impl NetworkRule {
             || !self.dns_restricted.is_empty()
             || !self.denyallow.is_empty()
     }
+
+    /// The rule as text that parses back to this rule: the pattern as stored, then the
+    /// modifiers, if any, in a fixed order and spelling. No original line is kept, so a rule
+    /// with modifiers may read differently from its list.
+    pub fn text(&self) -> String {
+        let mut modifiers = Vec::new();
+        if self.important {
+            modifiers.push("important".to_string());
+        }
+
+        if self.badfilter {
+            modifiers.push("badfilter".to_string());
+        }
+
+        for (name, bit) in CONTENT_TYPES {
+            if self.restricted_types & bit != 0 {
+                modifiers.push(format!("~{name}"));
+            }
+        }
+
+        let type_name = |code: &u16| {
+            DNS_TYPES
+                .iter()
+                .find(|(_, known)| known == code)
+                .map_or_else(|| code.to_string(), |(name, _)| name.to_string())
+        };
+        let types: Vec<String> = self
+            .dns_permitted
+            .iter()
+            .map(type_name)
+            .chain(
+                self.dns_restricted
+                    .iter()
+                    .map(|code| format!("~{}", type_name(code))),
+            )
+            .collect();
+        if !types.is_empty() {
+            modifiers.push(format!("dnstype={}", types.join("|")));
+        }
+
+        if !self.denyallow.is_empty() {
+            modifiers.push(format!("denyallow={}", self.denyallow.join("|")));
+        }
+
+        if !self.restricted_clients.is_empty() {
+            let clients: Vec<String> = self
+                .restricted_clients
+                .entries()
+                .iter()
+                .map(|client| format!("~{}", client_text(client)))
+                .collect();
+            modifiers.push(format!("client={}", clients.join("|")));
+        }
+
+        if !self.restricted_ctags.is_empty() {
+            let tags: Vec<String> = self
+                .restricted_ctags
+                .iter()
+                .map(|tag| format!("~{tag}"))
+                .collect();
+            modifiers.push(format!("ctag={}", tags.join("|")));
+        }
+
+        let allow = if self.whitelist { "@@" } else { "" };
+        if modifiers.is_empty() {
+            return format!("{allow}{}", self.pattern);
+        }
+
+        // The pattern and the modifiers are split at the last `$` that has no backslash.
+        let modifiers = modifiers.join(",").replace('$', "\\$");
+
+        format!("{allow}{}${modifiers}", self.pattern)
+    }
+}
+
+/// A `$client` name as `parse_clients` reads it back: bare when plain, otherwise quoted, with
+/// the quote and the two separators escaped.
+fn client_text(client: &str) -> String {
+    let plain = client
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'-'));
+    if plain {
+        return client.to_string();
+    }
+
+    let escaped = client
+        .replace('\'', "\\'")
+        .replace(',', "\\,")
+        .replace('|', "\\|");
+
+    format!("'{escaped}'")
 }
 
 /// What the parser saw, per line class.
@@ -1947,6 +2038,73 @@ mod tests {
     fn trailing_slash_star_becomes_a_separator() {
         assert_eq!(one("example.org/*"), "slow example.org^");
         assert_eq!(one("||path.example/*"), "slow ||path.example^");
+    }
+
+    fn slow_rule(line: &str) -> NetworkRule {
+        let mut parsed = None;
+        let mut parser = Parser::new(ListFormat::Adblock, usize::MAX);
+        let mut sink = |rule: Rule<'_>| {
+            if let Rule::Slow(rule) = rule {
+                parsed = Some(rule);
+            }
+        };
+        parser.push(format!("{line}\n").as_bytes(), &mut sink);
+        parser.finish(&mut sink);
+
+        parsed.unwrap_or_else(|| panic!("{line:?} is not a slow rule"))
+    }
+
+    #[test]
+    fn a_rule_without_modifiers_shows_as_written() {
+        for line in [
+            r"/^ad[0-9]+\./",
+            "/ads$/",
+            "||ad*.example^",
+            "@@||ok*.example^",
+        ] {
+            assert_eq!(slow_rule(line).text(), line);
+        }
+
+        assert_eq!(slow_rule("||ad*.example/*").text(), "||ad*.example^");
+    }
+
+    #[test]
+    fn rule_text_parses_back_to_the_same_rule() {
+        for line in [
+            "||ads.example^$important",
+            "@@||x.example^$important",
+            r"/^ad[0-9]+\./",
+            "/ads$/",
+            "||ad*.example^",
+            "||a.example^$dnstype=A|~AAAA",
+            "*$denyallow=x.example|y.example",
+            "||c.example^$client=~192.168.1.5|~laptop",
+            r"||m.example^$client=~'Mom\'s laptop'",
+            "||t.example^$ctag=~device_pc",
+            "||s.example^$~script,~image",
+            r"||d.example^$client=~'cash\$box'",
+            r"||e.example^$client=~'a\,b'|~'c\|d'",
+            r"||f.example^$client=~'x\$y\,z'",
+            r"||g.example^$client=~'back\\slash'",
+        ] {
+            let rule = slow_rule(line);
+            let text = rule.text();
+
+            assert_eq!(slow_rule(&text), rule, "{line} gave {text}");
+        }
+    }
+
+    #[test]
+    fn rule_text_is_the_pattern_and_modifiers_in_a_fixed_order() {
+        assert_eq!(
+            slow_rule("||a.example^$dnstype=A|~AAAA").text(),
+            "||a.example^$dnstype=A|~AAAA"
+        );
+        assert_eq!(slow_rule(r"/^ad[0-9]+\./").text(), r"/^ad[0-9]+\./");
+        assert_eq!(
+            slow_rule("||x.example^$dnstype=AAAA,important").text(),
+            "||x.example^$important,dnstype=AAAA"
+        );
     }
 
     #[test]

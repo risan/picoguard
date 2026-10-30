@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{RealLists, load_real};
-use picoguard::filter::engine::{CompiledList, Decision, Engine, ListBuilder};
+use picoguard::filter::engine::{CompiledList, Decision, Engine, ListBuilder, TYPE_A};
 use picoguard::filter::parse::{FastKind, ListFormat, Rule, dns_type_code};
 
 /// The target of plan S2.5 on x86 (P2 measured 26 microseconds before the index).
@@ -192,6 +192,80 @@ fn assembly_and_a_rule_change_on_the_real_lists_take_milliseconds() {
         assert!(
             rule_change <= MAX_RULE_CHANGE,
             "a rule change took {rule_change:?}, limit {MAX_RULE_CHANGE:?}"
+        );
+    }
+}
+
+/// Explain does a check, then looks the deciding rule up: about two checks and the text.
+/// Both are timed in the same passes, so a busy machine slows both alike.
+const MAX_EXPLAIN_TO_CHECK: f64 = 3.0;
+
+#[test]
+fn explain_on_the_real_lists_costs_a_few_checks() {
+    let real = load_real();
+    let engine = Engine::new(compile_real(&real), Vec::new());
+    let queries = queries_of(&real);
+
+    let (mut check, mut explain) = (f64::MAX, f64::MAX);
+    let mut explained = 0;
+    for _ in 0..if cfg!(debug_assertions) { 1 } else { 10 } {
+        check = check.min(best_check_micros(&engine, &queries).0);
+        explained = 0;
+        let started = Instant::now();
+        for &(input, record_type, is_ip) in &queries {
+            if std::hint::black_box(engine.explain(input, record_type, is_ip)).is_some() {
+                explained += 1;
+            }
+        }
+
+        explain = explain.min(started.elapsed().as_secs_f64() * 1e6 / queries.len() as f64);
+    }
+
+    println!(
+        "explain: {explain:.2} us average over {} queries ({check:.2} us per check), {explained} explained",
+        queries.len()
+    );
+    assert!(explained > 0);
+
+    if !cfg!(debug_assertions) {
+        assert!(
+            explain <= check * MAX_EXPLAIN_TO_CHECK,
+            "{explain:.2} us per explain, {check:.2} us per check"
+        );
+    }
+}
+
+/// What explain may hold the runtime thread for, with 20,000 slow rules that cannot match.
+/// Scanning them all would take milliseconds.
+const MAX_UNRELATED_EXPLAIN_MICROS: f64 = 10.0;
+
+#[test]
+fn explain_never_scans_slow_rules_that_cannot_match() {
+    let unrelated: String = (0..20_000)
+        .map(|number| format!("||unrelated-{number:05}*.invalid^\n"))
+        .collect();
+    let lists = vec![
+        Arc::new(CompiledList::from_text(ListFormat::Adblock, &unrelated).0),
+        Arc::new(CompiledList::from_text(ListFormat::Adblock, "||target.example^\n").0),
+    ];
+    assert_eq!(lists[0].slow_rule_count(), 20_000);
+    let engine = Engine::new(lists, Vec::new());
+    let explained = engine.explain("target.example", TYPE_A, false).unwrap();
+    assert_eq!(explained.list, 1);
+
+    const CALLS: u32 = 10_000;
+    let took = best_of(if cfg!(debug_assertions) { 1 } else { 10 }, || {
+        for _ in 0..CALLS {
+            std::hint::black_box(engine.explain("target.example", TYPE_A, false));
+        }
+    });
+    let average = took.as_secs_f64() * 1e6 / f64::from(CALLS);
+    println!("explain past 20,000 unrelated slow rules: {average:.2} us average");
+
+    if !cfg!(debug_assertions) {
+        assert!(
+            average <= MAX_UNRELATED_EXPLAIN_MICROS,
+            "{average:.2} us per explain, limit {MAX_UNRELATED_EXPLAIN_MICROS} us"
         );
     }
 }
