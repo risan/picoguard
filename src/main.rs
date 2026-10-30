@@ -433,7 +433,7 @@ fn serve(config: Config) -> Result<(), String> {
 
             let web = Web::new(
                 &config,
-                Arc::clone(pipeline.stats()),
+                Arc::clone(&pipeline),
                 scheduler.policy(),
                 scheduler.control(),
                 Arc::clone(&updates),
