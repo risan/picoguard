@@ -340,13 +340,15 @@ impl ListControl {
         };
 
         let current = self.policy.engine();
+        // The engine goes into its `Arc` here: the struct is over a kilobyte, and returned by
+        // value it would be one more copy in the task's output and in this future.
         let built = tokio::task::spawn_blocking(move || {
             let block = page_list(&rules, Action::Block);
             let allow = page_list(&rules, Action::Allow);
-            let engine = current.with_pinned(
+            let engine = Arc::new(current.with_pinned(
                 block.iter().cloned().collect(),
                 allow.iter().cloned().collect(),
-            );
+            ));
             drop(current);
 
             (rules, block, allow, engine)
@@ -358,7 +360,7 @@ impl ListControl {
             return;
         };
 
-        let old_engine = self.policy.swap_engine(Arc::new(engine));
+        let old_engine = self.policy.swap_engine(engine);
         let old_rules = std::mem::replace(&mut assembly.rules, rules);
         let old_block = std::mem::replace(&mut assembly.block, block);
         let old_allow = std::mem::replace(&mut assembly.allow, allow);
