@@ -1227,6 +1227,7 @@ mod tests {
 
     use super::*;
     use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse, soa};
+    use crate::dns::wire::{HEADER_LEN, skip_name};
     use crate::filter::engine::{CompiledList, Engine};
     use crate::filter::parse::ListFormat;
     use crate::names::reverse_name;
@@ -2348,15 +2349,13 @@ mod tests {
     }
 
     fn query_type(query: &[u8]) -> u16 {
-        let question_end =
-            crate::dns::wire::skip_name(query, crate::dns::wire::HEADER_LEN).unwrap() + 4;
+        let question_end = skip_name(query, HEADER_LEN).unwrap() + 4;
 
         u16::from_be_bytes([query[question_end - 4], query[question_end - 3]])
     }
 
     fn truncated_reply(query: &[u8]) -> Vec<u8> {
-        let question_end =
-            crate::dns::wire::skip_name(query, crate::dns::wire::HEADER_LEN).unwrap() + 4;
+        let question_end = skip_name(query, HEADER_LEN).unwrap() + 4;
         let mut reply = query[..question_end].to_vec();
         reply[2..4].copy_from_slice(&(0x8180 | flags::TC).to_be_bytes());
         reply[6..12].copy_from_slice(&[0; 6]);
@@ -2375,11 +2374,8 @@ mod tests {
         assert_eq!(pipeline.device_name(lan_address(1)), None);
 
         let names = device_names(&pipeline);
-        assert!(
-            wait_until(Duration::from_secs(3), || stalled.load(Ordering::SeqCst)
-                > 0)
-            .await
-        );
+        let has_stalled = || stalled.load(Ordering::SeqCst) > 0;
+        assert!(wait_until(Duration::from_secs(3), has_stalled).await);
         assert!(wait_until(Duration::from_secs(3), || names.held_bytes() == 1000).await);
         assert_eq!(pipeline.budget().used(), 0);
         assert_eq!(ask_printer(&pipeline).await, ["192.168.1.9"]);
