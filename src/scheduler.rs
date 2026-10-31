@@ -108,7 +108,8 @@ pub enum Action {
 }
 
 /// A rule added from the status page: the name and its subdomains.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ButtonRule {
     pub name: String,
     pub action: Action,

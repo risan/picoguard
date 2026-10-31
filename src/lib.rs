@@ -13,6 +13,7 @@ pub mod policy;
 pub mod release;
 pub mod scheduler;
 pub mod server;
+pub mod settings;
 pub mod stage;
 pub mod stats;
 pub mod update;
