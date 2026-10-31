@@ -25,8 +25,9 @@ use crate::filter::engine::{CompiledList, Engine, ListBuilder, Side};
 use crate::filter::parse::{FastKind, ListFormat, Rule};
 use crate::filter::snapshot::{Snapshot, SnapshotStore};
 use crate::lists::{Downloader, Limits, Refresh, RefreshError, Updated, Validators, refresh_file};
+use crate::pipeline::Pipeline;
 use crate::policy::Policy;
-use crate::settings::{SaveError, Saved};
+use crate::settings::{self, ChangeError, PageChange, SaveError, Saved};
 use crate::upstream::random_u64;
 
 /// How far an interval is moved, up or down, so lists do not refresh in step.
@@ -96,9 +97,9 @@ pub struct ListStatus {
 /// The most rules the status page may add.
 pub const MAX_BUTTON_RULES: usize = 500;
 
-/// The most rule changes that may wait or run at once. A change runs as a task of its own, so
-/// a client that goes away does not cancel it; this bounds those tasks whatever the request
-/// rate.
+/// The most changes that save (rules and settings) that may wait or run at once. A change
+/// runs as a task of its own, so a client that goes away does not cancel it; this bounds those
+/// tasks whatever the request rate.
 pub const MAX_PENDING_CHANGES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,22 +309,48 @@ impl ListControl {
         self.change(Edit::Remove(name)).await
     }
 
+    async fn change(self: &Arc<Self>, edit: Edit) -> Result<(), RuleError> {
+        self.spawn_change(|control, answer| async move { control.apply(edit, answer).await })
+            .await
+            .unwrap_or(Err(RuleError::NotApplied))
+    }
+
+    /// Changes the upstream and cache settings of the page: saved, then put in force.
+    pub async fn change_settings(
+        self: &Arc<Self>,
+        pipeline: &Arc<Pipeline>,
+        change: PageChange,
+    ) -> Result<(), ChangeError> {
+        let pipeline = Arc::clone(pipeline);
+
+        self.spawn_change(|control, answer| async move {
+            settings::apply(&control.saved, &pipeline, change, answer).await;
+        })
+        .await
+        .unwrap_or(Err(ChangeError::NotApplied))
+    }
+
     /// Waiting for a permit holds nothing and can be cancelled. Once the change is spawned it
     /// runs to its end, whether or not its caller still waits, so a change sent is applied
-    /// once and no build is ever dropped half done on the runtime thread.
-    async fn change(self: &Arc<Self>, edit: Edit) -> Result<(), RuleError> {
-        let permit = Arc::clone(&self.pending)
-            .acquire_owned()
-            .await
-            .map_err(|_| RuleError::NotApplied)?;
+    /// once and no build is ever dropped half done on the runtime thread. `None` when the
+    /// change ended without an answer.
+    async fn spawn_change<T, F>(
+        self: &Arc<Self>,
+        change: impl FnOnce(Arc<Self>, oneshot::Sender<T>) -> F,
+    ) -> Option<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let permit = Arc::clone(&self.pending).acquire_owned().await.ok()?;
         let (answer, answered) = oneshot::channel();
-        let control = Arc::clone(self);
+        let change = change(Arc::clone(self), answer);
         tokio::spawn(async move {
-            control.apply(edit, answer).await;
+            change.await;
             drop(permit);
         });
 
-        answered.await.unwrap_or(Err(RuleError::NotApplied))
+        answered.await.ok()
     }
 
     /// Holds the locks from the check until the replaced engine and lists are freed, so changes
@@ -433,7 +460,7 @@ fn page_list(rules: &[ButtonRule], action: Action) -> Option<Arc<CompiledList>> 
 
 /// Drops `garbage` on tokio's blocking pool and waits until it is gone: an engine must never
 /// be dropped on the DNS thread (plan D20).
-async fn drop_off_runtime<T: Send + 'static>(garbage: T) {
+pub(crate) async fn drop_off_runtime<T: Send + 'static>(garbage: T) {
     let _ = tokio::task::spawn_blocking(move || drop(garbage)).await;
 }
 

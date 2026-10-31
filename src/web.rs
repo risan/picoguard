@@ -42,7 +42,7 @@ use crate::scheduler::{
     Action, ButtonRule, ListControl, ListStatus, MAX_BUTTON_RULES, Role, RuleError, normalized_name,
 };
 use crate::server::bind_tcp;
-use crate::settings::{CacheSettings, SaveError, UpstreamSettings};
+use crate::settings::{CacheSettings, ChangeError, PageChange, SaveError, UpstreamSettings};
 use crate::stage::{Refused, Stager};
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, TopEntry};
 use crate::update::{Tag, UpdateView, Updates, parse_tag};
@@ -597,13 +597,7 @@ impl Web {
                 from: Source::Page,
             },
             None => CacheSetting {
-                values: CacheSettings {
-                    max_entries: file.cache.max_entries,
-                    max_bytes: file.cache.max_bytes,
-                    min_ttl: file.cache.min_ttl,
-                    max_ttl: file.cache.max_ttl,
-                    optimistic: file.cache.optimistic,
-                },
+                values: CacheSettings::of(&file.cache),
                 from: Source::File,
             },
         };
@@ -769,12 +763,21 @@ impl Web {
                     )
                 })?;
 
-                if let Some(key) = request.first_key() {
+                if let Some(key) = request.first_key_not_editable() {
                     return Err(Rejection::new(
                         StatusCode::CONFLICT,
                         format!("{key} is not editable yet"),
                     ));
                 }
+
+                let change = PageChange {
+                    upstream: request.upstream,
+                    cache: request.cache,
+                };
+                self.lists
+                    .change_settings(&self.pipeline, change)
+                    .await
+                    .map_err(|error| change_rejection(&error))?;
 
                 Ok(self.settings_response().await)
             }
@@ -1122,10 +1125,8 @@ struct SettingsRequest {
 }
 
 impl SettingsRequest {
-    fn first_key(&self) -> Option<&'static str> {
+    fn first_key_not_editable(&self) -> Option<&'static str> {
         [
-            ("upstream", self.upstream.is_some()),
-            ("cache", self.cache.is_some()),
             ("rewrites", self.rewrites.is_some()),
             ("safe_search", self.safe_search.is_some()),
             ("services", self.services.is_some()),
@@ -1157,6 +1158,21 @@ fn rule_rejection(error: RuleError) -> Rejection {
             "the change could not be applied",
         ),
         RuleError::NotSaved(error) => save_rejection(&error),
+    }
+}
+
+fn change_rejection(error: &ChangeError) -> Rejection {
+    match error {
+        ChangeError::Invalid(reason) => Rejection::new(StatusCode::BAD_REQUEST, reason.clone()),
+        ChangeError::UpstreamBusy => Rejection::new(
+            StatusCode::CONFLICT,
+            "the previous upstream change is still finishing; try again in a few seconds",
+        ),
+        ChangeError::NotSaved(error) => save_rejection(error),
+        ChangeError::NotApplied => Rejection::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the change could not be applied",
+        ),
     }
 }
 

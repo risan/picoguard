@@ -17,9 +17,11 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ConfigError, ListConfig, Rewrite};
+use crate::config::{CacheConfig, Config, ConfigError, ListConfig, Rewrite};
+use crate::pipeline::Pipeline;
 use crate::release;
-use crate::scheduler::{ButtonRule, MAX_BUTTON_RULES, normalized_name};
+use crate::scheduler::{ButtonRule, MAX_BUTTON_RULES, drop_off_runtime, normalized_name};
+use crate::upstream::Upstreams;
 
 pub const FILE_NAME: &str = "settings.json";
 const PART_NAME: &str = "settings.json.part";
@@ -89,6 +91,19 @@ pub struct CacheSettings {
     pub min_ttl: u32,
     pub max_ttl: u32,
     pub optimistic: bool,
+}
+
+impl CacheSettings {
+    /// The page's fields of `config`.
+    pub fn of(config: &CacheConfig) -> CacheSettings {
+        CacheSettings {
+            max_entries: config.max_entries,
+            max_bytes: config.max_bytes,
+            min_ttl: config.min_ttl,
+            max_ttl: config.max_ttl,
+            optimistic: config.optimistic,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,6 +432,130 @@ impl Saved {
                 Err(SaveError::Failed(error.to_string()))
             }
         }
+    }
+}
+
+/// A change of the page's upstream and cache settings. For each key, `None` leaves it as it
+/// is, `Some(None)` goes back to the config file's value and `Some(Some(value))` sets it.
+#[derive(Debug, Default)]
+pub struct PageChange {
+    pub upstream: Option<Option<UpstreamSettings>>,
+    pub cache: Option<Option<CacheSettings>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeError {
+    /// The settings were refused, with the reason.
+    Invalid(String),
+    /// Two replaced upstream pools are still in use by queries that started before them.
+    UpstreamBusy,
+    /// The change was not saved, so it is not in force either.
+    NotSaved(SaveError),
+    /// The task that applies the change ended without an answer.
+    NotApplied,
+}
+
+/// What a change puts in force once it is saved.
+struct Prepared {
+    upstreams: Option<Upstreams>,
+    cache: Option<CacheConfig>,
+}
+
+/// Builds the change, saves it, then puts it in force, all under the settings lock. Whatever
+/// can fail (a value out of range, a server that cannot be used, a full set of replaced pools,
+/// the write) fails before anything is in force. A change that leaves the settings as they are
+/// writes nothing; one that only moves a value between the page and the config file is saved
+/// and replaces nothing.
+pub(crate) async fn apply(
+    saved: &Saved,
+    pipeline: &Pipeline,
+    change: PageChange,
+    answer: tokio::sync::oneshot::Sender<Result<(), ChangeError>>,
+) {
+    let mut settings = saved.lock().await;
+    let upstream = change.upstream.unwrap_or_else(|| settings.upstream.clone());
+    let cache = change.cache.unwrap_or_else(|| settings.cache.clone());
+    if upstream == settings.upstream && cache == settings.cache {
+        let _ = answer.send(Ok(()));
+
+        return;
+    }
+
+    let old_upstream = std::mem::replace(&mut settings.upstream, upstream);
+    let old_cache = std::mem::replace(&mut settings.cache, cache);
+    let file = saved.file_config();
+    let prepared = prepare(file, &settings, &old_upstream, &old_cache, pipeline);
+    let saved_change = match prepared {
+        Ok(prepared) => saved
+            .save(&settings)
+            .await
+            .map(|()| prepared)
+            .map_err(ChangeError::NotSaved),
+
+        Err(error) => Err(error),
+    };
+    let prepared = match saved_change {
+        Ok(prepared) => prepared,
+
+        Err(error) => {
+            settings.upstream = old_upstream;
+            settings.cache = old_cache;
+            let _ = answer.send(Err(error));
+
+            return;
+        }
+    };
+
+    let replaced_upstreams = prepared
+        .upstreams
+        .map(|upstreams| pipeline.upstreams().replace(upstreams));
+    let replaced_cache = prepared.cache.map(|cache| pipeline.replace_cache(&cache));
+    let _ = answer.send(Ok(()));
+
+    // The lock is held until the replaced cache is freed, so changes never stack copies.
+    drop_off_runtime((replaced_upstreams, replaced_cache, old_upstream, old_cache)).await;
+}
+
+/// The objects `settings` needs that differ from those in force under the old values.
+fn prepare(
+    file: &Config,
+    settings: &Settings,
+    old_upstream: &Option<UpstreamSettings>,
+    old_cache: &Option<CacheSettings>,
+    pipeline: &Pipeline,
+) -> Result<Prepared, ChangeError> {
+    let config = merged(file, settings).map_err(ChangeError::Invalid)?;
+    let cache_in_force = |page: &Option<CacheSettings>| {
+        page.clone()
+            .unwrap_or_else(|| CacheSettings::of(&file.cache))
+    };
+
+    let upstreams =
+        if upstream_in_force(old_upstream, file) == upstream_in_force(&settings.upstream, file) {
+            None
+        } else {
+            if !pipeline.upstreams().can_replace() {
+                return Err(ChangeError::UpstreamBusy);
+            }
+
+            Some(
+                Upstreams::from_config(&config.upstream, &config.limits)
+                    .map_err(ChangeError::Invalid)?,
+            )
+        };
+    let cache =
+        (cache_in_force(old_cache) != cache_in_force(&settings.cache)).then_some(config.cache);
+
+    Ok(Prepared { upstreams, cache })
+}
+
+fn upstream_in_force<'a>(
+    page: &'a Option<UpstreamSettings>,
+    file: &'a Config,
+) -> (&'a [String], &'a [IpAddr]) {
+    match page {
+        Some(page) => (&page.servers, &page.bootstrap),
+        None => (&file.upstream.servers, &file.upstream.bootstrap),
     }
 }
 

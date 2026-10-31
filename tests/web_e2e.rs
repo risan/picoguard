@@ -3818,15 +3818,6 @@ async fn a_settings_change_of_a_key_not_editable_yet_is_refused_and_nothing_is_w
 
     for (key, value) in [
         (
-            "upstream",
-            serde_json::json!({"servers": ["https://9.9.9.9/dns-query"], "bootstrap": []}),
-        ),
-        (
-            "cache",
-            serde_json::json!({"max_entries": 1, "max_bytes": 262144, "min_ttl": 0,
-                               "max_ttl": 60, "optimistic": true}),
-        ),
-        (
             "rewrites",
             serde_json::json!([{"name": "nas.lan", "answer": "10.0.0.1"}]),
         ),
@@ -3916,4 +3907,283 @@ async fn only_the_settings_route_takes_a_body_of_64_kib() {
     assert_eq!(rule.status, 413);
     assert_eq!(rule.json()["error"], "the body is limited to 1 KiB");
     assert!(no_page_rules(&site).await);
+}
+
+fn upstream_body(servers: &[String]) -> String {
+    serde_json::json!({"upstream": {"servers": servers, "bootstrap": ["9.9.9.9"]}}).to_string()
+}
+
+fn udp(upstream: &common::harness::FakeUpstream) -> String {
+    format!("udp://{}", upstream.address)
+}
+
+fn upstream_counts(status: &Value) -> Vec<(String, u64)> {
+    upstream_entries(status)
+        .iter()
+        .map(|entry| {
+            (
+                entry["label"].as_str().unwrap().to_string(),
+                entry["answered"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn new_upstream_servers_answer_at_once_and_a_reset_goes_back_to_the_config_file() {
+    let (site, first) = plain_site().await;
+    let second = answering_upstream([8, 8, 8, 8], Duration::ZERO).await;
+    let before = ask(&site.dns, "one.example.", RecordType::A).await;
+    assert_eq!(addresses(&before), ["9.9.9.9"]);
+
+    let changed = site
+        .send(post(
+            "/api/settings",
+            &upstream_body(&[udp(&second), udp(&first)]),
+        ))
+        .await;
+
+    assert_eq!(changed.status, 200, "{}", changed.body);
+    assert_eq!(
+        changed.json()["upstream"],
+        serde_json::json!({
+            "servers": [udp(&second), udp(&first)],
+            "bootstrap": ["9.9.9.9"],
+            "from": "page",
+        })
+    );
+    assert_eq!(
+        saved_settings(&site).unwrap()["upstream"],
+        serde_json::json!({"servers": [udp(&second), udp(&first)], "bootstrap": ["9.9.9.9"]})
+    );
+    let status = site.send(get("/api/status")).await.json();
+    assert_eq!(
+        upstream_counts(&status),
+        [(udp(&second), 0), (udp(&first), 1)],
+        "a server kept keeps its counts"
+    );
+    for index in 0..20 {
+        let reply = ask(&site.dns, &format!("n{index}.example."), RecordType::A).await;
+        assert_eq!(reply.response_code, ResponseCode::NoError);
+    }
+    assert!(second.count() > 0, "the new server is used");
+
+    let reset = site
+        .send(post("/api/settings", "{\"upstream\": null}"))
+        .await;
+
+    assert_eq!(reset.status, 200, "{}", reset.body);
+    assert_eq!(reset.json()["upstream"]["from"], "file");
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({"version": 1})
+    );
+    let asked = second.count();
+    for index in 0..5 {
+        let reply = ask(&site.dns, &format!("back{index}.example."), RecordType::A).await;
+        assert_eq!(addresses(&reply), ["9.9.9.9"]);
+    }
+    assert_eq!(second.count(), asked);
+}
+
+#[tokio::test]
+async fn a_server_that_cannot_be_used_is_refused_with_the_reason_and_nothing_changes() {
+    let (site, first) = plain_site().await;
+
+    for (body, expected) in [
+        (upstream_body(&[]), "upstream.servers: 1 to 8 servers"),
+        (
+            upstream_body(&["9.9.9.9".to_string()]),
+            "upstream.servers[0] must start with one of",
+        ),
+        (
+            serde_json::json!({"upstream": {"servers": [udp(&first)], "bootstrap": ["x"]}})
+                .to_string(),
+            "",
+        ),
+        (
+            serde_json::json!({"cache": {"max_entries": 100, "max_bytes": 1024, "min_ttl": 0,
+                                         "max_ttl": 60, "optimistic": true}})
+            .to_string(),
+            "cache.max_bytes must be from 262144 to 16777216",
+        ),
+    ] {
+        let reply = site.send(post("/api/settings", &body)).await;
+
+        assert_eq!(reply.status, 400, "{body}: {}", reply.body);
+        assert!(
+            reply.json()["error"].as_str().unwrap().contains(expected),
+            "{body}: {}",
+            reply.body
+        );
+    }
+
+    assert!(saved_settings(&site).is_none());
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(settings["upstream"]["from"], "file");
+    assert_eq!(settings["cache"]["from"], "file");
+}
+
+#[tokio::test]
+async fn the_file_is_written_only_when_a_setting_in_force_changes() {
+    let (site, first) = plain_site().await;
+    let body = upstream_body(&[udp(&first)]);
+    let file = site.state.join(settings::FILE_NAME);
+
+    assert_eq!(site.send(post("/api/settings", &body)).await.status, 200);
+    assert!(file.exists());
+    std::fs::remove_file(&file).unwrap();
+
+    for body in [
+        body.as_str(),
+        "{}",
+        "{\"cache\": null}",
+        "{\"upstream\": {\"servers\": [], \"bootstrap\": []}, \"rewrites\": []}",
+    ] {
+        let reply = site.send(post("/api/settings", body)).await;
+
+        assert!(
+            reply.status == 200 || reply.status == 409,
+            "{body}: {}",
+            reply.body
+        );
+        assert!(!file.exists(), "{body} wrote the file");
+    }
+}
+
+/// Upstreams that answer after a while, so queries are still waiting when the servers change.
+async fn slow_upstreams() -> [common::harness::FakeUpstream; 2] {
+    [
+        answering_upstream([1, 1, 1, 1], Duration::from_millis(800)).await,
+        answering_upstream([2, 2, 2, 2], Duration::from_millis(800)).await,
+    ]
+}
+
+fn ask_later(site: &Site, name: String) -> tokio::task::JoinHandle<hickory_proto::op::Message> {
+    let dns = site.dns.clone();
+
+    tokio::spawn(async move { ask(&dns, &name, RecordType::A).await })
+}
+
+#[tokio::test]
+async fn queries_waiting_through_upstream_changes_all_get_their_answer() {
+    let upstreams = slow_upstreams().await;
+    let mut config = local_config(&upstreams[0]);
+    // A busy test machine must not turn a slow answer into a timeout.
+    config.upstream.timeout_ms = 4000;
+    let site = site(config).await;
+    let generations = || site.dns.pipeline.upstreams().generations();
+    let mut waiting = Vec::new();
+
+    for round in 0..2 {
+        waiting.extend((0..5).map(|index| ask_later(&site, format!("r{round}-{index}.example."))));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let next = upstream_body(&[udp(&upstreams[(round + 1) % 2])]);
+
+        assert_eq!(site.send(post("/api/settings", &next)).await.status, 200);
+    }
+
+    assert_eq!(generations(), 3);
+    let refused = site
+        .send(post("/api/settings", &upstream_body(&[udp(&upstreams[1])])))
+        .await;
+    assert_eq!(refused.status, 409, "{}", refused.body);
+    assert_eq!(
+        refused.json()["error"],
+        "the previous upstream change is still finishing; try again in a few seconds"
+    );
+
+    for round in 2..8 {
+        waiting.extend((0..3).map(|index| ask_later(&site, format!("r{round}-{index}.example."))));
+        let next = upstream_body(&[udp(&upstreams[round % 2])]);
+        loop {
+            let reply = site.send(post("/api/settings", &next)).await;
+            assert!(generations() <= 3);
+            if reply.status == 200 {
+                break;
+            }
+
+            assert_eq!(reply.status, 409, "{}", reply.body);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let total = waiting.len();
+    for query in waiting {
+        let reply = query.await.unwrap();
+        assert_eq!(reply.response_code, ResponseCode::NoError);
+        assert_eq!(reply.answers.len(), 1);
+    }
+
+    assert_eq!(total, 28);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while generations() > 1 {
+        assert!(Instant::now() < deadline, "replaced pools are still alive");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn cache_body(min_ttl: u32) -> String {
+    serde_json::json!({"cache": {"max_entries": 500, "max_bytes": 1048576, "min_ttl": min_ttl,
+                                  "max_ttl": 86400, "optimistic": false}})
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_cache_change_empties_the_cache_and_its_ttls_apply_at_once() {
+    let (site, upstream) = plain_site().await;
+    let first = ask(&site.dns, "ttl.example.", RecordType::A).await;
+    assert_eq!(first.answers[0].ttl, 300);
+    assert_eq!(site.dns.pipeline.cache_size().entries, 1);
+
+    let changed = site.send(post("/api/settings", &cache_body(900))).await;
+
+    assert_eq!(changed.status, 200, "{}", changed.body);
+    assert_eq!(
+        changed.json()["cache"],
+        serde_json::json!({"max_entries": 500, "max_bytes": 1048576, "min_ttl": 900,
+                           "max_ttl": 86400, "optimistic": false, "from": "page"})
+    );
+    assert_eq!(saved_settings(&site).unwrap()["cache"]["min_ttl"], 900);
+    assert_eq!(site.dns.pipeline.cache_size().entries, 0);
+    let asked = upstream.count();
+    let again = ask(&site.dns, "ttl.example.", RecordType::A).await;
+    assert_eq!(upstream.count(), asked + 1, "the old answer is gone");
+    assert_eq!(again.answers[0].ttl, 900);
+
+    let reset = site.send(post("/api/settings", "{\"cache\": null}")).await;
+
+    assert_eq!(reset.status, 200, "{}", reset.body);
+    assert_eq!(reset.json()["cache"]["from"], "file");
+    assert_eq!(site.dns.pipeline.cache_size().entries, 0);
+    let after = ask(&site.dns, "ttl.example.", RecordType::A).await;
+    assert_eq!(after.answers[0].ttl, 300);
+}
+
+#[tokio::test]
+async fn a_settings_change_that_cannot_be_saved_answers_503_and_keeps_what_is_in_force() {
+    let (site, first) = plain_site().await;
+    let second = answering_upstream([8, 8, 8, 8], Duration::ZERO).await;
+    ask(&site.dns, "kept.example.", RecordType::A).await;
+    std::fs::remove_dir_all(&site.state).unwrap();
+
+    let body = serde_json::json!({
+        "upstream": {"servers": [udp(&second)], "bootstrap": []},
+        "cache": {"max_entries": 10, "max_bytes": 262144, "min_ttl": 0, "max_ttl": 60,
+                  "optimistic": false},
+    })
+    .to_string();
+    let reply = site.send(post("/api/settings", &body)).await;
+
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(site.dns.pipeline.cache_size().entries, 1);
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(
+        settings["upstream"]["servers"],
+        serde_json::json!([udp(&first)])
+    );
+    assert_eq!(settings["cache"]["from"], "file");
+    let answer = ask(&site.dns, "other.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+    assert_eq!(second.count(), 0);
 }
