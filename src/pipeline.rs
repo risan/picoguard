@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::budget::{Budget, Charge};
-use crate::cache::{Cache, CacheKey, EntryToken, Memo};
+use crate::cache::{Cache, CacheKey, EntryToken, Memo, Ttls};
 use crate::config::{CacheConfig, Cidr, Config, is_allowed};
 use crate::dns::build::{self, Protocol, Reply, ReplyParts};
 use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, flags, rcode, rtype};
@@ -158,6 +158,9 @@ struct Delivery {
     age_secs_when_received: u32,
     received: Instant,
     source: Source,
+    /// The TTL settings of the cache the bytes were taken from or put into, read under the
+    /// same lock, so a cache replaced meanwhile cannot mix its settings into this reply.
+    ttls: Ttls,
     _charge: Charge,
 }
 
@@ -168,6 +171,7 @@ impl Delivery {
         cached_as: Option<EntryToken>,
         age_secs_when_received: u32,
         source: Source,
+        ttls: Ttls,
         charge: Charge,
     ) -> Delivery {
         Delivery {
@@ -177,6 +181,7 @@ impl Delivery {
             age_secs_when_received,
             received: Instant::now(),
             source,
+            ttls,
             _charge: charge,
         }
     }
@@ -837,6 +842,7 @@ impl Pipeline {
             Some(hit.token),
             hit.age_secs,
             Source::Cache { stale: hit.stale },
+            cache.ttls(),
             charge,
         )))
     }
@@ -876,8 +882,7 @@ impl Pipeline {
 
         let result = match decision {
             Decision::Pass => {
-                let ttls = self.cache.lock().unwrap().ttls();
-                let ttl_rule = ttls.rule(delivery.age_secs(), delivery.is_stale());
+                let ttl_rule = delivery.ttls.rule(delivery.age_secs(), delivery.is_stale());
                 reply.from_upstream(delivery.parts(), ttl_rule, out);
 
                 match delivery.source {
@@ -1108,6 +1113,7 @@ impl Pipeline {
         let key = CacheKey::new(&query);
         let mut cache = self.cache.lock().unwrap();
         let cached_as = cache.insert(&key, &bytes, &info, Instant::now());
+        let ttls = cache.ttls();
         // A final answer the cache refuses (TTL 0, no SOA, too big) is what the upstream says
         // now, so a stale entry for the question is no longer the best answer.
         if cached_as.is_none() && is_final_answer(&info) {
@@ -1123,7 +1129,7 @@ impl Pipeline {
         });
 
         Ok(Arc::new(Delivery::new(
-            bytes, info, cached_as, 0, source, charge,
+            bytes, info, cached_as, 0, source, ttls, charge,
         )))
     }
 }
@@ -1488,6 +1494,7 @@ mod tests {
             old_token,
             0,
             Source::Upstream(None),
+            pipeline.cache.lock().unwrap().ttls(),
             pipeline.budget.try_charge(1).unwrap(),
         );
 
@@ -1535,6 +1542,7 @@ mod tests {
                 token,
                 0,
                 Source::Upstream(None),
+                pipeline.cache.lock().unwrap().ttls(),
                 pipeline.budget.try_charge(1).unwrap(),
             );
             let reply = Reply::new(&query, pipeline.udp_size, Protocol::Udp);
@@ -1592,6 +1600,7 @@ mod tests {
             token,
             0,
             Source::Upstream(None),
+            pipeline.cache.lock().unwrap().ttls(),
             pipeline.budget.try_charge(1).unwrap(),
         );
         let reply = Reply::new(&query, pipeline.udp_size, Protocol::Tcp);
@@ -2177,6 +2186,7 @@ mod tests {
             old_token,
             0,
             Source::Upstream(None),
+            pipeline.cache.lock().unwrap().ttls(),
             pipeline.budget.try_charge(1).unwrap(),
         );
 
@@ -2190,6 +2200,29 @@ mod tests {
         let hit = cache.get(&CacheKey::new(&query), Instant::now()).unwrap();
         assert_ne!(Some(hit.token), old_token);
         assert_eq!(hit.memo, None);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_held_across_a_cache_replacement_keeps_the_ttl_settings_of_its_lookup() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("held.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0).unwrap();
+        let held = pipeline.hold_cache_hit(&query).unwrap();
+
+        drop(pipeline.replace_cache(&CacheConfig {
+            max_ttl: 60,
+            ..CacheConfig::default()
+        }));
+        let reply = Reply::new(&query, pipeline.udp_size, Protocol::Udp);
+        let mut out = Vec::new();
+        pipeline.deliver(&query, &reply, &held, &mut out);
+
+        assert_eq!(answer_ttls(&out), [300]);
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0).unwrap();
+        ask_quickly(&pipeline, &spec, &mut out);
+        assert_eq!(answer_ttls(&out), [60]);
     }
 
     const PRIVATE_CLIENTS: [&str; 8] = [
