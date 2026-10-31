@@ -29,6 +29,7 @@ use crate::lists::{Downloader, Limits, Refresh, RefreshError, Updated, Validator
 use crate::memory::{self, ListBytes, Memory};
 use crate::pipeline::Pipeline;
 use crate::policy::Policy;
+use crate::services::{self, ServiceList, Services, ServicesView, Wanted};
 use crate::settings::{
     self, ChangeError, ListRole, PageChange, PageList, SaveError, Saved, Settings,
 };
@@ -74,6 +75,8 @@ impl Timing {
 enum Work {
     Refresh,
     Save,
+    /// Download the catalog of the blocked services again.
+    Services,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -226,7 +229,8 @@ pub struct Explained {
     pub rule: String,
 }
 
-/// Where a list of the engine comes from, so explain can name it.
+/// Where a list of the engine comes from, so explain can name it. The lists of the blocked
+/// services follow these in the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListId {
     ConfigRules,
@@ -240,9 +244,12 @@ type InForce = (ListId, Arc<CompiledList>);
 /// What every swap after boot reads and writes under one lock.
 #[derive(Default)]
 struct Assembly {
-    /// The list of each engine position, as the scheduler last put the lists in force.
-    main_ids: Vec<ListId>,
-    allow_ids: Vec<ListId>,
+    /// The lists as the scheduler last put them in force, so a change of the blocked services
+    /// can build the next engine without it.
+    main: Vec<InForce>,
+    allowlists: Vec<InForce>,
+    /// The lists of the blocked services in force, after `main` in the engine.
+    services: Vec<ServiceList>,
     /// The page lists in force; `None` for a side without rules.
     block: Option<Arc<CompiledList>>,
     allow: Option<Arc<CompiledList>>,
@@ -300,6 +307,31 @@ impl Assembly {
             self.allow.iter().cloned().collect(),
         )
     }
+
+    /// Builds on `worker` the engine of `main`, `allowlists` and `services` with the page
+    /// lists in force.
+    async fn engine(
+        &self,
+        main: &[InForce],
+        allowlists: &[InForce],
+        services: &[ServiceList],
+        worker: &CompileWorker,
+    ) -> Result<Engine, CompileError> {
+        let main: Vec<Arc<CompiledList>> = main
+            .iter()
+            .map(|(_, list)| Arc::clone(list))
+            .chain(services.iter().map(|service| Arc::clone(&service.list)))
+            .collect();
+        let allow = allowlists
+            .iter()
+            .map(|(_, list)| Arc::clone(list))
+            .collect();
+        let (page_block, page_allow) = self.page_lists();
+
+        worker
+            .run(move || Engine::new(main, allow).with_pinned(page_block, page_allow))
+            .await
+    }
 }
 
 /// The scheduler seen from outside: what the lists look like, a way to ask for a refresh, and
@@ -328,6 +360,7 @@ pub struct ListControl {
     /// The saved settings hold the lists, so the config file's URL lists are not used.
     lists_on_page: AtomicBool,
     next_add: AtomicU64,
+    services: Services,
 }
 
 impl ListControl {
@@ -353,6 +386,7 @@ impl ListControl {
             budget_bytes: memory::budget_bytes(&file.limits),
             fixed_bytes: memory::fixed_bytes(&file.limits, &file.stats),
             cache_max_bytes: AtomicUsize::new(file.cache.max_bytes),
+            services: Services::new(&file.services, Timing::default().hour),
             saved,
             assembly: tokio::sync::Mutex::new(Assembly::default()),
             pending: Arc::new(Semaphore::new(MAX_PENDING_CHANGES)),
@@ -412,13 +446,22 @@ impl ListControl {
         self.cache_max_bytes.store(max_bytes, Ordering::Relaxed);
     }
 
+    /// What each list in force counts, in the order of `statuses`, then the blocked services
+    /// as one group.
     fn list_bytes(&self) -> Vec<ListBytes> {
+        let services = self.services_bytes();
+
         self.statuses
             .lock()
             .unwrap()
             .iter()
             .map(|status| status.bytes)
+            .chain([services])
             .collect()
+    }
+
+    fn services_bytes(&self) -> ListBytes {
+        self.services.state.lock().unwrap().bytes
     }
 
     /// What a compile may be charged now: the budget less what is held without it. The
@@ -455,6 +498,263 @@ impl ListControl {
         self.refresh_requested.notify_one();
     }
 
+    /// The blocked services of the page: the index of the catalog and which are on. The first
+    /// call downloads the catalog, as does one a minute after a download failed; until it is
+    /// read the view says it is loading.
+    pub fn services_view(self: &Arc<Self>) -> ServicesView {
+        if self.services.should_load_index() {
+            let control = Arc::clone(self);
+            tokio::spawn(async move {
+                if let Err(error) = control.services.fetch(&[]).await {
+                    log::warn!("cannot download the catalog of the blocked services: {error}");
+                }
+            });
+        }
+
+        self.services.view()
+    }
+
+    /// The lists of the blocked services `new` in place of those of `old`. A service switched
+    /// on downloads the catalog once and compiles the services that have no list yet, within
+    /// the room the memory budget leaves while the lists in force are held, and the new set
+    /// must fit with the others (plan D8); one switched off drops its list. Nothing is in force
+    /// before `put_services_in_force`. The caller holds the settings and admission locks.
+    pub(crate) async fn prepare_services(
+        &self,
+        old: &[String],
+        new: &[String],
+    ) -> Result<Vec<ServiceList>, ChangeError> {
+        let added: Vec<&String> = new.iter().filter(|id| !old.contains(id)).collect();
+        let unknown = |state: &services::State| {
+            let index = state.index.as_ref()?;
+            added
+                .iter()
+                .find(|id| !index.iter().any(|service| *service.id == ***id))
+                .map(|id| {
+                    ChangeError::Invalid(format!("there is no service {id:?} in the catalog"))
+                })
+        };
+        if let Some(error) = unknown(&self.services.state.lock().unwrap()) {
+            return Err(error);
+        }
+
+        let in_force = self.assembly.lock().await.services.clone();
+        let kept: Vec<ServiceList> = new
+            .iter()
+            .filter_map(|id| in_force.iter().find(|list| *list.id == **id).cloned())
+            .collect();
+        drop(in_force);
+        if added.is_empty() {
+            return Ok(kept);
+        }
+
+        let missing: Vec<String> = new
+            .iter()
+            .filter(|id| !kept.iter().any(|list| *list.id == ***id))
+            .cloned()
+            .collect();
+        let wanted = self.services.fetch(&missing).await.map_err(|error| {
+            ChangeError::Unavailable(format!(
+                "could not download the catalog of the blocked services: {error}"
+            ))
+        })?;
+        if let Some(error) = unknown(&self.services.state.lock().unwrap()) {
+            return Err(error);
+        }
+
+        self.compile_services(kept, wanted)
+            .await
+            .map_err(ChangeError::OverBudget)
+    }
+
+    /// `kept` and the lists of `wanted`, each compiled within the room the budget leaves while
+    /// the lists in force, the services in force and those compiled before it are held. The
+    /// set must fit the budget in place of the services in force; else the reason. A service
+    /// that does not compile (it blocks a canary name) is left out. The caller holds the
+    /// admission lock.
+    async fn compile_services(
+        &self,
+        kept: Vec<ServiceList>,
+        wanted: Vec<Wanted>,
+    ) -> Result<Vec<ServiceList>, String> {
+        let Some(worker) = self.services.worker() else {
+            return Err("the blocked services are not running".to_string());
+        };
+
+        let fixed = self.fixed_bytes;
+        let cache = self.cache_max_bytes.load(Ordering::Relaxed);
+        let mut held = self.list_bytes();
+        let mut lists = kept;
+        for (id, name, rules) in wanted {
+            let left = self
+                .budget_bytes
+                .saturating_sub(memory::steady_bytes(fixed, cache, &held));
+            match services::compile(worker, rules, left).await {
+                Ok(compiled) => {
+                    let list = ServiceList {
+                        id,
+                        label: format!("Blocked service: {name}"),
+                        list: compiled.list,
+                        fingerprint: compiled.fingerprint,
+                    };
+                    held.push(list.bytes());
+                    lists.push(list);
+                }
+
+                Err(CompileError::OverMemoryBudget) => {
+                    worker.discard(lists);
+
+                    return Err(format!(
+                        "the blocked services would pass the memory budget: {} left of {}",
+                        memory::megabytes(left),
+                        memory::megabytes(self.budget_bytes)
+                    ));
+                }
+
+                Err(error) => {
+                    log::warn!("blocked service {name}: its rules cannot be used: {error:?}");
+                }
+            }
+        }
+
+        let mut after = self.list_bytes();
+        *after.last_mut().expect("the services are counted last") = group_bytes(&lists);
+        let estimate = memory::estimate(fixed, cache, &after);
+        if estimate > self.budget_bytes {
+            worker.discard(lists);
+
+            return Err(format!(
+                "the blocked services would pass the memory budget: the estimate would be {} of {}",
+                memory::megabytes(estimate),
+                memory::megabytes(self.budget_bytes)
+            ));
+        }
+
+        Ok(lists)
+    }
+
+    /// Puts `lists` in force as the blocked services `selection`, and frees the lists they
+    /// replace off the DNS thread. `downloaded`: the catalog was read for them now. The caller
+    /// holds the admission lock.
+    pub(crate) async fn put_services_in_force(
+        &self,
+        lists: Vec<ServiceList>,
+        selection: Vec<String>,
+        downloaded: bool,
+    ) {
+        let Some(worker) = self.services.worker() else {
+            return;
+        };
+
+        let bytes = group_bytes(&lists);
+        let mut assembly = self.assembly.lock().await;
+        let replaced = match assembly
+            .engine(&assembly.main, &assembly.allowlists, &lists, worker)
+            .await
+        {
+            Ok(engine) => {
+                let old_engine = self.policy.swap_engine(Arc::new(engine));
+                let old_lists = std::mem::replace(&mut assembly.services, lists);
+                self.services_in_force(bytes, selection, downloaded);
+
+                (Some(old_engine), old_lists)
+            }
+
+            Err(error) => {
+                log::warn!("cannot build the filter with the blocked services: {error:?}");
+
+                (None, lists)
+            }
+        };
+        drop(assembly);
+        self.services.changed.notify_one();
+        worker.discard(replaced);
+        let _ = worker.run(|| ()).await;
+    }
+
+    /// Downloads the catalog again and puts the lists of the services switched on in force,
+    /// when they changed and fit the budget in place of those in force. A failure keeps the
+    /// lists in force and tries again later.
+    async fn refresh_services(&self, timing: &Timing) {
+        let admitted = self.admission.lock().await;
+        let selection = self.services.state.lock().unwrap().selection.clone();
+        if selection.is_empty() {
+            return;
+        }
+
+        let refreshed = match self.services.fetch(&selection).await {
+            Ok(wanted) => self.compile_services(Vec::new(), wanted).await,
+            Err(error) => Err(error),
+        };
+
+        match refreshed {
+            Ok(lists) => {
+                let in_force = self.assembly.lock().await;
+                let same =
+                    in_force.services.len() == lists.len()
+                        && in_force.services.iter().zip(&lists).all(|(old, new)| {
+                            old.id == new.id && old.fingerprint == new.fingerprint
+                        });
+                drop(in_force);
+
+                if same {
+                    self.services_checked();
+                    if let Some(worker) = self.services.worker() {
+                        worker.discard(lists);
+                        let _ = worker.run(|| ()).await;
+                    }
+                } else {
+                    log::info!("blocked services: {} lists", lists.len());
+                    self.put_services_in_force(lists, selection, true).await;
+                }
+            }
+
+            Err(error) => {
+                let mut state = self.services.state.lock().unwrap();
+                if state.failures == 0 {
+                    log::warn!(
+                        "blocked services: refresh failed, keeping the current lists: {error}"
+                    );
+                }
+
+                state.failures += 1;
+                state.error = Some(error);
+                state.next_check = Some(Instant::now() + timing.retry_after(state.failures));
+            }
+        }
+
+        drop(admitted);
+    }
+
+    /// The lists of the blocked services `selection`, which count `bytes`, are in force.
+    fn services_in_force(&self, bytes: ListBytes, selection: Vec<String>, downloaded: bool) {
+        let mut state = self.services.state.lock().unwrap();
+        state.bytes = bytes;
+        state.next_check = if selection.is_empty() {
+            None
+        } else if downloaded {
+            state.failures = 0;
+
+            Some(Instant::now() + jittered(self.services.interval))
+        } else {
+            state.next_check.or_else(|| Some(Instant::now()))
+        };
+        state.selection = selection;
+    }
+
+    /// The catalog was read and its lists are in force: the next check is a refresh interval
+    /// away.
+    fn services_checked(&self) {
+        let mut state = self.services.state.lock().unwrap();
+        state.failures = 0;
+        state.next_check = Some(Instant::now() + jittered(self.services.interval));
+    }
+
+    /// When the catalog is downloaded again; `None` with no service switched on.
+    fn services_due(&self) -> Option<Instant> {
+        self.services.state.lock().unwrap().next_check
+    }
+
     /// Calls `f` with the rules from the status page, in the order added. The rules are only
     /// borrowed: nothing is copied out.
     pub async fn with_button_rules<R>(&self, f: impl FnOnce(&[ButtonRule]) -> R) -> R {
@@ -466,10 +766,17 @@ impl ListControl {
     pub async fn explain(&self, name: &str) -> Option<Explained> {
         let assembly = self.assembly.lock().await;
         let explanation = self.policy.explain(name)?;
+        let at = explanation.list;
         let list = match explanation.side {
             Side::PinnedAllow | Side::PinnedBlock => "your rules".to_string(),
-            Side::Allowlists => self.list_name(assembly.allow_ids.get(explanation.list)),
-            Side::Main => self.list_name(assembly.main_ids.get(explanation.list)),
+            Side::Allowlists => self.list_name(assembly.allowlists.get(at).map(|(id, _)| id)),
+            Side::Main => match assembly.main.get(at) {
+                Some((id, _)) => self.list_name(Some(id)),
+                None => assembly
+                    .services
+                    .get(at - assembly.main.len())
+                    .map_or_else(String::new, |service| service.label.clone()),
+            },
         };
 
         Some(Explained {
@@ -775,20 +1082,30 @@ impl ListControl {
         worker: &CompileWorker,
     ) -> Result<(), CompileError> {
         let mut assembly = self.assembly.lock().await;
-        let (main_ids, main): (Vec<ListId>, Vec<Arc<CompiledList>>) = main.into_iter().unzip();
-        let (allow_ids, allow): (Vec<ListId>, Vec<Arc<CompiledList>>) = allow.into_iter().unzip();
-        let (page_block, page_allow) = assembly.page_lists();
-        let engine = worker
-            .run(move || Engine::new(main, allow).with_pinned(page_block, page_allow))
+        let engine = assembly
+            .engine(&main, &allow, &assembly.services, worker)
             .await?;
 
         let old_engine = self.policy.swap_engine(Arc::new(engine));
-        worker.discard(old_engine);
-        assembly.main_ids = main_ids;
-        assembly.allow_ids = allow_ids;
+        let old_main = std::mem::replace(&mut assembly.main, main);
+        let old_allow = std::mem::replace(&mut assembly.allowlists, allow);
+        worker.discard((old_engine, old_main, old_allow));
 
         Ok(())
     }
+}
+
+/// What the lists of the blocked services count in the estimate together: a refresh holds the
+/// whole old set while the new one is compiled (plan D8).
+fn group_bytes(lists: &[ServiceList]) -> ListBytes {
+    lists.iter().fold(ListBytes::default(), |group, list| {
+        let bytes = list.bytes();
+
+        ListBytes {
+            heap: group.heap + bytes.heap,
+            charge: group.charge + bytes.charge,
+        }
+    })
 }
 
 /// The page list of one action: a plain `||name^` or `@@||name^` per rule, built without
@@ -1054,8 +1371,6 @@ impl Scheduler {
         }
 
         let (main, allow) = scheduler.lists_in_force(None);
-        let (main_ids, main): (Vec<ListId>, Vec<Arc<CompiledList>>) = main.into_iter().unzip();
-        let (allow_ids, allow): (Vec<ListId>, Vec<Arc<CompiledList>>) = allow.into_iter().unzip();
         let (page_block, page_allow) = {
             let settings = saved.lock().await;
 
@@ -1064,13 +1379,13 @@ impl Scheduler {
                 page_list(&settings.page_rules, Action::Allow),
             )
         };
-        let (pinned_block, pinned_allow) = (
-            page_block.iter().cloned().collect(),
-            page_allow.iter().cloned().collect(),
-        );
-        let engine = scheduler
-            .worker
-            .run(move || Engine::new(main, allow).with_pinned(pinned_block, pinned_allow))
+        let assembly = Assembly {
+            block: page_block,
+            allow: page_allow,
+            ..Assembly::default()
+        };
+        let engine = assembly
+            .engine(&main, &allow, &[], &scheduler.worker)
             .await
             .map_err(|error| format!("cannot build the filter: {error:?}"))?;
 
@@ -1084,11 +1399,12 @@ impl Scheduler {
             .map_or(0, |rules| rules.heap_bytes());
         control.cache_max_bytes = AtomicUsize::new(config.cache.max_bytes);
         control.lists_on_page = AtomicBool::new(from_page);
-        let assembly = control.assembly.get_mut();
-        assembly.main_ids = main_ids;
-        assembly.allow_ids = allow_ids;
-        assembly.block = page_block;
-        assembly.allow = page_allow;
+        control.services = Services::new(&config.services, scheduler.timing.hour);
+        control.assembly = tokio::sync::Mutex::new(Assembly {
+            main,
+            allowlists: allow,
+            ..assembly
+        });
         scheduler.control = Arc::new(control);
         scheduler.publish_all();
 
@@ -1121,6 +1437,10 @@ impl Scheduler {
         tokio::pin!(stop);
         let control = self.control();
         let mut commands = self.commands.take();
+        let downloader = Arc::new(downloader);
+        control
+            .services
+            .start(Arc::clone(&downloader), self.worker.clone());
 
         loop {
             let next = self.next_work();
@@ -1150,6 +1470,10 @@ impl Scheduler {
                     continue;
                 }
 
+                () = control.services.changed.notified() => {
+                    continue;
+                }
+
                 Some(command) = command => {
                     let outcome = self.replace(command.blocklists, command.allowlists, command.from_page, &command.settings, &downloader).await;
                     let _ = command.reply.send(outcome);
@@ -1171,6 +1495,10 @@ impl Scheduler {
 
                 Work::Save => {
                     self.retry_save(index).await;
+                }
+
+                Work::Services => {
+                    control.refresh_services(&self.timing).await;
                 }
             }
         }
@@ -1213,6 +1541,7 @@ impl Scheduler {
         // they leave; the set after the change counts only the lists that stay.
         let mut held = control.list_bytes();
         let mut after: Vec<ListBytes> = kept.iter().flatten().map(|at| held[*at]).collect();
+        after.push(control.services_bytes());
         let mut admitted_copies = Vec::new();
         for (index, entry) in wanted.iter().enumerate() {
             if kept[index].is_some() || !entry.enabled {
@@ -1417,6 +1746,9 @@ impl Scheduler {
         for entry in &mut self.entries {
             entry.due = entry.due.min(now);
         }
+
+        let mut services = self.control.services.state.lock().unwrap();
+        services.next_check = services.next_check.map(|at| at.min(now));
     }
 
     fn next_work(&self) -> Option<(usize, Work, Instant)> {
@@ -1436,7 +1768,15 @@ impl Scheduler {
                 Some((index, Work::Save, pending.retry_at))
             });
 
-        refreshes.chain(saves).min_by_key(|(_, _, at)| *at)
+        let services = self
+            .control
+            .services_due()
+            .map(|at| (0, Work::Services, at));
+
+        refreshes
+            .chain(saves)
+            .chain(services)
+            .min_by_key(|(_, _, at)| *at)
     }
 
     /// Refreshes the list at `index` now. The list in force stays in force unless a new copy

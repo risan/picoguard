@@ -223,6 +223,7 @@ enum Job {
     Run(Box<dyn FnOnce() + Send>),
 }
 
+#[derive(Clone)]
 pub struct CompileWorker {
     jobs: std_mpsc::Sender<Job>,
 }

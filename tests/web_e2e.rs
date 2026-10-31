@@ -403,7 +403,17 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
 
 /// A site whose state folder holds `saved` as its settings file before it starts. The state
 /// folder is the stager's, as in the server.
-async fn site_saving(mut config: Config, kind: SiteKind, saved: Option<&str>) -> Site {
+async fn site_saving(config: Config, kind: SiteKind, saved: Option<&str>) -> Site {
+    site_timed(config, kind, saved, day_long_timing()).await
+}
+
+/// `site_saving` with the scheduler on `timing`.
+async fn site_timed(
+    mut config: Config,
+    kind: SiteKind,
+    saved: Option<&str>,
+    timing: Timing,
+) -> Site {
     let root = scratch(&format!("web-e2e-{}", SITES.fetch_add(1, Ordering::SeqCst)));
     let state = root.join("state");
     std::fs::create_dir(&state).unwrap();
@@ -419,7 +429,7 @@ async fn site_saving(mut config: Config, kind: SiteKind, saved: Option<&str>) ->
         Arc::new(loaded.saved),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
-        day_long_timing(),
+        timing,
     )
     .await
     .unwrap();
@@ -4068,26 +4078,13 @@ async fn the_settings_say_why_the_saved_file_is_not_used_until_a_save_replaces_i
 }
 
 #[tokio::test]
-async fn a_settings_change_of_a_key_not_editable_yet_is_refused_and_nothing_is_written() {
+async fn a_settings_change_that_is_not_valid_is_refused_and_nothing_is_written() {
     let (site, _upstream) = plain_site().await;
 
-    for (key, value) in [
-        ("services", serde_json::json!(["tiktok"])),
-        ("services", Value::Null),
-    ] {
-        let body = serde_json::json!({ key: value }).to_string();
-
-        let reply = site.send(post("/api/settings", &body)).await;
-
-        assert_eq!(reply.status, 409, "{body}: {}", reply.body);
-        assert_eq!(
-            reply.json()["error"],
-            format!("{key} is not editable yet"),
-            "{body}"
-        );
-    }
-
     for body in [
+        "{\"services\": [\"a b\"]}",
+        "{\"services\": [\"tiktok\", \"tiktok\"]}",
+        "{\"services\": \"tiktok\"}",
         "{\"web\": {}}",
         "{\"page_rules\": []}",
         "{\"lists\": null}",
@@ -4491,15 +4488,11 @@ async fn the_file_is_written_only_when_a_setting_in_force_changes() {
         body.as_str(),
         "{}",
         "{\"cache\": null}",
-        "{\"rewrites\": [], \"services\": []}",
+        "{\"rewrites\": null, \"safe_search\": null, \"services\": null}",
     ] {
         let reply = site.send(post("/api/settings", body)).await;
 
-        assert!(
-            reply.status == 200 || reply.status == 409,
-            "{body}: {}",
-            reply.body
-        );
+        assert_eq!(reply.status, 200, "{body}: {}", reply.body);
         assert!(!file.exists(), "{body} wrote the file");
     }
 }
@@ -4995,4 +4988,370 @@ async fn an_add_a_refresh_and_a_larger_cache_at_once_near_the_budget_never_pass_
         memory.budget_bytes
     );
     assert!(memory.estimate_bytes <= memory.budget_bytes);
+}
+
+// ---- Blocked services (plan D8) ----
+
+/// A small catalog in the shape of AdGuard's `services.json`, written for these tests.
+const CATALOG: &str = r#"{
+  "blocked_services": [
+    {"id": "chat", "name": "Chat", "group": "messenger", "icon_svg": "<svg>chat</svg>",
+     "rules": ["||chat.example^", "||chatcdn.example^"]},
+    {"id": "video", "name": "Video", "group": "streaming", "icon_svg": "<svg>video</svg>",
+     "rules": ["||video.example^"]},
+    {"id": "games", "name": "Games", "group": "gaming", "rules": ["||games.example^"]}
+  ],
+  "groups": [{"id": "messenger"}, {"id": "streaming"}, {"id": "gaming"}]
+}"#;
+
+const CATALOG_PATH: &str = "/services.json";
+
+fn fast_timing() -> Timing {
+    Timing {
+        hour: Duration::from_millis(300),
+        retries: [Duration::from_millis(200); 4],
+        first_check: Duration::from_secs(3600),
+    }
+}
+
+/// A site whose catalog of services is served by the returned server.
+async fn services_site(
+    block: &[&str],
+    timing: Timing,
+    change: impl FnOnce(&mut Config),
+) -> (Site, ListServer, common::harness::FakeUpstream) {
+    let catalog = ListServer::start().await;
+    catalog.serve(CATALOG_PATH, CATALOG, None);
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    config.services.catalog_url = catalog.url(CATALOG_PATH);
+    config.services.block = block.iter().map(|id| id.to_string()).collect();
+    change(&mut config);
+    let kind = SiteKind {
+        build: Build::current(),
+        installer: true,
+        release_target: true,
+    };
+    let site = site_timed(config, kind, None, timing).await;
+
+    (site, catalog, upstream)
+}
+
+async fn is_blocked(site: &Site, name: &str) -> bool {
+    addresses(&ask(&site.dns, name, RecordType::A).await) == ["0.0.0.0"]
+}
+
+/// Waits until `name` is blocked or not, as `blocked` says.
+async fn wait_until_blocked(site: &Site, name: &str, blocked: bool) {
+    for _ in 0..400 {
+        if is_blocked(site, name).await == blocked {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!(
+        "{name} never became {}",
+        if blocked { "blocked" } else { "allowed" }
+    );
+}
+
+/// `GET /api/services` once it is no longer loading.
+async fn loaded_services(site: &Site) -> Value {
+    for _ in 0..400 {
+        let reply = site.send(get("/api/services")).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let services = reply.json();
+        if services["loading"] == false {
+            return services;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("the services never loaded");
+}
+
+fn switched_on(services: &Value) -> Vec<String> {
+    services["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|service| service["on"] == true)
+        .map(|service| service["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn blocked_services_are_switched_on_and_off_and_reset_from_the_page() {
+    let (site, catalog, _upstream) = services_site(&[], day_long_timing(), |_| {}).await;
+
+    let services = loaded_services(&site).await;
+    assert_eq!(
+        services["services"],
+        serde_json::json!([
+            {"id": "chat", "name": "Chat", "group": "messenger", "on": false},
+            {"id": "video", "name": "Video", "group": "streaming", "on": false},
+            {"id": "games", "name": "Games", "group": "gaming", "on": false},
+        ])
+    );
+    assert!(services["loaded_at"].as_u64().unwrap() > 1_700_000_000);
+    assert_eq!(services["error"], Value::Null);
+    assert!(!services.to_string().contains("svg"));
+    assert_eq!(catalog.requested(CATALOG_PATH), 1);
+    assert!(!is_blocked(&site, "chat.example.").await);
+
+    let reply = site
+        .send(post("/api/settings", "{\"services\": [\"chat\"]}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(
+        reply.json()["services"],
+        serde_json::json!({"block": ["chat"], "from": "page"})
+    );
+    assert_eq!(catalog.requested(CATALOG_PATH), 2);
+    for name in ["chat.example.", "www.chat.example.", "chatcdn.example."] {
+        assert!(is_blocked(&site, name).await, "{name}");
+    }
+    assert!(!is_blocked(&site, "video.example.").await);
+    let explained = site
+        .send(get("/api/explain?name=chat.example"))
+        .await
+        .json();
+    assert_eq!(explained["decision"], "blocked");
+    assert_eq!(explained["list"], "Blocked service: Chat");
+    assert_eq!(switched_on(&loaded_services(&site).await), ["chat"]);
+    assert_eq!(
+        saved_settings(&site).unwrap()["services"],
+        serde_json::json!(["chat"])
+    );
+
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"chat\", \"video\"]}",
+        ))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(is_blocked(&site, "video.example.").await);
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert_eq!(catalog.requested(CATALOG_PATH), 3);
+    let file = site.state.join(settings::FILE_NAME);
+    std::fs::remove_file(&file).unwrap();
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"chat\", \"video\"]}",
+        ))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(!file.exists(), "the same services again write nothing");
+    assert_eq!(catalog.requested(CATALOG_PATH), 3);
+
+    let reply = site
+        .send(post("/api/settings", "{\"services\": [\"video\"]}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(!is_blocked(&site, "chat.example.").await);
+    assert!(is_blocked(&site, "video.example.").await);
+    assert_eq!(
+        catalog.requested(CATALOG_PATH),
+        3,
+        "switching off downloads nothing"
+    );
+
+    let before = saved_settings(&site);
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"video\", \"nope\"]}",
+        ))
+        .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert_eq!(
+        reply.json()["error"],
+        "there is no service \"nope\" in the catalog"
+    );
+    assert_eq!(saved_settings(&site), before);
+    assert_eq!(
+        catalog.requested(CATALOG_PATH),
+        3,
+        "an unknown id downloads nothing"
+    );
+
+    let reply = site
+        .send(post("/api/settings", "{\"services\": null}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(
+        reply.json()["services"],
+        serde_json::json!({"block": [], "from": "file"})
+    );
+    assert!(!is_blocked(&site, "video.example.").await);
+    assert!(saved_settings(&site).unwrap().get("services").is_none());
+    assert_eq!(catalog.requested(CATALOG_PATH), 3);
+}
+
+#[tokio::test]
+async fn services_from_the_config_file_are_loaded_once_at_start_and_pause_turns_them_off() {
+    let (site, catalog, _upstream) = {
+        let catalog_delay = Duration::from_millis(300);
+        let (site, catalog, upstream) = services_site(&["video"], day_long_timing(), |_| {}).await;
+        catalog.set_delay(catalog_delay);
+
+        (site, catalog, upstream)
+    };
+
+    wait_until_blocked(&site, "video.example.", true).await;
+    let services = loaded_services(&site).await;
+    assert_eq!(switched_on(&services), ["video"]);
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(
+        settings["services"],
+        serde_json::json!({"block": ["video"], "from": "file"})
+    );
+    assert_eq!(catalog.requested(CATALOG_PATH), 1);
+
+    let reply = site.send(post("/api/pause", "{\"minutes\": 5}")).await;
+    assert_eq!(reply.status, 200);
+    assert!(!is_blocked(&site, "video.example.").await);
+    let reply = site.send(post("/api/resume", "{}")).await;
+    assert_eq!(reply.status, 200);
+    assert!(is_blocked(&site, "video.example.").await);
+
+    assert!(saved_settings(&site).is_none(), "nothing was written");
+}
+
+#[tokio::test]
+async fn until_the_catalog_is_read_the_page_says_loading() {
+    let catalog = ListServer::start().await;
+    catalog.serve(CATALOG_PATH, CATALOG, None);
+    catalog.set_delay(Duration::from_millis(500));
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    config.services.catalog_url = catalog.url(CATALOG_PATH);
+    config.services.block = vec!["chat".to_string()];
+    let site = site(config).await;
+
+    let services = site.send(get("/api/services")).await.json();
+
+    assert_eq!(services["loading"], true);
+    assert_eq!(services["services"], serde_json::json!([]));
+    assert!(!is_blocked(&site, "chat.example.").await);
+    wait_until_blocked(&site, "chat.example.", true).await;
+    assert_eq!(loaded_services(&site).await["loading"], false);
+}
+
+#[tokio::test]
+async fn a_failed_refresh_keeps_the_service_lists_and_no_refresh_writes_a_file() {
+    let (site, catalog, _upstream) = services_site(&["chat"], fast_timing(), |config| {
+        config.services.refresh_hours = 1;
+    })
+    .await;
+    wait_until_blocked(&site, "chat.example.", true).await;
+
+    catalog.fail(CATALOG_PATH, 503);
+    let failed_once = catalog.requested(CATALOG_PATH) + 2;
+    for _ in 0..400 {
+        if catalog.requested(CATALOG_PATH) >= failed_once {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(catalog.requested(CATALOG_PATH) >= failed_once);
+    let services = site.send(get("/api/services")).await.json();
+    assert!(
+        services["error"].as_str().unwrap().contains("503"),
+        "{services}"
+    );
+    assert!(is_blocked(&site, "chat.example.").await, "the lists stay");
+
+    catalog.serve(
+        CATALOG_PATH,
+        &CATALOG.replace("||chatcdn.example^", "||chat2.example^"),
+        None,
+    );
+    wait_until_blocked(&site, "chat2.example.", true).await;
+    assert!(!is_blocked(&site, "chatcdn.example.").await);
+    assert_eq!(
+        site.send(get("/api/services")).await.json()["error"],
+        Value::Null
+    );
+
+    let written: Vec<_> = std::fs::read_dir(&site.state).unwrap().collect();
+    assert!(written.is_empty(), "{written:?}");
+}
+
+#[tokio::test]
+async fn no_catalog_is_downloaded_without_a_service_switched_on() {
+    let (site, catalog, _upstream) = services_site(&[], fast_timing(), |config| {
+        config.services.refresh_hours = 1;
+    })
+    .await;
+
+    let reply = site.send(post("/api/settings", "{\"services\": []}")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(
+        saved_settings(&site).unwrap()["services"],
+        serde_json::json!([])
+    );
+    let reply = site.send(post("/api/lists/refresh", "{}")).await;
+    assert_eq!(reply.status, 202);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    assert_eq!(catalog.requests(), 0);
+}
+
+#[tokio::test]
+async fn services_that_would_pass_the_memory_budget_are_refused_and_the_lists_stay() {
+    let big: Vec<String> = (0..2000)
+        .map(|n| format!("\"||n{n}.big.example^\""))
+        .collect();
+    let catalog_text = CATALOG.replace(
+        "\"rules\": [\"||games.example^\"]",
+        &format!("\"rules\": [{}]", big.join(", ")),
+    );
+    let (probe, _catalog, _upstream) = services_site(&[], day_long_timing(), |_| {}).await;
+    let memory = probe.control.memory();
+    drop(probe);
+    // A cache that leaves 20 KB of the budget: room for the small services, not for 2000
+    // rules.
+    let left = 20 * 1024;
+    let budget = memory.budget_bytes;
+    let cache_max_bytes =
+        Config::default().cache.max_bytes + (budget - memory.estimate_bytes - left) / 125 * 100;
+    let (site, catalog, _upstream) = services_site(&["chat"], day_long_timing(), |config| {
+        config.cache.max_bytes = cache_max_bytes;
+    })
+    .await;
+    catalog.serve(CATALOG_PATH, &catalog_text, None);
+    wait_until_blocked(&site, "chat.example.", true).await;
+    let memory = site.control.memory();
+    assert!(
+        memory.budget_bytes - memory.estimate_bytes < 40 * 1024,
+        "{memory:?}"
+    );
+
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"chat\", \"games\"]}",
+        ))
+        .await;
+
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.json()["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the blocked services would pass the memory budget"),
+        "{}",
+        reply.body
+    );
+    assert!(!is_blocked(&site, "n1.big.example.").await);
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert!(saved_settings(&site).is_none());
+    assert_eq!(site.control.memory(), memory);
 }

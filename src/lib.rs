@@ -15,6 +15,7 @@ pub mod release;
 pub mod rewrites;
 pub mod scheduler;
 pub mod server;
+pub mod services;
 pub mod settings;
 pub mod stage;
 pub mod stats;

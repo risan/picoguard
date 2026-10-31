@@ -232,6 +232,7 @@ enum Read {
     Rules,
     Explain,
     Settings,
+    Services,
 }
 
 /// Answered to `POST` only.
@@ -277,6 +278,7 @@ impl Route {
             "/api/settings" => Some(Route::Read(Read::Settings)),
             "/api/rules/remove" => Some(Route::Change(Change::RemoveRule)),
             "/api/explain" => Some(Route::Read(Read::Explain)),
+            "/api/services" => Some(Route::Read(Read::Services)),
             "/" => Some(Route::Read(Read::Page)),
             "/api/status" => Some(Route::Read(Read::Status)),
             "/api/querylog" => Some(Route::Read(Read::QueryLog)),
@@ -316,7 +318,9 @@ impl Route {
     /// the page's rules, the name check, the settings and every change.
     fn needs_password(&self) -> bool {
         match self {
-            Route::Read(Read::QueryLog | Read::Rules | Read::Explain | Read::Settings)
+            Route::Read(
+                Read::QueryLog | Read::Rules | Read::Explain | Read::Settings | Read::Services,
+            )
             | Route::Change(_) => true,
             Route::Read(Read::Page | Read::Status | Read::Lists) => false,
         }
@@ -539,6 +543,8 @@ impl Web {
             Read::Rules => Ok(self.rules_response().await),
 
             Read::Settings => Ok(self.settings_response().await),
+
+            Read::Services => Ok(json(StatusCode::OK, &self.lists.services_view())),
 
             Read::Explain => {
                 let name = name_param(query)
@@ -849,7 +855,6 @@ impl Web {
                 self.change_lists(ListEdit::Reset).await
             }
 
-            // Each key becomes editable with the release-2 part that applies it live.
             Change::Settings => {
                 let request = settings_request(body).ok_or_else(|| {
                     Rejection::new(
@@ -858,13 +863,6 @@ impl Web {
                     )
                 })?;
 
-                if let Some(key) = request.first_key_not_editable() {
-                    return Err(Rejection::new(
-                        StatusCode::CONFLICT,
-                        format!("{key} is not editable yet"),
-                    ));
-                }
-
                 let change = PageChange {
                     upstream: request.upstream,
                     cache: request.cache,
@@ -872,6 +870,7 @@ impl Web {
                         .rewrites
                         .map(|rewrites| rewrites.map(|list| list.iter().map(normalized).collect())),
                     safe_search: request.safe_search,
+                    services: request.services,
                 };
                 self.lists
                     .change_settings(&self.pipeline, change)
@@ -1367,12 +1366,6 @@ struct SettingsRequest {
     services: Option<Option<Vec<String>>>,
 }
 
-impl SettingsRequest {
-    fn first_key_not_editable(&self) -> Option<&'static str> {
-        self.services.is_some().then_some("services")
-    }
-}
-
 /// Like `rule_request`, the first byte must open an object.
 fn settings_request(body: &[u8]) -> Option<SettingsRequest> {
     if body.trim_ascii_start().first() != Some(&b'{') {
@@ -1410,6 +1403,8 @@ fn change_rejection(error: &ChangeError) -> Rejection {
             StatusCode::INTERNAL_SERVER_ERROR,
             "the change could not be applied",
         ),
+        ChangeError::OverBudget(reason) => Rejection::new(StatusCode::CONFLICT, reason.clone()),
+        ChangeError::Unavailable(reason) => Rejection::new(StatusCode::BAD_GATEWAY, reason.clone()),
     }
 }
 

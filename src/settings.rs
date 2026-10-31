@@ -438,7 +438,8 @@ impl Saved {
     }
 }
 
-/// A change of the page's upstream, cache, rewrite and SafeSearch settings. For each key,
+/// A change of the page's upstream, cache, rewrite, SafeSearch and blocked services settings.
+/// For each key,
 /// `None` leaves it as it is, `Some(None)` goes back to the config file's value and
 /// `Some(Some(value))` sets it.
 #[derive(Debug, Default)]
@@ -447,6 +448,7 @@ pub struct PageChange {
     pub cache: Option<Option<CacheSettings>>,
     pub rewrites: Option<Option<Vec<Rewrite>>>,
     pub safe_search: Option<Option<bool>>,
+    pub services: Option<Option<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,6 +461,10 @@ pub enum ChangeError {
     NotSaved(SaveError),
     /// The task that applies the change ended without an answer.
     NotApplied,
+    /// What the change needs would pass the memory budget, with the reason.
+    OverBudget(String),
+    /// What the change needs could not be downloaded, with the reason.
+    Unavailable(String),
 }
 
 /// What a change puts in force once it is saved.
@@ -486,24 +492,31 @@ pub(crate) async fn apply(
     let cache = change.cache.unwrap_or_else(|| settings.cache.clone());
     let rewrites = change.rewrites.unwrap_or_else(|| settings.rewrites.clone());
     let safe_search = change.safe_search.unwrap_or(settings.safe_search);
+    let services = change.services.unwrap_or_else(|| settings.services.clone());
     if upstream == settings.upstream
         && cache == settings.cache
         && rewrites == settings.rewrites
         && safe_search == settings.safe_search
+        && services == settings.services
     {
         let _ = answer.send(Ok(()));
 
         return;
     }
 
-    // A larger cache is admitted against the memory budget like a list, under the same lock
-    // as list compiles, held until the replaced cache is freed (plan D6).
+    // A larger cache and the lists of services switched on are admitted against the memory
+    // budget like a list, under the same lock as list compiles, held until what they replace
+    // is freed (plan D6, D8).
     let max_bytes = |page: &Option<CacheSettings>| {
         page.as_ref()
             .map_or(saved.file_config().cache.max_bytes, |cache| cache.max_bytes)
     };
     let (old_max_bytes, new_max_bytes) = (max_bytes(&settings.cache), max_bytes(&cache));
-    let admitted = if new_max_bytes == old_max_bytes {
+    let file_services = &saved.file_config().services.block;
+    let old_services = settings.services.as_ref().unwrap_or(file_services).clone();
+    let new_services = services.as_ref().unwrap_or(file_services).clone();
+    let services_change = !same_ids(&old_services, &new_services);
+    let admitted = if new_max_bytes == old_max_bytes && !services_change {
         None
     } else {
         Some(control.admission().await)
@@ -521,8 +534,24 @@ pub(crate) async fn apply(
         cache: std::mem::replace(&mut settings.cache, cache),
         rewrites: std::mem::replace(&mut settings.rewrites, rewrites),
         safe_search: std::mem::replace(&mut settings.safe_search, safe_search),
+        services: std::mem::replace(&mut settings.services, services),
     };
-    let prepared = prepare(saved.file_config(), &settings, &old, pipeline).await;
+    let prepared = match prepare(saved.file_config(), &settings, &old, pipeline).await {
+        Ok(prepared) if services_change => {
+            match control.prepare_services(&old_services, &new_services).await {
+                Ok(lists) => Ok((prepared, Some(lists))),
+
+                Err(error) => {
+                    drop_off_runtime(prepared).await;
+
+                    Err(error)
+                }
+            }
+        }
+
+        Ok(prepared) => Ok((prepared, None)),
+        Err(error) => Err(error),
+    };
     let saved_change = match prepared {
         Ok(prepared) => match saved.save(&settings).await {
             Ok(()) => Ok(prepared),
@@ -544,11 +573,19 @@ pub(crate) async fn apply(
             settings.cache = old.cache;
             settings.rewrites = old.rewrites;
             settings.safe_search = old.safe_search;
+            settings.services = old.services;
             let _ = answer.send(Err(error));
 
             return;
         }
     };
+    let (prepared, service_lists) = prepared;
+    if let Some(lists) = service_lists {
+        let downloaded = new_services.iter().any(|id| !old_services.contains(id));
+        control
+            .put_services_in_force(lists, new_services, downloaded)
+            .await;
+    }
 
     let replaced_upstreams = prepared
         .upstreams
@@ -573,6 +610,12 @@ struct Replaced {
     cache: Option<CacheSettings>,
     rewrites: Option<Vec<Rewrite>>,
     safe_search: Option<bool>,
+    services: Option<Vec<String>>,
+}
+
+/// Whether `a` and `b` switch on the same services, in any order.
+fn same_ids(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().all(|id| b.contains(id))
 }
 
 /// The objects `settings` needs that differ from those in force under the old values. The

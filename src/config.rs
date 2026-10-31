@@ -22,8 +22,8 @@ const MAX_TOP_K: usize = 1000;
 const MAX_OPTIMISTIC_ANSWER_TTL_SECS: usize = 3600;
 const MAX_OPTIMISTIC_MAX_AGE_SECS: usize = 604_800;
 const MAX_REWRITES: usize = 1000;
-const MAX_BLOCKED_SERVICES: usize = 1000;
-const MAX_SERVICE_ID_BYTES: usize = 64;
+pub(crate) const MAX_BLOCKED_SERVICES: usize = 1000;
+pub(crate) const MAX_SERVICE_ID_BYTES: usize = 64;
 
 /// Networks that may talk to picoguard: loopback, private ranges, CGNAT
 /// (which covers Tailscale) and link-local.
