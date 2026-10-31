@@ -929,6 +929,7 @@ install_with_password() {
     [ -n "$password" ] || fail "the shown password is empty"
 
     grep -qx 'user = "admin"' "$CONFIG" || fail "the config has no user line"
+    # shellcheck disable=SC2016 # the dollar signs are literal, part of the hash format
     grep -q '^password_hash = "pbkdf2-sha256\$600000\$' "$CONFIG" || fail "the config has no password_hash line"
 
     if grep -q '^password = ' "$CONFIG"; then
