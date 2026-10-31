@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, Semaphore, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::config::{Config, ListConfig};
@@ -29,7 +29,9 @@ use crate::lists::{Downloader, Limits, Refresh, RefreshError, Updated, Validator
 use crate::memory::{self, ListBytes, Memory};
 use crate::pipeline::Pipeline;
 use crate::policy::Policy;
-use crate::settings::{self, ChangeError, PageChange, SaveError, Saved};
+use crate::settings::{
+    self, ChangeError, ListRole, PageChange, PageList, SaveError, Saved, Settings,
+};
 use crate::upstream::random_u64;
 
 /// How far an interval is moved, up or down, so lists do not refresh in step.
@@ -144,6 +146,75 @@ pub enum RuleError {
     NotSaved(SaveError),
 }
 
+/// A change of the lists from the status page. A list is named by its role and source.
+#[derive(Debug, Clone)]
+pub enum ListEdit {
+    Add {
+        role: ListRole,
+        name: Option<String>,
+        url: String,
+        refresh_hours: u32,
+    },
+    Edit {
+        role: ListRole,
+        source: String,
+        name: Option<String>,
+        refresh_hours: Option<u32>,
+        enabled: Option<bool>,
+    },
+    Remove {
+        role: ListRole,
+        source: String,
+    },
+    /// Back to the config file's lists.
+    Reset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListError {
+    /// Refused with the reason, before anything was downloaded.
+    Invalid(String),
+    NoSuchList,
+    /// A path list: it is changed in the config file.
+    ConfigFileOnly,
+    /// An add is being checked already.
+    AddInFlight,
+    /// The list would pass the memory budget. `needs` is what it adds to the estimate, `None`
+    /// when its compile stopped at the room that was `left`.
+    OverBudget {
+        name: String,
+        needs: Option<usize>,
+        left: usize,
+        budget: usize,
+    },
+    /// The download or the compile of a list failed.
+    Failed {
+        name: String,
+        reason: String,
+    },
+    NotSaved(SaveError),
+    NotApplied,
+}
+
+/// The last list added from the page while it is checked, and how that ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingList {
+    pub role: ListRole,
+    pub name: Option<String>,
+    pub url: String,
+    /// `None` while it is checked.
+    pub outcome: Option<Result<(), ListError>>,
+}
+
+/// The lists the scheduler is to put in force, and the settings that hold them.
+struct Replace {
+    blocklists: Vec<ListConfig>,
+    allowlists: Vec<ListConfig>,
+    from_page: bool,
+    settings: Settings,
+    reply: oneshot::Sender<Result<(), ListError>>,
+}
+
 /// The rule that decides a name, and the list that holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Explained {
@@ -249,15 +320,27 @@ pub struct ListControl {
     cache_max_bytes: AtomicUsize,
     assembly: tokio::sync::Mutex<Assembly>,
     pending: Arc<Semaphore>,
+    /// To the scheduler's task, which owns the lists.
+    commands: mpsc::Sender<Replace>,
+    pending_list: Mutex<Option<PendingList>>,
 }
 
 impl ListControl {
     /// A control without lists or page lists, swapping engines into `policy` and saving rule
     /// changes to `saved`.
     pub fn new(policy: Arc<Policy>, saved: Arc<Saved>) -> ListControl {
-        let file = saved.file_config();
+        ListControl::with_commands(policy, saved).0
+    }
 
-        ListControl {
+    /// A control, and the end of its commands that the scheduler reads.
+    fn with_commands(
+        policy: Arc<Policy>,
+        saved: Arc<Saved>,
+    ) -> (ListControl, mpsc::Receiver<Replace>) {
+        let file = saved.file_config();
+        let (commands, received) = mpsc::channel(1);
+
+        let control = ListControl {
             statuses: Mutex::new(Vec::new()),
             refresh_requested: Notify::new(),
             policy,
@@ -268,7 +351,11 @@ impl ListControl {
             saved,
             assembly: tokio::sync::Mutex::new(Assembly::default()),
             pending: Arc::new(Semaphore::new(MAX_PENDING_CHANGES)),
-        }
+            commands,
+            pending_list: Mutex::new(None),
+        };
+
+        (control, received)
     }
 
     pub fn saved(&self) -> &Arc<Saved> {
@@ -406,6 +493,140 @@ impl ListControl {
         .unwrap_or(Err(ChangeError::NotApplied))
     }
 
+    /// The list added last from the page, while it is checked and after.
+    pub fn pending_list(&self) -> Option<PendingList> {
+        self.pending_list.lock().unwrap().clone()
+    }
+
+    /// Starts adding a list from the page. The request is checked and refused at once, or
+    /// accepted while the list is downloaded, compiled and admitted against the memory budget;
+    /// `pending_list` then says how that ends. One add at a time.
+    pub async fn add_list(self: &Arc<Self>, edit: ListEdit) -> Result<(), ListError> {
+        let ListEdit::Add {
+            role, name, url, ..
+        } = &edit
+        else {
+            return Err(ListError::NotApplied);
+        };
+
+        let previous = {
+            let mut pending = self.pending_list.lock().unwrap();
+            if pending.as_ref().is_some_and(|list| list.outcome.is_none()) {
+                return Err(ListError::AddInFlight);
+            }
+
+            pending.replace(PendingList {
+                role: *role,
+                name: name.clone(),
+                url: url.clone(),
+                outcome: None,
+            })
+        };
+
+        let accepted = self
+            .spawn_change(|control, answer| async move {
+                let outcome = control.apply_lists(edit, Some(answer)).await;
+                if let Some(pending) = control.pending_list.lock().unwrap().as_mut() {
+                    pending.outcome = Some(outcome);
+                }
+            })
+            .await
+            .unwrap_or(Err(ListError::NotApplied));
+        if accepted.is_err() {
+            *self.pending_list.lock().unwrap() = previous;
+        }
+
+        accepted
+    }
+
+    /// Edits, removes or resets the lists of the page: saved, then in force when this returns.
+    /// A list that is turned on again, or that a reset brings back, is downloaded and admitted
+    /// against the memory budget first.
+    pub async fn change_lists(self: &Arc<Self>, edit: ListEdit) -> Result<(), ListError> {
+        self.spawn_change(|control, answer| async move {
+            let outcome = control.apply_lists(edit, None).await;
+            let _ = answer.send(outcome);
+        })
+        .await
+        .unwrap_or(Err(ListError::NotApplied))
+    }
+
+    /// Under the settings lock: the page's lists after `edit`, checked as a whole, then handed
+    /// to the scheduler, which admits, saves and puts them in force. `accepted` is answered as
+    /// soon as the edit is checked; the outcome is returned.
+    async fn apply_lists(
+        &self,
+        edit: ListEdit,
+        mut accepted: Option<oneshot::Sender<Result<(), ListError>>>,
+    ) -> Result<(), ListError> {
+        let mut answer_early = |result: &Result<(), ListError>| {
+            if let Some(accepted) = accepted.take() {
+                let _ = accepted.send(result.clone());
+            }
+        };
+        let mut settings = self.saved.lock().await;
+        let file = self.saved.file_config();
+        let current = settings
+            .lists
+            .clone()
+            .unwrap_or_else(|| page_lists_of(file));
+        let lists = match edited_lists(file, &current, settings.lists.is_some(), edit) {
+            Ok(Some(lists)) => lists,
+
+            Ok(None) => {
+                answer_early(&Ok(()));
+
+                return Ok(());
+            }
+
+            Err(error) => {
+                answer_early(&Err(error.clone()));
+
+                return Err(error);
+            }
+        };
+        let mut next = settings.clone();
+        next.lists = lists;
+        let checked = {
+            let file = file.clone();
+            let next = next.clone();
+            tokio::task::spawn_blocking(move || settings::merged(&file, &next))
+                .await
+                .unwrap_or_else(|_| Err("the check was stopped".to_string()))
+        };
+        let config = match checked {
+            Ok(config) => config,
+
+            Err(reason) => {
+                let error = ListError::Invalid(reason);
+                answer_early(&Err(error.clone()));
+
+                return Err(error);
+            }
+        };
+
+        answer_early(&Ok(()));
+        let lists = next.lists.clone();
+        let (reply, replied) = oneshot::channel();
+        let command = Replace {
+            blocklists: config.lists,
+            allowlists: config.allowlists,
+            from_page: next.lists.is_some(),
+            settings: next,
+            reply,
+        };
+        if self.commands.send(command).await.is_err() {
+            return Err(ListError::NotApplied);
+        }
+
+        let outcome = replied.await.unwrap_or(Err(ListError::NotApplied));
+        if outcome.is_ok() {
+            settings.lists = lists;
+        }
+
+        outcome
+    }
+
     /// Waiting for a permit holds nothing and can be cancelled. Once the change is spawned it
     /// runs to its end, whether or not its caller still waits, so a change sent is applied
     /// once and no build is ever dropped half done on the runtime thread. `None` when the
@@ -534,6 +755,115 @@ fn page_list(rules: &[ButtonRule], action: Action) -> Option<Arc<CompiledList>> 
     any.then(|| Arc::new(builder.finish(ListFormat::Adblock)))
 }
 
+/// The URL lists of the config file as the page holds them: what the first edit from the page
+/// copies.
+fn page_lists_of(file: &Config) -> Vec<PageList> {
+    let blocklists = file.lists.iter().map(|list| (ListRole::Block, list));
+    let allowlists = file.allowlists.iter().map(|list| (ListRole::Allow, list));
+
+    blocklists
+        .chain(allowlists)
+        .filter_map(|(role, list)| {
+            Some(PageList {
+                role,
+                name: list.name.clone(),
+                url: list.url.clone()?,
+                refresh_hours: list.refresh_hours,
+                enabled: list.enabled,
+            })
+        })
+        .collect()
+}
+
+/// The page's lists after `edit`: `Some(None)` to go back to the config file's lists,
+/// `Some(Some(lists))` for the lists to save, `None` when the edit changes nothing. `current`
+/// is what is in force now (the config file's URL lists when `on_page` is false).
+fn edited_lists(
+    file: &Config,
+    current: &[PageList],
+    on_page: bool,
+    edit: ListEdit,
+) -> Result<Option<Option<Vec<PageList>>>, ListError> {
+    let position = |role: ListRole, source: &str| {
+        let lists = match role {
+            ListRole::Block => &file.lists,
+            ListRole::Allow => &file.allowlists,
+        };
+        if lists.iter().any(|list| {
+            list.path
+                .as_ref()
+                .is_some_and(|path| path.display().to_string() == source)
+        }) {
+            return Err(ListError::ConfigFileOnly);
+        }
+
+        current
+            .iter()
+            .position(|list| list.role == role && list.url == source)
+            .ok_or(ListError::NoSuchList)
+    };
+    let mut lists = current.to_vec();
+
+    match edit {
+        ListEdit::Reset => {
+            return Ok(on_page.then_some(None));
+        }
+
+        ListEdit::Add {
+            role,
+            name,
+            url,
+            refresh_hours,
+        } => {
+            if current
+                .iter()
+                .any(|list| list.role == role && list.url == url)
+            {
+                return Err(ListError::Invalid("that list is added already".to_string()));
+            }
+
+            lists.push(PageList {
+                role,
+                name,
+                url,
+                refresh_hours,
+                enabled: true,
+            });
+        }
+
+        ListEdit::Edit {
+            role,
+            source,
+            name,
+            refresh_hours,
+            enabled,
+        } => {
+            let list = &mut lists[position(role, &source)?];
+            if let Some(name) = name {
+                list.name = (!name.is_empty()).then_some(name);
+            }
+
+            if let Some(refresh_hours) = refresh_hours {
+                list.refresh_hours = refresh_hours;
+            }
+
+            if let Some(enabled) = enabled {
+                list.enabled = enabled;
+            }
+        }
+
+        ListEdit::Remove { role, source } => {
+            lists.remove(position(role, &source)?);
+        }
+    }
+
+    if lists == current {
+        return Ok(None);
+    }
+
+    Ok(Some(Some(lists)))
+}
+
 /// Drops `garbage` on tokio's blocking pool and waits until it is gone: an engine must never
 /// be dropped on the DNS thread (plan D20).
 pub(crate) async fn drop_off_runtime<T: Send + 'static>(garbage: T) {
@@ -596,6 +926,8 @@ pub struct Scheduler {
     timing: Timing,
     user_rules: Option<Arc<CompiledList>>,
     entries: Vec<Entry>,
+    /// Lists from the page to put in force; taken by `run`.
+    commands: Option<mpsc::Receiver<Replace>>,
 }
 
 impl Scheduler {
@@ -629,6 +961,7 @@ impl Scheduler {
             timing,
             user_rules,
             entries,
+            commands: None,
         };
 
         for index in 0..scheduler.entries.len() {
@@ -660,7 +993,8 @@ impl Scheduler {
 
         // The first engine is generation 0, so the policy is made with it, not swapped.
         scheduler.policy = Arc::new(Policy::with_engine(Arc::new(engine)));
-        let mut control = ListControl::new(scheduler.policy(), saved);
+        let (mut control, commands) = ListControl::with_commands(scheduler.policy(), saved);
+        scheduler.commands = Some(commands);
         control.fixed_bytes += scheduler
             .user_rules
             .as_ref()
@@ -702,8 +1036,23 @@ impl Scheduler {
     pub async fn run(mut self, downloader: Downloader, stop: impl Future<Output = ()>) {
         tokio::pin!(stop);
         let control = self.control();
+        let mut commands = self.commands.take();
 
-        while let Some((index, work, at)) = self.next_work() {
+        loop {
+            let next = self.next_work();
+            let due = async {
+                match &next {
+                    Some((_, _, at)) => tokio::time::sleep_until(*at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let command = async {
+                match commands.as_mut() {
+                    Some(commands) => commands.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+
             tokio::select! {
                 biased;
 
@@ -717,8 +1066,19 @@ impl Scheduler {
                     continue;
                 }
 
-                () = tokio::time::sleep_until(at) => {}
+                Some(command) = command => {
+                    let outcome = self.replace(command.blocklists, command.allowlists, command.from_page, &command.settings, &downloader).await;
+                    let _ = command.reply.send(outcome);
+
+                    continue;
+                }
+
+                () = due => {}
             }
+
+            let Some((index, work, _)) = next else {
+                continue;
+            };
 
             match work {
                 Work::Refresh => {
@@ -734,6 +1094,219 @@ impl Scheduler {
         for index in 0..self.entries.len() {
             self.retry_save(index).await;
         }
+    }
+
+    /// Puts `blocklists` and `allowlists` in force in place of the lists in force, then saves
+    /// `settings`, which hold them. A list in force before and after keeps its copy; a new
+    /// name or refresh interval changes only that. A list that is new, or on again, is
+    /// downloaded and compiled within the room the memory budget leaves, and its copy must
+    /// fit the budget; any that cannot be refuses the whole change. A list that is off or
+    /// gone is dropped. Nothing is in force before the settings are saved.
+    async fn replace(
+        &mut self,
+        blocklists: Vec<ListConfig>,
+        allowlists: Vec<ListConfig>,
+        from_page: bool,
+        settings: &Settings,
+        downloader: &Downloader,
+    ) -> Result<(), ListError> {
+        let control = Arc::clone(&self.control);
+        let admitted = control.admission.lock().await;
+        let wanted: Vec<Entry> = blocklists
+            .iter()
+            .map(|list| (Role::Blocklist, list))
+            .chain(allowlists.iter().map(|list| (Role::Allowlist, list)))
+            .filter_map(|(role, list)| Entry::new(role, list, from_page, &self.timing))
+            .collect();
+        let in_force = |wanted: &Entry| {
+            self.entries.iter().position(|entry| {
+                entry.enabled && entry.role == wanted.role && entry.key == wanted.key
+            })
+        };
+        let kept: Vec<Option<usize>> = wanted.iter().map(&in_force).collect();
+
+        let mut lists = control.list_bytes();
+        let mut admitted_copies = Vec::new();
+        for (index, entry) in wanted.iter().enumerate() {
+            if kept[index].is_some() || !entry.enabled {
+                continue;
+            }
+
+            match self.admit(entry, &lists, downloader).await {
+                Ok(compiled) => {
+                    lists.push(ListBytes {
+                        heap: compiled.compiled.list.heap_bytes(),
+                        charge: compiled.compiled.list.compile_charge(),
+                    });
+                    admitted_copies.push((index, compiled));
+                }
+
+                Err(error) => {
+                    self.worker.discard((wanted, admitted_copies));
+                    let _ = self.worker.run(|| ()).await;
+
+                    return Err(error);
+                }
+            }
+        }
+
+        if let Err(error) = control.saved.save(settings).await {
+            self.worker.discard((wanted, admitted_copies));
+            let _ = self.worker.run(|| ()).await;
+
+            return Err(ListError::NotSaved(error));
+        }
+
+        let mut old: Vec<Option<Entry>> = self.entries.drain(..).map(Some).collect();
+        let mut turned_off = Vec::new();
+        let mut snapshots = Vec::new();
+        for (index, mut entry) in wanted.into_iter().enumerate() {
+            if let Some(at) = kept[index] {
+                let mut kept = old[at].take().expect("each list is kept once");
+                turned_off.extend(kept.take_settings_of(entry));
+                entry = kept;
+            }
+
+            if let Some(at) = admitted_copies.iter().position(|(at, _)| *at == index) {
+                let (_, updated) = admitted_copies.swap_remove(at);
+                let Updated {
+                    compiled,
+                    validators,
+                } = *updated;
+                if matches!(entry.source, Source::Url(_)) {
+                    snapshots.push((
+                        self.entries.len(),
+                        Snapshot::new(&compiled, &entry.options, &entry.key, validators.clone()),
+                    ));
+                }
+
+                entry.loaded = Some(Loaded {
+                    format: compiled.summary.format,
+                    fingerprint: compiled.fingerprint,
+                    list: compiled.list,
+                    validators,
+                });
+                entry.checked = Some(Instant::now());
+                entry.due = Instant::now() + jittered(entry.interval);
+                log::info!("{}: added", entry.label);
+            }
+
+            self.entries.push(entry);
+        }
+
+        let (main, allow) = self.lists_in_force(None);
+        if let Err(error) = control.put_in_force(main, allow, &self.worker).await {
+            log::warn!("cannot build the filter with the changed lists: {error:?}");
+        }
+
+        self.publish_all();
+        for (index, snapshot) in snapshots {
+            self.save(index, snapshot, 0).await;
+        }
+
+        self.worker.discard((old, turned_off));
+        let _ = self.worker.run(|| ()).await;
+        drop(admitted);
+
+        Ok(())
+    }
+
+    /// Downloads and compiles the list of `entry` within the room the budget leaves with
+    /// `lists` in force, and checks that its copy fits.
+    async fn admit(
+        &self,
+        entry: &Entry,
+        lists: &[ListBytes],
+        downloader: &Downloader,
+    ) -> Result<Box<Updated>, ListError> {
+        let control = &self.control;
+        let steady = memory::steady_bytes(
+            control.fixed_bytes,
+            control.cache_max_bytes.load(Ordering::Relaxed),
+            lists,
+        );
+        let left = control.budget_bytes.saturating_sub(steady);
+        let fetched = match &entry.source {
+            Source::Url(url) => {
+                let limits = Limits {
+                    max_body_bytes: entry.max_body_bytes,
+                    ..Limits::default()
+                };
+
+                downloader
+                    .refresh(
+                        &self.worker,
+                        url,
+                        &Validators::default(),
+                        &limits,
+                        entry.options,
+                        left,
+                    )
+                    .await
+            }
+
+            Source::Path(path) => refresh_file(
+                &self.worker,
+                path.clone(),
+                entry.max_body_bytes,
+                entry.options,
+            )
+            .await
+            .map(|compiled| {
+                Refresh::Updated(Box::new(Updated {
+                    compiled,
+                    validators: Validators::default(),
+                }))
+            }),
+        };
+        let failed = |reason: String| ListError::Failed {
+            name: entry.label.clone(),
+            reason,
+        };
+        let updated = match fetched {
+            Ok(Refresh::Updated(updated)) => updated,
+            Ok(Refresh::NotModified) => return Err(failed("not modified".to_string())),
+
+            Err(RefreshError::Compile(CompileError::OverMemoryBudget)) => {
+                return Err(ListError::OverBudget {
+                    name: entry.label.clone(),
+                    needs: None,
+                    left,
+                    budget: control.budget_bytes,
+                });
+            }
+
+            Err(error) => return Err(failed(error.to_string())),
+        };
+
+        let list = &updated.compiled.list;
+        let mut with_it = lists.to_vec();
+        with_it.push(ListBytes {
+            heap: list.heap_bytes(),
+            charge: list.compile_charge(),
+        });
+        if !control.fits(&with_it) {
+            let before = memory::estimate(
+                control.fixed_bytes,
+                control.cache_max_bytes.load(Ordering::Relaxed),
+                lists,
+            );
+            let after = memory::estimate(
+                control.fixed_bytes,
+                control.cache_max_bytes.load(Ordering::Relaxed),
+                &with_it,
+            );
+            self.worker.discard(updated);
+
+            return Err(ListError::OverBudget {
+                name: entry.label.clone(),
+                needs: Some(after - before),
+                left: control.budget_bytes.saturating_sub(before),
+                budget: control.budget_bytes,
+            });
+        }
+
+        Ok(updated)
     }
 
     fn publish_all(&self) {
@@ -1139,6 +1712,41 @@ impl Scheduler {
 }
 
 impl Entry {
+    /// Takes what the page may change from `wanted`, the same list as the page has it now:
+    /// its name, its refresh interval, whether it is on, and its options, which only a new
+    /// config file changes. A list with other options is downloaded again soon. Returns the
+    /// copy of a list turned off, to be freed off the DNS thread.
+    fn take_settings_of(&mut self, wanted: Entry) -> Option<(Option<Loaded>, Option<PendingSave>)> {
+        self.label = wanted.label;
+        self.budgeted = wanted.budgeted;
+        if self.refresh_hours != wanted.refresh_hours {
+            self.refresh_hours = wanted.refresh_hours;
+            self.interval = wanted.interval;
+            if self.failures == 0 && self.loaded.is_some() {
+                self.due = Instant::now() + jittered(self.interval);
+            }
+        }
+
+        let mut dropped = None;
+        if !wanted.enabled {
+            self.enabled = false;
+            self.last_error = None;
+            dropped = Some((self.loaded.take(), self.pending_save.take()));
+        }
+
+        if self.options != wanted.options || self.max_body_bytes != wanted.max_body_bytes {
+            self.options = wanted.options;
+            self.max_body_bytes = wanted.max_body_bytes;
+            if let Some(loaded) = &mut self.loaded {
+                loaded.validators = Validators::default();
+            }
+
+            self.due = Instant::now();
+        }
+
+        dropped
+    }
+
     fn status(&self) -> ListStatus {
         ListStatus {
             name: self.label.clone(),
