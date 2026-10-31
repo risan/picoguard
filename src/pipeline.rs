@@ -239,13 +239,14 @@ enum Inner {
         asker: Asker,
         delivery: Option<Arc<Delivery>>,
     },
-    /// The compact query of a question rewritten to a target name, and the reply for the
-    /// target it waited for; `None` when the target got no answer. `finish` builds the answer
-    /// from it, never from the policy.
+    /// The compact query of a question rewritten to `target`, and the reply for the target
+    /// it waited for; `None` when the target got no answer. `finish` builds the answer from
+    /// it, never from the policy, while the question is still rewritten to that target.
     Rewritten {
         request: Vec<u8>,
         protocol: Protocol,
         asker: Asker,
+        target: Box<Name>,
         delivery: Option<Arc<Delivery>>,
     },
     /// The compact query of a question that got no answer; `finish` writes the SERVFAIL.
@@ -637,6 +638,7 @@ impl Pipeline {
                 request: compact,
                 protocol,
                 asker,
+                target: Box::new(target),
                 delivery: outcome.ok(),
             }));
         }
@@ -688,6 +690,11 @@ impl Pipeline {
                 ..
             } => {
                 let query = Query::parse(request).ok()?;
+                // A rewrite added, or SafeSearch back after a pause, since it was prepared.
+                if self.is_rewritten(&query.question.name) {
+                    return self.settle_now(request, *protocol, out).await;
+                }
+
                 let reply = Reply::new(&query, self.udp_size, *protocol);
 
                 Some(Finished(Some(self.deliver(&query, &reply, delivery, out))))
@@ -698,20 +705,20 @@ impl Pipeline {
                 protocol,
                 delivery: None,
                 ..
-            } => match self.settle(request, *protocol, None, out) {
-                Ok(settled) => Some(Finished(Some(Counted::of(settled.result())))),
-                Err(Quick::Replied) => Some(Finished(None)),
-                Err(Quick::Dropped) => None,
-                Err(Quick::NeedsUpstream) => self.resume(request, *protocol, out).await,
-            },
+            } => self.settle_now(request, *protocol, out).await,
 
             Inner::Rewritten {
                 request,
                 protocol,
+                target,
                 delivery,
                 ..
             } => {
                 let query = Query::parse(request).ok()?;
+                if self.target_of(&query).as_ref() != Some(&**target) {
+                    return self.settle_now(request, *protocol, out).await;
+                }
+
                 let reply = Reply::new(&query, self.udp_size, *protocol);
 
                 Some(Finished(Some(self.deliver_rewritten(
@@ -740,6 +747,22 @@ impl Pipeline {
 
         if let Ok(query) = Query::parse(request) {
             self.record(asker, &query, counted.result, counted.server);
+        }
+    }
+
+    /// Steps 2 to 6 again under the policy and rewrites of this moment, for a question whose
+    /// prepared answer does not hold any more.
+    async fn settle_now(
+        self: &Arc<Pipeline>,
+        request: &[u8],
+        protocol: Protocol,
+        out: &mut Vec<u8>,
+    ) -> Option<Finished> {
+        match self.settle(request, protocol, None, out) {
+            Ok(settled) => Some(Finished(Some(Counted::of(settled.result())))),
+            Err(Quick::Replied) => Some(Finished(None)),
+            Err(Quick::Dropped) => None,
+            Err(Quick::NeedsUpstream) => self.resume(request, protocol, out).await,
         }
     }
 
@@ -1020,6 +1043,18 @@ impl Pipeline {
         }
 
         Some(Rewritten::Answered)
+    }
+
+    /// Whether a rewrite answers `name` now.
+    fn is_rewritten(&self, name: &Name) -> bool {
+        let paused = self.policy.view(self.policy.now()).paused;
+        let safe_search = !paused && self.safe_search.load(Ordering::Relaxed);
+
+        self.rewrites
+            .lock()
+            .unwrap()
+            .find(name, safe_search)
+            .is_some()
     }
 
     /// The target name an A or AAAA question is rewritten to now, when its answer comes from

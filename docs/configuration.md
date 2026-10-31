@@ -268,6 +268,9 @@ answer = "nas.lan"
 - Rewrites come before `[local]` and the lists: a rewritten name is never blocked, a name under
   `[local] domains` can be rewritten without a `resolver`, and rewrites still apply while
   blocking is paused.
+- A reply that waits to be written (a slow TCP client) follows the rewrites, SafeSearch and
+  pause in force when it is written: a rewrite changed or a pause started or ended meanwhile
+  answers the question the new way.
 - The query log shows a rewritten query as "rewritten", and `/api/status` counts them in
   `counters.rewritten`.
 

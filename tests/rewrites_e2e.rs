@@ -18,6 +18,8 @@ use hickory_proto::rr::{RData, Record, RecordType};
 use picoguard::config::{Config, Rewrite};
 use picoguard::dns::build::Protocol;
 use picoguard::filter::engine::Engine;
+use picoguard::pipeline::Prepared;
+use picoguard::rewrites::Rewrites;
 use picoguard::stats::QueryResult;
 
 const SAFE_GOOGLE: [u8; 4] = [216, 239, 38, 120];
@@ -147,6 +149,41 @@ async fn start_with(
     change(&mut config);
 
     start(&config, engine).await
+}
+
+/// A TCP query prepared now, to be finished later with `finish_tcp`.
+async fn prepare_tcp(server: &Running, text: &str, rtype: RecordType) -> Prepared {
+    let mut query = Message::query();
+    query.metadata.id = 0x4444;
+    query.metadata.recursion_desired = true;
+    query.add_query(DnsQuery::query(name(text), rtype));
+
+    server
+        .pipeline
+        .prepare(
+            query.to_vec().unwrap(),
+            Protocol::Tcp,
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .expect("a prepared query")
+}
+
+async fn finish_tcp(server: &Running, prepared: Prepared) -> (Message, QueryResult) {
+    let mut out = Vec::new();
+    let finished = server
+        .pipeline
+        .finish(&prepared, &mut out)
+        .await
+        .expect("a reply");
+    server.pipeline.count(&prepared, finished);
+    let result = results(server).last().unwrap().1;
+
+    (Message::from_vec(&out).unwrap(), result)
+}
+
+fn table(entries: &[(&str, &str)]) -> Arc<Rewrites> {
+    Arc::new(Rewrites::new(&rewrites(entries)).unwrap())
 }
 
 /// Through `Pipeline::answer` over TCP: the query is prepared, then finished.
@@ -581,4 +618,109 @@ async fn a_target_with_an_address_rewrite_is_answered_from_it_and_a_name_rewrite
         "a target's own name rewrite is not followed"
     );
     assert_eq!(asked_names(&upstream), ["long.example."]);
+}
+
+#[tokio::test]
+async fn a_reply_prepared_while_paused_is_rewritten_by_safe_search_once_the_pause_ends() {
+    let upstream = scripted_upstream().await;
+    let server = start_with(&upstream, &[], true, engine_of(&[], &[]), |_| {}).await;
+    server
+        .policy
+        .pause(Duration::from_secs(60), server.policy.now());
+    let prepared = prepare_tcp(&server, "www.google.com.", RecordType::A).await;
+    server.policy.resume();
+
+    let (reply, result) = finish_tcp(&server, prepared).await;
+
+    assert_eq!(values(&reply), ["216.239.38.120"]);
+    assert_eq!(result, QueryResult::Rewritten);
+    assert_eq!(
+        asked_names(&upstream),
+        ["www.google.com.", "forcesafesearch.google.com."]
+    );
+}
+
+#[tokio::test]
+async fn a_safe_search_target_prepared_before_a_pause_is_not_delivered_during_it() {
+    let upstream = scripted_upstream().await;
+    let server = start_with(&upstream, &[], true, engine_of(&[], &[]), |_| {}).await;
+    let prepared = prepare_tcp(&server, "www.google.com.", RecordType::A).await;
+    server
+        .policy
+        .pause(Duration::from_secs(60), server.policy.now());
+
+    let (reply, result) = finish_tcp(&server, prepared).await;
+
+    assert_eq!(values(&reply), ["9.9.9.9"]);
+    assert_eq!(result, QueryResult::Pass);
+    assert_eq!(
+        asked_names(&upstream),
+        ["forcesafesearch.google.com.", "www.google.com."]
+    );
+}
+
+#[tokio::test]
+async fn a_target_prepared_before_a_rewrite_change_is_answered_by_the_rewrite_in_force() {
+    let upstream = scripted_upstream().await;
+    let server = start_with(
+        &upstream,
+        &[("alias.lan", "long.example")],
+        false,
+        engine_of(&[], &[]),
+        |_| {},
+    )
+    .await;
+    let prepared = |server| prepare_tcp(server, "alias.lan.", RecordType::A);
+
+    let waiting = prepared(&server).await;
+    let replaced = server
+        .pipeline
+        .replace_rewrites(table(&[("alias.lan", "short.example")]));
+    drop(replaced);
+    let (reply, result) = finish_tcp(&server, waiting).await;
+    assert_eq!(values(&reply), ["8.8.8.8"]);
+    assert_eq!(result, QueryResult::Rewritten);
+
+    let waiting = prepared(&server).await;
+    drop(
+        server
+            .pipeline
+            .replace_rewrites(table(&[("alias.lan", "10.0.0.9")])),
+    );
+    let (reply, result) = finish_tcp(&server, waiting).await;
+    assert_eq!(values(&reply), ["10.0.0.9"]);
+    assert_eq!(result, QueryResult::Rewritten);
+
+    drop(
+        server
+            .pipeline
+            .replace_rewrites(table(&[("alias.lan", "short.example")])),
+    );
+    let waiting = prepared(&server).await;
+    drop(server.pipeline.replace_rewrites(table(&[])));
+    let (reply, result) = finish_tcp(&server, waiting).await;
+    assert_eq!(values(&reply), ["9.9.9.9"]);
+    assert_eq!(result, QueryResult::Pass);
+
+    assert_eq!(
+        asked_names(&upstream),
+        ["long.example.", "short.example.", "alias.lan."]
+    );
+}
+
+#[tokio::test]
+async fn a_reply_prepared_before_a_rewrite_was_added_is_answered_by_the_rewrite() {
+    let upstream = scripted_upstream().await;
+    let server = start_with(&upstream, &[], false, engine_of(&[], &[]), |_| {}).await;
+    let prepared = prepare_tcp(&server, "plain.example.", RecordType::A).await;
+    drop(
+        server
+            .pipeline
+            .replace_rewrites(table(&[("plain.example", "10.1.1.1")])),
+    );
+
+    let (reply, result) = finish_tcp(&server, prepared).await;
+
+    assert_eq!(values(&reply), ["10.1.1.1"]);
+    assert_eq!(result, QueryResult::Rewritten);
 }
