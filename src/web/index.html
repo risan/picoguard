@@ -41,6 +41,7 @@ h2 small { font-weight: 400; }
 .r-cached { --dot: var(--good); }
 .r-blocked_request, .r-blocked_response, .d-blocked { --dot: var(--blocked); }
 .d-allowed { --dot: var(--good); }
+.r-rewritten, .d-rewritten { --dot: var(--accent); }
 .r-error { --dot: var(--warn); }
 #state { margin-left: auto; font-size: var(--t-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
 #state.bad { color: var(--blocked); }
@@ -131,7 +132,10 @@ td button { padding: 1px var(--s2); font-size: var(--t-sm); }
 #upstream-list li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); padding: var(--s1) 0; }
 #upstream-list code { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
 #upstream-list button { padding: 1px var(--s2); font-size: var(--t-sm); }
-#upstream-new, #bootstrap { flex: 1 1 12rem; width: auto; min-width: 0; }
+#upstream-new, #bootstrap, #rewrite-name, #rewrite-answer { flex: 1 1 12rem; width: auto; min-width: 0; }
+#rewrite-table td { overflow-wrap: anywhere; }
+#rewrite-table td:nth-child(2) { min-width: 7.5rem; }
+#rewrite-table td:last-child { width: 1%; white-space: nowrap; }
 .fields { display: grid; gap: var(--s3); margin: var(--s3) 0; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); }
 .fields label { display: grid; gap: var(--s1); font-size: var(--t-sm); color: var(--muted); }
 .fields input, .fields select { width: 100%; }
@@ -340,6 +344,34 @@ input[type="checkbox"] { width: auto; margin: 0; }
         <span id="cache-set-note"></span>
       </div>
     </section>
+
+    <section id="rewrites-card" class="wide">
+      <h2>Rewrites <small id="rewrites-from"></small></h2>
+      <p class="empty">picoguard answers these names itself, before any list and while paused: with the addresses given, or with the addresses of another name. *.name covers the names under it.</p>
+      <div id="rewrite-table"></div>
+      <form id="rewrite-add" class="actions">
+        <input id="rewrite-name" autocapitalize="none" placeholder="nas.lan or *.nas.lan" aria-label="Name">
+        <input id="rewrite-answer" autocapitalize="none" placeholder="192.168.1.10 or another name" aria-label="Answer">
+        <button>Add</button>
+      </form>
+      <div class="actions">
+        <button id="rewrites-save" class="go">Save</button>
+        <button id="rewrites-reset">Use the config file</button>
+        <span id="rewrites-note"></span>
+      </div>
+    </section>
+
+    <section id="safe-search-card" class="wide">
+      <h2>SafeSearch <small id="safe_search-from"></small></h2>
+      <div class="fields">
+        <label class="switch"><input id="safe-search" type="checkbox"> Force SafeSearch on Google, Bing and DuckDuckGo, and restricted mode on YouTube (off while filtering is paused)</label>
+      </div>
+      <div class="actions">
+        <button id="safe_search-save" class="go">Save</button>
+        <button id="safe_search-reset">Use the config file</button>
+        <span id="safe_search-note"></span>
+      </div>
+    </section>
   </div>
 </main>
 
@@ -349,7 +381,7 @@ const $ = (id) => document.getElementById(id);
 const QTYPES = { 1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT",
   28: "AAAA", 33: "SRV", 64: "SVCB", 65: "HTTPS", 255: "ANY" };
 const RESULTS = { pass: "upstream", cached: "cached", blocked_request: "blocked",
-  blocked_response: "blocked (answer)", error: "error" };
+  blocked_response: "blocked (answer)", rewritten: "rewritten", error: "error" };
 const INSTALL_TEXT = {
   checking: () => "Checking the release...",
   downloading: (i) => "Downloading " + (i.bytes / 1048576).toFixed(1) + " MB...",
@@ -513,6 +545,11 @@ function showCards(counters, percent) {
     ["Cached", counters.cached], ["Upstream", counters.upstream],
     ["Errors", counters.errors], ["Dropped", counters.dropped],
   ];
+
+  if (counters.rewritten) {
+    items.push(["Rewritten", counters.rewritten]);
+  }
+
   $("cards").replaceChildren(...items.map(([label, value], i) => {
     const card = el("div", undefined, i < 2 ? "card headline" : "card");
     card.append(el("span", label), el("b", typeof value === "number" ? value.toLocaleString() : value));
@@ -698,13 +735,14 @@ function showMemory(m) {
 }
 
 // A card being edited is left alone by the refresh until it is saved or reset.
-const editing = { upstream: false, cache: false };
+const editing = { upstream: false, cache: false, rewrites: false, safe_search: false };
 const CACHE_FIELDS = [["c-entries", "max_entries", 1], ["c-kib", "max_bytes", 1024],
   ["c-min", "min_ttl", 1], ["c-max", "max_ttl", 1]];
 let servers = [];
+let rewrites = [];
 
 function showSettingCards(s) {
-  [["upstream", s.upstream], ["cache", s.cache]].forEach(([key, value]) => {
+  [["upstream", s.upstream], ["cache", s.cache], ["rewrites", s.rewrites], ["safe_search", s.safe_search]].forEach(([key, value]) => {
     $(key + "-from").textContent = value.from === "page" ? "Set on this page" : "From the config file";
     $(key + "-reset").hidden = value.from !== "page";
   });
@@ -719,6 +757,31 @@ function showSettingCards(s) {
     CACHE_FIELDS.forEach(([id, key, unit]) => { $(id).value = s.cache[key] / unit; });
     $("c-optimistic").checked = s.cache.optimistic;
   }
+
+  if (!editing.rewrites) {
+    rewrites = s.rewrites.entries.map((r) => ({ name: r.name, answer: r.answer }));
+    showRewrites();
+  }
+
+  if (!editing.safe_search) {
+    $("safe-search").checked = s.safe_search.on;
+  }
+}
+
+function showRewrites() {
+  const rows = rewrites.map((r, i) => {
+    const tr = row([[r.name], [r.answer]]);
+    const td = el("td");
+    const remove = el("button", "Remove");
+    remove.dataset.i = i;
+    td.append(remove);
+    tr.append(td);
+
+    return tr;
+  });
+  $("rewrite-table").replaceChildren(rows.length
+    ? table(["Name", "Answer", ""], rows)
+    : el("p", "None.", "empty"));
 }
 
 function showServers() {
@@ -761,6 +824,8 @@ function showExplain(data) {
 
   if (data.decision === "none") {
     lines.push(["Rule", "no rule decides it"]);
+  } else if (data.decision === "rewritten") {
+    lines.push(["Answer", data.rule]);
   } else {
     lines.push(["List", data.list], ["Rule", el("code", data.rule)]);
   }
@@ -1184,6 +1249,33 @@ $("cache-save").addEventListener("click", () => {
   saveSetting("cache", cache, "cache-set-note");
 });
 $("upstream-reset").addEventListener("click", () => saveSetting("upstream", null, "upstream-note"));
+$("rewrite-table").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+
+  if (button) {
+    editing.rewrites = true;
+    rewrites.splice(Number(button.dataset.i), 1);
+    showRewrites();
+  }
+});
+$("rewrite-add").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const name = $("rewrite-name").value.trim();
+  const answer = $("rewrite-answer").value.trim();
+
+  if (name && answer) {
+    editing.rewrites = true;
+    rewrites.push({ name, answer });
+    showRewrites();
+    $("rewrite-name").value = "";
+    $("rewrite-answer").value = "";
+  }
+});
+$("rewrites-save").addEventListener("click", () => saveSetting("rewrites", rewrites, "rewrites-note"));
+$("rewrites-reset").addEventListener("click", () => saveSetting("rewrites", null, "rewrites-note"));
+$("safe-search").addEventListener("change", () => { editing.safe_search = true; });
+$("safe_search-save").addEventListener("click", () => saveSetting("safe_search", $("safe-search").checked, "safe_search-note"));
+$("safe_search-reset").addEventListener("click", () => saveSetting("safe_search", null, "safe_search-note"));
 $("cache-reset").addEventListener("click", () => saveSetting("cache", null, "cache-set-note"));
 $("check-form").addEventListener("submit", (event) => {
   event.preventDefault();

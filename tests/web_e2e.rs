@@ -517,9 +517,9 @@ async fn the_page_is_served_with_protective_headers() {
 /// binary, no memory at run time.
 const PAGE_HARD_CAP_BYTES: usize = 64 * 1024;
 
-/// This part, the list editing and the memory line; a later part raises it on purpose, never
-/// past the cap.
-const PAGE_BUDGET_BYTES: usize = 46 * 1024;
+/// This part, the rewrites and SafeSearch; a later part raises it on purpose, never past the
+/// cap.
+const PAGE_BUDGET_BYTES: usize = 50 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -868,6 +868,47 @@ async fn the_settings_tab_edits_the_upstream_servers_and_the_cache() {
         "max_bytes",
         "#upstream-list code",
         "overflow-wrap: anywhere",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+#[tokio::test]
+async fn the_settings_tab_edits_the_rewrites_and_safe_search() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "rewrites-card",
+        "rewrites-from",
+        "rewrite-table",
+        "rewrite-add",
+        "rewrite-name",
+        "rewrite-answer",
+        "rewrites-save",
+        "rewrites-reset",
+        "rewrites-note",
+        "safe-search-card",
+        "safe_search-from",
+        "safe-search",
+        "safe_search-save",
+        "safe_search-reset",
+        "safe_search-note",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "[\"rewrites\", s.rewrites]",
+        "[\"safe_search\", s.safe_search]",
+        "rewritten: \"rewritten\"",
+        "data.decision === \"rewritten\"",
+        "counters.rewritten",
+        "#rewrite-table td",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
