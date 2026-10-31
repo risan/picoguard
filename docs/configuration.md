@@ -71,6 +71,14 @@ They never go to the public servers.
 | `resolver` | not set | The router, as `IP:port`, for example `"192.168.1.1:53"`. |
 | `domains` | `[]` | Local domains that go to that resolver, for example `["lan", "home.arpa"]`. |
 
+Device names: with `resolver` set, the signed-in page names each private client shown in Top
+clients and the query log, from a PTR lookup to the router, with the IP beside the name. In the
+API, each `top_clients` entry of `/api/status` and each `/api/querylog` entry has `name`: the
+device name, or `null`. Names appear on a later refresh, never holding up the page or a DNS
+answer. A name is kept for its record's TTL (5 minutes to 1 day), and "no name" for 5 minutes,
+in memory, for at most 256 addresses. At most 4 lookups run at once, each giving up after 2
+seconds. Loopback and public addresses are never looked up.
+
 ## `[[lists]]` and `[[allowlists]]`
 
 Blocklists are `[[lists]]` tables. Allowlists (names that are never blocked) are
@@ -247,7 +255,8 @@ written in `[upstream] servers`, or the `[local] resolver` address), `kind` (`up
 
 - The counts start at picoguard's start. A try that is repeated on the next server counts as a
   failure on the first one, and the repeat counts on the second as its own answer or failure.
-- picoguard's own lookups count too: list downloads and the update check.
+- picoguard's own lookups count too: list downloads and the update check, and device-name lookups
+  (on the local entry).
 - A query that a blocking rule held back after the answer came in did reach the server and counts.
   A cached answer and a query blocked by a request rule never reach a server and do not count.
 - `avg_ms` is the average over the answers, in milliseconds with one decimal. The time runs from

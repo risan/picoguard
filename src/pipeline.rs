@@ -23,6 +23,7 @@ use crate::config::{Cidr, Config, is_allowed};
 use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
 use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, flags, rcode, rtype};
 use crate::filter::engine::{BlockedAnswer, Decision, Verdict, blocked_answer};
+use crate::names::DeviceNames;
 use crate::policy::{Policy, PolicyView};
 use crate::stats::{Event, QueryResult, Stats, StatsSettings};
 use crate::upstream::{Answered, Tally, UpstreamError, Upstreams};
@@ -327,6 +328,7 @@ pub struct Pipeline {
     private_networks: Vec<Cidr>,
     upstreams: Arc<Upstreams>,
     local_resolver: Option<(SocketAddr, Upstreams)>,
+    device_names: Option<Arc<DeviceNames>>,
     cache: Mutex<Cache>,
     inflight: Mutex<Inflight>,
     policy: Arc<Policy>,
@@ -343,6 +345,10 @@ impl Pipeline {
                 Upstreams::plain(resolver, &config.upstream, &config.limits),
             )
         });
+        let device_names = config
+            .local
+            .resolver
+            .map(|resolver| DeviceNames::new(resolver, &config.upstream, &config.limits));
         // A refresh holds a question slot and, while it waits, one exchange slot of a server.
         // Refreshes take at most half of the smaller pool, so client misses keep the other
         // half; at least one may run, so a single-slot setup still refreshes.
@@ -371,6 +377,7 @@ impl Pipeline {
                 .collect(),
             upstreams,
             local_resolver,
+            device_names,
             cache: Mutex::new(Cache::new(&config.cache)),
             inflight: Mutex::new(Inflight::default()),
             policy,
@@ -400,15 +407,36 @@ impl Pipeline {
             kind: ServerKind::Upstream,
             tally,
         });
+        let lookups = self
+            .device_names
+            .as_ref()
+            .map(|names| names.tally())
+            .unwrap_or_default();
         let local = self.local_resolver.iter().flat_map(|(address, resolver)| {
-            resolver.tallies().map(|(_, tally)| ServerTally {
+            resolver.tallies().map(move |(_, tally)| ServerTally {
                 label: address.to_string(),
                 kind: ServerKind::Local,
-                tally,
+                tally: Tally {
+                    answered: tally.answered + lookups.answered,
+                    failed: tally.failed + lookups.failed,
+                    answer_micros: tally.answer_micros.saturating_add(lookups.answer_micros),
+                },
             })
         });
 
         servers.chain(local).collect()
+    }
+
+    /// The device name of a private client address, from a PTR lookup through the `[local]`
+    /// resolver. Starts the lookup when one is due and never waits for it. `None` without a
+    /// `[local]` resolver, for loopback and public addresses, and until a name is known.
+    pub fn device_name(&self, client: IpAddr) -> Option<Box<str>> {
+        let names = self.device_names.as_ref()?;
+        if !is_allowed(&self.private_networks, client) {
+            return None;
+        }
+
+        names.name_of(client.to_canonical())
     }
 
     pub fn cache_size(&self) -> CacheSize {
@@ -1199,9 +1227,11 @@ mod tests {
 
     use super::*;
     use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse, soa};
+    use crate::dns::wire::{HEADER_LEN, skip_name};
     use crate::filter::engine::{CompiledList, Engine};
     use crate::filter::parse::ListFormat;
-    use crate::upstream::test_dns::{self, fake_dns};
+    use crate::names::reverse_name;
+    use crate::upstream::test_dns::{self, fake_dns, fake_router};
 
     const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
 
@@ -2111,5 +2141,306 @@ mod tests {
             ask_quickly(&pipeline, &specs[0], &mut out),
             Quick::NeedsUpstream
         );
+    }
+
+    const PRIVATE_CLIENTS: [&str; 8] = [
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.1.5",
+        "100.64.0.1",
+        "169.254.1.1",
+        "fd00::1",
+        "fe80::1",
+        "::ffff:192.168.1.6",
+    ];
+
+    fn lan_address(number: u32) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::from(0xC0A8_0100 + number))
+    }
+
+    fn pipeline_with_router(
+        router: SocketAddr,
+        configure: impl FnOnce(&mut Config),
+    ) -> Arc<Pipeline> {
+        let mut config = offline_config();
+        config.local.resolver = Some(router);
+        configure(&mut config);
+
+        Pipeline::new(&config, Arc::new(Policy::new())).unwrap()
+    }
+
+    fn device_names(pipeline: &Pipeline) -> &DeviceNames {
+        pipeline.device_names.as_deref().unwrap()
+    }
+
+    fn local_tally(pipeline: &Pipeline) -> Tally {
+        pipeline
+            .upstream_tallies()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Local)
+            .unwrap()
+            .tally
+    }
+
+    /// Polls `done` every 10 ms; false when it is still not true after `limit`.
+    async fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let started = Instant::now();
+
+        while !done() {
+            if started.elapsed() > limit {
+                return false;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        true
+    }
+
+    async fn ask_printer(pipeline: &Arc<Pipeline>) -> Vec<String> {
+        let request = QuerySpec::new("printer.lan.", RecordType::A).bytes();
+        let mut out = Vec::new();
+        let answered = timeout(
+            Duration::from_secs(1),
+            pipeline.answer(request, Protocol::Udp, CLIENT, &mut out),
+        )
+        .await;
+
+        assert_eq!(answered, Ok(true), "printer.lan was answered within 1 s");
+
+        answer_addresses(&out)
+    }
+
+    #[tokio::test]
+    async fn without_a_local_resolver_no_device_name_is_looked_up() {
+        let pipeline = pipeline_with_local(&[], None);
+
+        assert_eq!(pipeline.device_name("192.168.1.5".parse().unwrap()), None);
+        assert!(pipeline.device_names.is_none());
+    }
+
+    #[tokio::test]
+    async fn only_private_client_addresses_are_looked_up() {
+        let router = fake_router(&[], false).await;
+        let pipeline = pipeline_with_router(router.address, |_| {});
+
+        for never in [
+            "127.0.0.1",
+            "127.0.0.53",
+            "::1",
+            "8.8.8.8",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+        ] {
+            assert_eq!(
+                pipeline.device_name(never.parse().unwrap()),
+                None,
+                "{never}"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(router.asked(), Vec::<String>::new());
+
+        for private in PRIVATE_CLIENTS {
+            assert_eq!(pipeline.device_name(private.parse().unwrap()), None);
+            let answered = wait_until(Duration::from_secs(3), || {
+                device_names(&pipeline).lookups_in_flight() == 0
+            })
+            .await;
+            assert!(answered, "{private}");
+        }
+
+        let expected: Vec<String> = PRIVATE_CLIENTS
+            .iter()
+            .map(|private| reverse_name(private.parse().unwrap()).to_string())
+            .collect();
+        assert_eq!(router.asked(), expected);
+        assert_eq!(router.asked()[7], "6.1.168.192.in-addr.arpa");
+    }
+
+    #[tokio::test]
+    async fn a_silent_lookup_never_holds_a_slot_a_client_needs() {
+        let router = fake_router(&[], true).await;
+        let pipeline = pipeline_with_router(router.address, |config| {
+            config.local.domains = vec!["lan".to_string()];
+            config.limits.upstream_concurrency = 1;
+        });
+        let started = Instant::now();
+
+        for number in 0..20 {
+            assert_eq!(pipeline.device_name(lan_address(number)), None);
+        }
+
+        assert!(wait_until(Duration::from_secs(3), || router.asked().len() >= 4).await);
+        // Four first tries were sent before any could end at 1 s: none waited for the one
+        // slot the client pool has.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+
+        assert_eq!(ask_printer(&pipeline).await, ["192.168.1.9"]);
+        assert_eq!(device_names(&pipeline).lookups_in_flight(), 4);
+    }
+
+    /// A router on one port for UDP and TCP. UDP answers A at once with 192.168.1.9 and PTR
+    /// with TC set and no answer. TCP reads one query, writes a frame header advertising
+    /// 1,000 bytes with that query's ID, flags that it did, and stalls with the connection
+    /// open. Returns the address, the PTR questions over UDP, and the flag.
+    async fn stalling_router() -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (listener, udp) = loop {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            if let Ok(udp) = tokio::net::UdpSocket::bind(address).await {
+                break (listener, udp);
+            }
+        };
+        let address = listener.local_addr().unwrap();
+        let ptr_asked = Arc::new(AtomicUsize::new(0));
+        let stalled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&ptr_asked);
+        let stalls = Arc::clone(&stalled);
+
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 512];
+            while let Ok((length, peer)) = udp.recv_from(&mut buffer).await {
+                let query = &buffer[..length];
+                let reply = if query_type(query) == rtype::PTR {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    truncated_reply(query)
+                } else {
+                    test_dns::answer(query, [192, 168, 1, 9], false)
+                };
+                let _ = udp.send_to(&reply, peer).await;
+            }
+        });
+        tokio::spawn(async move {
+            while let Ok((mut connection, _)) = listener.accept().await {
+                let stalls = Arc::clone(&stalls);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let mut length = [0u8; 2];
+                    if connection.read_exact(&mut length).await.is_err() {
+                        return;
+                    }
+
+                    let mut query = vec![0; usize::from(u16::from_be_bytes(length))];
+                    if connection.read_exact(&mut query).await.is_err() {
+                        return;
+                    }
+
+                    let header = [0x03, 0xE8, query[0], query[1]];
+                    if connection.write_all(&header).await.is_err() {
+                        return;
+                    }
+
+                    stalls.fetch_add(1, Ordering::SeqCst);
+
+                    let mut rest = [0u8; 512];
+                    while connection.read(&mut rest).await.is_ok_and(|read| read > 0) {}
+                });
+            }
+        });
+
+        (address, ptr_asked, stalled)
+    }
+
+    fn query_type(query: &[u8]) -> u16 {
+        let question_end = skip_name(query, HEADER_LEN).unwrap() + 4;
+
+        u16::from_be_bytes([query[question_end - 4], query[question_end - 3]])
+    }
+
+    fn truncated_reply(query: &[u8]) -> Vec<u8> {
+        let question_end = skip_name(query, HEADER_LEN).unwrap() + 4;
+        let mut reply = query[..question_end].to_vec();
+        reply[2..4].copy_from_slice(&(0x8180 | flags::TC).to_be_bytes());
+        reply[6..12].copy_from_slice(&[0; 6]);
+
+        reply
+    }
+
+    #[tokio::test]
+    async fn a_stalled_tcp_lookup_holds_none_of_the_client_budget() {
+        let (router, ptr_asked, stalled) = stalling_router().await;
+        let pipeline = pipeline_with_router(router, |config| {
+            config.upstream.timeout_ms = 1000;
+            config.local.domains = vec!["lan".to_string()];
+        });
+
+        assert_eq!(pipeline.device_name(lan_address(1)), None);
+
+        let names = device_names(&pipeline);
+        let has_stalled = || stalled.load(Ordering::SeqCst) > 0;
+        assert!(wait_until(Duration::from_secs(3), has_stalled).await);
+        assert!(wait_until(Duration::from_secs(3), || names.held_bytes() == 1000).await);
+        assert_eq!(pipeline.budget().used(), 0);
+        assert_eq!(ask_printer(&pipeline).await, ["192.168.1.9"]);
+
+        assert!(wait_until(Duration::from_secs(5), || names.lookups_in_flight() == 0).await);
+        assert!(wait_until(Duration::from_secs(3), || names.held_bytes() == 0).await);
+        let asked = ptr_asked.load(Ordering::SeqCst);
+        assert_eq!(pipeline.device_name(lan_address(1)), None);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(ptr_asked.load(Ordering::SeqCst), asked, "no name is kept");
+        assert_eq!(names.lookups_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_local_entry_counts_client_queries_and_lookups_together() {
+        let owner = reverse_name(lan_address(1)).to_string();
+        let router = fake_router(&[(&owner, "pc.lan.", 600)], false).await;
+        let pipeline = pipeline_with_router(router.address, |config| {
+            config.local.domains = vec!["lan".to_string()];
+        });
+
+        assert_eq!(ask_printer(&pipeline).await, ["192.168.1.9"]);
+        assert_eq!(pipeline.device_name(lan_address(1)), None);
+        let named = wait_until(Duration::from_secs(5), || {
+            pipeline.device_name(lan_address(1)).is_some()
+        })
+        .await;
+
+        assert!(named);
+        assert_eq!(local_tally(&pipeline).answered, 2);
+    }
+
+    #[tokio::test]
+    async fn the_lookup_name_of_a_private_address_takes_the_local_route() {
+        let pipeline = pipeline_with_local(&[], Some("127.0.0.1:9"));
+
+        for private in PRIVATE_CLIENTS {
+            let address: IpAddr = private.parse().unwrap();
+            let name = reverse_name(address);
+
+            assert_eq!(
+                reverse_address(&name),
+                Some(address.to_canonical()),
+                "{private}"
+            );
+            assert_eq!(pipeline.route_of(&name), Route::Local, "{private}");
+        }
+    }
+
+    #[tokio::test]
+    async fn device_name_lookups_are_not_client_queries() {
+        let owner = reverse_name(lan_address(1)).to_string();
+        let router = fake_router(&[(&owner, "pc.lan.", 600)], false).await;
+        let pipeline = pipeline_with_router(router.address, |_| {});
+
+        assert_eq!(pipeline.device_name(lan_address(1)), None);
+        let named = wait_until(Duration::from_secs(5), || {
+            pipeline.device_name(lan_address(1)).as_deref() == Some("pc.lan")
+        })
+        .await;
+
+        assert!(named);
+        assert_eq!(counters(&pipeline).total, 0);
+        assert!(pipeline.stats().query_log(10).is_empty());
+        assert!(pipeline.stats().snapshot().top_clients.is_empty());
+        assert_eq!(local_tally(&pipeline).answered, 1);
     }
 }
