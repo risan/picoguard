@@ -20,7 +20,8 @@ saved from its own status page in its own `state.dir`.
 
 What you change on the status page is saved in `settings.json` in `[state] dir`
 (`/var/lib/picoguard/settings.json` by default), never in this file: picoguard cannot write
-`/etc/picoguard`. Today that is the Block and Allow rules from the query log.
+`/etc/picoguard`. Today that is the Block and Allow rules from the query log, the upstream servers
+and bootstrap addresses, and the cache settings (below).
 
 - A value saved from the page wins over the same value in this file. The page's rules join your
   `rules`; they never replace them.
@@ -39,8 +40,8 @@ What you change on the status page is saved in `settings.json` in `[state] dir`
 - A save that fails (for example a read-only state folder) answers 503
   `{"error": "could not save settings: <reason>"}`, and the change is not applied either.
 
-`GET /api/settings` (signed-in only) shows what the page will be able to change, each value with
-where it comes from (`"from": "page"` or `"file"`), and nothing of `[web]`:
+`GET /api/settings` (signed-in only) shows what the page can change, each value with where it
+comes from (`"from": "page"` or `"file"`), and nothing of `[web]`:
 
 ```json
 {"file": "/var/lib/picoguard/settings.json", "error": null, "can_save": true,
@@ -53,6 +54,40 @@ where it comes from (`"from": "page"` or `"file"`), and nothing of `[web]`:
 
 `error` is why the saved file was not used at start, until a save replaces it. `can_save` is
 `false` after a save failed, until one works.
+
+### Upstream servers and cache from the page
+
+The Settings tab has a card for each. The card says "From the config file" or "Set on this page";
+**Save** saves the card and puts it in force at once, without a restart, and **Use the config
+file** goes back to this file's values.
+
+- **Upstream servers**: `[upstream] servers` (1 to 8, in order; add, remove, move up and down)
+  and `bootstrap` (0 to 4 addresses). A server this file would refuse is refused with the same
+  reason, and nothing is saved. `timeout_ms` stays in this file. Queries already waiting finish on
+  the servers they started on; the new servers answer every query after the save. A server kept
+  by its exact address keeps its counts on the dashboard's Upstreams card, and a new one starts at
+  0; answers that queries in flight get from the old servers after the save are not counted. The
+  query log's "Via" column (`#0`, `#1`, ...) is the position in the list in force at the time.
+- Replaced servers close their connections once the queries that started on them have ended, within
+  `timeout_ms`. If two earlier changes are still finishing, a further change answers 409 "the
+  previous upstream change is still finishing; try again in a few seconds".
+- **Cache**: `max_entries`, `max_bytes` (256 KiB to 16 MiB from the page; the card asks in
+  KiB), `min_ttl`, `max_ttl` and `optimistic`. Saving a change empties the cache, like Clear
+  cache, and the new limits and TTLs apply to the next answer. The other `[cache]` keys stay in
+  this file.
+
+`POST /api/settings` takes any of `upstream` and `cache` (`rewrites`, `safe_search` and
+`services` answer 409 "<key> is not editable yet"). A value sets it, `null` goes back to this
+file. The body may be up to 64 KiB. It answers the same as `GET`, 400 with the reason for a
+value that is refused, 409 as above, or 503 when the file cannot be saved; in every refusal
+nothing changes.
+
+```json
+{"upstream": {"servers": ["tls://9.9.9.9#dns.quad9.net", "https://1.1.1.1/dns-query"], "bootstrap": ["9.9.9.9"]},
+ "cache": null}
+```
+
+A change that leaves the saved values as they are writes nothing.
 
 ## Top-level keys
 
