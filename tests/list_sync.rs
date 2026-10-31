@@ -21,8 +21,10 @@ use picoguard::filter::engine::Verdict;
 use picoguard::filter::snapshot::{self, SnapshotStore};
 use picoguard::lists::{Downloader, Names};
 use picoguard::policy::Policy;
-use picoguard::scheduler::{Action, ButtonRule, Explained, Role, RuleError, Scheduler, Timing};
-use picoguard::settings::{self, SaveError, Saved, Settings};
+use picoguard::scheduler::{
+    Action, ButtonRule, Explained, OVER_THE_MEMORY_BUDGET, Role, RuleError, Scheduler, Timing,
+};
+use picoguard::settings::{self, ListRole, PageList, SaveError, Saved, Settings};
 use picoguard::upstream::tls::Tls;
 use picoguard::upstream::{SharedUpstreams, Upstreams};
 
@@ -2134,12 +2136,121 @@ async fn a_list_that_is_off_is_left_out_at_boot() {
 
     let (scheduler, _store) = boot(&config).await;
 
-    let names: Vec<String> = scheduler
+    let shown: Vec<(String, bool, usize)> = scheduler
         .control()
         .statuses()
         .into_iter()
-        .map(|status| status.name)
+        .map(|status| (status.name, status.enabled, status.rules))
         .collect();
-    assert_eq!(names, ["on"]);
+    assert_eq!(
+        shown,
+        [("off".to_string(), false, 0), ("on".to_string(), true, 0)]
+    );
+    assert!(scheduler.list(0).is_none());
     assert!(!blocked(&scheduler.policy(), "ads.example"));
+}
+
+const MIB: usize = 1024 * 1024;
+
+fn page_list(url: String) -> PageList {
+    PageList {
+        role: ListRole::Block,
+        name: Some("page".to_string()),
+        url,
+        refresh_hours: 24,
+        enabled: true,
+    }
+}
+
+/// Boots on `file` with `lists` saved on the page, as a start after they were added.
+async fn boot_with_page_lists(file: &Config, lists: Vec<PageList>) -> Scheduler {
+    let settings = Settings {
+        lists: Some(lists),
+        ..Settings::default()
+    };
+    fs::write(
+        file.state.dir.join(settings::FILE_NAME),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+    let loaded = settings::with_saved(file.clone());
+    assert_eq!(loaded.saved.error(), None);
+
+    Scheduler::boot(
+        &loaded.config,
+        Arc::new(loaded.saved),
+        CompileWorker::spawn().unwrap(),
+        Arc::new(SnapshotStore::open(&file.state.dir).unwrap()),
+        quick_timing(),
+    )
+    .await
+    .unwrap()
+}
+
+/// `count` distinct rules.
+fn many_rules(count: usize) -> String {
+    (0..count)
+        .map(|index| format!("||n{index}.example^\n"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_page_list_whose_refresh_grows_past_the_budget_keeps_its_last_good_copy() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/tiny.txt", V1, None);
+    let mut file = config_of(&dir, Vec::new());
+    let lists = vec![page_list(server.url("/tiny.txt"))];
+    let estimate = {
+        let mut scheduler = boot_with_page_lists(&file, lists.clone()).await;
+        scheduler.refresh(0, &downloader()).await;
+        assert!(blocked(&scheduler.policy(), "ads.example."));
+
+        scheduler.control().memory().estimate_bytes
+    };
+    // Less than a mebibyte of room is left.
+    file.limits.memory_mb = estimate / MIB + 1;
+
+    let mut scheduler = boot_with_page_lists(&file, lists).await;
+    let control = scheduler.control();
+    let tiny = Arc::clone(scheduler.list(0).expect("booted from the snapshot"));
+    assert_eq!(control.memory().estimate_bytes, estimate);
+    server.serve("/tiny.txt", &many_rules(100_000), None);
+    scheduler.refresh(0, &downloader()).await;
+
+    let status = &control.statuses()[0];
+    assert_eq!(status.last_error.as_deref(), Some(OVER_THE_MEMORY_BUDGET));
+    assert!(Arc::ptr_eq(&tiny, scheduler.list(0).unwrap()));
+    assert!(blocked(&scheduler.policy(), "ads.example."));
+    assert!(!blocked(&scheduler.policy(), "n5.example."));
+    let memory = control.memory();
+    assert_eq!(memory.estimate_bytes, estimate);
+    assert!(memory.estimate_bytes <= memory.budget_bytes);
+
+    // A copy that grows within the room is put in force.
+    server.serve("/tiny.txt", &many_rules(1000), None);
+    scheduler.refresh(0, &downloader()).await;
+
+    assert_eq!(control.statuses()[0].last_error, None);
+    assert!(blocked(&scheduler.policy(), "n5.example."));
+    assert!(control.memory().estimate_bytes <= control.memory().budget_bytes);
+}
+
+#[tokio::test]
+async fn a_list_of_the_config_file_keeps_its_caps_only_whatever_the_budget() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/file.txt", &many_rules(100_000), None);
+    let mut config = config_of(&dir, vec![url_list("file", server.url("/file.txt"))]);
+    config.limits.memory_mb = 1;
+    let (mut scheduler, _store) = boot(&config).await;
+
+    scheduler.refresh(0, &downloader()).await;
+
+    let control = scheduler.control();
+    assert_eq!(control.statuses()[0].last_error, None);
+    assert!(blocked(&scheduler.policy(), "n5.example."));
+    let memory = control.memory();
+    assert!(memory.estimate_bytes > memory.budget_bytes);
+    assert!(!control.statuses()[0].from_page);
 }

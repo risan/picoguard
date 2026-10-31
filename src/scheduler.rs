@@ -12,6 +12,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ use crate::filter::engine::{CompiledList, Engine, ListBuilder, Side};
 use crate::filter::parse::{FastKind, ListFormat, Rule};
 use crate::filter::snapshot::{Snapshot, SnapshotStore};
 use crate::lists::{Downloader, Limits, Refresh, RefreshError, Updated, Validators, refresh_file};
+use crate::memory::{self, ListBytes, Memory};
 use crate::pipeline::Pipeline;
 use crate::policy::Policy;
 use crate::settings::{self, ChangeError, PageChange, SaveError, Saved};
@@ -79,11 +81,25 @@ pub enum Role {
     Allowlist,
 }
 
+/// What a refresh of a page list that would pass the memory budget says (plan D6).
+pub const OVER_THE_MEMORY_BUDGET: &str = "over the memory budget";
+
 /// What is known about one list, for the status page.
 #[derive(Debug, Clone)]
 pub struct ListStatus {
     pub name: String,
     pub role: Role,
+    /// The URL or the path as written: with the role, what names the list.
+    pub source: String,
+    /// A URL list; a path list is changed in the config file only.
+    pub is_url: bool,
+    /// Set on the status page, not taken from the config file.
+    pub from_page: bool,
+    /// A list that is off is not downloaded and holds nothing.
+    pub enabled: bool,
+    pub refresh_hours: u32,
+    /// What the copy in force counts in the memory estimate; zero without a copy.
+    pub bytes: ListBytes,
     /// The format the copy in force was read as (`auto` resolved); `None` before any copy.
     pub format: Option<ListFormat>,
     pub rules: usize,
@@ -219,8 +235,18 @@ pub struct ListControl {
     statuses: Mutex<Vec<ListStatus>>,
     refresh_requested: Notify,
     policy: Arc<Policy>,
-    /// Holds the page rules; its lock comes before the assembly lock.
+    /// Holds the page rules; its lock comes before the admission and the assembly lock.
     saved: Arc<Saved>,
+    /// Held from working out the room of a compile, or of a larger cache, until the result is
+    /// in force and what it replaced is freed, so two of them never count the same room
+    /// (plan D6). Every list refresh holds it too. Lock order: the settings lock, this, the
+    /// assembly lock.
+    admission: tokio::sync::Mutex<()>,
+    budget_bytes: usize,
+    /// `memory::fixed_bytes` and the config's own rules.
+    fixed_bytes: usize,
+    /// The cache's `max_bytes` in force.
+    cache_max_bytes: AtomicUsize,
     assembly: tokio::sync::Mutex<Assembly>,
     pending: Arc<Semaphore>,
 }
@@ -229,10 +255,16 @@ impl ListControl {
     /// A control without lists or page lists, swapping engines into `policy` and saving rule
     /// changes to `saved`.
     pub fn new(policy: Arc<Policy>, saved: Arc<Saved>) -> ListControl {
+        let file = saved.file_config();
+
         ListControl {
             statuses: Mutex::new(Vec::new()),
             refresh_requested: Notify::new(),
             policy,
+            admission: tokio::sync::Mutex::new(()),
+            budget_bytes: memory::budget_bytes(&file.limits),
+            fixed_bytes: memory::fixed_bytes(&file.limits, &file.stats),
+            cache_max_bytes: AtomicUsize::new(file.cache.max_bytes),
             saved,
             assembly: tokio::sync::Mutex::new(Assembly::default()),
             pending: Arc::new(Semaphore::new(MAX_PENDING_CHANGES)),
@@ -241,6 +273,50 @@ impl ListControl {
 
     pub fn saved(&self) -> &Arc<Saved> {
         &self.saved
+    }
+
+    /// The estimate of the whole process with the lists in force, and the budget.
+    pub fn memory(&self) -> Memory {
+        Memory {
+            estimate_bytes: memory::estimate(
+                self.fixed_bytes,
+                self.cache_max_bytes.load(Ordering::Relaxed),
+                &self.list_bytes(),
+            ),
+            budget_bytes: self.budget_bytes,
+        }
+    }
+
+    fn list_bytes(&self) -> Vec<ListBytes> {
+        self.statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|status| status.bytes)
+            .collect()
+    }
+
+    /// What a compile may be charged now: the budget less what is held without it. The
+    /// caller holds the admission lock.
+    fn compile_room(&self) -> usize {
+        let steady = memory::steady_bytes(
+            self.fixed_bytes,
+            self.cache_max_bytes.load(Ordering::Relaxed),
+            &self.list_bytes(),
+        );
+
+        self.budget_bytes.saturating_sub(steady)
+    }
+
+    /// Whether the estimate with `lists` in force stays within the budget.
+    fn fits(&self, lists: &[ListBytes]) -> bool {
+        let estimate = memory::estimate(
+            self.fixed_bytes,
+            self.cache_max_bytes.load(Ordering::Relaxed),
+            lists,
+        );
+
+        estimate <= self.budget_bytes
     }
 
     /// Blocklists first, then allowlists, in config order.
@@ -493,6 +569,11 @@ struct Entry {
     /// The URL or path as written; names the snapshot file.
     key: String,
     options: CompileOptions,
+    /// Off: never refreshed, and holds no copy.
+    enabled: bool,
+    /// A list of the page: every compile of it is admitted against the memory budget.
+    budgeted: bool,
+    refresh_hours: u32,
     interval: Duration,
     max_body_bytes: u64,
     loaded: Option<Loaded>,
@@ -528,12 +609,12 @@ impl Scheduler {
         timing: Timing,
     ) -> Result<Scheduler, String> {
         let user_rules = compile_user_rules(&config.rules, &worker).await?;
+        let from_page = saved.lock().await.lists.is_some();
         let blocklists = config.lists.iter().map(|list| (Role::Blocklist, list));
         let allowlists = config.allowlists.iter().map(|list| (Role::Allowlist, list));
         let entries = blocklists
             .chain(allowlists)
-            .filter(|(_, list)| list.enabled)
-            .filter_map(|(role, list)| Entry::new(role, list, &timing))
+            .filter_map(|(role, list)| Entry::new(role, list, from_page, &timing))
             .collect();
 
         let placeholder = Arc::new(Policy::new());
@@ -551,7 +632,9 @@ impl Scheduler {
         };
 
         for index in 0..scheduler.entries.len() {
-            scheduler.load_at_boot(index).await;
+            if scheduler.entries[index].enabled {
+                scheduler.load_at_boot(index).await;
+            }
         }
 
         let (main, allow) = scheduler.lists_in_force(None);
@@ -578,6 +661,11 @@ impl Scheduler {
         // The first engine is generation 0, so the policy is made with it, not swapped.
         scheduler.policy = Arc::new(Policy::with_engine(Arc::new(engine)));
         let mut control = ListControl::new(scheduler.policy(), saved);
+        control.fixed_bytes += scheduler
+            .user_rules
+            .as_ref()
+            .map_or(0, |rules| rules.heap_bytes());
+        control.cache_max_bytes = AtomicUsize::new(config.cache.max_bytes);
         let assembly = control.assembly.get_mut();
         assembly.main_ids = main_ids;
         assembly.allow_ids = allow_ids;
@@ -672,6 +760,7 @@ impl Scheduler {
             .entries
             .iter()
             .enumerate()
+            .filter(|(_, entry)| entry.enabled)
             .map(|(index, entry)| (index, Work::Refresh, entry.due));
         let saves = self
             .entries
@@ -687,9 +776,17 @@ impl Scheduler {
     }
 
     /// Refreshes the list at `index` now. The list in force stays in force unless a new copy
-    /// was compiled, assembled into an engine and swapped in.
+    /// was compiled, assembled into an engine and swapped in. A list of the page is compiled
+    /// within the room the memory budget leaves, and a larger copy must fit the budget.
     pub async fn refresh(&mut self, index: usize, downloader: &Downloader) {
-        let outcome = match self.fetch(index, downloader).await {
+        let control = Arc::clone(&self.control);
+        let admitted = control.admission.lock().await;
+        let room = if self.entries[index].budgeted {
+            control.compile_room()
+        } else {
+            usize::MAX
+        };
+        let outcome = match self.fetch(index, downloader, room).await {
             Ok(Refresh::NotModified) => {
                 log::info!("{}: not modified", self.entries[index].label);
 
@@ -697,6 +794,11 @@ impl Scheduler {
             }
 
             Ok(Refresh::Updated(updated)) => self.install(index, updated).await,
+
+            Err(RefreshError::Compile(CompileError::OverMemoryBudget)) => {
+                Err(OVER_THE_MEMORY_BUDGET.to_string())
+            }
+
             Err(error) => Err(error.to_string()),
         };
         let entry = &mut self.entries[index];
@@ -730,9 +832,18 @@ impl Scheduler {
         }
 
         self.publish(index);
+        // What the refresh replaced or refused is dropped on the worker before anything else
+        // may count the room it held.
+        let _ = self.worker.run(|| ()).await;
+        drop(admitted);
     }
 
-    async fn fetch(&self, index: usize, downloader: &Downloader) -> Result<Refresh, RefreshError> {
+    async fn fetch(
+        &self,
+        index: usize,
+        downloader: &Downloader,
+        admission_bytes: usize,
+    ) -> Result<Refresh, RefreshError> {
         let entry = &self.entries[index];
 
         match &entry.source {
@@ -754,7 +865,7 @@ impl Scheduler {
                         &previous,
                         &limits,
                         entry.options,
-                        usize::MAX,
+                        admission_bytes,
                     )
                     .await
             }
@@ -798,6 +909,12 @@ impl Scheduler {
             return Err("the new copy has no rules".to_string());
         }
 
+        if entry.budgeted && !self.fits_in_place_of(index, &updated.compiled.list) {
+            self.worker.discard(updated);
+
+            return Err(OVER_THE_MEMORY_BUDGET.to_string());
+        }
+
         let Updated {
             compiled,
             validators,
@@ -833,6 +950,24 @@ impl Scheduler {
         }
 
         Ok(())
+    }
+
+    /// Whether `list` may replace the copy of the list at `index`: a copy that is no larger
+    /// always may; a larger one only within the budget.
+    fn fits_in_place_of(&self, index: usize, list: &CompiledList) -> bool {
+        let mut lists = self.control.list_bytes();
+        let new = ListBytes {
+            heap: list.heap_bytes(),
+            charge: list.compile_charge(),
+        };
+        let old = lists[index];
+        if new.heap <= old.heap && new.charge <= old.charge {
+            return true;
+        }
+
+        lists[index] = new;
+
+        self.control.fits(&lists)
     }
 
     /// Writes `snapshot`; if that fails the entry keeps it to write again later.
@@ -1008,6 +1143,18 @@ impl Entry {
         ListStatus {
             name: self.label.clone(),
             role: self.role,
+            source: self.key.clone(),
+            is_url: matches!(self.source, Source::Url(_)),
+            from_page: self.budgeted,
+            enabled: self.enabled,
+            refresh_hours: self.refresh_hours,
+            bytes: self
+                .loaded
+                .as_ref()
+                .map_or_else(ListBytes::default, |loaded| ListBytes {
+                    heap: loaded.list.heap_bytes(),
+                    charge: loaded.list.compile_charge(),
+                }),
             format: self.loaded.as_ref().map(|loaded| loaded.format),
             rules: self
                 .loaded
@@ -1018,7 +1165,8 @@ impl Entry {
         }
     }
 
-    fn new(role: Role, list: &ListConfig, timing: &Timing) -> Option<Entry> {
+    /// `from_page`: the settings of the page hold the lists, so a URL list is the page's.
+    fn new(role: Role, list: &ListConfig, from_page: bool, timing: &Timing) -> Option<Entry> {
         let (source, key) = match (&list.url, &list.path) {
             (Some(url), _) => (Source::Url(url.clone()), url.clone()),
             (None, Some(path)) => (Source::Path(path.clone()), path.display().to_string()),
@@ -1040,6 +1188,9 @@ impl Entry {
                 slow_rule_budget: list.slow_rule_budget,
                 ..CompileOptions::new(list.format, list.max_rules)
             },
+            enabled: list.enabled,
+            budgeted: from_page && list.url.is_some(),
+            refresh_hours: list.refresh_hours,
             interval: timing.hour * list.refresh_hours,
             max_body_bytes: list.max_body_bytes,
             loaded: None,
