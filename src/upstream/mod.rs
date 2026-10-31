@@ -20,7 +20,7 @@ use std::fmt;
 use std::hash::BuildHasher;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -41,6 +41,9 @@ const INITIAL_SRTT_MS: f64 = 100.0;
 const SRTT_WEIGHT_OF_NEW_SAMPLE: f64 = 0.3;
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Replaced pools that may still be in use by what started before the change. Queries end
+/// within the timeout, so a few seconds after a change its pool is gone.
+const MAX_RETIRED: usize = 2;
 
 #[derive(Debug)]
 pub enum UpstreamError {
@@ -436,6 +439,18 @@ impl Upstreams {
             .map(|server| (server.label.as_str(), *server.tally.lock().unwrap()))
     }
 
+    fn carry_tallies(&self, replaced: &Upstreams) {
+        for server in &self.servers {
+            let same = replaced
+                .servers
+                .iter()
+                .find(|old| old.label == server.label);
+            if let Some(old) = same {
+                *server.tally.lock().unwrap() = *old.tally.lock().unwrap();
+            }
+        }
+    }
+
     /// Like `query_charged`, without a limit on the bytes held.
     pub async fn query(&self, request: &mut [u8]) -> Result<Vec<u8>, UpstreamError> {
         let unlimited = Budget::new(usize::MAX);
@@ -546,6 +561,54 @@ impl Upstreams {
     }
 }
 
+/// The upstream pool in force, replaced when the status page changes the servers. A query, a
+/// list download or an update check takes the current pool once at its start and keeps it to
+/// its end; a replaced pool is freed, its connections with it, when the last of them ends.
+pub struct SharedUpstreams {
+    current: Mutex<Arc<Upstreams>>,
+    retired: Mutex<Vec<Weak<Upstreams>>>,
+}
+
+impl SharedUpstreams {
+    pub fn new(upstreams: Upstreams) -> SharedUpstreams {
+        SharedUpstreams {
+            current: Mutex::new(Arc::new(upstreams)),
+            retired: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn current(&self) -> Arc<Upstreams> {
+        Arc::clone(&self.current.lock().unwrap())
+    }
+
+    /// The pool in force and the replaced ones still in use.
+    pub fn generations(&self) -> usize {
+        let mut retired = self.retired.lock().unwrap();
+        retired.retain(|pool| pool.strong_count() > 0);
+
+        1 + retired.len()
+    }
+
+    /// False while `MAX_RETIRED` replaced pools are still in use.
+    pub fn can_replace(&self) -> bool {
+        self.generations() <= MAX_RETIRED
+    }
+
+    /// Puts `next` in force and returns the pool it replaces. A server of `next` with the
+    /// label of a replaced one keeps its counts; what that one answers from here on is not
+    /// counted on the new pool.
+    pub fn replace(&self, next: Upstreams) -> Arc<Upstreams> {
+        let mut current = self.current.lock().unwrap();
+        next.carry_tallies(&current);
+        let replaced = std::mem::replace(&mut *current, Arc::new(next));
+        drop(current);
+
+        self.retired.lock().unwrap().push(Arc::downgrade(&replaced));
+
+        replaced
+    }
+}
+
 fn random_unit() -> f64 {
     (random_u64() >> 11) as f64 / (1u64 << 53) as f64
 }
@@ -638,7 +701,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
 
     use super::*;
@@ -726,6 +789,49 @@ mod tests {
     #[test]
     fn a_tally_adds_a_few_bytes_per_server() {
         assert!(std::mem::size_of::<Mutex<Tally>>() <= 64);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_pool_keeps_the_counts_of_servers_with_the_same_label() {
+        let first = good_udp().await;
+        let second = good_udp().await;
+        let shared = SharedUpstreams::new(upstreams(vec![udp_url(&first)], 1000));
+        for _ in 0..3 {
+            shared
+                .current()
+                .query(&mut query_for("example.com."))
+                .await
+                .unwrap();
+        }
+
+        shared.replace(upstreams(vec![udp_url(&second), udp_url(&first)], 1000));
+
+        let counts: Vec<_> = shared
+            .current()
+            .tallies()
+            .map(|(label, tally)| (label.to_string(), tally.answered))
+            .collect();
+        assert_eq!(counts, [(udp_url(&second), 0), (udp_url(&first), 3)]);
+    }
+
+    #[test]
+    fn at_most_two_replaced_pools_may_still_be_in_use() {
+        let pool = || upstreams(vec!["udp://127.0.0.1:9".to_string()], 1000);
+        let shared = SharedUpstreams::new(pool());
+        assert_eq!(shared.generations(), 1);
+
+        let first_held = shared.replace(pool());
+        let second_held = shared.replace(pool());
+        assert_eq!(shared.generations(), 3);
+        assert!(!shared.can_replace());
+
+        drop(first_held);
+        assert_eq!(shared.generations(), 2);
+        assert!(shared.can_replace());
+
+        drop(shared.replace(pool()));
+        drop(second_held);
+        assert_eq!(shared.generations(), 1);
     }
 
     #[tokio::test]
@@ -1430,27 +1536,138 @@ mod tests {
     async fn dot_echo_server(pki: &TestPki) -> TlsServer {
         let config = pki.server_config(&["dot"], rustls::crypto::ring::default_provider());
 
-        TlsServer::start(config, |mut stream| async move {
-            loop {
-                let mut length = [0u8; 2];
-                if stream.read_exact(&mut length).await.is_err() {
-                    break;
-                }
+        TlsServer::start(config, answer_frames).await
+    }
 
-                let mut query = vec![0; usize::from(u16::from_be_bytes(length))];
-                if stream.read_exact(&mut query).await.is_err() {
-                    break;
-                }
-
-                let reply = answer(&query, ANSWER_MARKER, false);
-                let mut frame = (reply.len() as u16).to_be_bytes().to_vec();
-                frame.extend_from_slice(&reply);
-                if stream.write_all(&frame).await.is_err() {
-                    break;
-                }
+    /// Answers framed queries until the client closes; it never closes an idle connection.
+    async fn answer_frames<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
+        loop {
+            let mut length = [0u8; 2];
+            if stream.read_exact(&mut length).await.is_err() {
+                break;
             }
+
+            let mut query = vec![0; usize::from(u16::from_be_bytes(length))];
+            if stream.read_exact(&mut query).await.is_err() {
+                break;
+            }
+
+            let reply = answer(&query, ANSWER_MARKER, false);
+            let mut frame = (reply.len() as u16).to_be_bytes().to_vec();
+            frame.extend_from_slice(&reply);
+            if stream.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Runs `connection`, counted in `open` until it ends.
+    async fn counted(open: Arc<AtomicUsize>, connection: impl Future<Output = ()>) {
+        open.fetch_add(1, Ordering::SeqCst);
+        connection.await;
+        open.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Puts a new pool from `pool` in force 20 times, each queried once, the replaced one
+    /// dropped. Afterwards only the pool in force may hold a connection and its tasks.
+    async fn replace_twenty_times(pool: impl Fn() -> Upstreams, open: &AtomicUsize) {
+        let tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let settle = || async {
+            for _ in 0..200 {
+                if open.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let shared = SharedUpstreams::new(pool());
+        shared
+            .current()
+            .query(&mut query_for("example.com."))
+            .await
+            .unwrap();
+        settle().await;
+        let one_pool = tasks();
+        assert_eq!(open.load(Ordering::SeqCst), 1);
+
+        for _ in 0..20 {
+            drop(shared.replace(pool()));
+            shared
+                .current()
+                .query(&mut query_for("example.com."))
+                .await
+                .unwrap();
+        }
+
+        settle().await;
+        assert_eq!(open.load(Ordering::SeqCst), 1, "connections still open");
+        assert_eq!(tasks(), one_pool, "tasks still alive");
+    }
+
+    #[tokio::test]
+    async fn a_replaced_tcp_pool_closes_its_idle_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let open = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&open);
+        tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                tokio::spawn(counted(Arc::clone(&counter), answer_frames(connection)));
+            }
+        });
+
+        replace_twenty_times(|| upstreams(vec![format!("tcp://{address}")], 1000), &open).await;
+    }
+
+    fn encrypted_pool(pki: &TestPki, spec: String) -> Upstreams {
+        let config = UpstreamConfig {
+            servers: vec![spec],
+            timeout_ms: 3000,
+            ..UpstreamConfig::default()
+        };
+        let tls = Arc::new(Tls::with_roots(pki.roots(), true));
+        let bootstrap = Arc::new(Bootstrap::at(Vec::new()));
+
+        Upstreams::with_parts(&config, &LimitsConfig::default(), tls, bootstrap).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_replaced_dot_pool_closes_its_idle_connection() {
+        let pki = TestPki::new();
+        let open = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&open);
+        let config = pki.server_config(&["dot"], rustls::crypto::ring::default_provider());
+        let server = TlsServer::start(config, move |stream| {
+            counted(Arc::clone(&counter), answer_frames(stream))
         })
-        .await
+        .await;
+        let spec = format!("tls://127.0.0.1:{}#localhost", server.address.port());
+
+        replace_twenty_times(|| encrypted_pool(&pki, spec.clone()), &open).await;
+    }
+
+    #[tokio::test]
+    async fn a_replaced_doh_pool_closes_its_idle_connection() {
+        let pki = TestPki::new();
+        let open = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&open);
+        let serve = crate::upstream::test_doh::serve_doh(Arc::new(
+            |_: &http::request::Parts, body: &[u8]| respond_with_answer(body),
+        ));
+        let server = TlsServer::start(crate::upstream::test_doh::doh_config(&pki), move |stream| {
+            counted(Arc::clone(&counter), serve(stream))
+        })
+        .await;
+        let spec = format!("https://127.0.0.1:{}/dns-query", server.address.port());
+
+        replace_twenty_times(|| encrypted_pool(&pki, spec.clone()), &open).await;
     }
 
     /// Queries `spec` through a full `Upstreams`, trusting the test CA and

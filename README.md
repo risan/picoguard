@@ -106,8 +106,9 @@ Move your settings from `AdGuardHome.yaml` to `/etc/picoguard/picoguard.toml`:
 | `local_ptr_upstreams`, private domains | `[local] resolver` |
 
 Not included: DHCP (your router does it), serving DoH/DoT to your devices, per-client settings,
-DNS rewrites, parental control and safe search, blocked-services toggles, query log on disk,
-DNSSEC validation, editing settings from the web page (edit the TOML file).
+parental control, query log on disk, DNSSEC validation, editing the other settings from the web
+page (edit the TOML file). Blocked services use AdGuard's catalog from its HostlistsRegistry,
+downloaded at run time and never shipped with picoguard.
 
 For redundancy, run two picoguard instances (for example two containers, or a board and a
 container) and give both addresses to your router as primary and secondary DNS.
@@ -122,14 +123,25 @@ container) and give both addresses to your router as primary and secondary DNS.
   last good copy.
 - Status page: totals and list status for everyone on the LAN; query log, top lists, upstream
   servers (answers, failures, average time) and pause only with the password. Block or Allow a
-  name from the query log (kept in memory until restart), and Check a name: which list and rule
-  decide it.
+  name from the query log (saved on the device, beside the config file, never in it), and Check a
+  name: which list and rule decide it. Change the upstream servers and the cache from the
+  Settings tab, and add, turn off, remove and reschedule lists from the Lists tab; they apply at
+  once, without a restart, and are saved the same way. A list that would pass the memory budget
+  (`[limits] memory_mb`) is refused before it is used.
+- DNS rewrites: answer a name (or every name under it) with your own addresses or with another
+  name's addresses, also for names under your local domains. SafeSearch: one switch forces safe
+  search on Google, Bing and DuckDuckGo and restricted mode on YouTube. Both from the config file
+  or the Settings tab.
+- Blocked services: switch off a whole service (TikTok, YouTube, a game, ...) from the Settings
+  tab or the config file; picoguard blocks every name it uses, from AdGuard's catalog of services,
+  downloaded at run time and refreshed daily.
 - The status page shows the version and, once a day, whether a newer release exists, and installs
   it with one click: the release is checked against a built-in signature key, a small root
   installer swaps the binary, and the old version comes back if the new one does not answer DNS.
   Turn the check and the button off with `[update] check = false`.
 - Almost no disk writes: the query log and statistics live in memory. The only routine write is
-  the last good copy of a list, only when it changed, and it can be turned off.
+  the last good copy of a list, only when it changed, and it can be turned off. Changes made on
+  the status page are written only when you make them.
 - Hardened service: its own system user, port 53 as the only privilege, and a systemd sandbox.
 - Static binaries for ARMv7, ARM64 and x86_64 Linux. One TOML file for all settings.
 

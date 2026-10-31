@@ -1,5 +1,6 @@
 //! Rules from the status page cost only their own bytes in force, and a change peaks at one
-//! more copy of them: alone, in a burst, and beside a list refresh. This test binary has a
+//! more copy of them and the settings file it saves: alone, in a burst, and beside a list
+//! refresh. This test binary has a
 //! counting global allocator and a single test, so nothing else allocates while it measures.
 
 mod common;
@@ -15,11 +16,12 @@ use common::http::ListServer;
 use picoguard::config::{Config, ListConfig, ListFormat};
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
-use picoguard::lists::{Downloader, MAX_PIECE_BYTES, PIECE_QUEUE};
+use picoguard::lists::{Downloader, MAX_PIECE_BYTES, Names, PIECE_QUEUE};
 use picoguard::policy::Policy;
 use picoguard::scheduler::{
     Action, ListControl, MAX_PENDING_CHANGES, RuleError, Scheduler, Timing,
 };
+use picoguard::settings::{self, Saved, Settings};
 use picoguard::upstream::tls::Tls;
 use tokio::task::JoinHandle;
 
@@ -65,8 +67,9 @@ const PER_RULE_BYTES: usize = 256;
 /// Rule-set shells, the engine struct, and a respawned blocking-pool thread.
 const FIXED_BYTES: usize = 32 * 1024;
 
-/// The engine struct, the empty rule-set shells and allocator slack of one change. Measured: a
-/// change with 500 rules peaked 2,713 bytes above one copy of them.
+/// The engine struct, the empty rule-set shells, the file write's task and allocator slack of
+/// one change. Measured: a change with 500 rules peaked 3,059 bytes above one copy of them and
+/// their 38,040-byte settings file.
 const CHANGE_SLACK_BYTES: usize = 4 * 1024;
 
 /// Run-to-run variance of the refresh itself: how far the download may run ahead of the
@@ -206,7 +209,9 @@ async fn finish_flips(
 
 fn downloader() -> Downloader {
     Downloader::new(
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     )
 }
@@ -215,7 +220,8 @@ fn downloader() -> Downloader {
 async fn page_rules_cost_only_their_own_bytes_and_a_change_peaks_at_one_copy_of_them() {
     let server = ListServer::start().await;
     serve(&server, 0);
-    let config = Config {
+    let state = common::release::scratch("rule-actions-memory");
+    let mut config = Config {
         lists: vec![ListConfig {
             name: Some("big".to_string()),
             url: Some(server.url("/big.txt")),
@@ -224,8 +230,10 @@ async fn page_rules_cost_only_their_own_bytes_and_a_change_peaks_at_one_copy_of_
         }],
         ..Config::default()
     };
+    config.state.dir = state.clone();
     let mut scheduler = Scheduler::boot(
         &config,
+        Arc::new(Saved::new(config.clone(), Settings::default(), None)),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
         Timing {
@@ -285,9 +293,13 @@ async fn page_rules_cost_only_their_own_bytes_and_a_change_peaks_at_one_copy_of_
         .unwrap();
     let change_peak = peak_since(before);
     settle().await;
+    // The file is encoded once into a buffer of its exact size.
+    let file_bytes = std::fs::metadata(state.join(settings::FILE_NAME))
+        .unwrap()
+        .len() as usize;
     assert!(
-        change_peak <= one_copy + CHANGE_SLACK_BYTES,
-        "a change peaked at {change_peak} bytes, one copy is {one_copy}"
+        change_peak <= one_copy + file_bytes + CHANGE_SLACK_BYTES,
+        "a change peaked at {change_peak} bytes, one copy is {one_copy}, the file {file_bytes}"
     );
     assert!(
         change_peak < refresh_peak,
@@ -333,8 +345,8 @@ async fn page_rules_cost_only_their_own_bytes_and_a_change_peaks_at_one_copy_of_
     settle().await;
 
     println!(
-        "refresh_peak {refresh_peak}, one_copy {one_copy} ({} per rule), change_peak {change_peak}, \
-         burst_peak {burst_peak}, overlap_peak {overlap_peak}",
+        "refresh_peak {refresh_peak}, one_copy {one_copy} ({} per rule), file_bytes {file_bytes}, \
+         change_peak {change_peak}, burst_peak {burst_peak}, overlap_peak {overlap_peak}",
         one_copy / PAGE_RULES
     );
     assert!(

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::compile::DEFAULT_SLOW_RULE_BUDGET;
 use crate::password::PasswordHash;
+use crate::scheduler::normalized_name;
 use crate::upstream::Upstreams;
 
 const UPSTREAM_SCHEMES: [&str; 4] = ["https://", "tls://", "udp://", "tcp://"];
@@ -19,6 +21,9 @@ const MAX_QUERY_LOG_ENTRIES: usize = 100_000;
 const MAX_TOP_K: usize = 1000;
 const MAX_OPTIMISTIC_ANSWER_TTL_SECS: usize = 3600;
 const MAX_OPTIMISTIC_MAX_AGE_SECS: usize = 604_800;
+const MAX_REWRITES: usize = 1000;
+pub(crate) const MAX_BLOCKED_SERVICES: usize = 1000;
+pub(crate) const MAX_SERVICE_ID_BYTES: usize = 64;
 
 /// Networks that may talk to picoguard: loopback, private ranges, CGNAT
 /// (which covers Tailscale) and link-local.
@@ -199,6 +204,9 @@ pub struct Config {
     pub blocked_ttl: u32,
     pub blocked_hosts: Vec<String>,
     pub refuse_any: bool,
+    pub rewrites: Vec<Rewrite>,
+    pub safe_search: bool,
+    pub services: ServicesConfig,
 }
 
 impl Default for Config {
@@ -235,6 +243,9 @@ impl Default for Config {
                 .map(String::from)
                 .to_vec(),
             refuse_any: true,
+            rewrites: Vec::new(),
+            safe_search: false,
+            services: ServicesConfig::default(),
         }
     }
 }
@@ -256,7 +267,7 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         self.server.validate()?;
         self.upstream.validate()?;
         self.local.validate()?;
@@ -267,6 +278,8 @@ impl Config {
         self.web.validate()?;
         self.stats.validate()?;
         self.state.validate()?;
+        validate_rewrites(&self.rewrites)?;
+        self.services.validate()?;
 
         // What the server would stop at when it starts.
         Upstreams::from_config(&self.upstream, &self.limits).map_err(ConfigError::Invalid)?;
@@ -411,6 +424,8 @@ pub struct ListConfig {
     /// Lets a downloaded list answer a name with the IP of its hosts line. Without it any IP
     /// but 0.0.0.0, ::, 127.0.0.1 and ::1 blocks like 0.0.0.0. Local files always may.
     pub allow_redirects: bool,
+    /// A list that is off is not downloaded and holds no memory.
+    pub enabled: bool,
 }
 
 impl Default for ListConfig {
@@ -425,6 +440,7 @@ impl Default for ListConfig {
             max_body_bytes: 64 * 1024 * 1024,
             slow_rule_budget: DEFAULT_SLOW_RULE_BUDGET,
             allow_redirects: false,
+            enabled: true,
         }
     }
 }
@@ -450,16 +466,7 @@ impl ListConfig {
             }
 
             (Some(url), None) => {
-                let Some(rest) = LIST_URL_SCHEMES
-                    .iter()
-                    .find_map(|scheme| url.strip_prefix(scheme))
-                else {
-                    return invalid(format!("{field}.url must start with http:// or https://"));
-                };
-
-                if !has_host(rest) {
-                    return invalid(format!("{field}.url has no host"));
-                }
+                validate_url(&format!("{field}.url"), url)?;
             }
 
             (None, Some(path)) => {
@@ -474,6 +481,21 @@ impl ListConfig {
         positive(&format!("{field}.max_body_bytes"), self.max_body_bytes)?;
         positive(&format!("{field}.slow_rule_budget"), self.slow_rule_budget)
     }
+}
+
+fn validate_url(field: &str, url: &str) -> Result<(), ConfigError> {
+    let Some(rest) = LIST_URL_SCHEMES
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme))
+    else {
+        return invalid(format!("{field} must start with http:// or https://"));
+    };
+
+    if !has_host(rest) {
+        return invalid(format!("{field} has no host"));
+    }
+
+    Ok(())
 }
 
 fn has_host(url_after_scheme: &str) -> bool {
@@ -491,12 +513,157 @@ fn has_host(url_after_scheme: &str) -> bool {
     !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
+/// A source is a list's identity on the status page, so one role holds it once.
 fn validate_lists(section: &str, lists: &[ListConfig]) -> Result<(), ConfigError> {
     for (index, list) in lists.iter().enumerate() {
         list.validate(&format!("{section}[{index}]"))?;
+
+        let same_source = lists[..index]
+            .iter()
+            .position(|other| other.url == list.url && other.path == list.path);
+        if let Some(first) = same_source {
+            return invalid(format!(
+                "{section}[{index}] has the same source as {section}[{first}]"
+            ));
+        }
     }
 
     Ok(())
+}
+
+/// A name that picoguard answers itself: `name` or `*.name` (its subdomains, not the name),
+/// and an IP address or another name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rewrite {
+    pub name: String,
+    pub answer: String,
+}
+
+/// What one name of the rewrites answers so far.
+#[derive(Default)]
+struct Answers {
+    addresses: bool,
+    names: usize,
+}
+
+/// A name has either addresses, as many as wanted, or exactly one other name.
+fn validate_rewrites(rewrites: &[Rewrite]) -> Result<(), ConfigError> {
+    if rewrites.len() > MAX_REWRITES {
+        return invalid(format!("rewrites: at most {MAX_REWRITES} entries"));
+    }
+
+    let mut answers: HashMap<String, Answers> = HashMap::new();
+    for (index, rewrite) in rewrites.iter().enumerate() {
+        let field = format!("rewrites[{index}]");
+        let Some(owner) = rewrite_owner(&rewrite.name) else {
+            return invalid(format!(
+                "{field}.name must be a domain name, or *. and a domain name"
+            ));
+        };
+
+        let target = if rewrite.answer.trim().parse::<IpAddr>().is_ok() {
+            None
+        } else {
+            // An address with a typo, such as a leading zero, would otherwise pass as a name.
+            let Some(target) = normalized_name(&rewrite.answer).filter(|target| {
+                !target
+                    .rsplit('.')
+                    .all(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+            }) else {
+                return invalid(format!(
+                    "{field}.answer must be an IP address or a domain name"
+                ));
+            };
+
+            Some(target)
+        };
+
+        if target.as_ref() == Some(&owner) {
+            return invalid(format!("{field} points {owner} at itself"));
+        }
+
+        let seen = answers.entry(owner).or_default();
+        match target {
+            Some(_) => seen.names += 1,
+            None => seen.addresses = true,
+        }
+
+        if seen.addresses && seen.names > 0 {
+            return invalid(format!(
+                "{field}: {} has addresses and a name",
+                rewrite.name.to_ascii_lowercase()
+            ));
+        }
+
+        if seen.names > 1 {
+            return invalid(format!(
+                "{field}: {} has more than one name",
+                rewrite.name.to_ascii_lowercase()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// The name a rewrite answers for, normalized, with its `*.` kept.
+fn rewrite_owner(name: &str) -> Option<String> {
+    let name = name.trim();
+
+    match name.strip_prefix("*.") {
+        Some(base) => normalized_name(base).map(|base| format!("*.{base}")),
+        None => normalized_name(name),
+    }
+}
+
+/// Blocked services (plan D8): the catalog is downloaded, never shipped.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServicesConfig {
+    /// The ids of the services to block.
+    pub block: Vec<String>,
+    pub catalog_url: String,
+    pub refresh_hours: u32,
+}
+
+impl Default for ServicesConfig {
+    fn default() -> Self {
+        ServicesConfig {
+            block: Vec::new(),
+            catalog_url: "https://adguardteam.github.io/HostlistsRegistry/assets/services.json"
+                .to_string(),
+            refresh_hours: 24,
+        }
+    }
+}
+
+impl ServicesConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.block.len() > MAX_BLOCKED_SERVICES {
+            return invalid(format!(
+                "services.block: at most {MAX_BLOCKED_SERVICES} entries"
+            ));
+        }
+
+        for (index, id) in self.block.iter().enumerate() {
+            let is_id = (1..=MAX_SERVICE_ID_BYTES).contains(&id.len())
+                && id.bytes().all(|byte| byte.is_ascii_graphic());
+            if !is_id {
+                return invalid(format!(
+                    "services.block[{index}] must be 1 to {MAX_SERVICE_ID_BYTES} visible characters"
+                ));
+            }
+
+            if self.block[..index].contains(id) {
+                return invalid(format!("services.block[{index}] is listed twice"));
+            }
+        }
+
+        validate_url("services.catalog_url", &self.catalog_url)?;
+
+        positive("services.refresh_hours", self.refresh_hours)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -574,6 +741,8 @@ pub struct LimitsConfig {
     pub tcp_write_timeout_secs: u64,
     pub upstream_reply_max: usize,
     pub pending_bytes: usize,
+    /// What the estimate of the whole process may reach when a list is added (plan D6).
+    pub memory_mb: usize,
 }
 
 impl Default for LimitsConfig {
@@ -593,6 +762,7 @@ impl Default for LimitsConfig {
             tcp_write_timeout_secs: 5,
             upstream_reply_max: 64 * 1024,
             pending_bytes: 1024 * 1024,
+            memory_mb: 48,
         }
     }
 }
@@ -613,6 +783,7 @@ impl LimitsConfig {
         positive("limits.tcp_write_timeout_secs", self.tcp_write_timeout_secs)?;
         positive("limits.upstream_reply_max", self.upstream_reply_max)?;
         positive("limits.pending_bytes", self.pending_bytes)?;
+        positive("limits.memory_mb", self.memory_mb)?;
 
         for (field, window) in [
             ("limits.h2_stream_window", self.h2_stream_window),
@@ -1615,6 +1786,195 @@ mod tests {
         let message = error_of("[server]\nbind = [\"not-an-ip\"]");
 
         assert!(message.contains("invalid IP address"), "{message}");
+    }
+
+    #[test]
+    fn the_release_2_keys_default_to_nothing_new() {
+        let config = Config::default();
+
+        assert!(config.rewrites.is_empty());
+        assert!(!config.safe_search);
+        assert!(config.services.block.is_empty());
+        assert_eq!(
+            config.services.catalog_url,
+            "https://adguardteam.github.io/HostlistsRegistry/assets/services.json"
+        );
+        assert_eq!(config.services.refresh_hours, 24);
+        assert_eq!(config.limits.memory_mb, 48);
+        assert!(config.lists.iter().all(|list| list.enabled));
+    }
+
+    #[test]
+    fn the_release_2_keys_parse() {
+        let config = Config::parse(
+            r#"
+            safe_search = true
+
+            [[rewrites]]
+            name = "nas.lan"
+            answer = "192.168.1.10"
+
+            [[rewrites]]
+            name = "nas.lan"
+            answer = "fd00::10"
+
+            [[rewrites]]
+            name = "*.nas.lan"
+            answer = "nas.lan"
+
+            [services]
+            block = ["tiktok", "amazon_streaming"]
+            catalog_url = "https://example.com/services.json"
+            refresh_hours = 12
+
+            [limits]
+            memory_mb = 32
+
+            [[lists]]
+            url = "https://example.com/a.txt"
+            enabled = false
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.safe_search);
+        assert_eq!(config.rewrites.len(), 3);
+        assert_eq!(config.rewrites[2].name, "*.nas.lan");
+        assert_eq!(config.rewrites[2].answer, "nas.lan");
+        assert_eq!(config.services.block, ["tiktok", "amazon_streaming"]);
+        assert_eq!(config.services.refresh_hours, 12);
+        assert_eq!(config.limits.memory_mb, 32);
+        assert!(!config.lists[0].enabled);
+    }
+
+    #[test]
+    fn bad_release_2_values_are_rejected_with_the_field_name() {
+        let too_many_rewrites: String = (0..1001)
+            .map(|index| format!("[[rewrites]]\nname = \"n{index}.lan\"\nanswer = \"10.0.0.1\"\n"))
+            .collect();
+        let too_many_services = format!(
+            "[services]\nblock = [{}]",
+            (0..1001)
+                .map(|index| format!("\"s{index}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let cases = [
+            (
+                "[[rewrites]]\nname = \"nas\"\nanswer = \"10.0.0.1\"".to_string(),
+                "rewrites[0].name must be a domain name",
+            ),
+            (
+                "[[rewrites]]\nname = \"*.\"\nanswer = \"10.0.0.1\"".to_string(),
+                "rewrites[0].name must be a domain name",
+            ),
+            (
+                "[[rewrites]]\nname = \"nas.lan\"\nanswer = \"not an answer\"".to_string(),
+                "rewrites[0].answer must be an IP address or a domain name",
+            ),
+            (
+                "[[rewrites]]\nname = \"nas.lan\"\nanswer = \"192.168.001.10\"".to_string(),
+                "rewrites[0].answer must be an IP address or a domain name",
+            ),
+            (
+                "[[rewrites]]\nname = \"nas.lan\"\nanswer = \"NAS.lan.\"".to_string(),
+                "rewrites[0] points nas.lan at itself",
+            ),
+            (
+                "[[rewrites]]\nname = \"a.lan\"\nanswer = \"10.0.0.1\"\n\
+                 [[rewrites]]\nname = \"A.lan\"\nanswer = \"b.lan\""
+                    .to_string(),
+                "rewrites[1]: a.lan has addresses and a name",
+            ),
+            (
+                "[[rewrites]]\nname = \"a.lan\"\nanswer = \"b.lan\"\n\
+                 [[rewrites]]\nname = \"a.lan\"\nanswer = \"10.0.0.1\""
+                    .to_string(),
+                "rewrites[1]: a.lan has addresses and a name",
+            ),
+            (
+                "[[rewrites]]\nname = \"a.lan\"\nanswer = \"b.lan\"\n\
+                 [[rewrites]]\nname = \"a.lan\"\nanswer = \"c.lan\""
+                    .to_string(),
+                "rewrites[1]: a.lan has more than one name",
+            ),
+            (
+                "[[rewrites]]\nname = \"a.lan\"\nanswer = \"10.0.0.1\"\nttl = 5".to_string(),
+                "unknown field `ttl`",
+            ),
+            (too_many_rewrites, "rewrites: at most 1000 entries"),
+            (
+                "[services]\nblock = [\"\"]".to_string(),
+                "services.block[0] must be 1 to 64 visible characters",
+            ),
+            (
+                format!("[services]\nblock = [\"{}\"]", "x".repeat(65)),
+                "services.block[0] must be 1 to 64 visible characters",
+            ),
+            (
+                "[services]\nblock = [\"a b\"]".to_string(),
+                "services.block[0] must be 1 to 64 visible characters",
+            ),
+            (
+                "[services]\nblock = [\"tiktok\", \"tiktok\"]".to_string(),
+                "services.block[1] is listed twice",
+            ),
+            (too_many_services, "services.block: at most 1000 entries"),
+            (
+                "[services]\ncatalog_url = \"ftp://example.com/s.json\"".to_string(),
+                "services.catalog_url must start with http:// or https://",
+            ),
+            (
+                "[services]\ncatalog_url = \"https://\"".to_string(),
+                "services.catalog_url has no host",
+            ),
+            (
+                "[services]\nrefresh_hours = 0".to_string(),
+                "services.refresh_hours must be > 0",
+            ),
+            (
+                "[limits]\nmemory_mb = 0".to_string(),
+                "limits.memory_mb must be > 0",
+            ),
+            (
+                "[[lists]]\nurl = \"https://e.com/a\"\n[[lists]]\npath = \"/l\"\n\
+                 [[lists]]\nurl = \"https://e.com/a\"\nname = \"again\""
+                    .to_string(),
+                "lists[2] has the same source as lists[0]",
+            ),
+            (
+                "[[allowlists]]\npath = \"/a\"\n[[allowlists]]\npath = \"/a\"".to_string(),
+                "allowlists[1] has the same source as allowlists[0]",
+            ),
+        ];
+
+        for (text, expected) in cases {
+            let message = error_of(&text);
+
+            assert!(
+                message.contains(expected),
+                "config {text:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_source_may_be_both_a_blocklist_and_an_allowlist() {
+        let config = Config::parse(
+            "[[lists]]\nurl = \"https://e.com/a\"\n[[allowlists]]\nurl = \"https://e.com/a\"",
+        );
+
+        assert!(config.is_ok(), "{config:?}");
+    }
+
+    #[test]
+    fn a_wildcard_and_its_base_name_are_separate_owners() {
+        let config = Config::parse(
+            "[[rewrites]]\nname = \"*.a.lan\"\nanswer = \"a.lan\"\n\
+             [[rewrites]]\nname = \"a.lan\"\nanswer = \"10.0.0.1\"",
+        );
+
+        assert!(config.is_ok(), "{config:?}");
     }
 
     #[test]

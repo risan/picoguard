@@ -13,14 +13,40 @@ use std::fmt;
 
 use regex_automata::meta::{self, Regex};
 use regex_automata::nfa::thompson::WhichCaptures;
-use regex_automata::util::syntax;
+use regex_syntax::ast::{self, Ast, ClassPerlKind, ClassSetItem};
+use regex_syntax::hir::translate::TranslatorBuilder;
 
 /// Compiled regexes may not grow beyond this many bytes. The slow-rule budget charges what
 /// each regex really holds, so this only bounds one regex and the time to compile it.
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
+/// What building any regex holds for a moment besides the regex: the tables of the NFA
+/// compiler. Measured at 300 to 500 KB in `tests/regex_admission_memory.rs`.
+pub const REGEX_BUILD_BYTES: usize = 640 * 1024;
+/// Building a regex holds up to this many times its NFA size limit on top of
+/// `REGEX_BUILD_BYTES`, also when the limit stops it (measured at under 4).
+pub const REGEX_BUILD_FACTOR: usize = 5;
+
 /// Go's `regexp` rejects repetition counts above this.
 const MAX_REPEAT: u32 = 1000;
+
+/// Parsing a regex holds its syntax tree, then the tree and its translation (the HIR) together
+/// (`regex_parse_bytes`). Measured in `tests/regex_admission_memory.rs` and on patterns of 4 KiB
+/// of one construct repeated: the tree at most 108 bytes per byte of the pattern and 2 KiB
+/// for a class, the translation at most 416 bytes per byte besides its Unicode classes.
+const AST_BYTES_PER_BYTE: usize = 128;
+const AST_BASE_BYTES: usize = 2048;
+const HIR_BYTES_PER_BYTE: usize = 512;
+/// A Unicode class (`\pL`, `\p{Any}`, `\w`, a wide range) once translated, case folding
+/// included: measured at most 81 KB. Inside brackets each item counts twice, for the
+/// negation or set operation that may copy it.
+const UNICODE_CLASS_BYTES: usize = 96 * 1024;
+const SMALL_CLASS_BYTES: usize = 4096;
+/// What a range of one character costs in a class: its folded ranges, grown by doubling.
+const CLASS_BYTES_PER_CHAR: usize = 32;
+/// A regex whose parse would hold more than this is too complex, whatever the room: a few
+/// dozen Unicode classes, never a real list's rule.
+const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// A compiled slow-rule pattern.
 pub struct Matcher {
@@ -41,20 +67,28 @@ enum Subject {
 enum Body {
     Any,
     Glob(Glob),
-    /// With the bytes it is charged: what it holds and what one search cache holds.
-    Regex(Regex, usize),
+    /// With the bytes it is charged (what it holds and what one search cache holds) and what
+    /// parsing it held (`regex_parse_bytes`).
+    Regex(Regex, usize, usize),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PatternError {
-    /// The regular expression is rejected by Go's `regexp` or cannot be compiled here.
-    Regex(String),
+    /// The regular expression is rejected by Go's `regexp` or cannot be compiled here, with
+    /// the most the attempt held while it parsed or built it.
+    Regex(String, usize),
+    /// The regular expression builds to more than `REGEX_SIZE_LIMIT` bytes.
+    TooComplex,
+    /// Building the regular expression would hold more than `Matcher::compile_within` allows.
+    TooBig,
 }
 
 impl fmt::Display for PatternError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PatternError::Regex(message) => write!(formatter, "regex: {message}"),
+            PatternError::Regex(message, _) => write!(formatter, "regex: {message}"),
+            PatternError::TooComplex => write!(formatter, "regex: too complex"),
+            PatternError::TooBig => write!(formatter, "regex: over the bytes it may hold"),
         }
     }
 }
@@ -62,6 +96,15 @@ impl fmt::Display for PatternError {
 impl Matcher {
     /// `pattern` is the rule pattern after urlfilter's normalization (`/*` to `^`).
     pub fn compile(pattern: &str) -> Result<Matcher, PatternError> {
+        Matcher::compile_within(pattern, usize::MAX)
+    }
+
+    /// `compile`, where building a regex may hold at most `room` bytes (see
+    /// `regex_build_bytes` and `regex_parse_bytes`). A regex that only more room would build
+    /// fails with `TooBig`, so a limit never turns a valid rule into a failed one; a regex that
+    /// is not valid fails as it would without a limit once the room holds what its attempt
+    /// held (`PatternError::Regex`), and with `TooBig` before.
+    pub fn compile_within(pattern: &str, room: usize) -> Result<Matcher, PatternError> {
         let is_regex = is_regex_pattern(pattern);
         let shortcut = if is_regex {
             regex_shortcut(pattern)
@@ -87,9 +130,9 @@ impl Matcher {
             if inner == ".*" {
                 Body::Any
             } else {
-                let (regex, cost) = compile_regex(inner)?;
+                let (regex, cost, parse_bytes) = compile_regex(inner, room)?;
 
-                Body::Regex(regex, cost)
+                Body::Regex(regex, cost, parse_bytes)
             }
         } else {
             Body::Glob(Glob::parse(pattern))
@@ -108,7 +151,19 @@ impl Matcher {
         match &self.body {
             Body::Any => 0,
             Body::Glob(glob) => glob.cost_bytes(),
-            Body::Regex(_, cost) => *cost,
+            Body::Regex(_, cost, _) => *cost,
+        }
+    }
+
+    /// The most that building this matcher held at once, as `regex_build_bytes` and
+    /// `regex_parse_bytes` count it.
+    pub fn build_bytes(&self) -> usize {
+        match &self.body {
+            Body::Regex(regex, _, parse_bytes) => {
+                regex_build_bytes(regex.memory_usage()) + parse_bytes
+            }
+
+            Body::Any | Body::Glob(_) => 0,
         }
     }
 
@@ -132,7 +187,7 @@ impl Matcher {
         match &self.body {
             Body::Any => true,
             Body::Glob(glob) => glob.is_match(subject.as_bytes()),
-            Body::Regex(regex, _) => regex.is_match(subject),
+            Body::Regex(regex, _, _) => regex.is_match(subject),
         }
     }
 }
@@ -149,24 +204,145 @@ fn uses_url(pattern: &str) -> bool {
         || (pattern.len() >= 4 && pattern.starts_with('/') && pattern.ends_with('.'))
 }
 
-/// The regex and its cost: the memory it holds plus one search cache (the pool of the regex
-/// makes one per thread that searches; the DNS thread and the compile worker are the only
-/// ones). The engines of the `regex` crate that grow their caches while they search, the
-/// lazy DFA among them, are not built in, so both numbers are fixed once compiled.
-fn compile_regex(source: &str) -> Result<(Regex, usize), PatternError> {
+/// The regex, its cost (the memory it holds plus one search cache) and what parsing it held.
+/// The pool of the regex makes one cache per thread that searches; the DNS thread and the
+/// compile worker are the only ones. The engines of the `regex` crate that grow their caches
+/// while they search, the lazy DFA among them, are not built in, so both numbers are fixed
+/// once compiled. Each step is charged against `room` before it allocates: the syntax tree by
+/// the length of the pattern, the translation by its length and its classes, counted on the
+/// tree, and the automaton by its size limit.
+fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize, usize), PatternError> {
     let translated = translate_go_regex(source)?;
+    let fits = |bytes: usize| room == usize::MAX || REGEX_BUILD_BYTES + bytes <= room;
+    let ast_bytes = AST_BASE_BYTES + AST_BYTES_PER_BYTE * translated.len();
+    if !fits(ast_bytes) {
+        return Err(PatternError::TooBig);
+    }
+
+    let ast = ast::parse::Parser::new()
+        .parse(&translated)
+        .map_err(|error| PatternError::Regex(error.to_string(), REGEX_BUILD_BYTES + ast_bytes))?;
+    let parse_bytes = regex_parse_bytes(&ast, translated.len());
+    if parse_bytes > MAX_PARSE_BYTES {
+        if too_complex_build_bytes() > room {
+            return Err(PatternError::TooBig);
+        }
+
+        return Err(PatternError::TooComplex);
+    }
+
+    if !fits(parse_bytes) {
+        return Err(PatternError::TooBig);
+    }
+
+    let hir = TranslatorBuilder::new()
+        .case_insensitive(true)
+        .build()
+        .translate(&translated, &ast)
+        .map_err(|error| PatternError::Regex(error.to_string(), REGEX_BUILD_BYTES + parse_bytes))?;
+    drop(ast);
+    let size_limit = if room == usize::MAX {
+        REGEX_SIZE_LIMIT
+    } else {
+        let left = room - REGEX_BUILD_BYTES - parse_bytes;
+
+        (left / REGEX_BUILD_FACTOR).min(REGEX_SIZE_LIMIT)
+    };
     let regex = meta::Builder::new()
         .configure(
             meta::Config::new()
-                .nfa_size_limit(Some(REGEX_SIZE_LIMIT))
+                .nfa_size_limit(Some(size_limit))
                 .which_captures(WhichCaptures::None),
         )
-        .syntax(syntax::Config::new().case_insensitive(true))
-        .build(&translated)
-        .map_err(|error| PatternError::Regex(error.to_string()))?;
+        .build_from_hir(&hir)
+        .map_err(|error| match error.size_limit() {
+            Some(_) if size_limit < REGEX_SIZE_LIMIT || too_complex_build_bytes() > room => {
+                PatternError::TooBig
+            }
+            Some(_) => PatternError::TooComplex,
+            None => PatternError::Regex(
+                error.to_string(),
+                parse_bytes + REGEX_BUILD_BYTES + REGEX_BUILD_FACTOR * size_limit,
+            ),
+        })?;
+    drop(hir);
+    if regex_build_bytes(regex.memory_usage()) + parse_bytes > room {
+        return Err(PatternError::TooBig);
+    }
+
     let cost = regex.memory_usage() + regex.create_cache().memory_usage();
 
-    Ok((regex, cost))
+    Ok((regex, cost, parse_bytes))
+}
+
+/// What parsing a regex of `length` bytes with this syntax tree holds at most: the tree, and
+/// its translation with every Unicode class in it.
+fn regex_parse_bytes(ast: &Ast, length: usize) -> usize {
+    let classes = ast::visit(ast, ClassBytes(0)).unwrap_or(usize::MAX / 2);
+
+    AST_BASE_BYTES + (AST_BYTES_PER_BYTE + HIR_BYTES_PER_BYTE) * length + classes
+}
+
+/// Adds up what the classes of a syntax tree cost once translated.
+struct ClassBytes(usize);
+
+impl ClassBytes {
+    fn perl(kind: &ClassPerlKind) -> usize {
+        match kind {
+            ClassPerlKind::Word => UNICODE_CLASS_BYTES,
+            ClassPerlKind::Digit | ClassPerlKind::Space => SMALL_CLASS_BYTES,
+        }
+    }
+}
+
+impl ast::Visitor for ClassBytes {
+    type Output = usize;
+    type Err = std::convert::Infallible;
+
+    fn finish(self) -> Result<usize, Self::Err> {
+        Ok(self.0)
+    }
+
+    fn visit_pre(&mut self, ast: &Ast) -> Result<(), Self::Err> {
+        self.0 += match ast {
+            Ast::ClassUnicode(_) => UNICODE_CLASS_BYTES,
+            Ast::ClassPerl(class) => ClassBytes::perl(&class.kind),
+            _ => 0,
+        };
+
+        Ok(())
+    }
+
+    fn visit_class_set_item_pre(&mut self, item: &ClassSetItem) -> Result<(), Self::Err> {
+        let bytes = match item {
+            ClassSetItem::Unicode(_) => UNICODE_CLASS_BYTES,
+            ClassSetItem::Perl(class) => ClassBytes::perl(&class.kind),
+            ClassSetItem::Ascii(_) => SMALL_CLASS_BYTES,
+            ClassSetItem::Range(range) => {
+                let width = (range.end.c as usize).saturating_sub(range.start.c as usize) + 1;
+
+                (CLASS_BYTES_PER_CHAR * width).min(UNICODE_CLASS_BYTES)
+            }
+            _ => 0,
+        };
+        self.0 += 2 * bytes;
+
+        Ok(())
+    }
+}
+
+/// The room `Matcher::compile_within` needs to build again a regex that holds `regex_bytes`:
+/// the NFA size limit it then gets is half as large again as the regex (its NFA grows past
+/// its final size while it is built, by up to 1.5 times as measured), with 4 KiB for the
+/// smallest ones.
+pub fn regex_build_bytes(regex_bytes: usize) -> usize {
+    REGEX_BUILD_BYTES + REGEX_BUILD_FACTOR * (regex_bytes + regex_bytes / 2 + 4096)
+}
+
+/// What a regex that is too complex held at most: its parse, and the build that
+/// `REGEX_SIZE_LIMIT` stopped.
+pub fn too_complex_build_bytes() -> usize {
+    MAX_PARSE_BYTES + regex_build_bytes(REGEX_SIZE_LIMIT)
 }
 
 // ---- Glob patterns ----
@@ -587,7 +763,7 @@ pub fn translate_go_regex(source: &str) -> Result<String, PatternError> {
 }
 
 fn syntax_error(message: &str) -> PatternError {
-    PatternError::Regex(message.to_string())
+    PatternError::Regex(message.to_string(), 0)
 }
 
 fn push_escaped(out: &mut String, c: char) {

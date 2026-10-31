@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use common::release::{Files, REQUEST_ID, TARGET, hex, scratch, sign, test_key};
 use common::stream::{Route, StreamServer, pattern_hash};
+use picoguard::lists::Names;
 use picoguard::release::{Request, VerifySetup, verify_update};
 use picoguard::stage::{StageSetup, StageTiming, Stager};
 use picoguard::update::{Build, Latest, Updates};
@@ -158,7 +159,9 @@ fn staging_peaks_below_a_megabyte_whatever_the_size_and_keeps_nothing() {
                 },
             },
             updates,
-            Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+            Names::Resolver(Arc::new(|_| {
+                Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+            })),
             Arc::new(Tls::with_webpki_roots()),
         );
 

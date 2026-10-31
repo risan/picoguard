@@ -19,11 +19,15 @@ use picoguard::dns::wire::Query;
 use picoguard::filter::compile::{CompileOptions, CompileWorker};
 use picoguard::filter::engine::Verdict;
 use picoguard::filter::snapshot::{self, SnapshotStore};
-use picoguard::lists::{Downloader, resolver_over};
+use picoguard::lists::{Downloader, Names};
 use picoguard::policy::Policy;
-use picoguard::scheduler::{Action, ButtonRule, Explained, Role, RuleError, Scheduler, Timing};
-use picoguard::upstream::Upstreams;
+use picoguard::scheduler::{
+    Action, ButtonRule, Explained, ListControl, ListEdit, ListError, OVER_THE_MEMORY_BUDGET, Role,
+    RuleError, Scheduler, Timing,
+};
+use picoguard::settings::{self, ListRole, PageList, SaveError, Saved, Settings};
 use picoguard::upstream::tls::Tls;
+use picoguard::upstream::{SharedUpstreams, Upstreams};
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -140,15 +144,26 @@ fn config_of(dir: &StateDir, lists: Vec<ListConfig>) -> Config {
 
 fn downloader() -> Downloader {
     Downloader::new(
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     )
+}
+
+/// The saved settings in the state folder of `config`, as a start reads them.
+fn saved_of(config: &Config) -> Arc<Saved> {
+    let loaded = settings::with_saved(config.clone());
+    assert_eq!(&loaded.config, config, "these tests save page rules only");
+
+    Arc::new(loaded.saved)
 }
 
 async fn boot_with(config: &Config, store: SnapshotStore) -> (Scheduler, Arc<SnapshotStore>) {
     let store = Arc::new(store);
     let scheduler = Scheduler::boot(
         config,
+        saved_of(config),
         CompileWorker::spawn().unwrap(),
         Arc::clone(&store),
         quick_timing(),
@@ -858,7 +873,7 @@ async fn list_hosts_are_resolved_through_the_upstream_pool() {
         &Config::default().limits,
     );
     let downloader = Downloader::new(
-        resolver_over(Arc::new(upstreams)),
+        Names::Upstreams(Arc::new(SharedUpstreams::new(upstreams))),
         Arc::new(Tls::with_webpki_roots()),
     );
     let url = format!("http://lists.example:{}/l.txt", server.address.port());
@@ -1272,6 +1287,7 @@ async fn asking_for_a_refresh_checks_every_list_once_and_one_at_a_time() {
     let config = config_of(&dir, lists);
     let scheduler = Scheduler::boot(
         &config,
+        saved_of(&config),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
         slow_timing(),
@@ -1315,6 +1331,7 @@ async fn repeated_requests_during_a_refresh_still_refresh_every_list() {
     let config = config_of(&dir, lists);
     let scheduler = Scheduler::boot(
         &config,
+        saved_of(&config),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
         slow_timing(),
@@ -1535,6 +1552,7 @@ async fn a_rule_change_during_a_slow_download_is_applied_at_once_and_both_stay()
     let config = config_of(&dir, vec![url_list("slow", server.url("/slow.txt"))]);
     let scheduler = Scheduler::boot(
         &config,
+        saved_of(&config),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
         slow_timing(),
@@ -1762,27 +1780,148 @@ async fn bad_names_are_refused_before_anything_changes() {
     assert!(page_rules(&control).await.is_empty());
 }
 
+fn settings_file(dir: &StateDir) -> Option<Settings> {
+    settings::read(&dir.file(settings::FILE_NAME)).unwrap()
+}
+
 #[tokio::test]
-async fn page_rules_are_gone_after_a_restart_and_nothing_is_written() {
+async fn page_rules_come_back_after_a_restart_and_only_their_file_is_written() {
     let dir = StateDir::new();
     fs::write(dir.file("block.txt"), "||list.example^\n").unwrap();
     let config = config_of(&dir, vec![path_list(dir.file("block.txt"))]);
     let (scheduler, _) = boot(&config).await;
     let control = scheduler.control();
+    let before = every_file(dir.path());
     for name in ["a.example", "b.example", "c.example"] {
         control.add_button_rule(name, Action::Block).await.unwrap();
     }
 
     assert!(blocked(&scheduler.policy(), "b.example."));
     let files = every_file(dir.path());
+    let written: Vec<_> = files
+        .iter()
+        .filter(|file| !before.contains(file))
+        .map(|(path, _)| path.clone())
+        .collect();
+    assert_eq!(written, [dir.file(settings::FILE_NAME)]);
+    assert_eq!(files.len(), before.len() + 1);
     drop(scheduler);
 
     let (restarted, _) = boot(&config).await;
 
-    assert!(page_rules(&restarted.control()).await.is_empty());
-    assert!(!blocked(&restarted.policy(), "b.example."));
+    assert_eq!(
+        page_rules(&restarted.control()).await,
+        [
+            rule("a.example", Action::Block),
+            rule("b.example", Action::Block),
+            rule("c.example", Action::Block)
+        ]
+    );
+    assert_eq!(generation(&restarted.policy()), 0);
+    assert!(blocked(&restarted.policy(), "b.example."));
     assert!(blocked(&restarted.policy(), "list.example."));
     assert_eq!(every_file(dir.path()), files);
+}
+
+#[tokio::test]
+async fn saved_page_rules_win_over_the_lists_from_the_first_engine_on() {
+    let dir = StateDir::new();
+    fs::write(dir.file("block.txt"), "||ads.example^\n").unwrap();
+    let config = config_of(&dir, vec![path_list(dir.file("block.txt"))]);
+    fs::write(
+        dir.file(settings::FILE_NAME),
+        "{\"version\": 1, \"page_rules\": [\
+         {\"name\": \"ads.example\", \"action\": \"allow\"},\
+         {\"name\": \"b.example\", \"action\": \"block\"}]}",
+    )
+    .unwrap();
+
+    let (scheduler, _) = boot(&config).await;
+
+    let policy = scheduler.policy();
+    assert_eq!(generation(&policy), 0);
+    assert_eq!(decision(&policy, "ads.example."), Verdict::Allow);
+    assert!(blocked(&policy, "x.b.example."));
+}
+
+#[tokio::test]
+async fn every_rule_change_is_saved_whole() {
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let control = scheduler.control();
+
+    control
+        .add_button_rule("a.example", Action::Block)
+        .await
+        .unwrap();
+    control
+        .add_button_rule("b.example", Action::Allow)
+        .await
+        .unwrap();
+    control
+        .add_button_rule("a.example", Action::Allow)
+        .await
+        .unwrap();
+    control.remove_button_rule("b.example").await.unwrap();
+
+    let saved = settings_file(&dir).unwrap();
+    assert_eq!(saved.page_rules, [rule("a.example", Action::Allow)]);
+    assert_eq!(saved.page_rules, page_rules(&control).await);
+}
+
+#[tokio::test]
+async fn a_change_that_changes_nothing_writes_nothing() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let control = scheduler.control();
+    control
+        .add_button_rule("a.example", Action::Block)
+        .await
+        .unwrap();
+    let file = dir.file(settings::FILE_NAME);
+    let identity = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+
+        (metadata.ino(), metadata.mtime(), metadata.mtime_nsec())
+    };
+    let written = identity(&file);
+    let before = generation(&scheduler.policy());
+
+    assert_eq!(
+        control.add_button_rule("A.example.", Action::Block).await,
+        Ok(())
+    );
+    assert_eq!(
+        control.remove_button_rule("other.example").await,
+        Err(RuleError::NoSuchRule)
+    );
+
+    assert_eq!(identity(&file), written);
+    assert_eq!(generation(&scheduler.policy()), before);
+}
+
+#[tokio::test]
+async fn a_rule_that_cannot_be_saved_is_not_applied() {
+    let dir = StateDir::new();
+    let mut config = config_of(&dir, Vec::new());
+    config.state.dir = dir.file("missing");
+    let (scheduler, _) = boot_with(&config, SnapshotStore::disabled()).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    let before = generation(&policy);
+
+    let refused = control.add_button_rule("b.example", Action::Block).await;
+
+    assert!(
+        matches!(&refused, Err(RuleError::NotSaved(SaveError::Failed(_)))),
+        "{refused:?}"
+    );
+    assert!(!blocked(&policy, "b.example."));
+    assert_eq!(generation(&policy), before);
+    assert!(page_rules(&control).await.is_empty());
+    assert!(!control.saved().can_save());
+    assert!(!dir.file("missing").exists());
 }
 
 #[tokio::test]
@@ -1972,4 +2111,550 @@ async fn explain_names_the_deciding_list_and_rule_and_ignores_pause() {
         control.explain("list.example").await,
         explained(false, "Ads list", "||list.example^")
     );
+}
+
+#[tokio::test]
+async fn a_list_that_is_off_is_left_out_at_boot() {
+    let dir = StateDir::new();
+    let file = dir.file("off.txt");
+    fs::write(&file, V1).unwrap();
+    let config = config_of(
+        &dir,
+        vec![
+            ListConfig {
+                name: Some("off".to_string()),
+                path: Some(file),
+                enabled: false,
+                ..ListConfig::default()
+            },
+            ListConfig {
+                name: Some("on".to_string()),
+                url: Some("https://lists.example/on.txt".to_string()),
+                ..ListConfig::default()
+            },
+        ],
+    );
+
+    let (scheduler, _store) = boot(&config).await;
+
+    let shown: Vec<(String, bool, usize)> = scheduler
+        .control()
+        .statuses()
+        .into_iter()
+        .map(|status| (status.name, status.enabled, status.rules))
+        .collect();
+    assert_eq!(
+        shown,
+        [("off".to_string(), false, 0), ("on".to_string(), true, 0)]
+    );
+    assert!(scheduler.list(0).is_none());
+    assert!(!blocked(&scheduler.policy(), "ads.example"));
+}
+
+const MIB: usize = 1024 * 1024;
+
+fn page_list(url: String) -> PageList {
+    PageList {
+        role: ListRole::Block,
+        name: Some("page".to_string()),
+        url,
+        refresh_hours: 24,
+        enabled: true,
+    }
+}
+
+/// Boots on `file` with `lists` saved on the page, as a start after they were added.
+async fn boot_with_page_lists(file: &Config, lists: Vec<PageList>) -> Scheduler {
+    let settings = Settings {
+        lists: Some(lists),
+        ..Settings::default()
+    };
+    fs::write(
+        file.state.dir.join(settings::FILE_NAME),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+    let loaded = settings::with_saved(file.clone());
+    assert_eq!(loaded.saved.error(), None);
+
+    Scheduler::boot(
+        &loaded.config,
+        Arc::new(loaded.saved),
+        CompileWorker::spawn().unwrap(),
+        Arc::new(SnapshotStore::open(&file.state.dir).unwrap()),
+        quick_timing(),
+    )
+    .await
+    .unwrap()
+}
+
+/// `count` distinct rules.
+fn many_rules(count: usize) -> String {
+    (0..count)
+        .map(|index| format!("||n{index}.example^\n"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_page_list_whose_refresh_grows_past_the_budget_keeps_its_last_good_copy() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/tiny.txt", V1, None);
+    let mut file = config_of(&dir, Vec::new());
+    let lists = vec![page_list(server.url("/tiny.txt"))];
+    let estimate = {
+        let mut scheduler = boot_with_page_lists(&file, lists.clone()).await;
+        scheduler.refresh(0, &downloader()).await;
+        assert!(blocked(&scheduler.policy(), "ads.example."));
+
+        scheduler.control().memory().estimate_bytes
+    };
+    // Less than a mebibyte of room is left.
+    file.limits.memory_mb = estimate / MIB + 1;
+
+    let mut scheduler = boot_with_page_lists(&file, lists).await;
+    let control = scheduler.control();
+    let tiny = Arc::clone(scheduler.list(0).expect("booted from the snapshot"));
+    assert_eq!(control.memory().estimate_bytes, estimate);
+    server.serve("/tiny.txt", &many_rules(100_000), None);
+    scheduler.refresh(0, &downloader()).await;
+
+    let status = &control.statuses()[0];
+    assert_eq!(status.last_error.as_deref(), Some(OVER_THE_MEMORY_BUDGET));
+    assert!(Arc::ptr_eq(&tiny, scheduler.list(0).unwrap()));
+    assert!(blocked(&scheduler.policy(), "ads.example."));
+    assert!(!blocked(&scheduler.policy(), "n5.example."));
+    let memory = control.memory();
+    assert_eq!(memory.estimate_bytes, estimate);
+    assert!(memory.estimate_bytes <= memory.budget_bytes);
+
+    // A copy that grows within the room is put in force.
+    server.serve("/tiny.txt", &many_rules(1000), None);
+    scheduler.refresh(0, &downloader()).await;
+
+    assert_eq!(control.statuses()[0].last_error, None);
+    assert!(blocked(&scheduler.policy(), "n5.example."));
+    assert!(control.memory().estimate_bytes <= control.memory().budget_bytes);
+}
+
+#[tokio::test]
+async fn a_reset_counts_only_the_lists_that_stay_against_the_budget() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/page.txt", &many_rules(200_000), None);
+    let other: String = (0..200_000)
+        .map(|index| format!("||m{index}.example^\n"))
+        .collect();
+    server.serve("/file.txt", &other, None);
+    let mut file = config_of(&dir, vec![url_list("file", server.url("/file.txt"))]);
+    let lists = vec![page_list(server.url("/page.txt"))];
+    let estimate = {
+        let mut scheduler = boot_with_page_lists(&file, lists.clone()).await;
+        scheduler.refresh(0, &downloader()).await;
+        assert!(blocked(&scheduler.policy(), "n5.example."));
+
+        scheduler.control().memory().estimate_bytes
+    };
+    // Room for the file's list while the page's is still held, not for both to stay.
+    file.limits.memory_mb = estimate / MIB + 1;
+    let scheduler = boot_with_page_lists(&file, lists).await;
+    let control = scheduler.control();
+    let policy = scheduler.policy();
+    tokio::spawn(scheduler.run(downloader(), std::future::pending()));
+
+    control.change_lists(ListEdit::Reset).await.unwrap();
+
+    assert!(blocked(&policy, "m5.example."));
+    assert!(!blocked(&policy, "n5.example."));
+    let memory = control.memory();
+    assert!(memory.estimate_bytes <= memory.budget_bytes);
+}
+
+#[tokio::test]
+async fn a_list_of_the_config_file_keeps_its_caps_only_whatever_the_budget() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/file.txt", &many_rules(100_000), None);
+    let mut config = config_of(&dir, vec![url_list("file", server.url("/file.txt"))]);
+    config.limits.memory_mb = 1;
+    let (mut scheduler, _store) = boot(&config).await;
+
+    scheduler.refresh(0, &downloader()).await;
+
+    let control = scheduler.control();
+    assert_eq!(control.statuses()[0].last_error, None);
+    assert!(blocked(&scheduler.policy(), "n5.example."));
+    let memory = control.memory();
+    assert!(memory.estimate_bytes > memory.budget_bytes);
+    assert!(!control.statuses()[0].from_page);
+}
+
+/// A scheduler that refreshes nothing by itself for a day, running in its own task.
+async fn running(config: &Config) -> (Arc<ListControl>, Arc<Policy>) {
+    let loaded = settings::with_saved(config.clone());
+    let scheduler = Scheduler::boot(
+        &loaded.config,
+        Arc::new(loaded.saved),
+        CompileWorker::spawn().unwrap(),
+        Arc::new(SnapshotStore::open(&config.state.dir).unwrap()),
+        Timing {
+            hour: Duration::from_secs(3600),
+            retries: [Duration::from_secs(3600); 4],
+            first_check: Duration::from_secs(3600 * 1000),
+        },
+    )
+    .await
+    .unwrap();
+    let control = scheduler.control();
+    let policy = scheduler.policy();
+    tokio::spawn(scheduler.run(downloader(), std::future::pending()));
+
+    (control, policy)
+}
+
+fn add(name: &str, url: String) -> ListEdit {
+    ListEdit::Add {
+        role: ListRole::Block,
+        name: Some(name.to_string()),
+        url,
+        refresh_hours: 12,
+    }
+}
+
+/// How the add in flight ends.
+async fn added(control: &ListControl) -> Result<(), ListError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(outcome) = control.pending_list().and_then(|list| list.outcome) {
+            return outcome;
+        }
+
+        assert!(Instant::now() < deadline, "the add never ended");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn shown(control: &ListControl) -> Vec<(String, bool, bool)> {
+    control
+        .statuses()
+        .into_iter()
+        .map(|status| (status.name, status.enabled, status.from_page))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_list_added_from_the_page_is_admitted_saved_and_in_force_with_the_file_lists_copied() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/file.txt", "||file.example^\n", None);
+    server.serve("/added.txt", V1, None);
+    let config = config_of(&dir, vec![url_list("file", server.url("/file.txt"))]);
+    let (control, policy) = running(&config).await;
+
+    control
+        .add_list(add("Added", server.url("/added.txt")))
+        .await
+        .unwrap();
+
+    assert_eq!(added(&control).await, Ok(()));
+    assert!(blocked(&policy, "ads.example."));
+    assert_eq!(
+        shown(&control),
+        [
+            ("file".to_string(), true, true),
+            ("Added".to_string(), true, true)
+        ]
+    );
+    let saved = settings_file(&dir).unwrap().lists.unwrap();
+    assert_eq!(
+        saved
+            .iter()
+            .map(|list| (list.name.as_deref(), list.refresh_hours))
+            .collect::<Vec<_>>(),
+        [(Some("file"), 24), (Some("Added"), 12)]
+    );
+    let memory = control.memory();
+    assert!(memory.estimate_bytes <= memory.budget_bytes);
+    assert_eq!(server.requested("/added.txt"), 1);
+}
+
+#[tokio::test]
+async fn an_add_over_the_budget_or_that_fails_is_refused_and_nothing_is_written() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/big.txt", &many_rules(200_000), None);
+    server.fail("/missing.txt", 404);
+    let mut config = config_of(&dir, Vec::new());
+    let estimate = running(&config).await.0.memory().estimate_bytes;
+    config.limits.memory_mb = estimate / MIB + 2;
+    let (control, policy) = running(&config).await;
+
+    control
+        .add_list(add("Big", server.url("/big.txt")))
+        .await
+        .unwrap();
+    let refused = added(&control).await;
+
+    let Err(ListError::OverBudget {
+        name, needs, left, ..
+    }) = refused
+    else {
+        panic!("{refused:?}");
+    };
+    assert_eq!(name, "Big");
+    assert_eq!(needs, None, "the compile stopped at the room left");
+    assert!(left <= 2 * MIB);
+    assert!(!blocked(&policy, "n5.example."));
+
+    control
+        .add_list(add("Missing", server.url("/missing.txt")))
+        .await
+        .unwrap();
+    let failed = added(&control).await;
+
+    assert!(
+        matches!(&failed, Err(ListError::Failed { reason, .. }) if reason.contains("404")),
+        "{failed:?}"
+    );
+    assert!(control.statuses().is_empty());
+    assert!(
+        every_file(dir.path()).is_empty(),
+        "{:?}",
+        every_file(dir.path())
+    );
+}
+
+#[tokio::test]
+async fn a_list_whose_copy_passes_the_budget_after_its_compile_is_refused_with_what_it_needs() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    // The compile is charged for the slow rules it holds, and the copy keeps them all.
+    let slow: String = (0..2000)
+        .map(|index| format!("||a{index}*.example^\n"))
+        .collect();
+    server.serve("/slow.txt", &slow, None);
+    let mut config = config_of(&dir, Vec::new());
+    let (probe, _) = running(&config).await;
+    let estimate = probe.memory().estimate_bytes;
+    config.limits.memory_mb = estimate / MIB + 1;
+    let (control, _policy) = running(&config).await;
+
+    control
+        .add_list(add("Slow", server.url("/slow.txt")))
+        .await
+        .unwrap();
+    let refused = added(&control).await;
+
+    assert!(
+        matches!(refused, Err(ListError::OverBudget { .. })),
+        "{refused:?}"
+    );
+    assert!(settings_file(&dir).is_none());
+}
+
+#[tokio::test]
+async fn one_add_at_a_time_and_a_bad_add_is_refused_before_it_starts() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/slow.txt", V1, None);
+    server.set_delay(Duration::from_millis(500));
+    let config = config_of(&dir, Vec::new());
+    let (control, _policy) = running(&config).await;
+
+    control
+        .add_list(add("Slow", server.url("/slow.txt")))
+        .await
+        .unwrap();
+    let second = control
+        .add_list(add("Other", server.url("/other.txt")))
+        .await;
+
+    assert_eq!(second, Err(ListError::AddInFlight));
+    assert_eq!(added(&control).await, Ok(()));
+    assert_eq!(
+        control
+            .add_list(add("Again", server.url("/slow.txt")))
+            .await,
+        Err(ListError::Invalid("that list is added already".to_string()))
+    );
+    let bad = control
+        .add_list(ListEdit::Add {
+            role: ListRole::Block,
+            name: None,
+            url: "ftp://lists.example/a.txt".to_string(),
+            refresh_hours: 24,
+        })
+        .await;
+    assert!(
+        matches!(&bad, Err(ListError::Invalid(reason)) if reason.contains("http:// or https://")),
+        "{bad:?}"
+    );
+    assert_eq!(
+        control.pending_list().unwrap().outcome,
+        Some(Ok(())),
+        "a refused request leaves the last outcome"
+    );
+}
+
+#[tokio::test]
+async fn page_lists_are_renamed_rescheduled_turned_off_and_on_removed_and_reset() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/file.txt", "||file.example^\n", None);
+    server.serve("/page.txt", V1, None);
+    let local = dir.file("mine.txt");
+    fs::write(&local, "||mine.example^\n").unwrap();
+    let config = config_of(
+        &dir,
+        vec![
+            url_list("file", server.url("/file.txt")),
+            named_path_list("Mine", local.clone()),
+        ],
+    );
+    let (control, policy) = running(&config).await;
+    control
+        .add_list(add("Page", server.url("/page.txt")))
+        .await
+        .unwrap();
+    assert_eq!(added(&control).await, Ok(()));
+    let source = server.url("/page.txt");
+    let edit =
+        |name: Option<&str>, refresh_hours: Option<u32>, enabled: Option<bool>| ListEdit::Edit {
+            role: ListRole::Block,
+            source: source.clone(),
+            name: name.map(str::to_string),
+            refresh_hours,
+            enabled,
+        };
+
+    control
+        .change_lists(edit(Some("Renamed"), Some(6), None))
+        .await
+        .unwrap();
+    let status = control.statuses()[2].clone();
+    assert_eq!((status.name.as_str(), status.refresh_hours), ("Renamed", 6));
+    assert_eq!(server.requested("/page.txt"), 1, "kept, not downloaded");
+
+    control
+        .change_lists(edit(None, None, Some(false)))
+        .await
+        .unwrap();
+    assert!(!blocked(&policy, "ads.example."));
+    assert_eq!(control.statuses()[2].rules, 0);
+    assert!(!control.statuses()[2].enabled);
+
+    control
+        .change_lists(edit(None, None, Some(true)))
+        .await
+        .unwrap();
+    assert!(blocked(&policy, "ads.example."));
+    assert_eq!(server.requested("/page.txt"), 2, "downloaded again");
+
+    let path = ListEdit::Edit {
+        role: ListRole::Block,
+        source: local.display().to_string(),
+        name: None,
+        refresh_hours: Some(2),
+        enabled: None,
+    };
+    assert_eq!(
+        control.change_lists(path).await,
+        Err(ListError::ConfigFileOnly)
+    );
+    assert_eq!(
+        control
+            .change_lists(ListEdit::Remove {
+                role: ListRole::Allow,
+                source: source.clone(),
+            })
+            .await,
+        Err(ListError::NoSuchList)
+    );
+
+    control
+        .change_lists(ListEdit::Remove {
+            role: ListRole::Block,
+            source: source.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(!blocked(&policy, "ads.example."));
+    assert_eq!(
+        shown(&control),
+        [
+            ("Mine".to_string(), true, false),
+            ("file".to_string(), true, true)
+        ]
+    );
+
+    control.change_lists(ListEdit::Reset).await.unwrap();
+    assert_eq!(settings_file(&dir).unwrap().lists, None);
+    assert_eq!(
+        shown(&control),
+        [
+            ("file".to_string(), true, false),
+            ("Mine".to_string(), true, false)
+        ],
+        "in the config file's order"
+    );
+    assert!(blocked(&policy, "mine.example."));
+    let written = fs::read(dir.file(settings::FILE_NAME)).unwrap();
+    control.change_lists(ListEdit::Reset).await.unwrap();
+    assert_eq!(fs::read(dir.file(settings::FILE_NAME)).unwrap(), written);
+}
+
+#[tokio::test]
+async fn an_added_list_boots_from_its_snapshot_after_a_restart() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/page.txt", V1, None);
+    let config = config_of(&dir, Vec::new());
+    {
+        let (control, _policy) = running(&config).await;
+        control
+            .add_list(add("Page", server.url("/page.txt")))
+            .await
+            .unwrap();
+        assert_eq!(added(&control).await, Ok(()));
+        assert_eq!(dir.snapshot_files().len(), 1);
+    }
+
+    server.stop().await;
+    let loaded = settings::with_saved(config.clone());
+    let (scheduler, store) =
+        boot_with(&loaded.config, SnapshotStore::open(dir.path()).unwrap()).await;
+
+    assert!(blocked(&scheduler.policy(), "ads.example."));
+    assert_eq!(scheduler.list(0).unwrap().rule_count(), 1);
+    assert_eq!(store.bytes_written(), 0);
+}
+
+#[tokio::test]
+async fn a_refresh_of_a_page_list_with_new_content_never_touches_the_settings_file() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/page.txt", V1, None);
+    let config = config_of(&dir, Vec::new());
+    let (control, policy) = running(&config).await;
+    control
+        .add_list(add("Page", server.url("/page.txt")))
+        .await
+        .unwrap();
+    assert_eq!(added(&control).await, Ok(()));
+    let path = dir.file(settings::FILE_NAME);
+    let written = fs::read(&path).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+    server.serve("/page.txt", V2, None);
+    control.refresh_all();
+    assert!(
+        eventually(Duration::from_secs(5), || blocked(
+            &policy,
+            "tracker.example."
+        ))
+        .await
+    );
+
+    assert_eq!(fs::read(&path).unwrap(), written);
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
 }

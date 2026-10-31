@@ -10,7 +10,7 @@
 //! magic[8] file_version u32
 //! body: fingerprint u128, content_hash u128, compiler_version u32, configured_format u8,
 //!       effective_format u8, max_rules u32, allow_redirects u8, source, etag?, last_modified?,
-//!       counters (u64 each), first_invalid?, regex_failed u64,
+//!       counters (u64 each), first_invalid?, regex_failed u64, compile_charge u64,
 //!       6 plain-rule arrays (u64 length, u64 hashes),
 //!       host groups (u32 count; IP text, u64 length, u64 hashes),
 //!       slow rules (u32 count; flags u8, content types u32, pattern, record types,
@@ -34,14 +34,15 @@ use tokio::sync::{mpsc, oneshot};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128};
 
 use super::compile::{
-    COMPILER_VERSION, CompileOptions, Compiled, NAME_OVERHEAD_BYTES, SlowRuleBudget,
-    TEXT_BYTE_COST, blocks_a_canary,
+    COMPILE_PEAK_BYTES_PER_RULE, COMPILER_VERSION, CompileOptions, Compiled, NAME_OVERHEAD_BYTES,
+    SlowRuleBudget, TEXT_BYTE_COST, blocks_a_canary,
 };
 use super::engine::{CompiledList, FAST_KINDS, HostRules, MAX_HOST_GROUPS, SlowRule};
 use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
+use super::pattern::too_complex_build_bytes;
 use crate::lists::Validators;
 
-pub const FILE_VERSION: u32 = 4;
+pub const FILE_VERSION: u32 = 5;
 
 const MAGIC: [u8; 8] = *b"PICOSNAP";
 const PREAMBLE_BYTES: u64 = 12;
@@ -473,6 +474,7 @@ fn encode<W: Write>(snapshot: &Snapshot, mut out: W) -> io::Result<()> {
 
     let list = &snapshot.list;
     encoder.u64(list.regex_failed)?;
+    encoder.u64(list.compile_charge as u64)?;
     for array in &list.fast {
         encoder.u64s(array)?;
     }
@@ -809,6 +811,7 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
 
     let first_invalid = decoder.optional_text("invalid line")?;
     let regex_failed = decoder.u64()?;
+    let compile_charge = decoder.u64()?;
 
     let mut fast: [Vec<u64>; FAST_KINDS] = Default::default();
     for array in fast.iter_mut() {
@@ -868,12 +871,25 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
         return Err(SnapshotError::Corrupt("fingerprint"));
     }
 
-    let list = Arc::new(CompiledList {
+    let mut list = CompiledList {
         fast,
         hosts,
         slow,
         regex_failed,
-    });
+        compile_charge: 0,
+    };
+    // The compile charged every plain rule it kept, and no more than its caps allow.
+    let plain_rules = (list.rule_count() - list.slow_rule_count()) as u64;
+    let most = u64::from(options.max_rules)
+        .saturating_mul(COMPILE_PEAK_BYTES_PER_RULE as u64)
+        .saturating_add(options.slow_rule_budget as u64)
+        .saturating_add(too_complex_build_bytes() as u64);
+    if compile_charge < plain_rules * COMPILE_PEAK_BYTES_PER_RULE as u64 || compile_charge > most {
+        return Err(SnapshotError::Corrupt("compile charge"));
+    }
+
+    list.compile_charge = compile_charge as usize;
+    let list = Arc::new(list);
     if options.check_canaries && blocks_a_canary(&list) {
         return Err(SnapshotError::BlocksCanary);
     }
@@ -1344,6 +1360,7 @@ ads.*.tracker
         }
 
         assert_eq!(a.regex_failed, b.regex_failed);
+        assert_eq!(a.compile_charge, b.compile_charge);
     }
 
     #[tokio::test]
@@ -1943,6 +1960,7 @@ ads.*.tracker
                 },
                 slow: Vec::new(),
                 regex_failed: 0,
+                compile_charge: 0,
             })
         };
         let unlimited = CompileOptions {

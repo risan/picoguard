@@ -796,6 +796,7 @@ dependencies = [
  "rcgen",
  "regex",
  "regex-automata",
+ "regex-syntax",
  "ring",
  "rustls",
  "serde",

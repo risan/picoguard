@@ -13,9 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::config::Config;
-use crate::lists::{
-    Downloader, Fetch, FetchError, Limits, PIECE_QUEUE, Piece, Resolver, Validators,
-};
+use crate::lists::{Downloader, Fetch, FetchError, Limits, Names, PIECE_QUEUE, Piece, Validators};
 use crate::scheduler::{jittered, unit_random};
 use crate::stage::InstallView;
 use crate::upstream::tls::Tls;
@@ -519,7 +517,7 @@ fn outcome_of(error: &FetchError) -> Outcome {
 pub fn start(
     config: &Config,
     url: &str,
-    resolver: Resolver,
+    names: Names,
     tls: Arc<Tls>,
     updates: Arc<Updates>,
     timing: CheckTiming,
@@ -528,7 +526,7 @@ pub fn start(
         return None;
     }
 
-    let checker = Checker::new(Downloader::new(resolver, tls), url);
+    let checker = Checker::new(Downloader::new(names, tls), url);
 
     Some(tokio::spawn(run(checker, updates, timing)))
 }

@@ -2,6 +2,7 @@ mod common;
 
 use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -195,6 +196,133 @@ fn check_rejects_a_missing_file() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(text(&output.stderr).contains("/nonexistent/picoguard.toml"));
+}
+
+/// A fresh state folder for one test.
+fn state_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("picoguard-cli-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    dir
+}
+
+fn check_with_saved_settings(name: &str, settings: &str) -> (Output, PathBuf) {
+    let state = state_dir(name);
+    std::fs::write(state.join("settings.json"), settings).unwrap();
+    let path = write_config(
+        &format!("{name}.toml"),
+        &format!("[state]\ndir = {state:?}\n"),
+    );
+
+    (
+        picoguard(&["--check", "-c", path.to_str().unwrap()]),
+        state.join("settings.json"),
+    )
+}
+
+#[test]
+fn check_warns_about_saved_settings_it_would_ignore_and_still_passes() {
+    for (index, (settings, reason)) in [
+        ("{\"version\": 1", "EOF while parsing"),
+        ("{\"version\": 1, \"web\": {}}", "unknown field `web`"),
+        (
+            "{\"version\": 1, \"upstream\": {\"servers\": [\"8.8.8.8\"], \"bootstrap\": []}}",
+            "upstream.servers[0] must start with one of",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (output, file) = check_with_saved_settings(&format!("bad-settings-{index}"), settings);
+
+        assert_eq!(output.status.code(), Some(0), "{settings}");
+        assert_eq!(text(&output.stdout).trim(), "OK", "{settings}");
+        let warning = text(&output.stderr);
+        let expected = format!(
+            "warning: saved settings in {} will be ignored: ",
+            file.display()
+        );
+        assert!(warning.starts_with(&expected), "{settings}: {warning}");
+        assert!(warning.contains(reason), "{settings}: {warning}");
+        assert_eq!(warning.lines().count(), 1, "{warning}");
+    }
+}
+
+#[test]
+fn check_of_good_saved_settings_prints_only_ok() {
+    let (output, _) = check_with_saved_settings(
+        "good-settings",
+        "{\"version\": 1, \"page_rules\": [{\"name\": \"ads.example\", \"action\": \"block\"}]}",
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(text(&output.stdout).trim(), "OK");
+    assert!(text(&output.stderr).is_empty(), "{}", text(&output.stderr));
+}
+
+/// Starts the server with `settings_path` prepared by `prepare`, then stops it and returns
+/// what it wrote to stderr.
+fn stderr_of_a_run_with_saved_settings(name: &str, prepare: impl Fn(&Path)) -> String {
+    let state = state_dir(name);
+    prepare(&state.join("settings.json"));
+    let mut server = start(&format!("{name}.toml"), |port| {
+        format!(
+            "lists = []\n[server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+             [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
+             [web]\nenabled = false\n\
+             [state]\ndir = {state:?}\n"
+        )
+    });
+    server.child.kill().unwrap();
+
+    text(&server.child.wait_with_output().unwrap().stderr)
+}
+
+/// The run logs one warning that names `reason`, and nothing else.
+fn assert_started_with_a_warning(name: &str, prepare: impl Fn(&Path), reason: &str) {
+    let stderr = stderr_of_a_run_with_saved_settings(name, prepare);
+
+    assert_eq!(stderr.lines().count(), 1, "{name}: {stderr}");
+    assert!(stderr.starts_with("WARN "), "{name}: {stderr}");
+    assert!(
+        stderr.contains("saved settings in ") && stderr.contains(" are not used: "),
+        "{name}: {stderr}"
+    );
+    assert!(stderr.contains(reason), "{name}: {stderr}");
+}
+
+#[test]
+fn saved_settings_that_cannot_be_used_never_stop_a_start() {
+    let elsewhere = state_dir("settings-target").join("settings.json");
+    std::fs::write(&elsewhere, "{\"version\": 1}").unwrap();
+
+    assert_started_with_a_warning(
+        "settings-broken",
+        |path| std::fs::write(path, "{\"version\":").unwrap(),
+        "EOF while parsing",
+    );
+    assert_started_with_a_warning(
+        "settings-link",
+        |path| std::os::unix::fs::symlink(&elsewhere, path).unwrap(),
+        "cannot read it",
+    );
+    assert_started_with_a_warning(
+        "settings-pipe",
+        |path| assert!(Command::new("mkfifo").arg(path).status().unwrap().success()),
+        "not a regular file",
+    );
+    assert_started_with_a_warning(
+        "settings-large",
+        |path| {
+            std::fs::write(
+                path,
+                format!("{{\"version\": 1}}{}", " ".repeat(256 * 1024)),
+            )
+            .unwrap()
+        },
+        "larger than allowed",
+    );
 }
 
 /// Runs the server on a free port until it answers, then stops it and
