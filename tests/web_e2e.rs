@@ -3832,6 +3832,10 @@ async fn the_settings_show_each_value_with_where_it_comes_from_and_no_web_value(
             "rewrites": {"entries": [], "from": "file"},
             "safe_search": {"on": true, "from": "page"},
             "services": {"block": [], "from": "file"},
+            "memory": {
+                "estimate_bytes": site.control.memory().estimate_bytes,
+                "budget_bytes": 48 * 1024 * 1024,
+            },
         })
     );
     for secret in ["s3cret", "admin", "password", "user"] {
@@ -4082,6 +4086,47 @@ async fn a_server_that_cannot_be_used_is_refused_with_the_reason_and_nothing_cha
     let settings = site.send(get("/api/settings")).await.json();
     assert_eq!(settings["upstream"]["from"], "file");
     assert_eq!(settings["cache"]["from"], "file");
+}
+
+fn cache_of_size(max_bytes: usize) -> String {
+    serde_json::json!({"cache": {"max_entries": 10000, "max_bytes": max_bytes, "min_ttl": 0,
+                                 "max_ttl": 86400, "optimistic": true}})
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_larger_cache_that_would_pass_the_memory_budget_is_refused_and_a_smaller_one_is_not() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let probe = site(local_config(&upstream)).await;
+    let estimate = probe.control.memory().estimate_bytes;
+    let mut config = local_config(&upstream);
+    // Room for the default cache and about 2 MiB more.
+    config.limits.memory_mb = estimate / (1024 * 1024) + 2;
+    let site = site(config).await;
+
+    let larger = site
+        .send(post("/api/settings", &cache_of_size(16 * 1024 * 1024)))
+        .await;
+
+    assert_eq!(larger.status, 400, "{}", larger.body);
+    let error = larger.json()["error"].as_str().unwrap().to_string();
+    assert!(
+        error
+            .starts_with("a cache of 16.0 MB would pass the memory budget: the estimate would be "),
+        "{error}"
+    );
+    assert!(saved_settings(&site).is_none());
+    let memory = site.send(get("/api/settings")).await.json()["memory"].clone();
+    assert_eq!(memory["estimate_bytes"], estimate);
+
+    let smaller = site
+        .send(post("/api/settings", &cache_of_size(1024 * 1024)))
+        .await;
+
+    assert_eq!(smaller.status, 200, "{}", smaller.body);
+    let memory = &smaller.json()["memory"];
+    assert!(memory["estimate_bytes"].as_u64().unwrap() < estimate as u64);
+    assert!(memory["estimate_bytes"].as_u64() <= memory["budget_bytes"].as_u64());
 }
 
 #[tokio::test]

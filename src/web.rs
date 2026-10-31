@@ -36,6 +36,7 @@ use tokio::time::timeout;
 
 use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
 use crate::config::{Cidr, Config, ListFormat, Rewrite, WebConfig, is_allowed};
+use crate::memory::Memory;
 use crate::pipeline::{CacheSize, Pipeline, ServerKind, ServerTally};
 use crate::policy::Policy;
 use crate::scheduler::{
@@ -622,6 +623,7 @@ impl Web {
                     block: settings.services.as_deref().unwrap_or(&file.services.block),
                     from: Source::of(&settings.services),
                 },
+                memory: self.lists.memory(),
             },
         )
     }
@@ -1230,6 +1232,8 @@ struct SettingsView<'a> {
     rewrites: RewritesSetting<'a>,
     safe_search: SafeSearchSetting,
     services: ServicesSetting<'a>,
+    /// The estimate of the whole process and the budget it is admitted against (plan D6).
+    memory: Memory,
 }
 
 #[derive(Serialize)]

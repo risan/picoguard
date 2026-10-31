@@ -374,6 +374,32 @@ impl ListControl {
         }
     }
 
+    /// The admission lock (see the field). The caller holds the settings lock or none.
+    pub(crate) async fn admission(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.admission.lock().await
+    }
+
+    /// Whether a cache of `max_bytes` keeps the estimate within the budget; the reason when
+    /// not. The caller holds the admission lock.
+    pub(crate) fn cache_fits(&self, max_bytes: usize) -> Result<(), String> {
+        let estimate = memory::estimate(self.fixed_bytes, max_bytes, &self.list_bytes());
+        if estimate <= self.budget_bytes {
+            return Ok(());
+        }
+
+        Err(format!(
+            "a cache of {} would pass the memory budget: the estimate would be {} of {}",
+            memory::megabytes(max_bytes),
+            memory::megabytes(estimate),
+            memory::megabytes(self.budget_bytes)
+        ))
+    }
+
+    /// The cache in force now has `max_bytes`. The caller holds the admission lock.
+    pub(crate) fn set_cache_max_bytes(&self, max_bytes: usize) {
+        self.cache_max_bytes.store(max_bytes, Ordering::Relaxed);
+    }
+
     fn list_bytes(&self) -> Vec<ListBytes> {
         self.statuses
             .lock()
@@ -487,7 +513,7 @@ impl ListControl {
         let pipeline = Arc::clone(pipeline);
 
         self.spawn_change(|control, answer| async move {
-            settings::apply(&control.saved, &pipeline, change, answer).await;
+            settings::apply(&control, &pipeline, change, answer).await;
         })
         .await
         .unwrap_or(Err(ChangeError::NotApplied))

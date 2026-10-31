@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::{CacheConfig, Config, ConfigError, ListConfig, Rewrite};
 use crate::pipeline::Pipeline;
 use crate::release;
-use crate::scheduler::{ButtonRule, MAX_BUTTON_RULES, drop_off_runtime, normalized_name};
+use crate::scheduler::{
+    ButtonRule, ListControl, MAX_BUTTON_RULES, drop_off_runtime, normalized_name,
+};
 use crate::upstream::Upstreams;
 
 pub const FILE_NAME: &str = "settings.json";
@@ -467,16 +469,37 @@ struct Prepared {
 /// writes nothing; one that only moves a value between the page and the config file is saved
 /// and replaces nothing.
 pub(crate) async fn apply(
-    saved: &Saved,
+    control: &ListControl,
     pipeline: &Pipeline,
     change: PageChange,
     answer: tokio::sync::oneshot::Sender<Result<(), ChangeError>>,
 ) {
+    let saved = control.saved();
     let mut settings = saved.lock().await;
     let upstream = change.upstream.unwrap_or_else(|| settings.upstream.clone());
     let cache = change.cache.unwrap_or_else(|| settings.cache.clone());
     if upstream == settings.upstream && cache == settings.cache {
         let _ = answer.send(Ok(()));
+
+        return;
+    }
+
+    // A larger cache is admitted against the memory budget like a list, under the same lock
+    // as list compiles, held until the replaced cache is freed (plan D6).
+    let max_bytes = |page: &Option<CacheSettings>| {
+        page.as_ref()
+            .map_or(saved.file_config().cache.max_bytes, |cache| cache.max_bytes)
+    };
+    let (old_max_bytes, new_max_bytes) = (max_bytes(&settings.cache), max_bytes(&cache));
+    let admitted = if new_max_bytes == old_max_bytes {
+        None
+    } else {
+        Some(control.admission().await)
+    };
+    if new_max_bytes > old_max_bytes
+        && let Err(reason) = control.cache_fits(new_max_bytes)
+    {
+        let _ = answer.send(Err(ChangeError::Invalid(reason)));
 
         return;
     }
@@ -520,10 +543,12 @@ pub(crate) async fn apply(
         .upstreams
         .map(|upstreams| pipeline.upstreams().replace(upstreams));
     let replaced_cache = prepared.cache.map(|cache| pipeline.replace_cache(&cache));
+    control.set_cache_max_bytes(new_max_bytes);
     let _ = answer.send(Ok(()));
 
-    // The lock is held until the replaced cache is freed, so changes never stack copies.
+    // The locks are held until the replaced cache is freed, so changes never stack copies.
     drop_off_runtime((replaced_upstreams, replaced_cache, old_upstream, old_cache)).await;
+    drop(admitted);
 }
 
 /// The objects `settings` needs that differ from those in force under the old values. The

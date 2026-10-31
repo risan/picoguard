@@ -3,6 +3,8 @@
 //! page makes the cache larger. The constants are measured; `tests/memory_estimate.rs` checks
 //! the estimate against what full stats, a full cache and real lists hold.
 
+use serde::Serialize;
+
 use crate::config::{LimitsConfig, StatsConfig};
 
 const MIB: usize = 1024 * 1024;
@@ -26,7 +28,7 @@ pub const TOP_ENTRY_BYTES: usize = 336;
 pub const CACHE_HEAP_PERCENT: usize = 125;
 
 /// What the estimate shows on the page: what the process may hold, and the budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Memory {
     pub estimate_bytes: usize,
     pub budget_bytes: usize,
@@ -52,6 +54,11 @@ pub fn cache_bytes(max_bytes: usize) -> usize {
 
 pub fn budget_bytes(limits: &LimitsConfig) -> usize {
     limits.memory_mb * MIB
+}
+
+/// `bytes` in MB with one decimal, as the page and its messages show them.
+pub fn megabytes(bytes: usize) -> String {
+    format!("{:.1} MB", bytes as f64 / MIB as f64)
 }
 
 /// What one compiled list in force counts in the estimate.
@@ -98,6 +105,12 @@ mod tests {
         assert_eq!(steady_bytes(10_000, 400, &lists), 10_000 + 500 + 1500);
         assert_eq!(estimate(10_000, 400, &lists), 10_000 + 500 + 1500 + 4000);
         assert_eq!(estimate(10_000, 400, &[]), 10_500);
+    }
+
+    #[test]
+    fn megabytes_have_one_decimal() {
+        assert_eq!(megabytes(48 * MIB), "48.0 MB");
+        assert_eq!(megabytes(MIB + MIB / 2), "1.5 MB");
     }
 
     #[test]
