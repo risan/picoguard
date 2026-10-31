@@ -3978,13 +3978,8 @@ async fn a_settings_change_of_a_key_not_editable_yet_is_refused_and_nothing_is_w
     let (site, _upstream) = plain_site().await;
 
     for (key, value) in [
-        (
-            "rewrites",
-            serde_json::json!([{"name": "nas.lan", "answer": "10.0.0.1"}]),
-        ),
-        ("safe_search", serde_json::json!(true)),
         ("services", serde_json::json!(["tiktok"])),
-        ("safe_search", Value::Null),
+        ("services", Value::Null),
     ] {
         let body = serde_json::json!({ key: value }).to_string();
 
@@ -4068,6 +4063,168 @@ async fn only_the_settings_route_takes_a_body_of_64_kib() {
     assert_eq!(rule.status, 413);
     assert_eq!(rule.json()["error"], "the body is limited to 1 KiB");
     assert!(no_page_rules(&site).await);
+}
+
+fn rewrite_body(entries: &[(&str, &str)]) -> String {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|(name, answer)| serde_json::json!({"name": name, "answer": answer}))
+        .collect();
+
+    serde_json::json!({ "rewrites": entries }).to_string()
+}
+
+#[tokio::test]
+async fn rewrites_and_safe_search_apply_at_once_and_a_reset_goes_back_to_the_config_file() {
+    let (site, upstream) = plain_site().await;
+    let body = serde_json::json!({
+        "rewrites": [
+            {"name": " NAS.lan. ", "answer": "192.168.1.10"},
+            {"name": "*.NAS.lan", "answer": "FD00:0::10"},
+        ],
+        "safe_search": true,
+    })
+    .to_string();
+
+    let changed = site.send(post("/api/settings", &body)).await;
+
+    assert_eq!(changed.status, 200, "{}", changed.body);
+    let kept = serde_json::json!([
+        {"name": "nas.lan", "answer": "192.168.1.10"},
+        {"name": "*.nas.lan", "answer": "fd00::10"},
+    ]);
+    assert_eq!(
+        changed.json()["rewrites"],
+        serde_json::json!({"entries": kept, "from": "page"})
+    );
+    assert_eq!(
+        changed.json()["safe_search"],
+        serde_json::json!({"on": true, "from": "page"})
+    );
+    let saved = saved_settings(&site).unwrap();
+    assert_eq!(saved["rewrites"], kept);
+    assert_eq!(saved["safe_search"], true);
+    let answer = ask(&site.dns, "nas.lan.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["192.168.1.10"]);
+    let answer = ask(&site.dns, "tv.nas.lan.", RecordType::AAAA).await;
+    assert_eq!(addresses(&answer), ["fd00::10"]);
+    let answer = ask(&site.dns, "www.google.com.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+    let asked: Vec<String> = upstream
+        .received()
+        .iter()
+        .map(|query| query.queries[0].name().to_string())
+        .collect();
+    assert_eq!(asked, ["forcesafesearch.google.com."]);
+
+    let explained = site.send(get("/api/explain?name=nas.lan")).await.json();
+    assert_eq!(
+        explained,
+        serde_json::json!({"name": "nas.lan", "decision": "rewritten", "list": "your rewrites",
+                           "rule": "rewritten to 192.168.1.10 (your rewrite)"})
+    );
+    let explained = site.send(get("/api/explain?name=google.de")).await.json();
+    assert_eq!(explained["list"], "SafeSearch");
+    assert_eq!(
+        explained["rule"],
+        "rewritten to forcesafesearch.google.com (SafeSearch)"
+    );
+
+    let reset = site
+        .send(post(
+            "/api/settings",
+            "{\"rewrites\": null, \"safe_search\": null}",
+        ))
+        .await;
+
+    assert_eq!(reset.status, 200, "{}", reset.body);
+    assert_eq!(reset.json()["rewrites"]["from"], "file");
+    assert_eq!(reset.json()["safe_search"]["on"], false);
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({"version": 1})
+    );
+    let answer = ask(&site.dns, "nas.lan.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+    let explained = site.send(get("/api/explain?name=google.de")).await.json();
+    assert_eq!(explained["decision"], "none");
+}
+
+#[tokio::test]
+async fn the_same_rewrites_again_write_nothing() {
+    let (site, _upstream) = plain_site().await;
+    let file = site.state.join(settings::FILE_NAME);
+    let body = rewrite_body(&[("nas.lan", "192.168.1.10")]);
+    assert_eq!(site.send(post("/api/settings", &body)).await.status, 200);
+    std::fs::remove_file(&file).unwrap();
+
+    for body in [
+        body,
+        rewrite_body(&[("NAS.lan.", " 192.168.1.10")]),
+        "{\"safe_search\": null}".to_string(),
+    ] {
+        let reply = site.send(post("/api/settings", &body)).await;
+
+        assert_eq!(reply.status, 200, "{body}: {}", reply.body);
+        assert!(!file.exists(), "{body} wrote the file");
+    }
+}
+
+#[tokio::test]
+async fn rewrites_that_cannot_be_used_are_refused_with_the_reason_and_nothing_changes() {
+    let (site, _upstream) = plain_site().await;
+    let too_many: Vec<(String, &str)> = (0..1001)
+        .map(|index| (format!("n{index}.lan"), "10.0.0.1"))
+        .collect();
+    let too_many: Vec<(&str, &str)> = too_many
+        .iter()
+        .map(|(name, answer)| (name.as_str(), *answer))
+        .collect();
+
+    for (body, expected) in [
+        (
+            rewrite_body(&[("nas", "10.0.0.1")]),
+            "rewrites[0].name must be a domain name",
+        ),
+        (
+            rewrite_body(&[("nas.lan", "nas.lan")]),
+            "rewrites[0] points nas.lan at itself",
+        ),
+        (
+            rewrite_body(&[("a.lan", "10.0.0.1"), ("a.lan", "b.lan")]),
+            "rewrites[1]: a.lan has addresses and a name",
+        ),
+        (
+            rewrite_body(&[("a.lan", "192.168.001.10")]),
+            "rewrites[0].answer must be an IP address or a domain name",
+        ),
+        (rewrite_body(&too_many), "rewrites: at most 1000 entries"),
+    ] {
+        let reply = site.send(post("/api/settings", &body)).await;
+
+        assert_eq!(reply.status, 400, "{expected}: {}", reply.body);
+        assert!(
+            reply.json()["error"].as_str().unwrap().contains(expected),
+            "{expected}: {}",
+            reply.body
+        );
+    }
+
+    for body in [
+        "{\"rewrites\": [{\"name\": \"a.lan\"}]}",
+        "{\"rewrites\": [{\"name\": \"a.lan\", \"answer\": \"10.0.0.1\", \"ttl\": 5}]}",
+        "{\"safe_search\": \"yes\"}",
+    ] {
+        let reply = site.send(post("/api/settings", body)).await;
+
+        assert_eq!(reply.status, 400, "{body}: {}", reply.body);
+    }
+
+    assert!(saved_settings(&site).is_none());
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(settings["rewrites"]["from"], "file");
+    let answer = ask(&site.dns, "a.lan.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
 }
 
 fn upstream_body(servers: &[String]) -> String {
@@ -4240,7 +4397,7 @@ async fn the_file_is_written_only_when_a_setting_in_force_changes() {
         body.as_str(),
         "{}",
         "{\"cache\": null}",
-        "{\"upstream\": {\"servers\": [], \"bootstrap\": []}, \"rewrites\": []}",
+        "{\"rewrites\": [], \"services\": []}",
     ] {
         let reply = site.send(post("/api/settings", body)).await;
 

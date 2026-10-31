@@ -36,9 +36,11 @@ use tokio::time::timeout;
 
 use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
 use crate::config::{Cidr, Config, ListFormat, Rewrite, WebConfig, is_allowed};
+use crate::dns::wire::Name;
 use crate::memory::{self, Memory};
 use crate::pipeline::{CacheSize, Pipeline, ServerKind, ServerTally};
 use crate::policy::Policy;
+use crate::rewrites::{By, normalized};
 use crate::scheduler::{
     Action, ButtonRule, ListControl, ListEdit, ListError, ListStatus, MAX_BUTTON_RULES,
     PendingList, Role, RuleError, normalized_name,
@@ -541,6 +543,26 @@ impl Web {
             Read::Explain => {
                 let name = name_param(query)
                     .ok_or_else(|| Rejection::new(StatusCode::BAD_REQUEST, NOT_A_DOMAIN_NAME))?;
+                // A rewrite answers before any list.
+                let rewritten =
+                    Name::from_text(&name).and_then(|wire| self.pipeline.rewrite_explained(&wire));
+                if let Some((to, by)) = rewritten {
+                    let (list, by) = match by {
+                        By::User => ("your rewrites", "your rewrite"),
+                        By::SafeSearch => ("SafeSearch", "SafeSearch"),
+                    };
+
+                    return Ok(json(
+                        StatusCode::OK,
+                        &ExplainView {
+                            name,
+                            decision: "rewritten",
+                            list: Some(list.to_string()),
+                            rule: Some(format!("rewritten to {to} ({by})")),
+                        },
+                    ));
+                }
+
                 let explained = self.lists.explain(&name).await;
                 let decision = match &explained {
                     Some(explained) if explained.allowed => "allowed",
@@ -846,6 +868,10 @@ impl Web {
                 let change = PageChange {
                     upstream: request.upstream,
                     cache: request.cache,
+                    rewrites: request
+                        .rewrites
+                        .map(|rewrites| rewrites.map(|list| list.iter().map(normalized).collect())),
+                    safe_search: request.safe_search,
                 };
                 self.lists
                     .change_settings(&self.pipeline, change)
@@ -1343,13 +1369,7 @@ struct SettingsRequest {
 
 impl SettingsRequest {
     fn first_key_not_editable(&self) -> Option<&'static str> {
-        [
-            ("rewrites", self.rewrites.is_some()),
-            ("safe_search", self.safe_search.is_some()),
-            ("services", self.services.is_some()),
-        ]
-        .into_iter()
-        .find_map(|(key, sent)| sent.then_some(key))
+        self.services.is_some().then_some("services")
     }
 }
 
@@ -1486,7 +1506,7 @@ struct ServicesSetting<'a> {
 #[derive(Serialize)]
 struct ExplainView {
     name: String,
-    /// `blocked`, `allowed` or `none`.
+    /// `rewritten`, `blocked`, `allowed` or `none`.
     decision: &'static str,
     list: Option<String>,
     rule: Option<String>,

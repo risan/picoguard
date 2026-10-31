@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{CacheConfig, Config, ConfigError, ListConfig, Rewrite};
 use crate::pipeline::Pipeline;
 use crate::release;
+use crate::rewrites::Rewrites;
 use crate::scheduler::{
     ButtonRule, ListControl, MAX_BUTTON_RULES, drop_off_runtime, normalized_name,
 };
@@ -437,12 +438,15 @@ impl Saved {
     }
 }
 
-/// A change of the page's upstream and cache settings. For each key, `None` leaves it as it
-/// is, `Some(None)` goes back to the config file's value and `Some(Some(value))` sets it.
+/// A change of the page's upstream, cache, rewrite and SafeSearch settings. For each key,
+/// `None` leaves it as it is, `Some(None)` goes back to the config file's value and
+/// `Some(Some(value))` sets it.
 #[derive(Debug, Default)]
 pub struct PageChange {
     pub upstream: Option<Option<UpstreamSettings>>,
     pub cache: Option<Option<CacheSettings>>,
+    pub rewrites: Option<Option<Vec<Rewrite>>>,
+    pub safe_search: Option<Option<bool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,6 +465,8 @@ pub enum ChangeError {
 struct Prepared {
     upstreams: Option<Upstreams>,
     cache: Option<CacheConfig>,
+    rewrites: Option<Arc<Rewrites>>,
+    safe_search: bool,
 }
 
 /// Builds the change, saves it, then puts it in force, all under the settings lock. Whatever
@@ -478,7 +484,13 @@ pub(crate) async fn apply(
     let mut settings = saved.lock().await;
     let upstream = change.upstream.unwrap_or_else(|| settings.upstream.clone());
     let cache = change.cache.unwrap_or_else(|| settings.cache.clone());
-    if upstream == settings.upstream && cache == settings.cache {
+    let rewrites = change.rewrites.unwrap_or_else(|| settings.rewrites.clone());
+    let safe_search = change.safe_search.unwrap_or(settings.safe_search);
+    if upstream == settings.upstream
+        && cache == settings.cache
+        && rewrites == settings.rewrites
+        && safe_search == settings.safe_search
+    {
         let _ = answer.send(Ok(()));
 
         return;
@@ -504,16 +516,13 @@ pub(crate) async fn apply(
         return;
     }
 
-    let old_upstream = std::mem::replace(&mut settings.upstream, upstream);
-    let old_cache = std::mem::replace(&mut settings.cache, cache);
-    let prepared = prepare(
-        saved.file_config(),
-        &settings,
-        &old_upstream,
-        &old_cache,
-        pipeline,
-    )
-    .await;
+    let old = Replaced {
+        upstream: std::mem::replace(&mut settings.upstream, upstream),
+        cache: std::mem::replace(&mut settings.cache, cache),
+        rewrites: std::mem::replace(&mut settings.rewrites, rewrites),
+        safe_search: std::mem::replace(&mut settings.safe_search, safe_search),
+    };
+    let prepared = prepare(saved.file_config(), &settings, &old, pipeline).await;
     let saved_change = match prepared {
         Ok(prepared) => match saved.save(&settings).await {
             Ok(()) => Ok(prepared),
@@ -531,8 +540,10 @@ pub(crate) async fn apply(
         Ok(prepared) => prepared,
 
         Err(error) => {
-            settings.upstream = old_upstream;
-            settings.cache = old_cache;
+            settings.upstream = old.upstream;
+            settings.cache = old.cache;
+            settings.rewrites = old.rewrites;
+            settings.safe_search = old.safe_search;
             let _ = answer.send(Err(error));
 
             return;
@@ -543,22 +554,34 @@ pub(crate) async fn apply(
         .upstreams
         .map(|upstreams| pipeline.upstreams().replace(upstreams));
     let replaced_cache = prepared.cache.map(|cache| pipeline.replace_cache(&cache));
+    let replaced_rewrites = prepared
+        .rewrites
+        .map(|rewrites| pipeline.replace_rewrites(rewrites));
+    pipeline.set_safe_search(prepared.safe_search);
     control.set_cache_max_bytes(new_max_bytes);
     let _ = answer.send(Ok(()));
 
     // The locks are held until the replaced cache is freed, so changes never stack copies.
-    drop_off_runtime((replaced_upstreams, replaced_cache, old_upstream, old_cache)).await;
+    drop_off_runtime((replaced_upstreams, replaced_cache, replaced_rewrites, old)).await;
     drop(admitted);
 }
 
+/// The page's values a change replaced: put back when it fails, freed off the runtime once it
+/// is in force.
+struct Replaced {
+    upstream: Option<UpstreamSettings>,
+    cache: Option<CacheSettings>,
+    rewrites: Option<Vec<Rewrite>>,
+    safe_search: Option<bool>,
+}
+
 /// The objects `settings` needs that differ from those in force under the old values. The
-/// checks and the new pool are built off the runtime thread: building TLS settings may read
-/// files (`/proc/cpuinfo` on 32-bit ARM).
+/// checks, the new pool and the rewrite table are built off the runtime thread: building TLS
+/// settings may read files (`/proc/cpuinfo` on 32-bit ARM).
 async fn prepare(
     file: &Config,
     settings: &Settings,
-    old_upstream: &Option<UpstreamSettings>,
-    old_cache: &Option<CacheSettings>,
+    old: &Replaced,
     pipeline: &Pipeline,
 ) -> Result<Prepared, ChangeError> {
     let cache_in_force = |page: &Option<CacheSettings>| {
@@ -566,8 +589,10 @@ async fn prepare(
             .unwrap_or_else(|| CacheSettings::of(&file.cache))
     };
     let new_upstreams =
-        upstream_in_force(old_upstream, file) != upstream_in_force(&settings.upstream, file);
-    let new_cache = cache_in_force(old_cache) != cache_in_force(&settings.cache);
+        upstream_in_force(&old.upstream, file) != upstream_in_force(&settings.upstream, file);
+    let new_cache = cache_in_force(&old.cache) != cache_in_force(&settings.cache);
+    let new_rewrites =
+        rewrites_in_force(&old.rewrites, file) != rewrites_in_force(&settings.rewrites, file);
     let shared = Arc::clone(pipeline.upstreams());
     let file = file.clone();
     let settings = settings.clone();
@@ -587,13 +612,27 @@ async fn prepare(
             None
         };
 
+        let rewrites = if new_rewrites {
+            Some(Arc::new(
+                Rewrites::new(&config.rewrites).map_err(ChangeError::Invalid)?,
+            ))
+        } else {
+            None
+        };
+
         Ok(Prepared {
             upstreams,
             cache: new_cache.then_some(config.cache),
+            rewrites,
+            safe_search: config.safe_search,
         })
     })
     .await
     .unwrap_or(Err(ChangeError::NotApplied))
+}
+
+fn rewrites_in_force<'a>(page: &'a Option<Vec<Rewrite>>, file: &'a Config) -> &'a [Rewrite] {
+    page.as_deref().unwrap_or(&file.rewrites)
 }
 
 fn upstream_in_force<'a>(
