@@ -5,7 +5,6 @@ use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use picoguard::config::Config;
 use picoguard::dns_check;
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
@@ -15,6 +14,7 @@ use picoguard::pipeline::Pipeline;
 use picoguard::release::{self, Refusal, VerifySetup};
 use picoguard::scheduler::{Scheduler, Timing};
 use picoguard::server::{self, Listeners};
+use picoguard::settings::{self, Loaded};
 use picoguard::stage::{
     INSTALLER_DIR, MAX_BINARY_BYTES, RELEASE_DOWNLOAD_URL, StageSetup, StageTiming, Stager,
 };
@@ -334,9 +334,17 @@ extern "C" fn restore_terminal_and_exit(_signal: libc::c_int) {
     unsafe { libc::_exit(130) };
 }
 
+/// A saved-settings file that cannot be used is a warning: picoguard would still start.
 fn check(config_path: &Path) -> ExitCode {
-    match Config::load(config_path) {
-        Ok(_) => {
+    match settings::load(config_path) {
+        Ok(loaded) => {
+            if let Some(reason) = loaded.saved.error() {
+                eprintln!(
+                    "warning: saved settings in {} will be ignored: {reason}",
+                    loaded.saved.path().display()
+                );
+            }
+
             println!("OK");
 
             ExitCode::SUCCESS
@@ -351,8 +359,8 @@ fn check(config_path: &Path) -> ExitCode {
 }
 
 fn run(config_path: &Path) -> ExitCode {
-    let config = match Config::load(config_path) {
-        Ok(config) => config,
+    let loaded = match settings::load(config_path) {
+        Ok(loaded) => loaded,
 
         Err(error) => {
             eprintln!("{error}");
@@ -361,14 +369,21 @@ fn run(config_path: &Path) -> ExitCode {
         }
     };
 
-    picoguard::log::init(config.log.level);
+    picoguard::log::init(loaded.config.log.level);
     log::info!(
         "picoguard {} loaded {}",
         env!("CARGO_PKG_VERSION"),
         config_path.display()
     );
 
-    if let Err(message) = serve(config) {
+    if let Some(reason) = loaded.saved.error() {
+        log::warn!(
+            "saved settings in {} are not used: {reason}",
+            loaded.saved.path().display()
+        );
+    }
+
+    if let Err(message) = serve(loaded) {
         log::error!("{message}");
 
         return ExitCode::FAILURE;
@@ -377,7 +392,9 @@ fn run(config_path: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn serve(config: Config) -> Result<(), String> {
+fn serve(loaded: Loaded) -> Result<(), String> {
+    let config = loaded.config;
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
