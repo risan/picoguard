@@ -2238,6 +2238,39 @@ async fn a_page_list_whose_refresh_grows_past_the_budget_keeps_its_last_good_cop
 }
 
 #[tokio::test]
+async fn a_reset_counts_only_the_lists_that_stay_against_the_budget() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/page.txt", &many_rules(200_000), None);
+    let other: String = (0..200_000)
+        .map(|index| format!("||m{index}.example^\n"))
+        .collect();
+    server.serve("/file.txt", &other, None);
+    let mut file = config_of(&dir, vec![url_list("file", server.url("/file.txt"))]);
+    let lists = vec![page_list(server.url("/page.txt"))];
+    let estimate = {
+        let mut scheduler = boot_with_page_lists(&file, lists.clone()).await;
+        scheduler.refresh(0, &downloader()).await;
+        assert!(blocked(&scheduler.policy(), "n5.example."));
+
+        scheduler.control().memory().estimate_bytes
+    };
+    // Room for the file's list while the page's is still held, not for both to stay.
+    file.limits.memory_mb = estimate / MIB + 1;
+    let scheduler = boot_with_page_lists(&file, lists).await;
+    let control = scheduler.control();
+    let policy = scheduler.policy();
+    tokio::spawn(scheduler.run(downloader(), std::future::pending()));
+
+    control.change_lists(ListEdit::Reset).await.unwrap();
+
+    assert!(blocked(&policy, "m5.example."));
+    assert!(!blocked(&policy, "n5.example."));
+    let memory = control.memory();
+    assert!(memory.estimate_bytes <= memory.budget_bytes);
+}
+
+#[tokio::test]
 async fn a_list_of_the_config_file_keeps_its_caps_only_whatever_the_budget() {
     let dir = StateDir::new();
     let server = ListServer::start().await;

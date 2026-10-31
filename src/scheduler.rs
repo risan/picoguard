@@ -1186,19 +1186,24 @@ impl Scheduler {
         };
         let kept: Vec<Option<usize>> = wanted.iter().map(&in_force).collect();
 
-        let mut lists = control.list_bytes();
+        // Every list in force stays held until the new set is, so a compile has the room
+        // they leave; the set after the change counts only the lists that stay.
+        let mut held = control.list_bytes();
+        let mut after: Vec<ListBytes> = kept.iter().flatten().map(|at| held[*at]).collect();
         let mut admitted_copies = Vec::new();
         for (index, entry) in wanted.iter().enumerate() {
             if kept[index].is_some() || !entry.enabled {
                 continue;
             }
 
-            match self.admit(entry, &lists, downloader).await {
+            match self.admit(entry, &held, &after, downloader).await {
                 Ok(compiled) => {
-                    lists.push(ListBytes {
+                    let bytes = ListBytes {
                         heap: compiled.compiled.list.heap_bytes(),
                         charge: compiled.compiled.list.compile_charge(),
-                    });
+                    };
+                    held.push(bytes);
+                    after.push(bytes);
                     admitted_copies.push((index, compiled));
                 }
 
@@ -1272,19 +1277,20 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Downloads and compiles the list of `entry` within the room the budget leaves with
-    /// `lists` in force, and checks that its copy fits.
+    /// Downloads and compiles the list of `entry` within the room the budget leaves while
+    /// `held` are held, and checks that its copy fits with the lists `after` the change.
     async fn admit(
         &self,
         entry: &Entry,
-        lists: &[ListBytes],
+        held: &[ListBytes],
+        after: &[ListBytes],
         downloader: &Downloader,
     ) -> Result<Box<Updated>, ListError> {
         let control = &self.control;
         let steady = memory::steady_bytes(
             control.fixed_bytes,
             control.cache_max_bytes.load(Ordering::Relaxed),
-            lists,
+            held,
         );
         let left = control.budget_bytes.saturating_sub(steady);
         let fetched = match &entry.source {
@@ -1341,7 +1347,7 @@ impl Scheduler {
         };
 
         let list = &updated.compiled.list;
-        let mut with_it = lists.to_vec();
+        let mut with_it = after.to_vec();
         with_it.push(ListBytes {
             heap: list.heap_bytes(),
             charge: list.compile_charge(),
@@ -1350,7 +1356,7 @@ impl Scheduler {
             let before = memory::estimate(
                 control.fixed_bytes,
                 control.cache_max_bytes.load(Ordering::Relaxed),
-                lists,
+                after,
             );
             let after = memory::estimate(
                 control.fixed_bytes,
