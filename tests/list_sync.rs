@@ -23,8 +23,8 @@ use picoguard::lists::{Downloader, resolver_over};
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ButtonRule, Explained, Role, RuleError, Scheduler, Timing};
 use picoguard::settings::{self, SaveError, Saved, Settings};
-use picoguard::upstream::Upstreams;
 use picoguard::upstream::tls::Tls;
+use picoguard::upstream::{SharedUpstreams, Upstreams};
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -868,7 +868,7 @@ async fn list_hosts_are_resolved_through_the_upstream_pool() {
         &Config::default().limits,
     );
     let downloader = Downloader::new(
-        resolver_over(Arc::new(upstreams)),
+        resolver_over(Arc::new(SharedUpstreams::new(upstreams))),
         Arc::new(Tls::with_webpki_roots()),
     );
     let url = format!("http://lists.example:{}/l.txt", server.address.port());

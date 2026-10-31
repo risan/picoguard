@@ -20,7 +20,7 @@ use std::fmt;
 use std::hash::BuildHasher;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -41,6 +41,9 @@ const INITIAL_SRTT_MS: f64 = 100.0;
 const SRTT_WEIGHT_OF_NEW_SAMPLE: f64 = 0.3;
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Replaced pools that may still be in use by what started before the change. Queries end
+/// within the timeout, so a few seconds after a change its pool is gone.
+const MAX_RETIRED: usize = 2;
 
 #[derive(Debug)]
 pub enum UpstreamError {
@@ -436,6 +439,18 @@ impl Upstreams {
             .map(|server| (server.label.as_str(), *server.tally.lock().unwrap()))
     }
 
+    fn carry_tallies(&self, replaced: &Upstreams) {
+        for server in &self.servers {
+            let same = replaced
+                .servers
+                .iter()
+                .find(|old| old.label == server.label);
+            if let Some(old) = same {
+                *server.tally.lock().unwrap() = *old.tally.lock().unwrap();
+            }
+        }
+    }
+
     /// Like `query_charged`, without a limit on the bytes held.
     pub async fn query(&self, request: &mut [u8]) -> Result<Vec<u8>, UpstreamError> {
         let unlimited = Budget::new(usize::MAX);
@@ -543,6 +558,54 @@ impl Upstreams {
         }
 
         healthy[healthy.len() - 1]
+    }
+}
+
+/// The upstream pool in force, replaced when the status page changes the servers. A query, a
+/// list download or an update check takes the current pool once at its start and keeps it to
+/// its end; a replaced pool is freed, its connections with it, when the last of them ends.
+pub struct SharedUpstreams {
+    current: Mutex<Arc<Upstreams>>,
+    retired: Mutex<Vec<Weak<Upstreams>>>,
+}
+
+impl SharedUpstreams {
+    pub fn new(upstreams: Upstreams) -> SharedUpstreams {
+        SharedUpstreams {
+            current: Mutex::new(Arc::new(upstreams)),
+            retired: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn current(&self) -> Arc<Upstreams> {
+        Arc::clone(&self.current.lock().unwrap())
+    }
+
+    /// The pool in force and the replaced ones still in use.
+    pub fn generations(&self) -> usize {
+        let mut retired = self.retired.lock().unwrap();
+        retired.retain(|pool| pool.strong_count() > 0);
+
+        1 + retired.len()
+    }
+
+    /// False while `MAX_RETIRED` replaced pools are still in use.
+    pub fn can_replace(&self) -> bool {
+        self.generations() <= MAX_RETIRED
+    }
+
+    /// Puts `next` in force and returns the pool it replaces. A server of `next` with the
+    /// label of a replaced one keeps its counts; what that one answers from here on is not
+    /// counted on the new pool.
+    pub fn replace(&self, next: Upstreams) -> Arc<Upstreams> {
+        let mut current = self.current.lock().unwrap();
+        next.carry_tallies(&current);
+        let replaced = std::mem::replace(&mut *current, Arc::new(next));
+        drop(current);
+
+        self.retired.lock().unwrap().push(Arc::downgrade(&replaced));
+
+        replaced
     }
 }
 
@@ -726,6 +789,49 @@ mod tests {
     #[test]
     fn a_tally_adds_a_few_bytes_per_server() {
         assert!(std::mem::size_of::<Mutex<Tally>>() <= 64);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_pool_keeps_the_counts_of_servers_with_the_same_label() {
+        let first = good_udp().await;
+        let second = good_udp().await;
+        let shared = SharedUpstreams::new(upstreams(vec![udp_url(&first)], 1000));
+        for _ in 0..3 {
+            shared
+                .current()
+                .query(&mut query_for("example.com."))
+                .await
+                .unwrap();
+        }
+
+        shared.replace(upstreams(vec![udp_url(&second), udp_url(&first)], 1000));
+
+        let counts: Vec<_> = shared
+            .current()
+            .tallies()
+            .map(|(label, tally)| (label.to_string(), tally.answered))
+            .collect();
+        assert_eq!(counts, [(udp_url(&second), 0), (udp_url(&first), 3)]);
+    }
+
+    #[test]
+    fn at_most_two_replaced_pools_may_still_be_in_use() {
+        let pool = || upstreams(vec!["udp://127.0.0.1:9".to_string()], 1000);
+        let shared = SharedUpstreams::new(pool());
+        assert_eq!(shared.generations(), 1);
+
+        let first_held = shared.replace(pool());
+        let second_held = shared.replace(pool());
+        assert_eq!(shared.generations(), 3);
+        assert!(!shared.can_replace());
+
+        drop(first_held);
+        assert_eq!(shared.generations(), 2);
+        assert!(shared.can_replace());
+
+        drop(shared.replace(pool()));
+        drop(second_held);
+        assert_eq!(shared.generations(), 1);
     }
 
     #[tokio::test]

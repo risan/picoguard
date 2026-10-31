@@ -35,8 +35,8 @@ use tokio_rustls::client::TlsStream;
 
 use crate::dns::wire::{CLASS_IN, Name, RData, Records, Section, rtype};
 use crate::filter::compile::{CompileError, CompileOptions, CompileWorker, Compiled};
-use crate::upstream::Upstreams;
 use crate::upstream::tls::{Alpn, Tls, lacks_shared_cipher};
+use crate::upstream::{SharedUpstreams, Upstreams};
 
 pub const MAX_PIECE_BYTES: usize = 64 * 1024;
 
@@ -220,12 +220,12 @@ impl std::error::Error for FetchError {}
 pub type ResolveFuture = Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>>;
 pub type Resolver = Arc<dyn Fn(String) -> ResolveFuture + Send + Sync>;
 
-/// The production [`Resolver`]: list host names go through picoguard's own upstream pool,
-/// unfiltered. A and AAAA are asked together; IPv4 addresses come first, because a board
+/// The production [`Resolver`]: list host names go through picoguard's own upstream pool in
+/// force, unfiltered. A and AAAA are asked together; IPv4 addresses come first, because a board
 /// often has no IPv6 route.
-pub fn resolver_over(upstreams: Arc<Upstreams>) -> Resolver {
+pub fn resolver_over(upstreams: Arc<SharedUpstreams>) -> Resolver {
     Arc::new(move |host: String| {
-        let upstreams = Arc::clone(&upstreams);
+        let upstreams = upstreams.current();
 
         Box::pin(async move {
             let (v4, v6) = tokio::join!(
@@ -2677,11 +2677,11 @@ mod tests {
             vec!["2001:db8::7".parse().unwrap()],
         )
         .await;
-        let upstreams = Arc::new(Upstreams::plain(
+        let upstreams = Arc::new(SharedUpstreams::new(Upstreams::plain(
             dns.address,
             &UpstreamConfig::default(),
             &LimitsConfig::default(),
-        ));
+        )));
         let resolver = resolver_over(upstreams);
 
         let addresses = resolver("lists.example".to_string()).await.unwrap();
@@ -2703,16 +2703,16 @@ mod tests {
             vec!["2001:db8::7".parse().unwrap()],
         )
         .await;
-        let upstreams = Arc::new(Upstreams::plain(
+        let upstreams = Arc::new(SharedUpstreams::new(Upstreams::plain(
             dns.address,
             &UpstreamConfig::default(),
             &LimitsConfig::default(),
-        ));
+        )));
         let resolver = resolver_over(Arc::clone(&upstreams));
 
         resolver("lists.example".to_string()).await.unwrap();
 
-        let (_, tally) = upstreams.tallies().next().unwrap();
+        let (_, tally) = upstreams.current().tallies().next().unwrap();
         assert_eq!((tally.answered, tally.failed), (2, 0));
     }
 
@@ -2723,16 +2723,16 @@ mod tests {
             timeout_ms: 200,
             ..UpstreamConfig::default()
         };
-        let empty = resolver_over(Arc::new(Upstreams::plain(
+        let empty = resolver_over(Arc::new(SharedUpstreams::new(Upstreams::plain(
             dns.address,
             &config,
             &LimitsConfig::default(),
-        )));
-        let dead = resolver_over(Arc::new(Upstreams::plain(
+        ))));
+        let dead = resolver_over(Arc::new(SharedUpstreams::new(Upstreams::plain(
             "127.0.0.1:9".parse().unwrap(),
             &config,
             &LimitsConfig::default(),
-        )));
+        ))));
 
         assert!(empty("lists.example".to_string()).await.is_err());
         assert!(dead("lists.example".to_string()).await.is_err());

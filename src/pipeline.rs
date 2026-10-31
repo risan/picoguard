@@ -26,7 +26,7 @@ use crate::filter::engine::{BlockedAnswer, Decision, Verdict, blocked_answer};
 use crate::names::DeviceNames;
 use crate::policy::{Policy, PolicyView};
 use crate::stats::{Event, QueryResult, Stats, StatsSettings};
-use crate::upstream::{Answered, Tally, UpstreamError, Upstreams};
+use crate::upstream::{Answered, SharedUpstreams, Tally, UpstreamError, Upstreams};
 
 /// Reverse lookups of these ranges go to the local resolver.
 const PRIVATE_NETWORKS: [&str; 7] = [
@@ -326,7 +326,7 @@ pub struct Pipeline {
     local_domains: Vec<Name>,
     private_reverse_zones: Vec<Name>,
     private_networks: Vec<Cidr>,
-    upstreams: Arc<Upstreams>,
+    upstreams: Arc<SharedUpstreams>,
     local_resolver: Option<(SocketAddr, Upstreams)>,
     device_names: Option<Arc<DeviceNames>>,
     cache: Mutex<Cache>,
@@ -338,7 +338,10 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(config: &Config, policy: Arc<Policy>) -> Result<Arc<Pipeline>, String> {
-        let upstreams = Arc::new(Upstreams::from_config(&config.upstream, &config.limits)?);
+        let upstreams = Arc::new(SharedUpstreams::new(Upstreams::from_config(
+            &config.upstream,
+            &config.limits,
+        )?));
         let local_resolver = config.local.resolver.map(|resolver| {
             (
                 resolver,
@@ -394,15 +397,16 @@ impl Pipeline {
         &self.stats
     }
 
-    /// The upstream pool, shared with the list downloader, which resolves list hosts through
-    /// it.
-    pub fn upstreams(&self) -> &Arc<Upstreams> {
+    /// The upstream pool in force, shared with the list downloader, the stager and the update
+    /// check, which resolve their hosts through it.
+    pub fn upstreams(&self) -> &Arc<SharedUpstreams> {
         &self.upstreams
     }
 
     /// The configured servers in config order, then the local resolver when there is one.
     pub fn upstream_tallies(&self) -> Vec<ServerTally> {
-        let servers = self.upstreams.tallies().map(|(label, tally)| ServerTally {
+        let upstreams = self.upstreams.current();
+        let servers = upstreams.tallies().map(|(label, tally)| ServerTally {
             label: label.to_string(),
             kind: ServerKind::Upstream,
             tally,
@@ -1084,13 +1088,15 @@ impl Pipeline {
     }
 
     async fn fetch(&self, mut request: Vec<u8>, route: Route) -> Outcome {
+        let current;
         let upstreams = if route == Route::Local {
             self.local_resolver
                 .as_ref()
                 .map(|(_, resolver)| resolver)
                 .ok_or(Failure::Upstream)?
         } else {
-            &self.upstreams
+            current = self.upstreams.current();
+            &*current
         };
         let Answered {
             reply: mut bytes,
