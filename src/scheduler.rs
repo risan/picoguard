@@ -29,7 +29,7 @@ use crate::lists::{Downloader, Limits, Refresh, RefreshError, Updated, Validator
 use crate::memory::{self, ListBytes, Memory};
 use crate::pipeline::Pipeline;
 use crate::policy::Policy;
-use crate::services::{self, ServiceList, Services, ServicesView, Wanted};
+use crate::services::{self, MAX_SELECTED_RULES, ServiceList, Services, ServicesView, Wanted};
 use crate::settings::{
     self, ChangeError, ListRole, PageChange, PageList, SaveError, Saved, Settings,
 };
@@ -562,24 +562,35 @@ impl ListControl {
             return Err(error);
         }
 
-        self.compile_services(kept, wanted)
-            .await
-            .map_err(ChangeError::OverBudget)
+        self.compile_services(kept, wanted).await
     }
 
     /// `kept` and the lists of `wanted`, each compiled within the room the budget leaves while
     /// the lists in force, the services in force and those compiled before it are held. The
-    /// set must fit the budget in place of the services in force; else the reason. A service
-    /// that does not compile (it blocks a canary name) is left out. The caller holds the
-    /// admission lock.
+    /// set holds at most `MAX_SELECTED_RULES` rules and must fit the budget in place of the
+    /// services in force; else the reason. A service that does not compile (it blocks a
+    /// canary name) is left out. The caller holds the admission lock.
     async fn compile_services(
         &self,
         kept: Vec<ServiceList>,
         wanted: Vec<Wanted>,
-    ) -> Result<Vec<ServiceList>, String> {
+    ) -> Result<Vec<ServiceList>, ChangeError> {
         let Some(worker) = self.services.worker() else {
-            return Err("the blocked services are not running".to_string());
+            return Err(ChangeError::Unavailable(
+                "the blocked services are not running".to_string(),
+            ));
         };
+
+        let rules = kept.iter().map(|list| list.rules).sum::<usize>()
+            + wanted
+                .iter()
+                .map(|(_, _, rules)| rules.lines().count())
+                .sum::<usize>();
+        if rules > MAX_SELECTED_RULES {
+            return Err(ChangeError::Invalid(format!(
+                "the services switched on would hold {rules} rules, more than {MAX_SELECTED_RULES}"
+            )));
+        }
 
         let fixed = self.fixed_bytes;
         let cache = self.cache_max_bytes.load(Ordering::Relaxed);
@@ -589,6 +600,7 @@ impl ListControl {
             let left = self
                 .budget_bytes
                 .saturating_sub(memory::steady_bytes(fixed, cache, &held));
+            let count = rules.lines().count();
             match services::compile(worker, rules, left).await {
                 Ok(compiled) => {
                     let list = ServiceList {
@@ -596,6 +608,7 @@ impl ListControl {
                         label: format!("Blocked service: {name}"),
                         list: compiled.list,
                         fingerprint: compiled.fingerprint,
+                        rules: count,
                     };
                     held.push(list.bytes());
                     lists.push(list);
@@ -604,11 +617,11 @@ impl ListControl {
                 Err(CompileError::OverMemoryBudget) => {
                     worker.discard(lists);
 
-                    return Err(format!(
+                    return Err(ChangeError::OverBudget(format!(
                         "the blocked services would pass the memory budget: {} left of {}",
                         memory::megabytes(left),
                         memory::megabytes(self.budget_bytes)
-                    ));
+                    )));
                 }
 
                 Err(error) => {
@@ -623,11 +636,11 @@ impl ListControl {
         if estimate > self.budget_bytes {
             worker.discard(lists);
 
-            return Err(format!(
+            return Err(ChangeError::OverBudget(format!(
                 "the blocked services would pass the memory budget: the estimate would be {} of {}",
                 memory::megabytes(estimate),
                 memory::megabytes(self.budget_bytes)
-            ));
+            )));
         }
 
         Ok(lists)
@@ -683,7 +696,15 @@ impl ListControl {
         }
 
         let refreshed = match self.services.fetch(&selection).await {
-            Ok(wanted) => self.compile_services(Vec::new(), wanted).await,
+            Ok(wanted) => self
+                .compile_services(Vec::new(), wanted)
+                .await
+                .map_err(|error| match error {
+                    ChangeError::Invalid(reason)
+                    | ChangeError::OverBudget(reason)
+                    | ChangeError::Unavailable(reason) => reason,
+                    other => format!("{other:?}"),
+                }),
             Err(error) => Err(error),
         };
 

@@ -129,8 +129,10 @@ grouped as the catalog groups them, a filter box, "From the config file" or "Set
   (once for the change) and builds that service's list, within the [memory
   budget](#the-memory-budget); switching one off drops its list and downloads nothing.
 - Refused, with nothing saved or changed: an id the catalog does not have (400 "there is no
-  service "x" in the catalog"), services that would pass the memory budget (409 "the blocked
-  services would pass the memory budget: ..."), or a catalog that cannot be downloaded (502
+  service "x" in the catalog"), services that would hold more than 20,000 rules together, those
+  already on included (400 "the services switched on would hold 22000 rules, more than 20000"),
+  services that would pass the memory budget (409 "the blocked services would pass the memory
+  budget: ..."), or a catalog that cannot be downloaded (502
   "could not download the catalog of the blocked services: ...").
 
 `GET /api/services` (signed-in only) shows the catalog's services and which are on; the first

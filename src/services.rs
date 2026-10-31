@@ -37,6 +37,8 @@ pub(crate) struct ServiceList {
     pub label: String,
     pub list: Arc<CompiledList>,
     pub fingerprint: u128,
+    /// The rules it was compiled from, which count in `MAX_SELECTED_RULES`.
+    pub rules: usize,
 }
 
 impl ServiceList {
@@ -289,17 +291,6 @@ pub fn parse(body: &[u8], wanted: &[String]) -> Result<Catalog, String> {
     .map_err(|error| format!("the catalog is not valid: {error}"))?;
     if !found {
         return Err("the catalog has no blocked_services".to_string());
-    }
-
-    let selected: usize = catalog
-        .rules
-        .iter()
-        .map(|(_, rules)| rules.lines().count())
-        .sum();
-    if selected > MAX_SELECTED_RULES {
-        return Err(format!(
-            "the services switched on hold {selected} rules, more than {MAX_SELECTED_RULES}"
-        ));
     }
 
     catalog.services.shrink_to_fit();
@@ -732,23 +723,6 @@ mod tests {
         assert_eq!(
             catalog.rules[0].1,
             "||a.example^\n||e.example^$dnstype=~CNAME\n/^f[0-9]+\\.example$/\n"
-        );
-    }
-
-    #[test]
-    fn the_services_switched_on_hold_at_most_20000_rules() {
-        let rules: Vec<String> = (0..2000).map(|n| format!("||n{n}.example^")).collect();
-        let rules: Vec<&str> = rules.iter().map(String::as_str).collect();
-        let entries: Vec<serde_json::Value> = (0..11)
-            .map(|n| entry(&format!("s{n}"), "S", "g", &rules))
-            .collect();
-        let ten: Vec<String> = (0..10).map(|n| format!("s{n}")).collect();
-        let eleven: Vec<String> = (0..11).map(|n| format!("s{n}")).collect();
-
-        assert!(parse(&body(entries.clone()), &ten).is_ok());
-        assert_eq!(
-            parse(&body(entries), &eleven).unwrap_err(),
-            "the services switched on hold 22000 rules, more than 20000"
         );
     }
 

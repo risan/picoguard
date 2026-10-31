@@ -5387,3 +5387,76 @@ async fn services_that_would_pass_the_memory_budget_are_refused_and_the_lists_st
     assert!(saved_settings(&site).is_none());
     assert_eq!(site.control.memory(), memory);
 }
+
+/// A catalog of `count` services `s0`, `s1`, ..., each with `rules` rules.
+fn catalog_of(count: usize, rules: usize) -> String {
+    let entries: Vec<String> = (0..count)
+        .map(|service| {
+            let rules: Vec<String> = (0..rules)
+                .map(|rule| format!("\"||r{rule}.s{service}.example^\""))
+                .collect();
+
+            format!(
+                "{{\"id\": \"s{service}\", \"name\": \"S{service}\", \"group\": \"g\", \
+                 \"rules\": [{}]}}",
+                rules.join(", ")
+            )
+        })
+        .collect();
+
+    format!("{{\"blocked_services\": [{}]}}", entries.join(", "))
+}
+
+fn services_body(ids: std::ops::Range<usize>) -> String {
+    let ids: Vec<String> = ids.map(|id| format!("\"s{id}\"")).collect();
+
+    format!("{{\"services\": [{}]}}", ids.join(", "))
+}
+
+#[tokio::test]
+async fn services_switched_on_one_change_at_a_time_stay_within_20000_rules() {
+    let (site, catalog, _upstream) = services_site(&[], day_long_timing(), |_| {}).await;
+    catalog.serve(CATALOG_PATH, &catalog_of(11, 2000), None);
+    let refused = |reply: &Reply| {
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert_eq!(
+            reply.json()["error"],
+            "the services switched on would hold 22000 rules, more than 20000"
+        );
+    };
+
+    refused(
+        &site
+            .send(post("/api/settings", &services_body(0..11)))
+            .await,
+    );
+    assert!(saved_settings(&site).is_none());
+
+    let reply = site.send(post("/api/settings", &services_body(0..9))).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let reply = site
+        .send(post("/api/settings", &services_body(0..10)))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(is_blocked(&site, "r1999.s9.example.").await);
+    let memory = site.control.memory();
+    let before = saved_settings(&site);
+
+    refused(
+        &site
+            .send(post("/api/settings", &services_body(0..11)))
+            .await,
+    );
+    assert!(!is_blocked(&site, "r0.s10.example.").await);
+    assert!(is_blocked(&site, "r0.s0.example.").await);
+    assert_eq!(saved_settings(&site), before);
+    assert_eq!(site.control.memory(), memory);
+    assert_eq!(loaded_services(&site).await["error"], Value::Null);
+
+    let reply = site
+        .send(post("/api/settings", &services_body(1..11)))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(is_blocked(&site, "r0.s10.example.").await);
+    assert!(!is_blocked(&site, "r0.s0.example.").await);
+}
