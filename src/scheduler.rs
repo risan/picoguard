@@ -12,7 +12,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -548,18 +548,33 @@ impl ListControl {
                 outcome: None,
             })
         };
+        // Until the add is spawned, a caller that goes away takes the reservation with it.
+        let mut reserved = Reservation {
+            pending: &self.pending_list,
+            previous: Some(previous),
+            spawned: AtomicBool::new(false),
+        };
 
         let accepted = self
-            .spawn_change(|control, answer| async move {
-                let outcome = control.apply_lists(edit, Some(answer)).await;
-                if let Some(pending) = control.pending_list.lock().unwrap().as_mut() {
-                    pending.outcome = Some(outcome);
+            .spawn_change(|control, answer| {
+                reserved.spawned.store(true, Ordering::Relaxed);
+
+                async move {
+                    let outcome = control.apply_lists(edit, Some(answer)).await;
+                    // A refused add has put the row before it back, which keeps its outcome.
+                    if let Some(pending) = control.pending_list.lock().unwrap().as_mut()
+                        && pending.outcome.is_none()
+                    {
+                        pending.outcome = Some(outcome);
+                    }
                 }
             })
             .await
             .unwrap_or(Err(ListError::NotApplied));
-        if accepted.is_err() {
-            *self.pending_list.lock().unwrap() = previous;
+        if accepted.is_ok() {
+            reserved.previous = None;
+        } else {
+            reserved.spawned.store(false, Ordering::Relaxed);
         }
 
         accepted
@@ -779,6 +794,26 @@ fn page_list(rules: &[ButtonRule], action: Action) -> Option<Arc<CompiledList>> 
     }
 
     any.then(|| Arc::new(builder.finish(ListFormat::Adblock)))
+}
+
+/// The add being checked, held in the pending row from the check of `add_list` until its task
+/// is spawned. Dropped before that, or refused, it puts the row as it was back.
+struct Reservation<'a> {
+    pending: &'a Mutex<Option<PendingList>>,
+    previous: Option<Option<PendingList>>,
+    spawned: AtomicBool,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.spawned.load(Ordering::Relaxed) {
+            return;
+        }
+
+        if let Some(previous) = self.previous.take() {
+            *self.pending.lock().unwrap() = previous;
+        }
+    }
 }
 
 /// The URL lists of the config file as the page holds them: what the first edit from the page
@@ -1986,6 +2021,53 @@ mod tests {
                 .add_button_rule("later.example", Action::Block)
                 .await,
             Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_add_whose_caller_leaves_before_it_starts_leaves_no_add_in_flight() {
+        let dir = TestDir::new("scheduler-add-left");
+        let control = Arc::new(ListControl::new(Arc::new(Policy::new()), saved_in(&dir)));
+        let held = Arc::clone(&control.pending)
+            .acquire_many_owned(MAX_PENDING_CHANGES as u32)
+            .await
+            .unwrap();
+        let add = || ListEdit::Add {
+            role: ListRole::Block,
+            name: None,
+            url: "https://lists.example/a.txt".to_string(),
+            refresh_hours: 24,
+        };
+
+        tokio::select! {
+            biased;
+
+            _ = control.add_list(add()) => {
+                panic!("the add started without a permit");
+            }
+
+            () = std::future::ready(()) => {}
+        }
+
+        assert_eq!(control.pending_list(), None);
+        drop(held);
+        // No scheduler reads the commands here, so the add is checked and then not applied.
+        assert_eq!(control.add_list(add()).await, Ok(()));
+        for _ in 0..200 {
+            if control
+                .pending_list()
+                .and_then(|list| list.outcome)
+                .is_some()
+            {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            control.pending_list().and_then(|list| list.outcome),
+            Some(Err(ListError::NotApplied))
         );
     }
 
