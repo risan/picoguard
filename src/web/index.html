@@ -136,6 +136,11 @@ td button { padding: 1px var(--s2); font-size: var(--t-sm); }
 #rewrite-table td { overflow-wrap: anywhere; }
 #rewrite-table td:nth-child(2) { min-width: 7.5rem; }
 #rewrite-table td:last-child { width: 1%; white-space: nowrap; }
+#service-filter { width: 100%; max-width: 20rem; margin-bottom: var(--s2); }
+#service-groups { margin-bottom: var(--s3); }
+#service-groups h3 { margin: var(--s3) 0 var(--s1); font-size: var(--t-sm); font-weight: 600; color: var(--muted); }
+#service-groups div { display: grid; gap: var(--s1) var(--s3); grid-template-columns: repeat(auto-fill, minmax(min(100%, 11rem), 1fr)); }
+#service-groups label { display: flex; align-items: center; gap: var(--s2); overflow-wrap: anywhere; }
 .fields { display: grid; gap: var(--s3); margin: var(--s3) 0; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); }
 .fields label { display: grid; gap: var(--s1); font-size: var(--t-sm); color: var(--muted); }
 .fields input, .fields select { width: 100%; }
@@ -370,6 +375,19 @@ input[type="checkbox"] { width: auto; margin: 0; }
         <button id="safe_search-save" class="go">Save</button>
         <button id="safe_search-reset">Use the config file</button>
         <span id="safe_search-note"></span>
+      </div>
+    </section>
+
+    <section id="services-card" class="wide">
+      <h2>Blocked services <small id="services-from"></small></h2>
+      <p class="empty">Blocks every name of a service, off while filtering is paused. The list of services is AdGuard's, downloaded when it is needed.</p>
+      <input id="service-filter" type="search" autocapitalize="none" placeholder="Filter" aria-label="Filter the services">
+      <p id="services-state" class="empty"></p>
+      <div id="service-groups"></div>
+      <div class="actions">
+        <button id="services-save" class="go">Save</button>
+        <button id="services-reset">Use the config file</button>
+        <span id="services-note"></span>
       </div>
     </section>
   </div>
@@ -735,14 +753,16 @@ function showMemory(m) {
 }
 
 // A card being edited is left alone by the refresh until it is saved or reset.
-const editing = { upstream: false, cache: false, rewrites: false, safe_search: false };
+const editing = { upstream: false, cache: false, rewrites: false, safe_search: false, services: false };
 const CACHE_FIELDS = [["c-entries", "max_entries", 1], ["c-kib", "max_bytes", 1024],
   ["c-min", "min_ttl", 1], ["c-max", "max_ttl", 1]];
 let servers = [];
 let rewrites = [];
+let chosen = new Set();
+let catalog = [];
 
 function showSettingCards(s) {
-  [["upstream", s.upstream], ["cache", s.cache], ["rewrites", s.rewrites], ["safe_search", s.safe_search]].forEach(([key, value]) => {
+  [["upstream", s.upstream], ["cache", s.cache], ["rewrites", s.rewrites], ["safe_search", s.safe_search], ["services", s.services]].forEach(([key, value]) => {
     $(key + "-from").textContent = value.from === "page" ? "Set on this page" : "From the config file";
     $(key + "-reset").hidden = value.from !== "page";
   });
@@ -766,6 +786,43 @@ function showSettingCards(s) {
   if (!editing.safe_search) {
     $("safe-search").checked = s.safe_search.on;
   }
+
+  if (!editing.services) {
+    chosen = new Set(s.services.block);
+    showServiceSwitches();
+  }
+}
+
+// The catalog is read on the first visit of the Settings tab, not before.
+async function loadServices() {
+  const v = await api("/api/services");
+  const state = $("services-state");
+  catalog = v.services;
+  state.className = v.error ? "err" : "empty";
+  state.textContent = v.loading ? "Loading the list of services\u2026"
+    : v.error ? "The list of services could not be downloaded: " + v.error
+    : v.loaded_at ? "List of services downloaded " + new Date(v.loaded_at * 1000).toLocaleString() + "." : "";
+  showServiceSwitches();
+}
+
+function showServiceSwitches() {
+  const filter = $("service-filter").value.trim().toLowerCase();
+  const groups = new Map();
+  catalog.filter((x) => !filter || (x.name + " " + x.id).toLowerCase().includes(filter)).forEach((x) => {
+    const label = el("label");
+    const box = el("input");
+    box.type = "checkbox";
+    box.value = x.id;
+    box.checked = chosen.has(x.id);
+    label.append(box, x.name);
+    groups.set(x.group, [...(groups.get(x.group) || []), label]);
+  });
+  $("service-groups").replaceChildren(...[...groups].flatMap(([group, labels]) => {
+    const div = el("div");
+    div.append(...labels);
+
+    return [el("h3", group.replace(/_/g, " ")), div];
+  }));
 }
 
 function showRewrites() {
@@ -1060,6 +1117,10 @@ async function update() {
       showQueries(log.entries);
       showRules(rules);
       showSettings(saved);
+
+      if (!$("panel-settings").hidden) {
+        await loadServices();
+      }
     }
 
     $("state").textContent = "updated " + new Date().toLocaleTimeString();
@@ -1117,7 +1178,13 @@ async function act(path, body, done, failed) {
 
 document.querySelectorAll("[data-tab]").forEach((tab) =>
   tab.addEventListener("click", () => { location.hash = tab.dataset.tab; }));
-window.addEventListener("hashchange", showTab);
+window.addEventListener("hashchange", () => {
+  showTab();
+
+  if (signedIn && !$("panel-settings").hidden) {
+    loadServices().catch(() => {});
+  }
+});
 document.querySelectorAll("button[data-minutes]").forEach((button) =>
   button.addEventListener("click", () =>
     act("/api/pause", { minutes: Number(button.dataset.minutes) })));
@@ -1276,6 +1343,13 @@ $("rewrites-reset").addEventListener("click", () => saveSetting("rewrites", null
 $("safe-search").addEventListener("change", () => { editing.safe_search = true; });
 $("safe_search-save").addEventListener("click", () => saveSetting("safe_search", $("safe-search").checked, "safe_search-note"));
 $("safe_search-reset").addEventListener("click", () => saveSetting("safe_search", null, "safe_search-note"));
+$("service-filter").addEventListener("input", showServiceSwitches);
+$("service-groups").addEventListener("change", (event) => {
+  editing.services = true;
+  chosen[event.target.checked ? "add" : "delete"](event.target.value);
+});
+$("services-save").addEventListener("click", () => saveSetting("services", [...chosen], "services-note"));
+$("services-reset").addEventListener("click", () => saveSetting("services", null, "services-note"));
 $("cache-reset").addEventListener("click", () => saveSetting("cache", null, "cache-set-note"));
 $("check-form").addEventListener("submit", (event) => {
   event.preventDefault();

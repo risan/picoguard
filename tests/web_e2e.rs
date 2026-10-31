@@ -527,9 +527,8 @@ async fn the_page_is_served_with_protective_headers() {
 /// binary, no memory at run time.
 const PAGE_HARD_CAP_BYTES: usize = 64 * 1024;
 
-/// This part, the rewrites and SafeSearch; a later part raises it on purpose, never past the
-/// cap.
-const PAGE_BUDGET_BYTES: usize = 50 * 1024;
+/// The last part, the blocked services; raised on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 54 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -919,6 +918,39 @@ async fn the_settings_tab_edits_the_rewrites_and_safe_search() {
         "data.decision === \"rewritten\"",
         "counters.rewritten",
         "#rewrite-table td",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+#[tokio::test]
+async fn the_settings_tab_switches_blocked_services_by_group_with_a_filter() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "services-card",
+        "services-from",
+        "service-filter",
+        "services-state",
+        "service-groups",
+        "services-save",
+        "services-reset",
+        "services-note",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "[\"services\", s.services]",
+        "api(\"/api/services\")",
+        "saveSetting(\"services\"",
+        "editing.services",
+        "AdGuard",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
