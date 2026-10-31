@@ -152,9 +152,13 @@ estimate = 6 MiB                                    the idle process (binary, ru
          + the largest list's compile again                          a refresh builds a new copy
 ```
 
-A list's compile is charged 24 bytes for each plain rule (its array grows by doubling, so the
-old and new array live together for a moment) and the estimated cost of each slow rule. The
-numbers are measured: the tests compare them with what full stats, a full cache and the real
+A list's compile is charged 24 bytes for each plain rule, duplicates included (its array grows
+by doubling, so the old and new array live together for a moment), and the estimated cost of
+each slow rule. Building a `/regex/` rule holds more for a moment (about 640 KB of compiler
+tables, plus five times its automaton at most), so a compile within little room refuses the list
+before it builds such a regex, and the list's compile charge is the most its compile needed at
+any one moment. A compile of the same text again always fits in that charge. The numbers are
+measured: the tests compare them with what full stats, a full cache and the real
 lists hold. With the defaults and the three default lists the estimate is about 25 MB.
 
 - **Checked when** a list is added or turned on again, a list from the page is refreshed, and the
