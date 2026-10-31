@@ -4634,6 +4634,7 @@ async fn page_lists_are_edited_removed_and_reset_through_the_api() {
         .await;
     assert_eq!(removed.status, 200, "{}", removed.body);
     assert_eq!(removed.json()["lists"], serde_json::json!([]));
+    assert_eq!(removed.json()["from"], "page", "no lists, set on the page");
     assert_eq!(
         saved_settings(&site).unwrap()["lists"],
         serde_json::json!([])
@@ -4641,6 +4642,7 @@ async fn page_lists_are_edited_removed_and_reset_through_the_api() {
 
     let reset = site.send(post("/api/lists/reset", "{}")).await;
     assert_eq!(reset.status, 200, "{}", reset.body);
+    assert_eq!(reset.json()["from"], "file");
     assert_eq!(
         saved_settings(&site).unwrap(),
         serde_json::json!({"version": 1})

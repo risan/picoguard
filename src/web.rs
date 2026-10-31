@@ -934,6 +934,11 @@ impl Web {
         json(
             StatusCode::OK,
             &ListsView {
+                from: if self.lists.lists_on_page() {
+                    Source::Page
+                } else {
+                    Source::File
+                },
                 lists: self.list_views(),
                 pending: self
                     .lists
@@ -1680,6 +1685,8 @@ impl UpstreamView {
 
 #[derive(Serialize)]
 struct ListsView {
+    /// `page` when the saved settings hold the lists, even none at all.
+    from: Source,
     lists: Vec<ListView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending: Option<PendingView>,

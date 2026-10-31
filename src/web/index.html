@@ -817,7 +817,7 @@ function listControl(node, l, action) {
 function showLists(data) {
   showMemory(data.memory);
   showPending(data.pending);
-  const page = data.lists.some((l) => l.from === "page");
+  const page = data.from === "page";
   $("lists-from").textContent = page ? "Set on this page"
     : "From the config file; the first change here copies its lists to this page";
   $("lists-reset").hidden = !page;

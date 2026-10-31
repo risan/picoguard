@@ -323,6 +323,8 @@ pub struct ListControl {
     /// To the scheduler's task, which owns the lists.
     commands: mpsc::Sender<Replace>,
     pending_list: Mutex<Option<PendingList>>,
+    /// The saved settings hold the lists, so the config file's URL lists are not used.
+    lists_on_page: AtomicBool,
 }
 
 impl ListControl {
@@ -353,6 +355,7 @@ impl ListControl {
             pending: Arc::new(Semaphore::new(MAX_PENDING_CHANGES)),
             commands,
             pending_list: Mutex::new(None),
+            lists_on_page: AtomicBool::new(false),
         };
 
         (control, received)
@@ -360,6 +363,11 @@ impl ListControl {
 
     pub fn saved(&self) -> &Arc<Saved> {
         &self.saved
+    }
+
+    /// Whether the saved settings hold the lists, even none at all.
+    pub fn lists_on_page(&self) -> bool {
+        self.lists_on_page.load(Ordering::Relaxed)
     }
 
     /// The estimate of the whole process with the lists in force, and the budget.
@@ -1061,6 +1069,7 @@ impl Scheduler {
             .as_ref()
             .map_or(0, |rules| rules.heap_bytes());
         control.cache_max_bytes = AtomicUsize::new(config.cache.max_bytes);
+        control.lists_on_page = AtomicBool::new(from_page);
         let assembly = control.assembly.get_mut();
         assembly.main_ids = main_ids;
         assembly.allow_ids = allow_ids;
@@ -1265,6 +1274,7 @@ impl Scheduler {
             log::warn!("cannot build the filter with the changed lists: {error:?}");
         }
 
+        control.lists_on_page.store(from_page, Ordering::Relaxed);
         self.publish_all();
         for (index, snapshot) in snapshots {
             self.save(index, snapshot, 0).await;
