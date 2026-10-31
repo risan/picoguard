@@ -24,6 +24,8 @@ use picoguard::stats::QueryResult;
 
 const SAFE_GOOGLE: [u8; 4] = [216, 239, 38, 120];
 const ANY_OTHER: [u8; 4] = [9, 9, 9, 9];
+/// How long the scripted upstream takes for a name that starts with "slow".
+const SLOW: Duration = Duration::from_millis(300);
 
 fn rewrites(entries: &[(&str, &str)]) -> Vec<Rewrite> {
     entries
@@ -79,6 +81,7 @@ fn asked_names(upstream: &FakeUpstream) -> Vec<String> {
 }
 
 /// Answers by question name, as a scripted upstream; any other A question gets `ANY_OTHER`.
+/// A name that starts with "slow" is answered after `SLOW`, and `silent.example` never.
 async fn scripted_upstream() -> FakeUpstream {
     fake_upstream(|query| {
         let question = &query.queries[0];
@@ -131,7 +134,17 @@ async fn scripted_upstream() -> FakeUpstream {
             _ => {}
         }
 
-        vec![(Duration::ZERO, reply)]
+        if owner == "silent.example." {
+            return Vec::new();
+        }
+
+        let delay = if owner.starts_with("slow") {
+            SLOW
+        } else {
+            Duration::ZERO
+        };
+
+        vec![(delay, reply)]
     })
     .await
 }
@@ -722,5 +735,142 @@ async fn a_reply_prepared_before_a_rewrite_was_added_is_answered_by_the_rewrite(
     let (reply, result) = finish_tcp(&server, prepared).await;
 
     assert_eq!(values(&reply), ["10.1.1.1"]);
+    assert_eq!(result, QueryResult::Rewritten);
+}
+
+#[tokio::test]
+async fn a_rewrite_changed_while_the_new_target_is_looked_up_answers_by_the_latest() {
+    let upstream = scripted_upstream().await;
+    let server = start_with(
+        &upstream,
+        &[("alias.lan", "long.example")],
+        false,
+        engine_of(&[], &[]),
+        |_| {},
+    )
+    .await;
+    let waiting = prepare_tcp(&server, "alias.lan.", RecordType::A).await;
+    drop(
+        server
+            .pipeline
+            .replace_rewrites(table(&[("alias.lan", "slow-1.example")])),
+    );
+
+    let change = async {
+        tokio::time::sleep(SLOW / 6).await;
+        drop(
+            server
+                .pipeline
+                .replace_rewrites(table(&[("alias.lan", "10.0.0.7")])),
+        );
+    };
+    let ((reply, result), ()) = tokio::join!(finish_tcp(&server, waiting), change);
+
+    assert_eq!(values(&reply), ["10.0.0.7"]);
+    assert_eq!(result, QueryResult::Rewritten);
+    assert_eq!(asked_names(&upstream), ["long.example.", "slow-1.example."]);
+}
+
+#[tokio::test]
+async fn a_rewrite_added_while_the_name_itself_is_looked_up_answers_by_it() {
+    let upstream = scripted_upstream().await;
+    let server = start_with(
+        &upstream,
+        &[("slow-2.example", "long.example")],
+        false,
+        engine_of(&[], &[]),
+        |_| {},
+    )
+    .await;
+    let waiting = prepare_tcp(&server, "slow-2.example.", RecordType::A).await;
+    drop(server.pipeline.replace_rewrites(table(&[])));
+
+    let change = async {
+        tokio::time::sleep(SLOW / 6).await;
+        drop(
+            server
+                .pipeline
+                .replace_rewrites(table(&[("slow-2.example", "10.0.0.8")])),
+        );
+    };
+    let ((reply, result), ()) = tokio::join!(finish_tcp(&server, waiting), change);
+
+    assert_eq!(values(&reply), ["10.0.0.8"]);
+    assert_eq!(result, QueryResult::Rewritten);
+}
+
+#[tokio::test]
+async fn a_rewrite_that_keeps_changing_while_it_waits_ends_in_servfail_after_three_lookups() {
+    let upstream = scripted_upstream().await;
+    let server = start_with(
+        &upstream,
+        &[("alias.lan", "long.example")],
+        false,
+        engine_of(&[], &[]),
+        |config| {
+            config.upstream.timeout_ms = 3000;
+        },
+    )
+    .await;
+    let waiting = prepare_tcp(&server, "alias.lan.", RecordType::A).await;
+    drop(
+        server
+            .pipeline
+            .replace_rewrites(table(&[("alias.lan", "slow-0.example")])),
+    );
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let changing = {
+        let pipeline = Arc::clone(&server.pipeline);
+        let done = Arc::clone(&done);
+        tokio::spawn(async move {
+            for round in 1.. {
+                tokio::time::sleep(SLOW / 6).await;
+                if done.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                let target = format!("slow-{round}.example");
+                drop(pipeline.replace_rewrites(table(&[("alias.lan", &target)])));
+            }
+        })
+    };
+
+    let started = Instant::now();
+    let (reply, result) = finish_tcp(&server, waiting).await;
+    let took = started.elapsed();
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    changing.await.unwrap();
+
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(result, QueryResult::Error);
+    assert!(took < Duration::from_millis(3000), "{took:?}");
+    let slow_lookups = asked_names(&upstream)
+        .iter()
+        .filter(|name| name.starts_with("slow"))
+        .count();
+    assert_eq!(slow_lookups, 3, "{:?}", asked_names(&upstream));
+}
+
+#[tokio::test]
+async fn a_query_that_got_no_answer_is_answered_by_a_rewrite_added_since() {
+    let upstream = scripted_upstream().await;
+    let server = start_with(&upstream, &[], false, engine_of(&[], &[]), |config| {
+        config.upstream.timeout_ms = 300;
+    })
+    .await;
+    let failed = prepare_tcp(&server, "silent.example.", RecordType::A).await;
+    let (reply, result) = finish_tcp(&server, failed).await;
+    assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(result, QueryResult::Error);
+
+    let failed = prepare_tcp(&server, "silent.example.", RecordType::A).await;
+    drop(
+        server
+            .pipeline
+            .replace_rewrites(table(&[("silent.example", "10.0.0.9")])),
+    );
+    let (reply, result) = finish_tcp(&server, failed).await;
+
+    assert_eq!(values(&reply), ["10.0.0.9"]);
     assert_eq!(result, QueryResult::Rewritten);
 }

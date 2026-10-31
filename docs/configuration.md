@@ -313,7 +313,10 @@ answer = "nas.lan"
   blocking is paused.
 - A reply that waits to be written (a slow TCP client) follows the rewrites, SafeSearch and
   pause in force when it is written: a rewrite changed or a pause started or ended meanwhile
-  answers the question the new way.
+  answers the question the new way, and so does a rewrite added for a question that got no
+  answer. A lookup this needs is checked again when it ends; if they changed once more while
+  it waited, the question is answered the newest way, with at most three lookups within the
+  upstream `timeout_ms`, then SERVFAIL.
 - The query log shows a rewritten query as "rewritten", and `/api/status` counts them in
   `counters.rewritten`.
 

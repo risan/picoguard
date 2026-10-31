@@ -10,13 +10,14 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 
 use crate::budget::{Budget, Charge};
 use crate::cache::{Cache, CacheKey, EntryToken, Memo, Ttls};
@@ -59,6 +60,10 @@ const PRIVATE_REVERSE_ZONES: [&str; 11] = [
 ];
 const IPV4_REVERSE_LABELS: usize = 6;
 const IPV6_REVERSE_LABELS: usize = 34;
+/// The lookups a reply settled again when it is written may wait for, each started because
+/// the rewrites, SafeSearch or a pause changed what the question needs while the one before
+/// waited.
+const MAX_LOOKUPS: usize = 3;
 
 /// What the steps that need no waiting settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -731,9 +736,16 @@ impl Pipeline {
 
             Inner::Failed {
                 request, protocol, ..
-            } => self
-                .servfail(request, *protocol, out)
-                .then_some(Finished(Some(Counted::of(QueryResult::Error)))),
+            } => {
+                // A rewrite added since answers it.
+                if Query::parse(request).is_ok_and(|query| self.is_rewritten(&query.question.name))
+                {
+                    return self.settle_now(request, *protocol, out).await;
+                }
+
+                self.servfail(request, *protocol, out)
+                    .then_some(Finished(Some(Counted::of(QueryResult::Error))))
+            }
         }
     }
 
@@ -751,22 +763,11 @@ impl Pipeline {
     }
 
     /// Steps 2 to 6 again under the policy and rewrites of this moment, for a question whose
-    /// prepared answer does not hold any more.
+    /// prepared answer does not hold any more. A lookup is checked again when it ends, and
+    /// the question settled once more when what it needs changed meanwhile; after
+    /// `MAX_LOOKUPS` lookups or the upstream timeout, an answer that needs a lookup is a
+    /// SERVFAIL.
     async fn settle_now(
-        self: &Arc<Pipeline>,
-        request: &[u8],
-        protocol: Protocol,
-        out: &mut Vec<u8>,
-    ) -> Option<Finished> {
-        match self.settle(request, protocol, None, out) {
-            Ok(settled) => Some(Finished(Some(Counted::of(settled.result())))),
-            Err(Quick::Replied) => Some(Finished(None)),
-            Err(Quick::Dropped) => None,
-            Err(Quick::NeedsUpstream) => self.resume(request, protocol, out).await,
-        }
-    }
-
-    async fn resume(
         self: &Arc<Pipeline>,
         request: &[u8],
         protocol: Protocol,
@@ -774,42 +775,87 @@ impl Pipeline {
     ) -> Option<Finished> {
         let query = Query::parse(request).ok()?;
         let reply = Reply::new(&query, self.udp_size, protocol);
-        if let Some(target) = self.target_of(&query) {
-            let delivery =
-                match timeout(self.resume_limit, self.resolve_target(&query, &target)).await {
-                    Ok(Err(Failure::Overloaded)) => {
-                        return self.shed_now(&reply, protocol, out);
-                    }
+        let deadline = Instant::now() + self.resume_limit;
+        let mut lookups = 0;
 
-                    Ok(outcome) => outcome.ok(),
-                    Err(_) => None,
-                };
-
-            return Some(Finished(Some(self.deliver_rewritten(
-                &query,
-                &reply,
-                delivery.as_deref(),
-                out,
-            ))));
-        }
-
-        let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
-            return self.shed_now(&reply, protocol, out);
-        };
-
-        match timeout(self.resume_limit, receiver).await {
-            Ok(Ok(Ok(delivery))) => {
-                Some(Finished(Some(self.deliver(&query, &reply, &delivery, out))))
+        loop {
+            match self.settle(request, protocol, None, out) {
+                Ok(settled) => return Some(Finished(Some(Counted::of(settled.result())))),
+                Err(Quick::Replied) => return Some(Finished(None)),
+                Err(Quick::Dropped) => return None,
+                Err(Quick::NeedsUpstream) => {}
             }
 
-            Ok(Ok(Err(Failure::Overloaded))) => self.shed_now(&reply, protocol, out),
+            if lookups == MAX_LOOKUPS || Instant::now() >= deadline {
+                reply.error(rcode::SERVFAIL, out);
+
+                return Some(Finished(Some(Counted::of(QueryResult::Error))));
+            }
+
+            lookups += 1;
+            if let ControlFlow::Break(finished) =
+                self.resume(&query, &reply, protocol, deadline, out).await
+            {
+                return finished;
+            }
+        }
+    }
+
+    /// Steps 4 to 6 for what the question needs now, waiting until `deadline` at most.
+    /// `Continue` when the rewrites, SafeSearch or a pause changed what it needs meanwhile.
+    async fn resume(
+        self: &Arc<Pipeline>,
+        query: &Query<'_>,
+        reply: &Reply<'_, '_>,
+        protocol: Protocol,
+        deadline: Instant,
+        out: &mut Vec<u8>,
+    ) -> ControlFlow<Option<Finished>> {
+        if let Some(target) = self.target_of(query) {
+            let outcome = timeout_at(deadline.into(), self.resolve_target(query, &target)).await;
+            if self.target_of(query).as_ref() != Some(&target) {
+                return ControlFlow::Continue(());
+            }
+
+            let delivery = match outcome {
+                Ok(Err(Failure::Overloaded)) => {
+                    return ControlFlow::Break(self.shed_now(reply, protocol, out));
+                }
+
+                Ok(outcome) => outcome.ok(),
+                Err(_) => None,
+            };
+
+            return ControlFlow::Break(Some(Finished(Some(self.deliver_rewritten(
+                query,
+                reply,
+                delivery.as_deref(),
+                out,
+            )))));
+        }
+
+        let Ok((_waiting, receiver)) = self.join_or_start(query) else {
+            return ControlFlow::Break(self.shed_now(reply, protocol, out));
+        };
+
+        let outcome = timeout_at(deadline.into(), receiver).await;
+        if self.is_rewritten(&query.question.name) {
+            return ControlFlow::Continue(());
+        }
+
+        ControlFlow::Break(match outcome {
+            Ok(Ok(Ok(delivery))) => {
+                Some(Finished(Some(self.deliver(query, reply, &delivery, out))))
+            }
+
+            Ok(Ok(Err(Failure::Overloaded))) => self.shed_now(reply, protocol, out),
 
             _ => {
                 reply.error(rcode::SERVFAIL, out);
 
                 Some(Finished(Some(Counted::of(QueryResult::Error))))
             }
-        }
+        })
     }
 
     /// A SERVFAIL in place of `prepared`, for a reply that cannot be queued or written. A
@@ -2621,7 +2667,7 @@ mod tests {
     async fn ask_printer(pipeline: &Arc<Pipeline>) -> Vec<String> {
         let request = QuerySpec::new("printer.lan.", RecordType::A).bytes();
         let mut out = Vec::new();
-        let answered = timeout(
+        let answered = tokio::time::timeout(
             Duration::from_secs(1),
             pipeline.answer(request, Protocol::Udp, CLIENT, &mut out),
         )
