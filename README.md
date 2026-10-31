@@ -148,7 +148,7 @@ container) and give both addresses to your router as primary and secondary DNS.
 
 ## Status
 
-Version 0.3.1 is released. Measured on x86_64 so far; numbers from a real ARM board
+Version 0.4.0 is released. Measured on x86_64 so far; numbers from a real ARM board
 are still to come.
 
 ## Known differences from AdGuard Home
