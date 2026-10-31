@@ -15,7 +15,7 @@ use picoguard::rewrites::Rewrites;
 const ENTRIES: usize = 1000;
 const SWAPS: usize = 20;
 /// 1000 home names, 900 with an address and 100 wildcards with a target name. Measured:
-/// 81,760 bytes.
+/// 80,170 bytes.
 const TYPICAL_BUDGET: usize = 96 * 1024;
 /// 1000 names of 239 characters, each with a target name as long. Measured:
 /// 520,960 bytes.
@@ -83,6 +83,30 @@ fn longest() -> Vec<Rewrite> {
         .collect()
 }
 
+/// 500 addresses on one name, and 500 names rewritten to it: the aliases share the
+/// addresses. Measured: 38,995 bytes; a copy for each alias held 4,288,995.
+const SHARED_BUDGET: usize = 48 * 1024;
+
+/// One name with 500 addresses, and 500 aliases whose target is that name, so each answers
+/// with its addresses.
+fn shared() -> Vec<Rewrite> {
+    (0..ENTRIES)
+        .map(|index| {
+            if index < ENTRIES / 2 {
+                rewrite(
+                    "many.home.lan".to_string(),
+                    format!("10.0.{}.{}", index / 250, index % 250 + 1),
+                )
+            } else {
+                rewrite(
+                    format!("alias-{index}.home.lan"),
+                    "many.home.lan".to_string(),
+                )
+            }
+        })
+        .collect()
+}
+
 /// The bytes the table of `rewrites` holds once built.
 fn held_by(rewrites: &[Rewrite]) -> (Rewrites, usize) {
     let before = live();
@@ -99,12 +123,18 @@ async fn a_thousand_rewrites_fit_their_budget_and_replacing_them_leaves_nothing(
 
     let (typical_table, typical_bytes) = held_by(&typical);
     let (longest_table, longest_bytes) = held_by(&longest);
-    println!("1000 rewrites hold {typical_bytes} bytes; with the longest names {longest_bytes}");
+    let (shared_table, shared_bytes) = held_by(&shared());
+    println!(
+        "1000 rewrites hold {typical_bytes} bytes; with the longest names {longest_bytes}; \
+         500 addresses on one name and 500 aliases of it {shared_bytes}"
+    );
 
     assert_eq!(typical_table.len(), ENTRIES);
+    assert_eq!(shared_table.len(), ENTRIES / 2 + 1);
     assert!(typical_bytes <= TYPICAL_BUDGET, "{typical_bytes}");
     assert!(longest_bytes <= LONGEST_BUDGET, "{longest_bytes}");
-    drop((typical_table, longest_table));
+    assert!(shared_bytes <= SHARED_BUDGET, "{shared_bytes}");
+    drop((typical_table, longest_table, shared_table));
 
     let mut config = Config::default();
     config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];

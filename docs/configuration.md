@@ -329,7 +329,8 @@ answer = "nas.lan"
 SafeSearch is off while blocking is paused. A rewrite of yours for the same name wins.
 
 Memory: 1000 rewrites of home names hold about 80 KB, and 1000 of the longest names about
-520 KB. They are not part of the memory estimate.
+520 KB. A name rewritten to a name with addresses shares them, so 500 addresses on one name and
+500 names rewritten to it hold about 40 KB. They are not part of the memory estimate.
 
 ## `[server]`
 

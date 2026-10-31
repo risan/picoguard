@@ -69,15 +69,16 @@ pub enum By {
 enum Answer {
     Addresses(Box<[IpAddr]>),
     Target(Box<str>),
+    /// A target name whose own rewrite has addresses: the entry that holds them, which is
+    /// always an `Addresses`, so an alias shares them and costs no copy.
+    AddressesOf(Entry),
 }
 
-impl Answer {
-    fn found(&self) -> Found<'_> {
-        match self {
-            Answer::Addresses(addresses) => Found::Addresses(addresses),
-            Answer::Target(target) => Found::Target(target),
-        }
-    }
+/// Where an answer is in the tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    Exact(usize),
+    Wildcard(usize),
 }
 
 /// Owner names in wire format with their answers, sorted by owner.
@@ -88,8 +89,9 @@ type Table = Vec<(Box<[u8]>, Answer)>;
 pub struct Rewrites {
     exact: Table,
     wildcards: Table,
-    /// The SafeSearch names that a rewrite of the user gives addresses.
-    safe_search_addresses: Vec<(&'static str, Box<[IpAddr]>)>,
+    /// The SafeSearch names that a rewrite of the user gives addresses, and the entry that
+    /// holds them.
+    safe_search_addresses: Vec<(&'static str, Entry)>,
 }
 
 impl Rewrites {
@@ -119,7 +121,7 @@ impl Rewrites {
                         *addresses = more.into_boxed_slice();
                     }
 
-                    Answer::Target(_) => {
+                    Answer::Target(_) | Answer::AddressesOf(_) => {
                         return Err(format!("rewrite {owner:?} has addresses and a name"));
                     }
                 }
@@ -158,19 +160,16 @@ impl Rewrites {
     /// are no loops.
     fn answer_targets_with_addresses(&mut self) {
         let addresses_of = |rewrites: &Rewrites, target: &str| {
-            let name = Name::from_text(target)?;
+            let entry = rewrites.find_user(&Name::from_text(target)?)?;
 
-            match rewrites.find_user(&name)? {
-                Answer::Addresses(addresses) => Some(addresses.clone()),
-                Answer::Target(_) => None,
-            }
+            matches!(rewrites.answer(entry), Answer::Addresses(_)).then_some(entry)
         };
-        let resolved = |rewrites: &Rewrites, table: &Table| -> Vec<Option<Box<[IpAddr]>>> {
+        let resolved = |rewrites: &Rewrites, table: &Table| -> Vec<Option<Entry>> {
             table
                 .iter()
                 .map(|(_, answer)| match answer {
                     Answer::Target(target) => addresses_of(rewrites, target),
-                    Answer::Addresses(_) => None,
+                    Answer::Addresses(_) | Answer::AddressesOf(_) => None,
                 })
                 .collect()
         };
@@ -182,9 +181,9 @@ impl Rewrites {
             .collect();
 
         for (table, resolved) in [(&mut self.exact, exact), (&mut self.wildcards, wildcards)] {
-            for ((_, answer), addresses) in table.iter_mut().zip(resolved) {
-                if let Some(addresses) = addresses {
-                    *answer = Answer::Addresses(addresses);
+            for ((_, answer), owner) in table.iter_mut().zip(resolved) {
+                if let Some(owner) = owner {
+                    *answer = Answer::AddressesOf(owner);
                 }
             }
         }
@@ -193,8 +192,8 @@ impl Rewrites {
     /// The rewrite of `name`: the user's own first, then SafeSearch when `safe_search` is on.
     /// An exact name beats a wildcard, and a longer wildcard a shorter one.
     pub fn find(&self, name: &Name, safe_search: bool) -> Option<(Found<'_>, By)> {
-        if let Some(answer) = self.find_user(name) {
-            return Some((answer.found(), By::User));
+        if let Some(entry) = self.find_user(name) {
+            return Some((self.found(entry), By::User));
         }
 
         if !safe_search {
@@ -207,17 +206,17 @@ impl Rewrites {
             .iter()
             .find(|(safe, _)| *safe == target)
         {
-            Some((_, addresses)) => Found::Addresses(addresses),
+            Some((_, owner)) => self.found(*owner),
             None => Found::Target(target),
         };
 
         Some((found, By::SafeSearch))
     }
 
-    fn find_user(&self, name: &Name) -> Option<&Answer> {
+    fn find_user(&self, name: &Name) -> Option<Entry> {
         let wire = name.as_wire();
-        if let Some(answer) = search(&self.exact, wire) {
-            return Some(answer);
+        if let Some(index) = search(&self.exact, wire) {
+            return Some(Entry::Exact(index));
         }
 
         // `*.x` answers for the names below x, never x itself: only the proper suffixes count.
@@ -225,12 +224,28 @@ impl Rewrites {
         while wire[start] != 0 {
             start += 1 + usize::from(wire[start]);
 
-            if let Some(answer) = search(&self.wildcards, &wire[start..]) {
-                return Some(answer);
+            if let Some(index) = search(&self.wildcards, &wire[start..]) {
+                return Some(Entry::Wildcard(index));
             }
         }
 
         None
+    }
+
+    fn answer(&self, entry: Entry) -> &Answer {
+        match entry {
+            Entry::Exact(index) => &self.exact[index].1,
+            Entry::Wildcard(index) => &self.wildcards[index].1,
+        }
+    }
+
+    fn found(&self, entry: Entry) -> Found<'_> {
+        match self.answer(entry) {
+            Answer::Addresses(addresses) => Found::Addresses(addresses),
+            Answer::Target(target) => Found::Target(target),
+            // One step: the owner holds addresses.
+            Answer::AddressesOf(owner) => self.found(*owner),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -242,12 +257,10 @@ impl Rewrites {
     }
 }
 
-fn search<'a>(table: &'a Table, wire: &[u8]) -> Option<&'a Answer> {
-    let index = table
+fn search(table: &Table, wire: &[u8]) -> Option<usize> {
+    table
         .binary_search_by(|(owner, _)| owner.as_ref().cmp(wire))
-        .ok()?;
-
-    Some(&table[index].1)
+        .ok()
 }
 
 /// The SafeSearch name of a search engine's name, if it has one.
