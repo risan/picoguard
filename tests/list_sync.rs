@@ -1973,3 +1973,37 @@ async fn explain_names_the_deciding_list_and_rule_and_ignores_pause() {
         explained(false, "Ads list", "||list.example^")
     );
 }
+
+#[tokio::test]
+async fn a_list_that_is_off_is_left_out_at_boot() {
+    let dir = StateDir::new();
+    let file = dir.file("off.txt");
+    fs::write(&file, V1).unwrap();
+    let config = config_of(
+        &dir,
+        vec![
+            ListConfig {
+                name: Some("off".to_string()),
+                path: Some(file),
+                enabled: false,
+                ..ListConfig::default()
+            },
+            ListConfig {
+                name: Some("on".to_string()),
+                url: Some("https://lists.example/on.txt".to_string()),
+                ..ListConfig::default()
+            },
+        ],
+    );
+
+    let (scheduler, _store) = boot(&config).await;
+
+    let names: Vec<String> = scheduler
+        .control()
+        .statuses()
+        .into_iter()
+        .map(|status| status.name)
+        .collect();
+    assert_eq!(names, ["on"]);
+    assert!(!blocked(&scheduler.policy(), "ads.example"));
+}

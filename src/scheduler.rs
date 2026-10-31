@@ -487,6 +487,7 @@ impl Scheduler {
         let allowlists = config.allowlists.iter().map(|list| (Role::Allowlist, list));
         let entries = blocklists
             .chain(allowlists)
+            .filter(|(_, list)| list.enabled)
             .filter_map(|(role, list)| Entry::new(role, list, &timing))
             .collect();
 
