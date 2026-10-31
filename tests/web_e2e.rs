@@ -3678,14 +3678,36 @@ async fn a_rule_that_cannot_be_saved_answers_503_and_changes_nothing() {
 #[tokio::test]
 async fn a_client_that_leaves_during_a_save_leaves_the_file_and_the_rules_in_agreement() {
     let (site, _upstream) = plain_site().await;
-    let held = site.control.saved().lock().await;
+    // Met twice by the save: once when the file is written, once to let it be renamed.
+    let rename = Arc::new(std::sync::Barrier::new(2));
+    let hook = Arc::clone(&rename);
+    site.control.saved().run_before_rename(move || {
+        hook.wait();
+        hook.wait();
+    });
+    let meet = || {
+        let rename = Arc::clone(&rename);
+        tokio::task::spawn_blocking(move || {
+            rename.wait();
+        })
+    };
     let request = post("/api/rules", &rule_body("left.example", "block")).signed_in(ADMIN);
     let mut stream = TcpStream::connect(site.web).await.unwrap();
     stream.write_all(&request.bytes(site.web)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    tokio::time::timeout(Duration::from_secs(5), meet())
+        .await
+        .expect("the save never reached the rename")
+        .unwrap();
     drop(stream);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    drop(held);
+    let before = ask(&site.dns, "left.example.", RecordType::A).await;
+    assert_eq!(
+        addresses(&before),
+        ["9.9.9.9"],
+        "in force before it was saved"
+    );
+    meet().await.unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while no_page_rules(&site).await {

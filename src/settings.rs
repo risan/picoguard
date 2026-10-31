@@ -12,8 +12,8 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -349,7 +349,10 @@ pub struct Saved {
     error: Mutex<Option<String>>,
     /// False after a save failed, until one works.
     can_save: AtomicBool,
+    before_rename: Mutex<Option<BeforeRename>>,
 }
+
+type BeforeRename = Arc<dyn Fn() + Send + Sync>;
 
 impl Saved {
     pub fn new(file_config: Config, settings: Settings, error: Option<String>) -> Saved {
@@ -359,7 +362,15 @@ impl Saved {
             settings: tokio::sync::Mutex::new(settings),
             error: Mutex::new(error),
             can_save: AtomicBool::new(true),
+            before_rename: Mutex::new(None),
         }
+    }
+
+    /// Runs `hook` on the writing thread of every later save, after the `.part` file is
+    /// written and before it is renamed: a test can disconnect a client right there.
+    #[doc(hidden)]
+    pub fn run_before_rename(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.before_rename.lock().unwrap() = Some(Arc::new(hook));
     }
 
     pub fn path(&self) -> &Path {
@@ -387,7 +398,8 @@ impl Saved {
     pub async fn save(&self, settings: &Settings) -> Result<(), SaveError> {
         let bytes = encode(settings)?;
         let dir = self.file_config.state.dir.clone();
-        let written = tokio::task::spawn_blocking(move || write(&dir, &bytes))
+        let before_rename = self.before_rename.lock().unwrap().clone();
+        let written = tokio::task::spawn_blocking(move || write(&dir, &bytes, before_rename))
             .await
             .unwrap_or_else(|_| Err(io::Error::other("the write was stopped")));
         self.can_save.store(written.is_ok(), Ordering::Relaxed);
@@ -442,7 +454,7 @@ fn encode(settings: &Settings) -> Result<Vec<u8>, SaveError> {
 
 /// The file appears whole or not at all (as `stage::write_whole`). Once it is renamed in place
 /// it is saved: a failed sync of the folder after that is only logged.
-fn write(dir: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write(dir: &Path, bytes: &[u8], before_rename: Option<BeforeRename>) -> io::Result<()> {
     let part = dir.join(PART_NAME);
     match fs::remove_file(&part) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => {
@@ -464,6 +476,10 @@ fn write(dir: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&part);
 
         return Err(error);
+    }
+
+    if let Some(hook) = before_rename {
+        hook();
     }
 
     fs::rename(&part, dir.join(FILE_NAME))?;
