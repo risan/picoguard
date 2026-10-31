@@ -1,4 +1,4 @@
-//! The status page and its JSON API (plan D16). One HTML page, seven reads, eight mutations,
+//! The status page and its JSON API (plan D16). One HTML page, seven reads, twelve mutations,
 //! and sign-in and sign-out. A web page on another device of the LAN must not be able to pause
 //! blocking, so every request passes the access policy before it reaches a handler:
 //!
@@ -36,14 +36,17 @@ use tokio::time::timeout;
 
 use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
 use crate::config::{Cidr, Config, ListFormat, Rewrite, WebConfig, is_allowed};
-use crate::memory::Memory;
+use crate::memory::{self, Memory};
 use crate::pipeline::{CacheSize, Pipeline, ServerKind, ServerTally};
 use crate::policy::Policy;
 use crate::scheduler::{
-    Action, ButtonRule, ListControl, ListStatus, MAX_BUTTON_RULES, Role, RuleError, normalized_name,
+    Action, ButtonRule, ListControl, ListEdit, ListError, ListStatus, MAX_BUTTON_RULES,
+    PendingList, Role, RuleError, normalized_name,
 };
 use crate::server::bind_tcp;
-use crate::settings::{CacheSettings, ChangeError, PageChange, SaveError, UpstreamSettings};
+use crate::settings::{
+    CacheSettings, ChangeError, ListRole, PageChange, SaveError, UpstreamSettings,
+};
 use crate::stage::{Refused, Stager};
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, TopEntry};
 use crate::update::{Tag, UpdateView, Updates, parse_tag};
@@ -241,6 +244,10 @@ enum Change {
     AddRule,
     RemoveRule,
     Settings,
+    AddList,
+    EditList,
+    RemoveList,
+    ResetLists,
 }
 
 impl Change {
@@ -274,6 +281,10 @@ impl Route {
             "/api/pause" => Some(Route::Change(Change::Pause)),
             "/api/resume" => Some(Route::Change(Change::Resume)),
             "/api/lists/refresh" => Some(Route::Change(Change::RefreshLists)),
+            "/api/lists/add" => Some(Route::Change(Change::AddList)),
+            "/api/lists/edit" => Some(Route::Change(Change::EditList)),
+            "/api/lists/remove" => Some(Route::Change(Change::RemoveList)),
+            "/api/lists/reset" => Some(Route::Change(Change::ResetLists)),
             "/api/cache/clear" => Some(Route::Change(Change::ClearCache)),
             "/api/update" => Some(Route::Change(Change::Install)),
             "/api/login" => Some(Route::Change(Change::Login)),
@@ -520,12 +531,7 @@ impl Web {
                 ))
             }
 
-            Read::Lists => Ok(json(
-                StatusCode::OK,
-                &ListsView {
-                    lists: self.list_views(),
-                },
-            )),
+            Read::Lists => Ok(self.lists_response()),
 
             Read::Rules => Ok(self.rules_response().await),
 
@@ -756,6 +762,70 @@ impl Web {
                 Ok(self.rules_response().await)
             }
 
+            Change::AddList => {
+                let request: AddListRequest = object_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"role\": \"block\" or \"allow\", \"name\": \"...\", \"url\": \"...\", \"refresh_hours\": 1 to 168}",
+                    )
+                })?;
+                let edit = ListEdit::Add {
+                    role: request.role,
+                    name: list_name(request.name)?,
+                    url: request.url,
+                    refresh_hours: request.refresh_hours,
+                };
+                self.lists
+                    .add_list(edit)
+                    .await
+                    .map_err(|error| list_rejection(&error))?;
+
+                Ok(json(StatusCode::ACCEPTED, &AddStarted { list: "checking" }))
+            }
+
+            Change::EditList => {
+                let request: EditListRequest = object_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"role\", \"source\"} with any of \"name\", \"refresh_hours\" and \"enabled\"",
+                    )
+                })?;
+                let edit = ListEdit::Edit {
+                    role: request.role,
+                    source: request.source,
+                    name: match request.name {
+                        Some(name) => Some(list_name(Some(name))?.unwrap_or_default()),
+                        None => None,
+                    },
+                    refresh_hours: request.refresh_hours,
+                    enabled: request.enabled,
+                };
+
+                self.change_lists(edit).await
+            }
+
+            Change::RemoveList => {
+                let request: ListSourceRequest = object_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"role\": \"block\" or \"allow\", \"source\": \"...\"}",
+                    )
+                })?;
+                let edit = ListEdit::Remove {
+                    role: request.role,
+                    source: request.source,
+                };
+
+                self.change_lists(edit).await
+            }
+
+            Change::ResetLists => {
+                let _: Empty = object_request(body)
+                    .ok_or_else(|| Rejection::new(StatusCode::BAD_REQUEST, "send {}"))?;
+
+                self.change_lists(ListEdit::Reset).await
+            }
+
             // Each key becomes editable with the release-2 part that applies it live.
             Change::Settings => {
                 let request = settings_request(body).ok_or_else(|| {
@@ -784,6 +854,15 @@ impl Web {
                 Ok(self.settings_response().await)
             }
         }
+    }
+
+    async fn change_lists(&self, edit: ListEdit) -> Result<Response<Full<Bytes>>, Rejection> {
+        self.lists
+            .change_lists(edit)
+            .await
+            .map_err(|error| list_rejection(&error))?;
+
+        Ok(self.lists_response())
     }
 
     /// Every change needs a password, so a change handler always has one.
@@ -836,12 +915,33 @@ impl Web {
         }
     }
 
+    /// The source of a list is left out without a password, like the upstream servers: a
+    /// URL can carry a private token.
     fn list_views(&self) -> Vec<ListView> {
+        let signed_in = self.auth.is_some();
+
         self.lists
             .statuses()
             .into_iter()
-            .map(ListView::of)
+            .map(|status| ListView::of(status, signed_in))
             .collect()
+    }
+
+    fn lists_response(&self) -> Response<Full<Bytes>> {
+        let signed_in = self.auth.is_some();
+
+        json(
+            StatusCode::OK,
+            &ListsView {
+                lists: self.list_views(),
+                pending: self
+                    .lists
+                    .pending_list()
+                    .filter(|_| signed_in)
+                    .map(PendingView::of),
+                memory: self.lists.memory(),
+            },
+        )
     }
 }
 
@@ -1032,7 +1132,8 @@ fn login_request(body: &[u8]) -> Option<LoginRequest> {
     serde_json::from_slice(body).ok()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Empty {}
 
 fn with_cookie(mut response: Response<Full<Bytes>>, cookie: &str) -> Response<Full<Bytes>> {
@@ -1099,6 +1200,114 @@ fn remove_request(body: &[u8]) -> Option<RemoveRequest> {
     }
 
     serde_json::from_slice(body).ok()
+}
+
+/// The longest name of a list the page may give.
+const MAX_LIST_NAME_CHARS: usize = 100;
+
+/// A JSON object of `T` and nothing else; the first byte must open an object, as for
+/// `install_version`.
+fn object_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+
+    serde_json::from_slice(body).ok()
+}
+
+/// A list name from the page, trimmed; `None` when it is empty.
+fn list_name(name: Option<String>) -> Result<Option<String>, Rejection> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let name = name.trim();
+    if name.chars().count() > MAX_LIST_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err(Rejection::new(
+            StatusCode::BAD_REQUEST,
+            "a list name has at most 100 characters and no control characters",
+        ));
+    }
+
+    Ok((!name.is_empty()).then(|| name.to_string()))
+}
+
+/// A list from the page is always a URL list; its format and caps come from the config file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddListRequest {
+    role: ListRole,
+    #[serde(default)]
+    name: Option<String>,
+    url: String,
+    refresh_hours: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditListRequest {
+    role: ListRole,
+    source: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    refresh_hours: Option<u32>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListSourceRequest {
+    role: ListRole,
+    source: String,
+}
+
+fn list_rejection(error: &ListError) -> Rejection {
+    match error {
+        ListError::Invalid(reason) => Rejection::new(StatusCode::BAD_REQUEST, reason.clone()),
+        ListError::NoSuchList => Rejection::new(StatusCode::NOT_FOUND, "no such list"),
+        ListError::ConfigFileOnly => Rejection::new(
+            StatusCode::CONFLICT,
+            "this list is read from a file: change it in the config file",
+        ),
+        ListError::AddInFlight => Rejection::new(
+            StatusCode::CONFLICT,
+            "a list is being added; try again when it is done",
+        ),
+        ListError::OverBudget { .. } => Rejection::new(StatusCode::CONFLICT, list_outcome(error)),
+        ListError::Failed { .. } => Rejection::new(StatusCode::BAD_GATEWAY, list_outcome(error)),
+        ListError::NotSaved(error) => save_rejection(error),
+        ListError::NotApplied => Rejection::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the change could not be applied",
+        ),
+    }
+}
+
+/// How a list change from the page ended, as the page shows it.
+fn list_outcome(error: &ListError) -> String {
+    match error {
+        ListError::OverBudget {
+            name,
+            needs,
+            left,
+            budget,
+        } => {
+            let needs = match needs {
+                Some(needs) => memory::megabytes(*needs),
+                None => format!("more than {}", memory::megabytes(*left)),
+            };
+
+            format!(
+                "refused: {name} needs {needs}, {} left of {}",
+                memory::megabytes(*left),
+                memory::megabytes(*budget)
+            )
+        }
+
+        ListError::Failed { name, reason } => format!("failed: {name}: {reason}"),
+        other => format!("failed: {}", list_rejection(other).message),
+    }
 }
 
 /// A key sent as `null` is `Some(None)`: back to the config file's value.
@@ -1346,10 +1555,20 @@ struct ListView {
     /// Seconds since the copy in force was loaded or last confirmed current.
     age_seconds: Option<u64>,
     last_error: Option<String>,
+    enabled: bool,
+    refresh_hours: u32,
+    /// The URL or path; with `kind`, what names the list in a change. Left out without a
+    /// password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    /// A URL list, which the page may change; a path list is changed in the config file.
+    editable: bool,
+    from: Source,
+    heap_bytes: usize,
 }
 
 impl ListView {
-    fn of(status: ListStatus) -> ListView {
+    fn of(status: ListStatus, with_source: bool) -> ListView {
         ListView {
             name: status.name,
             kind: status.role,
@@ -1357,8 +1576,51 @@ impl ListView {
             rules: status.rules,
             age_seconds: status.checked.map(|checked| checked.elapsed().as_secs()),
             last_error: status.last_error,
+            enabled: status.enabled,
+            refresh_hours: status.refresh_hours,
+            source: with_source.then_some(status.source),
+            editable: status.is_url,
+            from: if status.from_page {
+                Source::Page
+            } else {
+                Source::File
+            },
+            heap_bytes: status.bytes.heap,
         }
     }
+}
+
+/// The list added last from the page: `checking`, then `added`, `refused: ...` or
+/// `failed: ...`.
+#[derive(Serialize)]
+struct PendingView {
+    kind: Role,
+    name: Option<String>,
+    source: String,
+    state: String,
+}
+
+impl PendingView {
+    fn of(list: PendingList) -> PendingView {
+        PendingView {
+            kind: match list.role {
+                ListRole::Block => Role::Blocklist,
+                ListRole::Allow => Role::Allowlist,
+            },
+            name: list.name,
+            source: list.url,
+            state: match &list.outcome {
+                None => "checking".to_string(),
+                Some(Ok(())) => "added".to_string(),
+                Some(Err(error)) => list_outcome(error),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AddStarted {
+    list: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1386,6 +1648,9 @@ impl UpstreamView {
 #[derive(Serialize)]
 struct ListsView {
     lists: Vec<ListView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending: Option<PendingView>,
+    memory: Memory,
 }
 
 #[derive(Serialize)]

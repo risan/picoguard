@@ -2343,6 +2343,10 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
         ("explain", get("/api/explain?name=ads.example")),
         ("the settings", get("/api/settings")),
         ("a settings change", post("/api/settings", "{}")),
+        ("add a list", post("/api/lists/add", "{}")),
+        ("edit a list", post("/api/lists/edit", "{}")),
+        ("remove a list", post("/api/lists/remove", "{}")),
+        ("reset the lists", post("/api/lists/reset", "{}")),
     ] {
         let reply = site.send(request).await;
 
@@ -4291,4 +4295,281 @@ async fn a_settings_change_that_cannot_be_saved_answers_503_and_keeps_what_is_in
     let answer = ask(&site.dns, "other.example.", RecordType::A).await;
     assert_eq!(addresses(&answer), ["9.9.9.9"]);
     assert_eq!(second.count(), 0);
+}
+
+/// A site with no list of the config file, and a server for the lists the page adds.
+async fn list_site(
+    configure: impl FnOnce(&mut Config),
+) -> (Site, ListServer, common::harness::FakeUpstream) {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    configure(&mut config);
+    let site = site(config).await;
+
+    (site, ListServer::start().await, upstream)
+}
+
+fn add_body(name: &str, url: &str) -> String {
+    serde_json::json!({"role": "block", "name": name, "url": url, "refresh_hours": 12}).to_string()
+}
+
+/// `/api/lists` once the add in flight has ended.
+async fn after_the_add(site: &Site) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let lists = site.send(get("/api/lists")).await.json();
+        if lists["pending"]["state"] != "checking" {
+            return lists;
+        }
+
+        assert!(Instant::now() < deadline, "the add never ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_list_added_from_the_page_is_checked_then_added_and_blocks() {
+    let (site, server, _upstream) = list_site(|_| {}).await;
+    server.serve("/list.txt", "||added.example^\n", None);
+    server.set_delay(Duration::from_millis(300));
+    let url = server.url("/list.txt");
+
+    let reply = site
+        .send(post("/api/lists/add", &add_body("Added", &url)))
+        .await;
+
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(reply.json(), serde_json::json!({"list": "checking"}));
+    let checking = site.send(get("/api/lists")).await.json();
+    assert_eq!(
+        checking["pending"],
+        serde_json::json!({"kind": "blocklist", "name": "Added", "source": url, "state": "checking"})
+    );
+    let second = site
+        .send(post(
+            "/api/lists/add",
+            &add_body("Second", &server.url("/b.txt")),
+        ))
+        .await;
+    assert_eq!(second.status, 409, "{}", second.body);
+
+    let lists = after_the_add(&site).await;
+
+    assert_eq!(lists["pending"]["state"], "added");
+    let row = &lists["lists"][0];
+    assert_eq!(row["name"], "Added");
+    assert_eq!(row["source"], url);
+    assert_eq!(row["enabled"], true);
+    assert_eq!(row["refresh_hours"], 12);
+    assert_eq!(row["editable"], true);
+    assert_eq!(row["from"], "page");
+    assert_eq!(row["rules"], 1);
+    assert!(row["heap_bytes"].as_u64().unwrap() > 0);
+    let memory = &lists["memory"];
+    assert!(memory["estimate_bytes"].as_u64() <= memory["budget_bytes"].as_u64());
+    let answer = ask(&site.dns, "added.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["0.0.0.0"]);
+    assert_eq!(
+        saved_settings(&site).unwrap()["lists"],
+        serde_json::json!([{"role": "block", "name": "Added", "url": url, "refresh_hours": 12, "enabled": true}])
+    );
+}
+
+#[tokio::test]
+async fn an_add_that_would_pass_the_budget_or_cannot_be_downloaded_says_why_and_saves_nothing() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let estimate = site(local_config(&upstream))
+        .await
+        .control
+        .memory()
+        .estimate_bytes;
+    let (site, server, _upstream) =
+        list_site(|config| config.limits.memory_mb = estimate / (1024 * 1024) + 1).await;
+    let big: String = (0..200_000)
+        .map(|index| format!("||n{index}.example^\n"))
+        .collect();
+    server.serve("/big.txt", &big, None);
+    server.fail("/gone.txt", 404);
+
+    site.send(post(
+        "/api/lists/add",
+        &add_body("Big", &server.url("/big.txt")),
+    ))
+    .await;
+    let refused = after_the_add(&site).await;
+    site.send(post(
+        "/api/lists/add",
+        &add_body("Gone", &server.url("/gone.txt")),
+    ))
+    .await;
+    let failed = after_the_add(&site).await;
+
+    let refused = refused["pending"]["state"].as_str().unwrap().to_string();
+    assert!(
+        refused.starts_with("refused: Big needs more than ") && refused.contains(" MB left of "),
+        "{refused}"
+    );
+    let failed = failed["pending"]["state"].as_str().unwrap().to_string();
+    assert!(
+        failed.starts_with("failed: Gone: ") && failed.contains("404"),
+        "{failed}"
+    );
+    assert!(saved_settings(&site).is_none());
+    assert_eq!(
+        site.send(get("/api/lists")).await.json()["lists"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test]
+async fn a_list_change_from_the_page_never_sets_a_path_redirects_or_anything_unknown() {
+    let local = scratch("web-e2e-path-list").join("mine.txt");
+    std::fs::write(&local, "||mine.example^\n").unwrap();
+    let path = local.clone();
+    let (site, server, _upstream) = list_site(move |config| {
+        config.lists = vec![ListConfig {
+            name: Some("Mine".to_string()),
+            path: Some(path),
+            ..ListConfig::default()
+        }];
+    })
+    .await;
+    let url = server.url("/a.txt");
+
+    for (body, status) in [
+        (
+            serde_json::json!({"role": "block", "url": url, "refresh_hours": 12, "allow_redirects": true}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "block", "path": "/etc/passwd", "refresh_hours": 12}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "block", "url": "file:///etc/passwd", "refresh_hours": 12}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "block", "url": url, "refresh_hours": 0}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "block", "url": url, "refresh_hours": 169}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "deny", "url": url, "refresh_hours": 12}),
+            400,
+        ),
+    ] {
+        let reply = site.send(post("/api/lists/add", &body.to_string())).await;
+
+        assert_eq!(reply.status, status, "{body}: {}", reply.body);
+    }
+
+    let source = local.display().to_string();
+    let edit = site
+        .send(post(
+            "/api/lists/edit",
+            &serde_json::json!({"role": "block", "source": source, "enabled": false}).to_string(),
+        ))
+        .await;
+    let remove = site
+        .send(post(
+            "/api/lists/remove",
+            &serde_json::json!({"role": "block", "source": source}).to_string(),
+        ))
+        .await;
+    let missing = site
+        .send(post(
+            "/api/lists/remove",
+            &serde_json::json!({"role": "block", "source": url}).to_string(),
+        ))
+        .await;
+
+    assert_eq!(edit.status, 409, "{}", edit.body);
+    assert_eq!(remove.status, 409, "{}", remove.body);
+    assert_eq!(missing.status, 404, "{}", missing.body);
+    assert!(saved_settings(&site).is_none());
+    let lists = site.send(get("/api/lists")).await.json();
+    assert_eq!(lists["lists"][0]["editable"], false);
+    assert_eq!(lists["lists"][0]["from"], "file");
+    assert_eq!(server.requests(), 0);
+}
+
+#[tokio::test]
+async fn page_lists_are_edited_removed_and_reset_through_the_api() {
+    let (site, server, _upstream) = list_site(|_| {}).await;
+    server.serve("/list.txt", "||edited.example^\n", None);
+    let url = server.url("/list.txt");
+    site.send(post("/api/lists/add", &add_body("Edited", &url)))
+        .await;
+    assert_eq!(after_the_add(&site).await["pending"]["state"], "added");
+
+    let off = site
+        .send(post(
+            "/api/lists/edit",
+            &serde_json::json!({"role": "block", "source": url, "enabled": false, "name": "Off", "refresh_hours": 3})
+                .to_string(),
+        ))
+        .await;
+
+    assert_eq!(off.status, 200, "{}", off.body);
+    let row = &off.json()["lists"][0];
+    assert_eq!(
+        (
+            &row["name"],
+            &row["enabled"],
+            &row["refresh_hours"],
+            &row["rules"]
+        ),
+        (
+            &Value::from("Off"),
+            &Value::from(false),
+            &Value::from(3),
+            &Value::from(0)
+        )
+    );
+    let answer = ask(&site.dns, "edited.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+
+    let removed = site
+        .send(post(
+            "/api/lists/remove",
+            &serde_json::json!({"role": "block", "source": url}).to_string(),
+        ))
+        .await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert_eq!(removed.json()["lists"], serde_json::json!([]));
+    assert_eq!(
+        saved_settings(&site).unwrap()["lists"],
+        serde_json::json!([])
+    );
+
+    let reset = site.send(post("/api/lists/reset", "{}")).await;
+    assert_eq!(reset.status, 200, "{}", reset.body);
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({"version": 1})
+    );
+}
+
+#[tokio::test]
+async fn without_a_password_the_lists_show_no_source_and_no_pending_add() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    config.lists = vec![ListConfig {
+        name: Some("Private".to_string()),
+        url: Some("https://lists.example/list.txt?token=secret".to_string()),
+        ..ListConfig::default()
+    }];
+    let site = site(config).await;
+
+    let lists = site.send(get("/api/lists")).await;
+
+    assert_eq!(lists.status, 200);
+    assert!(!lists.body.contains("secret"), "{}", lists.body);
+    assert!(lists.json().get("pending").is_none());
+    assert!(lists.json()["memory"]["budget_bytes"].as_u64().is_some());
 }
