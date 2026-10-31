@@ -15,6 +15,7 @@ use super::engine::{
     CompiledList, Decision, Engine, ListBuilder, MAX_HOST_GROUPS, SlowRule, TYPE_A,
 };
 use super::parse::{ListFormat, ParseSummary, Parser, Rule};
+use super::pattern::{PatternError, too_complex_build_bytes};
 use super::snapshot::{self, Snapshot, SnapshotError};
 use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 
@@ -339,6 +340,48 @@ fn run(queue: std_mpsc::Receiver<Job>) {
     }
 }
 
+/// What a compile is charged against its admission limit (plan D6): every rule as it comes,
+/// duplicates included, and the most it needed at one moment, while a regex was built. A
+/// compile of the same text again needs exactly `charge` (`CompiledList::compile_charge`).
+struct Admission {
+    left: usize,
+    charged: usize,
+    peak: usize,
+}
+
+impl Admission {
+    fn new(limit: usize) -> Admission {
+        Admission {
+            left: limit,
+            charged: 0,
+            peak: 0,
+        }
+    }
+
+    /// Records `bytes` held for a moment on top of what is charged; the caller made sure they
+    /// fit.
+    fn note(&mut self, bytes: usize) {
+        self.peak = self.peak.max(self.charged + bytes);
+    }
+
+    /// Charges `bytes` for good; false when they do not fit.
+    fn take(&mut self, bytes: usize) -> bool {
+        let Some(left) = self.left.checked_sub(bytes) else {
+            return false;
+        };
+
+        self.left = left;
+        self.charged += bytes;
+        self.peak = self.peak.max(self.charged);
+
+        true
+    }
+
+    fn charge(&self) -> usize {
+        self.peak
+    }
+}
+
 fn compile(
     options: CompileOptions,
     admission_bytes: usize,
@@ -349,7 +392,7 @@ fn compile(
         .allow_redirects(options.allow_redirects);
     let mut hasher = Xxh3::new();
     let mut budget = SlowRuleBudget::new(options.slow_rule_budget);
-    let mut admission_left = admission_bytes;
+    let mut admission = Admission::new(admission_bytes);
     let mut seen_slow_rules = HashSet::new();
     let over_budget = Cell::new(false);
     let over_admission = Cell::new(false);
@@ -364,8 +407,33 @@ fn compile(
                 return;
             }
 
+            // Every slow rule is charged at least `floor`, a failed one exactly that. What the
+            // admission leaves after it and the rule's own part bounds its regex while it is
+            // built, so a refused rule never holds its automaton first.
             let pattern_len = slow.pattern.len();
-            let compiled = SlowRule::compile(slow);
+            let floor = SEEN_SLOW_RULE_BYTES + TEXT_BYTE_COST * pattern_len;
+            let room = admission.left.saturating_sub(floor + SLOW_RULE_BYTES);
+            let compiled = match SlowRule::compile_within(slow, room) {
+                Ok(compiled) => {
+                    admission.note(floor + SLOW_RULE_BYTES + compiled.build_bytes());
+
+                    Ok(compiled)
+                }
+
+                Err(PatternError::TooBig) => {
+                    over_admission.set(true);
+
+                    return;
+                }
+
+                Err(PatternError::TooComplex) => {
+                    admission.note(floor + SLOW_RULE_BYTES + too_complex_build_bytes());
+
+                    Err(())
+                }
+
+                Err(PatternError::Regex(_)) => Err(()),
+            };
             let charged = budget.charge_seen().and_then(|()| match &compiled {
                 Ok(compiled) => budget.charge(compiled),
                 Err(()) => budget.charge_failed(pattern_len),
@@ -380,13 +448,10 @@ fn compile(
                 + compiled
                     .as_ref()
                     .map_or(TEXT_BYTE_COST * pattern_len, slow_rule_cost);
-            match admission_left.checked_sub(charge) {
-                Some(left) => admission_left = left,
-                None => {
-                    over_admission.set(true);
+            if !admission.take(charge) {
+                over_admission.set(true);
 
-                    return;
-                }
+                return;
             }
 
             builder.add_slow(compiled);
@@ -394,13 +459,10 @@ fn compile(
             return;
         }
 
-        match admission_left.checked_sub(COMPILE_PEAK_BYTES_PER_RULE) {
-            Some(left) => admission_left = left,
-            None => {
-                over_admission.set(true);
+        if !admission.take(COMPILE_PEAK_BYTES_PER_RULE) {
+            over_admission.set(true);
 
-                return;
-            }
+            return;
         }
 
         if let Rule::Host { ip, .. } = &rule
@@ -449,7 +511,9 @@ fn compile(
     }
 
     let content_hash = hasher.digest128();
-    let list = Arc::new(builder.finish(summary.format));
+    let mut list = builder.finish(summary.format);
+    list.compile_charge = admission.charge();
+    let list = Arc::new(list);
     if options.check_canaries && blocks_a_canary(&list) {
         return Err(CompileError::BlocksCanary);
     }
@@ -818,6 +882,32 @@ mod tests {
         assert_eq!(admitted.list.rule_count(), free.list.rule_count());
         assert_eq!(admitted.list.heap_bytes(), free.list.heap_bytes());
         assert_eq!(refused.err(), Some(CompileError::OverMemoryBudget));
+    }
+
+    #[tokio::test]
+    async fn every_copy_of_a_rule_is_in_the_charge_so_the_same_list_is_admitted_again() {
+        const COPIES: usize = 100_000;
+        let worker = CompileWorker::spawn().unwrap();
+        let text = "||same.example^\n".repeat(COPIES);
+        let uncapped = CompileOptions {
+            max_rules: COPIES as u32,
+            ..options(ListFormat::Auto)
+        };
+        let free = compile_in_pieces(&worker, uncapped, text.as_bytes(), 64 * 1024)
+            .await
+            .unwrap();
+        let charge = free.list.compile_charge();
+
+        assert_eq!(free.list.rule_count(), 1);
+        assert_eq!(charge, COPIES * COMPILE_PEAK_BYTES_PER_RULE);
+        let again = worker.start_within(uncapped, charge);
+        again
+            .pieces
+            .send(Piece::Data(text.as_bytes().to_vec()))
+            .await
+            .unwrap();
+        again.pieces.send(Piece::End).await.unwrap();
+        assert_eq!(again.result().await.unwrap().list.compile_charge(), charge);
     }
 
     #[tokio::test]

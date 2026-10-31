@@ -19,6 +19,13 @@ use regex_automata::util::syntax;
 /// each regex really holds, so this only bounds one regex and the time to compile it.
 const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
+/// What building any regex holds for a moment besides the regex: the tables of the NFA
+/// compiler. Measured at 300 to 500 KB in `tests/regex_admission_memory.rs`.
+pub const REGEX_BUILD_BYTES: usize = 640 * 1024;
+/// Building a regex holds up to this many times its NFA size limit on top of
+/// `REGEX_BUILD_BYTES`, also when the limit stops it (measured at under 4).
+pub const REGEX_BUILD_FACTOR: usize = 5;
+
 /// Go's `regexp` rejects repetition counts above this.
 const MAX_REPEAT: u32 = 1000;
 
@@ -49,12 +56,18 @@ enum Body {
 pub enum PatternError {
     /// The regular expression is rejected by Go's `regexp` or cannot be compiled here.
     Regex(String),
+    /// The regular expression builds to more than `REGEX_SIZE_LIMIT` bytes.
+    TooComplex,
+    /// Building the regular expression would hold more than `Matcher::compile_within` allows.
+    TooBig,
 }
 
 impl fmt::Display for PatternError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PatternError::Regex(message) => write!(formatter, "regex: {message}"),
+            PatternError::TooComplex => write!(formatter, "regex: too complex"),
+            PatternError::TooBig => write!(formatter, "regex: over the bytes it may hold"),
         }
     }
 }
@@ -62,6 +75,14 @@ impl fmt::Display for PatternError {
 impl Matcher {
     /// `pattern` is the rule pattern after urlfilter's normalization (`/*` to `^`).
     pub fn compile(pattern: &str) -> Result<Matcher, PatternError> {
+        Matcher::compile_within(pattern, usize::MAX)
+    }
+
+    /// `compile`, where building a regex may hold at most `room` bytes (see
+    /// `regex_build_bytes`). A regex that only more room would build fails with `TooBig`, so a
+    /// limit never turns a valid rule into a failed one; a regex that is not valid fails as it
+    /// would without a limit.
+    pub fn compile_within(pattern: &str, room: usize) -> Result<Matcher, PatternError> {
         let is_regex = is_regex_pattern(pattern);
         let shortcut = if is_regex {
             regex_shortcut(pattern)
@@ -87,7 +108,7 @@ impl Matcher {
             if inner == ".*" {
                 Body::Any
             } else {
-                let (regex, cost) = compile_regex(inner)?;
+                let (regex, cost) = compile_regex(inner, room)?;
 
                 Body::Regex(regex, cost)
             }
@@ -109,6 +130,14 @@ impl Matcher {
             Body::Any => 0,
             Body::Glob(glob) => glob.cost_bytes(),
             Body::Regex(_, cost) => *cost,
+        }
+    }
+
+    /// The most that building this matcher held at once, as `regex_build_bytes` counts it.
+    pub fn build_bytes(&self) -> usize {
+        match &self.body {
+            Body::Regex(regex, _) => regex_build_bytes(regex.memory_usage()),
+            Body::Any | Body::Glob(_) => 0,
         }
     }
 
@@ -153,20 +182,54 @@ fn uses_url(pattern: &str) -> bool {
 /// makes one per thread that searches; the DNS thread and the compile worker are the only
 /// ones). The engines of the `regex` crate that grow their caches while they search, the
 /// lazy DFA among them, are not built in, so both numbers are fixed once compiled.
-fn compile_regex(source: &str) -> Result<(Regex, usize), PatternError> {
+fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize), PatternError> {
     let translated = translate_go_regex(source)?;
+    let hir = syntax::parse_with(&translated, &syntax::Config::new().case_insensitive(true))
+        .map_err(|error| PatternError::Regex(error.to_string()))?;
+    let size_limit = if room == usize::MAX {
+        REGEX_SIZE_LIMIT
+    } else {
+        let Some(left) = room.checked_sub(REGEX_BUILD_BYTES) else {
+            return Err(PatternError::TooBig);
+        };
+
+        (left / REGEX_BUILD_FACTOR).min(REGEX_SIZE_LIMIT)
+    };
     let regex = meta::Builder::new()
         .configure(
             meta::Config::new()
-                .nfa_size_limit(Some(REGEX_SIZE_LIMIT))
+                .nfa_size_limit(Some(size_limit))
                 .which_captures(WhichCaptures::None),
         )
-        .syntax(syntax::Config::new().case_insensitive(true))
-        .build(&translated)
-        .map_err(|error| PatternError::Regex(error.to_string()))?;
+        .build_from_hir(&hir)
+        .map_err(|error| match error.size_limit() {
+            Some(_) if size_limit < REGEX_SIZE_LIMIT || too_complex_build_bytes() > room => {
+                PatternError::TooBig
+            }
+            Some(_) => PatternError::TooComplex,
+            None => PatternError::Regex(error.to_string()),
+        })?;
+    drop(hir);
+    if regex_build_bytes(regex.memory_usage()) > room {
+        return Err(PatternError::TooBig);
+    }
+
     let cost = regex.memory_usage() + regex.create_cache().memory_usage();
 
     Ok((regex, cost))
+}
+
+/// The room `Matcher::compile_within` needs to build again a regex that holds `regex_bytes`:
+/// the NFA size limit it then gets is half as large again as the regex (its NFA grows past
+/// its final size while it is built, by up to 1.5 times as measured), with 4 KiB for the
+/// smallest ones.
+pub fn regex_build_bytes(regex_bytes: usize) -> usize {
+    REGEX_BUILD_BYTES + REGEX_BUILD_FACTOR * (regex_bytes + regex_bytes / 2 + 4096)
+}
+
+/// What building a regex that `REGEX_SIZE_LIMIT` stopped held at most.
+pub fn too_complex_build_bytes() -> usize {
+    regex_build_bytes(REGEX_SIZE_LIMIT)
 }
 
 // ---- Glob patterns ----
