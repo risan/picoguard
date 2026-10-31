@@ -122,14 +122,15 @@ container) and give both addresses to your router as primary and secondary DNS.
   last good copy.
 - Status page: totals and list status for everyone on the LAN; query log, top lists, upstream
   servers (answers, failures, average time) and pause only with the password. Block or Allow a
-  name from the query log (kept in memory until restart), and Check a name: which list and rule
-  decide it.
+  name from the query log (saved on the device, beside the config file, never in it), and Check a
+  name: which list and rule decide it.
 - The status page shows the version and, once a day, whether a newer release exists, and installs
   it with one click: the release is checked against a built-in signature key, a small root
   installer swaps the binary, and the old version comes back if the new one does not answer DNS.
   Turn the check and the button off with `[update] check = false`.
 - Almost no disk writes: the query log and statistics live in memory. The only routine write is
-  the last good copy of a list, only when it changed, and it can be turned off.
+  the last good copy of a list, only when it changed, and it can be turned off. Changes made on
+  the status page are written only when you make them.
 - Hardened service: its own system user, port 53 as the only privilege, and a systemd sandbox.
 - Static binaries for ARMv7, ARM64 and x86_64 Linux. One TOML file for all settings.
 

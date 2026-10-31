@@ -13,7 +13,46 @@ It prints `OK` or the first error. Unknown keys are errors, so a typo cannot hid
 Top-level keys (`blocked_ttl`, `rules`, ...) must come before the first `[section]` header. This
 is a TOML rule.
 
-Two instances can use the same file. They do not sync with each other.
+Two instances can use the same file. They do not sync with each other, and each keeps what is
+saved from its own status page in its own `state.dir`.
+
+## Settings saved from the status page
+
+What you change on the status page is saved in `settings.json` in `[state] dir`
+(`/var/lib/picoguard/settings.json` by default), never in this file: picoguard cannot write
+`/etc/picoguard`. Today that is the Block and Allow rules from the query log.
+
+- A value saved from the page wins over the same value in this file. The page's rules join your
+  `rules`; they never replace them.
+- The file is written only when you save a change on the page: never at start, on a timer or on a
+  list refresh, and not for a change that changes nothing. It is written whole, as
+  `settings.json.part` first and then renamed, readable by picoguard's user only.
+- picoguard never deletes or rewrites the file on its own. To go back to this file alone, stop
+  picoguard and delete `settings.json`.
+- A saved file that cannot be used (unreadable, a link or anything but a plain file, larger than
+  256 KiB, not valid, or a value that makes the config invalid) never stops picoguard. It starts on
+  this file alone, logs one warning, and the page says "Saved settings could not be used:
+  <reason>. Saving from this page replaces them."
+- `picoguard --check` checks the saved file too. When it would be ignored, it prints
+  `warning: saved settings in <path> will be ignored: <reason>`, and still `OK` with exit code 0:
+  picoguard would start.
+- A save that fails (for example a read-only state folder) answers 503
+  `{"error": "could not save settings: <reason>"}`, and the change is not applied either.
+
+`GET /api/settings` (signed-in only) shows what the page will be able to change, each value with
+where it comes from (`"from": "page"` or `"file"`), and nothing of `[web]`:
+
+```json
+{"file": "/var/lib/picoguard/settings.json", "error": null, "can_save": true,
+ "upstream": {"servers": ["https://1.1.1.1/dns-query"], "bootstrap": ["9.9.9.9", "1.1.1.1"], "from": "file"},
+ "cache": {"max_entries": 10000, "max_bytes": 4194304, "min_ttl": 0, "max_ttl": 86400, "optimistic": true, "from": "file"},
+ "rewrites": {"entries": [], "from": "file"},
+ "safe_search": {"on": false, "from": "file"},
+ "services": {"block": [], "from": "file"}}
+```
+
+`error` is why the saved file was not used at start, until a save replaces it. `can_save` is
+`false` after a save failed, until one works.
 
 ## Top-level keys
 
@@ -84,7 +123,8 @@ seconds. Loopback and public addresses are never looked up.
 Blocklists are `[[lists]]` tables. Allowlists (names that are never blocked) are
 `[[allowlists]]` with the same keys. If the file has no `[[lists]]` at all, picoguard uses the
 AdGuard DNS filter, HaGeZi Pro and HaGeZi Threat Intelligence mini. As soon as you write one
-`[[lists]]`, only your lists are used.
+`[[lists]]`, only your lists are used. One `url` or `path` may appear once among the `[[lists]]`,
+and once among the `[[allowlists]]`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -240,8 +280,8 @@ can pause blocking for a set time, refresh the lists, clear the DNS cache, block
 and check which rule decides a name.
 
 Without a password the page is read-only and limited: it shows totals and list status only. The
-query log, pause, resume, refresh, Clear cache, `/api/rules`, `/api/rules/remove` and
-`/api/explain` answer 403 ("set web.user and web.password_hash (or web.password) to use this"),
+query log, pause, resume, refresh, Clear cache, `/api/rules`, `/api/rules/remove`,
+`/api/explain` and `/api/settings` answer 403 ("set web.user and web.password_hash (or web.password) to use this"),
 and the page says so. The top lists, the
 upstream servers and the cache size are left out of `/api/status`, and the page hides them.
 picoguard logs one warning at start when no password is set. Every device that may open the page
@@ -332,8 +372,9 @@ Each row of the query log has **Block** (or **Allow** when the query was blocked
 Block and Allow add a rule for that name and its subdomains; the Lists tab shows them in the card
 **Your rules**, each with **Remove**, and your config `rules` read-only below them.
 
-- The rules are kept in memory only. A restart or an update clears them, and nothing is written
-  to disk. Add a rule you want to keep to `rules` in the config.
+- The rules are saved on the device (see "Settings saved from the status page") and are back
+  after a restart or an update. A change is saved before it is in force; one that cannot be saved
+  answers 503 and changes nothing.
 - At most 500 names.
 - A name is trimmed, lowercased and loses one trailing dot. It must then be 1 to 253 characters in
   at least two labels of 1 to 63 letters, digits, hyphens or underscores, none starting with a
@@ -390,8 +431,8 @@ Statistics and the query log live in memory only and are lost on restart.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `dir` | `"/var/lib/picoguard"` | Where list snapshots go. The systemd unit creates this directory (`StateDirectory=picoguard`). |
-| `persist_lists` | `true` | Keep a copy of each changed list on disk. This is the only routine write. When `false`, nothing is written; lists live in memory and download again at every start. |
+| `dir` | `"/var/lib/picoguard"` | Where list snapshots and the settings saved from the status page (`settings.json`) go. The systemd unit creates this directory (`StateDirectory=picoguard`). |
+| `persist_lists` | `true` | Keep a copy of each changed list on disk. This is the only routine write; `settings.json` is written only when you save a change on the page. When `false`, no list is written; lists live in memory and download again at every start. |
 
 ## `[update]`
 
