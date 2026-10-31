@@ -4159,8 +4159,8 @@ async fn the_file_is_written_only_when_a_setting_in_force_changes() {
 /// Upstreams that answer after a while, so queries are still waiting when the servers change.
 async fn slow_upstreams() -> [common::harness::FakeUpstream; 2] {
     [
-        answering_upstream([1, 1, 1, 1], Duration::from_millis(800)).await,
-        answering_upstream([2, 2, 2, 2], Duration::from_millis(800)).await,
+        answering_upstream([1, 1, 1, 1], Duration::from_millis(1500)).await,
+        answering_upstream([2, 2, 2, 2], Duration::from_millis(1500)).await,
     ]
 }
 
@@ -4175,7 +4175,7 @@ async fn queries_waiting_through_upstream_changes_all_get_their_answer() {
     let upstreams = slow_upstreams().await;
     let mut config = local_config(&upstreams[0]);
     // A busy test machine must not turn a slow answer into a timeout.
-    config.upstream.timeout_ms = 4000;
+    config.upstream.timeout_ms = 6000;
     let site = site(config).await;
     let generations = || site.dns.pipeline.upstreams().generations();
     let mut waiting = Vec::new();
