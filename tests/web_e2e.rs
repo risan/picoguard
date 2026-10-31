@@ -763,6 +763,7 @@ async fn the_settings_tab_says_where_settings_are_saved_and_why_they_are_not_use
         "\". Saving from this page replaces them.\"",
         "s.can_save",
         "\"tab-log\", \"tab-settings\"",
+        "#settings-file { overflow-wrap: anywhere; }",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
