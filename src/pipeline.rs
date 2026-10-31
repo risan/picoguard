@@ -19,8 +19,8 @@ use tokio::time::timeout;
 
 use crate::budget::{Budget, Charge};
 use crate::cache::{Cache, CacheKey, EntryToken, Memo};
-use crate::config::{Cidr, Config, is_allowed};
-use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
+use crate::config::{CacheConfig, Cidr, Config, is_allowed};
+use crate::dns::build::{self, Protocol, Reply, ReplyParts};
 use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, flags, rcode, rtype};
 use crate::filter::engine::{BlockedAnswer, Decision, Verdict, blocked_answer};
 use crate::names::DeviceNames;
@@ -315,9 +315,6 @@ pub struct Pipeline {
     udp_size: u16,
     resume_limit: Duration,
     refuse_any: bool,
-    cache_min_ttl: u32,
-    cache_max_ttl: u32,
-    optimistic_answer_ttl: u32,
     blocked_ttl: u32,
     max_inflight_queries: usize,
     max_waiting_clients: usize,
@@ -364,9 +361,6 @@ impl Pipeline {
             udp_size: config.server.udp_size,
             resume_limit: Duration::from_millis(config.upstream.timeout_ms),
             refuse_any: config.refuse_any,
-            cache_min_ttl: config.cache.min_ttl,
-            cache_max_ttl: config.cache.max_ttl,
-            optimistic_answer_ttl: config.cache.optimistic_answer_ttl_secs,
             blocked_ttl: config.blocked_ttl,
             max_inflight_queries: config.limits.max_inflight_queries,
             max_waiting_clients: config.limits.max_waiting_clients,
@@ -456,6 +450,16 @@ impl Pipeline {
     /// cancelled: their answers are cached when they land.
     pub fn clear_cache(&self) -> usize {
         self.cache.lock().unwrap().clear()
+    }
+
+    /// Puts an empty cache built from `config` in place of the one in force, with its TTL
+    /// settings, and returns the replaced cache to be freed off the DNS thread. Lookups in
+    /// flight are not cancelled: their answers go into the new cache when they land.
+    pub fn replace_cache(&self, config: &CacheConfig) -> Cache {
+        let mut cache = self.cache.lock().unwrap();
+        let next = cache.successor(config);
+
+        std::mem::replace(&mut *cache, next)
     }
 
     /// The budget for replies held for delivery. Queued TCP replies draw on it.
@@ -778,6 +782,7 @@ impl Pipeline {
 
         let key = CacheKey::new(&query);
         let mut cache = self.cache.lock().unwrap();
+        let ttls = cache.ttls();
         let Some(hit) = cache.get(&key, now) else {
             return Err(Quick::NeedsUpstream);
         };
@@ -794,7 +799,7 @@ impl Pipeline {
         };
         let result = match &decision {
             Decision::Pass => {
-                reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs, hit.stale), out);
+                reply.from_upstream(hit.parts, ttls.rule(hit.age_secs, hit.stale), out);
 
                 QueryResult::Cached
             }
@@ -871,7 +876,8 @@ impl Pipeline {
 
         let result = match decision {
             Decision::Pass => {
-                let ttl_rule = self.ttl_rule(delivery.age_secs(), delivery.is_stale());
+                let ttls = self.cache.lock().unwrap().ttls();
+                let ttl_rule = ttls.rule(delivery.age_secs(), delivery.is_stale());
                 reply.from_upstream(delivery.parts(), ttl_rule, out);
 
                 match delivery.source {
@@ -919,24 +925,6 @@ impl Pipeline {
             BlockedAnswer::Empty => reply.error(rcode::NOERROR, out),
             BlockedAnswer::NoData => reply.blocked(self.blocked_ttl, out),
             BlockedAnswer::TooMany => reply.too_big(out),
-        }
-    }
-
-    /// A stale answer carries the optimistic answer TTL in every record, the SOA of a
-    /// negative answer included; a fresh one is clamped and aged.
-    fn ttl_rule(&self, age: u32, stale: bool) -> TtlRule {
-        if stale {
-            return TtlRule {
-                min: self.optimistic_answer_ttl,
-                max: self.optimistic_answer_ttl,
-                age: 0,
-            };
-        }
-
-        TtlRule {
-            min: self.cache_min_ttl,
-            max: self.cache_max_ttl,
-            age,
         }
     }
 
@@ -2147,6 +2135,61 @@ mod tests {
             ask_quickly(&pipeline, &specs[0], &mut out),
             Quick::NeedsUpstream
         );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_cache_is_empty_and_its_ttls_apply_at_once() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("ttl.example.", RecordType::A);
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 10).unwrap();
+        let mut out = Vec::new();
+        ask_quickly(&pipeline, &spec, &mut out);
+        assert_eq!(answer_ttls(&out), [290]);
+
+        let replaced = pipeline.replace_cache(&CacheConfig {
+            min_ttl: 600,
+            max_ttl: 3600,
+            ..CacheConfig::default()
+        });
+
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(pipeline.cache_size().entries, 0);
+        assert_eq!(
+            ask_quickly(&pipeline, &spec, &mut out),
+            Quick::NeedsUpstream
+        );
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 10).unwrap();
+        ask_quickly(&pipeline, &spec, &mut out);
+        assert_eq!(answer_ttls(&out), [590]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_delivered_after_the_cache_is_replaced_never_marks_a_new_entry() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("late.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let bytes = reply_with_address(&spec, [9, 9, 9, 9]);
+        let old_token = insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0);
+        let delivery = Delivery::new(
+            bytes.clone(),
+            ResponseInfo::parse(&bytes).unwrap(),
+            old_token,
+            0,
+            Source::Upstream(None),
+            pipeline.budget.try_charge(1).unwrap(),
+        );
+
+        drop(pipeline.replace_cache(&CacheConfig::default()));
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0).unwrap();
+        let reply = Reply::new(&query, pipeline.udp_size, Protocol::Udp);
+        let mut out = Vec::new();
+        pipeline.deliver(&query, &reply, &delivery, &mut out);
+
+        let mut cache = pipeline.cache.lock().unwrap();
+        let hit = cache.get(&CacheKey::new(&query), Instant::now()).unwrap();
+        assert_ne!(Some(hit.token), old_token);
+        assert_eq!(hit.memo, None);
     }
 
     const PRIVATE_CLIENTS: [&str; 8] = [
