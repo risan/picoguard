@@ -2246,6 +2246,8 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
         ("remove a rule", post("/api/rules/remove", REMOVE_BODY)),
         ("the rules", get("/api/rules")),
         ("explain", get("/api/explain?name=ads.example")),
+        ("the settings", get("/api/settings")),
+        ("a settings change", post("/api/settings", "{}")),
     ] {
         let reply = site.send(request).await;
 
@@ -2343,11 +2345,19 @@ async fn a_get_of_a_mutation_names_the_method_that_works() {
             ..post("/api/rules", RULE_BODY)
         })
         .await;
+    let settings = site
+        .send(Request {
+            method: "PUT",
+            ..post("/api/settings", "{}")
+        })
+        .await;
 
     assert_eq!(reply.header("allow"), Some("POST"));
     assert_eq!(read.header("allow"), Some("GET"));
     assert_eq!(removal.header("allow"), Some("POST"));
     assert_eq!(rules.header("allow"), Some("GET, POST"));
+    assert_eq!(settings.status, 405);
+    assert_eq!(settings.header("allow"), Some("GET, POST"));
 }
 
 #[tokio::test]
@@ -3657,4 +3667,197 @@ async fn a_client_that_leaves_during_a_save_leaves_the_file_and_the_rules_in_agr
     assert_eq!(saved_settings(&site).unwrap()["page_rules"], in_force);
     let answer = ask(&site.dns, "left.example.", RecordType::A).await;
     assert_eq!(addresses(&answer), ["0.0.0.0"]);
+}
+
+/// A site with a password whose state folder holds `saved` before it starts.
+async fn site_with_saved(saved: &str) -> (Site, common::harness::FakeUpstream) {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let kind = SiteKind {
+        build: Build::current(),
+        installer: true,
+        release_target: true,
+    };
+    let site = site_saving(local_config(&upstream), kind, Some(saved)).await;
+
+    (site, upstream)
+}
+
+#[tokio::test]
+async fn the_settings_show_each_value_with_where_it_comes_from_and_no_web_value() {
+    let (site, upstream) = site_with_saved(
+        "{\"version\": 1, \"safe_search\": true, \"cache\": {\"max_entries\": 500, \
+         \"max_bytes\": 1048576, \"min_ttl\": 5, \"max_ttl\": 600, \"optimistic\": false}}",
+    )
+    .await;
+
+    let reply = site.send(get("/api/settings")).await;
+
+    assert_eq!(reply.status, 200);
+    let file = site.state.join(settings::FILE_NAME);
+    assert_eq!(
+        reply.json(),
+        serde_json::json!({
+            "file": file.display().to_string(),
+            "error": null,
+            "can_save": true,
+            "upstream": {
+                "servers": [format!("udp://{}", upstream.address)],
+                "bootstrap": ["9.9.9.9", "1.1.1.1"],
+                "from": "file",
+            },
+            "cache": {
+                "max_entries": 500,
+                "max_bytes": 1048576,
+                "min_ttl": 5,
+                "max_ttl": 600,
+                "optimistic": false,
+                "from": "page",
+            },
+            "rewrites": {"entries": [], "from": "file"},
+            "safe_search": {"on": true, "from": "page"},
+            "services": {"block": [], "from": "file"},
+        })
+    );
+    for secret in ["s3cret", "admin", "password", "user"] {
+        assert!(!reply.body.contains(secret), "{secret}: {}", reply.body);
+    }
+}
+
+#[tokio::test]
+async fn the_settings_say_why_the_saved_file_is_not_used_until_a_save_replaces_it() {
+    let (site, _upstream) = site_with_saved("{\"version\": 1, \"safe_search\": tru").await;
+
+    let reply = site.send(get("/api/settings")).await.json();
+
+    assert!(
+        reply["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("EOF while parsing")),
+        "{reply}"
+    );
+    assert_eq!(
+        reply["safe_search"],
+        serde_json::json!({"on": false, "from": "file"})
+    );
+
+    let added = site
+        .send(post("/api/rules", &rule_body("ads.example", "allow")))
+        .await;
+
+    assert_eq!(added.status, 200);
+    let reply = site.send(get("/api/settings")).await.json();
+    assert_eq!(reply["error"], Value::Null);
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({
+            "version": 1,
+            "page_rules": [{"name": "ads.example", "action": "allow"}],
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_settings_change_of_a_key_not_editable_yet_is_refused_and_nothing_is_written() {
+    let (site, _upstream) = plain_site().await;
+
+    for (key, value) in [
+        (
+            "upstream",
+            serde_json::json!({"servers": ["https://9.9.9.9/dns-query"], "bootstrap": []}),
+        ),
+        (
+            "cache",
+            serde_json::json!({"max_entries": 1, "max_bytes": 262144, "min_ttl": 0,
+                               "max_ttl": 60, "optimistic": true}),
+        ),
+        (
+            "rewrites",
+            serde_json::json!([{"name": "nas.lan", "answer": "10.0.0.1"}]),
+        ),
+        ("safe_search", serde_json::json!(true)),
+        ("services", serde_json::json!(["tiktok"])),
+        ("safe_search", Value::Null),
+    ] {
+        let body = serde_json::json!({ key: value }).to_string();
+
+        let reply = site.send(post("/api/settings", &body)).await;
+
+        assert_eq!(reply.status, 409, "{body}: {}", reply.body);
+        assert_eq!(
+            reply.json()["error"],
+            format!("{key} is not editable yet"),
+            "{body}"
+        );
+    }
+
+    for body in [
+        "{\"web\": {}}",
+        "{\"page_rules\": []}",
+        "{\"lists\": null}",
+        "{\"safe_search\": \"yes\"}",
+        "[]",
+        "",
+    ] {
+        let reply = site.send(post("/api/settings", body)).await;
+
+        assert_eq!(reply.status, 400, "{body}: {}", reply.body);
+    }
+
+    assert!(saved_settings(&site).is_none());
+}
+
+#[tokio::test]
+async fn a_settings_change_of_nothing_writes_nothing_and_answers_the_settings() {
+    let (site, _upstream) = plain_site().await;
+
+    let changed = site.send(post("/api/settings", "{}")).await;
+
+    assert_eq!(changed.status, 200);
+    assert_eq!(changed.json(), site.send(get("/api/settings")).await.json());
+    assert!(saved_settings(&site).is_none());
+}
+
+#[tokio::test]
+async fn only_the_settings_route_takes_a_body_of_64_kib() {
+    let (site, _upstream) = plain_site().await;
+    let padded = |length: usize| format!("{{}}{}", " ".repeat(length - 2));
+
+    for length in [2048, 64 * 1024] {
+        let reply = site.send(post("/api/settings", &padded(length))).await;
+
+        assert_eq!(reply.status, 200, "{length}: {}", reply.body);
+    }
+
+    let over = site
+        .send(post("/api/settings", &padded(64 * 1024 + 1)))
+        .await;
+    let chunked = padded(64 * 1024 + 1);
+    let over_unannounced = site
+        .send(Request {
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ],
+            body: format!("{:x}\r\n{chunked}\r\n0\r\n\r\n", chunked.len()).into_bytes(),
+            ..post("/api/settings", "")
+        })
+        .await;
+    let rule = site
+        .send(post(
+            "/api/rules",
+            &format!(
+                "{{\"name\": \"a.example\", \"action\": \"block\"}}{}",
+                " ".repeat(1024)
+            ),
+        ))
+        .await;
+
+    for reply in [&over, &over_unannounced] {
+        assert_eq!(reply.status, 413);
+        assert_eq!(reply.json()["error"], "the body is limited to 64 KiB");
+    }
+
+    assert_eq!(rule.status, 413);
+    assert_eq!(rule.json()["error"], "the body is limited to 1 KiB");
+    assert!(no_page_rules(&site).await);
 }

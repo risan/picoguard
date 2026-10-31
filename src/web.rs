@@ -1,5 +1,5 @@
-//! The status page and its JSON API (plan D16). One HTML page, six reads, seven mutations, and
-//! sign-in and sign-out. A web page on another device of the LAN must not be able to pause
+//! The status page and its JSON API (plan D16). One HTML page, seven reads, eight mutations,
+//! and sign-in and sign-out. A web page on another device of the LAN must not be able to pause
 //! blocking, so every request passes the access policy before it reaches a handler:
 //!
 //! - a peer outside `web.allow_from` is closed before a byte is read;
@@ -12,7 +12,8 @@
 //!   log and every change answer 403;
 //! - a mutation must be `POST` with `Content-Type: application/json` (which a cross-site form
 //!   cannot send, and a cross-site script can only send after a CORS preflight that is never
-//!   answered), carry no `Origin` other than the page's own, and have a body of at most 1 KiB.
+//!   answered), carry no `Origin` other than the page's own, and have a body of at most 1 KiB
+//!   (64 KiB for the settings).
 
 use std::borrow::Cow;
 use std::convert::Infallible;
@@ -34,14 +35,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
-use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
+use crate::config::{Cidr, Config, ListFormat, Rewrite, WebConfig, is_allowed};
 use crate::pipeline::{CacheSize, Pipeline, ServerKind, ServerTally};
 use crate::policy::Policy;
 use crate::scheduler::{
     Action, ButtonRule, ListControl, ListStatus, MAX_BUTTON_RULES, Role, RuleError, normalized_name,
 };
 use crate::server::bind_tcp;
-use crate::settings::SaveError;
+use crate::settings::{CacheSettings, SaveError, UpstreamSettings};
 use crate::stage::{Refused, Stager};
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, TopEntry};
 use crate::update::{Tag, UpdateView, Updates, parse_tag};
@@ -51,6 +52,8 @@ mod auth;
 const PAGE: &str = include_str!("web/index.html");
 
 const MAX_BODY_BYTES: usize = 1024;
+/// A settings change carries whole lists (upstreams, rewrites, services).
+const MAX_SETTINGS_BODY_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 /// The smallest buffer hyper accepts; it bounds the request line and headers together.
 const MAX_HEAD_BYTES: usize = 8 * 1024;
@@ -221,6 +224,7 @@ enum Read {
     Lists,
     Rules,
     Explain,
+    Settings,
 }
 
 /// Answered to `POST` only.
@@ -235,6 +239,16 @@ enum Change {
     Logout,
     AddRule,
     RemoveRule,
+    Settings,
+}
+
+impl Change {
+    fn max_body_bytes(self) -> usize {
+        match self {
+            Change::Settings => MAX_SETTINGS_BODY_BYTES,
+            _ => MAX_BODY_BYTES,
+        }
+    }
 }
 
 enum Route {
@@ -243,11 +257,13 @@ enum Route {
 }
 
 impl Route {
-    /// `/api/rules` is the one path with a read and a change: `GET` lists, `POST` adds.
+    /// `/api/rules` and `/api/settings` have a read and a change: `GET` reads, `POST` changes.
     fn of(path: &str, method: &Method) -> Option<Route> {
         match path {
             "/api/rules" if method == Method::POST => Some(Route::Change(Change::AddRule)),
             "/api/rules" => Some(Route::Read(Read::Rules)),
+            "/api/settings" if method == Method::POST => Some(Route::Change(Change::Settings)),
+            "/api/settings" => Some(Route::Read(Read::Settings)),
             "/api/rules/remove" => Some(Route::Change(Change::RemoveRule)),
             "/api/explain" => Some(Route::Read(Read::Explain)),
             "/" => Some(Route::Read(Read::Page)),
@@ -268,7 +284,8 @@ impl Route {
     /// What a 405 names in `Allow`.
     fn allowed_methods(&self) -> &'static str {
         match self {
-            Route::Read(Read::Rules) | Route::Change(Change::AddRule) => "GET, POST",
+            Route::Read(Read::Rules | Read::Settings)
+            | Route::Change(Change::AddRule | Change::Settings) => "GET, POST",
             Route::Read(_) => "GET",
             Route::Change(_) => "POST",
         }
@@ -281,10 +298,11 @@ impl Route {
     }
 
     /// Whether the page shows this only to a signed-in user: the query log, the top lists,
-    /// the page's rules, the name check and every change.
+    /// the page's rules, the name check, the settings and every change.
     fn needs_password(&self) -> bool {
         match self {
-            Route::Read(Read::QueryLog | Read::Rules | Read::Explain) | Route::Change(_) => true,
+            Route::Read(Read::QueryLog | Read::Rules | Read::Explain | Read::Settings)
+            | Route::Change(_) => true,
             Route::Read(Read::Page | Read::Status | Read::Lists) => false,
         }
     }
@@ -382,7 +400,7 @@ impl Web {
 
                 check_origin(&head.headers, host)?;
                 check_json_content_type(&head.headers)?;
-                let body = read_body(&head.headers, body).await?;
+                let body = read_body(&head.headers, body, change.max_body_bytes()).await?;
 
                 self.change(change, &body, &head.headers, peer).await
             }
@@ -510,6 +528,8 @@ impl Web {
 
             Read::Rules => Ok(self.rules_response().await),
 
+            Read::Settings => Ok(self.settings_response().await),
+
             Read::Explain => {
                 let name = name_param(query)
                     .ok_or_else(|| Rejection::new(StatusCode::BAD_REQUEST, NOT_A_DOMAIN_NAME))?;
@@ -551,6 +571,65 @@ impl Web {
                 )
             })
             .await
+    }
+
+    /// Each value in force with where it comes from, read under the settings lock. Nothing of
+    /// `web` is ever part of it.
+    async fn settings_response(&self) -> Response<Full<Bytes>> {
+        let saved = self.lists.saved();
+        let settings = saved.lock().await;
+        let file = saved.file_config();
+        let upstream = match &settings.upstream {
+            Some(upstream) => UpstreamSetting {
+                servers: &upstream.servers,
+                bootstrap: &upstream.bootstrap,
+                from: Source::Page,
+            },
+            None => UpstreamSetting {
+                servers: &file.upstream.servers,
+                bootstrap: &file.upstream.bootstrap,
+                from: Source::File,
+            },
+        };
+        let cache = match &settings.cache {
+            Some(cache) => CacheSetting {
+                values: cache.clone(),
+                from: Source::Page,
+            },
+            None => CacheSetting {
+                values: CacheSettings {
+                    max_entries: file.cache.max_entries,
+                    max_bytes: file.cache.max_bytes,
+                    min_ttl: file.cache.min_ttl,
+                    max_ttl: file.cache.max_ttl,
+                    optimistic: file.cache.optimistic,
+                },
+                from: Source::File,
+            },
+        };
+
+        json(
+            StatusCode::OK,
+            &SettingsView {
+                file: saved.path().display().to_string(),
+                error: saved.error(),
+                can_save: saved.can_save(),
+                upstream,
+                cache,
+                rewrites: RewritesSetting {
+                    entries: settings.rewrites.as_deref().unwrap_or(&file.rewrites),
+                    from: Source::of(&settings.rewrites),
+                },
+                safe_search: SafeSearchSetting {
+                    on: settings.safe_search.unwrap_or(file.safe_search),
+                    from: Source::of(&settings.safe_search),
+                },
+                services: ServicesSetting {
+                    block: settings.services.as_deref().unwrap_or(&file.services.block),
+                    from: Source::of(&settings.services),
+                },
+            },
+        )
     }
 
     async fn change(
@@ -679,6 +758,25 @@ impl Web {
                     .map_err(rule_rejection)?;
 
                 Ok(self.rules_response().await)
+            }
+
+            // Each key becomes editable with the release-2 part that applies it live.
+            Change::Settings => {
+                let request = settings_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send an object of upstream, cache, rewrites, safe_search and services",
+                    )
+                })?;
+
+                if let Some(key) = request.first_key() {
+                    return Err(Rejection::new(
+                        StatusCode::CONFLICT,
+                        format!("{key} is not editable yet"),
+                    ));
+                }
+
+                Ok(self.settings_response().await)
             }
         }
     }
@@ -846,11 +944,15 @@ fn check_json_content_type(headers: &HeaderMap) -> Result<(), Rejection> {
     ))
 }
 
-async fn read_body(headers: &HeaderMap, body: Incoming) -> Result<Bytes, Rejection> {
+async fn read_body(
+    headers: &HeaderMap,
+    body: Incoming,
+    max_bytes: usize,
+) -> Result<Bytes, Rejection> {
     let too_large = || {
         Rejection::new(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "the body is limited to 1 KiB",
+            format!("the body is limited to {} KiB", max_bytes / 1024),
         )
     };
 
@@ -858,11 +960,11 @@ async fn read_body(headers: &HeaderMap, body: Incoming) -> Result<Bytes, Rejecti
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok());
-    if declared.is_some_and(|length| length > MAX_BODY_BYTES) {
+    if declared.is_some_and(|length| length > max_bytes) {
         return Err(too_large());
     }
 
-    match Limited::new(body, MAX_BODY_BYTES).collect().await {
+    match Limited::new(body, max_bytes).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
 
         Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => Err(too_large()),
@@ -994,6 +1096,54 @@ fn remove_request(body: &[u8]) -> Option<RemoveRequest> {
     serde_json::from_slice(body).ok()
 }
 
+/// A key sent as `null` is `Some(None)`: back to the config file's value.
+fn set_or_reset<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// What a settings change may send: each key set to a value or to `null`, or left out.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsRequest {
+    #[serde(default, deserialize_with = "set_or_reset")]
+    upstream: Option<Option<UpstreamSettings>>,
+    #[serde(default, deserialize_with = "set_or_reset")]
+    cache: Option<Option<CacheSettings>>,
+    #[serde(default, deserialize_with = "set_or_reset")]
+    rewrites: Option<Option<Vec<Rewrite>>>,
+    #[serde(default, deserialize_with = "set_or_reset")]
+    safe_search: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "set_or_reset")]
+    services: Option<Option<Vec<String>>>,
+}
+
+impl SettingsRequest {
+    fn first_key(&self) -> Option<&'static str> {
+        [
+            ("upstream", self.upstream.is_some()),
+            ("cache", self.cache.is_some()),
+            ("rewrites", self.rewrites.is_some()),
+            ("safe_search", self.safe_search.is_some()),
+            ("services", self.services.is_some()),
+        ]
+        .into_iter()
+        .find_map(|(key, sent)| sent.then_some(key))
+    }
+}
+
+/// Like `rule_request`, the first byte must open an object.
+fn settings_request(body: &[u8]) -> Option<SettingsRequest> {
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+
+    serde_json::from_slice(body).ok()
+}
+
 fn rule_rejection(error: RuleError) -> Rejection {
     match error {
         RuleError::NotADomainName => Rejection::new(StatusCode::BAD_REQUEST, NOT_A_DOMAIN_NAME),
@@ -1034,6 +1184,68 @@ struct RulesView<'a> {
     rules: &'a [ButtonRule],
     config_rules: &'a [String],
     max: usize,
+}
+
+/// Where a value in force comes from.
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Source {
+    Page,
+    File,
+}
+
+impl Source {
+    fn of<T>(page_value: &Option<T>) -> Source {
+        match page_value {
+            Some(_) => Source::Page,
+            None => Source::File,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SettingsView<'a> {
+    file: String,
+    /// Why the saved file was not used at start, until a save replaces it.
+    error: Option<String>,
+    can_save: bool,
+    upstream: UpstreamSetting<'a>,
+    cache: CacheSetting,
+    rewrites: RewritesSetting<'a>,
+    safe_search: SafeSearchSetting,
+    services: ServicesSetting<'a>,
+}
+
+#[derive(Serialize)]
+struct UpstreamSetting<'a> {
+    servers: &'a [String],
+    bootstrap: &'a [IpAddr],
+    from: Source,
+}
+
+#[derive(Serialize)]
+struct CacheSetting {
+    #[serde(flatten)]
+    values: CacheSettings,
+    from: Source,
+}
+
+#[derive(Serialize)]
+struct RewritesSetting<'a> {
+    entries: &'a [Rewrite],
+    from: Source,
+}
+
+#[derive(Serialize)]
+struct SafeSearchSetting {
+    on: bool,
+    from: Source,
+}
+
+#[derive(Serialize)]
+struct ServicesSetting<'a> {
+    block: &'a [String],
+    from: Source,
 }
 
 #[derive(Serialize)]
