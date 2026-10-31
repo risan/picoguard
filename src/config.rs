@@ -562,10 +562,15 @@ fn validate_rewrites(rewrites: &[Rewrite]) -> Result<(), ConfigError> {
             ));
         };
 
-        let target = if rewrite.answer.parse::<IpAddr>().is_ok() {
+        let target = if rewrite.answer.trim().parse::<IpAddr>().is_ok() {
             None
         } else {
-            let Some(target) = normalized_name(&rewrite.answer) else {
+            // An address with a typo, such as a leading zero, would otherwise pass as a name.
+            let Some(target) = normalized_name(&rewrite.answer).filter(|target| {
+                !target
+                    .rsplit('.')
+                    .all(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+            }) else {
                 return invalid(format!(
                     "{field}.answer must be an IP address or a domain name"
                 ));
@@ -1865,6 +1870,10 @@ mod tests {
             ),
             (
                 "[[rewrites]]\nname = \"nas.lan\"\nanswer = \"not an answer\"".to_string(),
+                "rewrites[0].answer must be an IP address or a domain name",
+            ),
+            (
+                "[[rewrites]]\nname = \"nas.lan\"\nanswer = \"192.168.001.10\"".to_string(),
                 "rewrites[0].answer must be an IP address or a domain name",
             ),
             (

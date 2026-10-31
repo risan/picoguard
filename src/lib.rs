@@ -12,6 +12,7 @@ pub mod password;
 pub mod pipeline;
 pub mod policy;
 pub mod release;
+pub mod rewrites;
 pub mod scheduler;
 pub mod server;
 pub mod settings;

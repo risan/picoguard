@@ -281,6 +281,7 @@ impl fmt::Display for Name {
     }
 }
 
+#[derive(Clone)]
 pub struct Labels<'a> {
     remaining: &'a [u8],
 }
