@@ -21,8 +21,8 @@ saved from its own status page in its own `state.dir`.
 What you change on the status page is saved in `settings.json` in `[state] dir`
 (`/var/lib/picoguard/settings.json` by default), never in this file: picoguard cannot write
 `/etc/picoguard`. Today that is the Block and Allow rules from the query log, the upstream servers
-and bootstrap addresses, the cache settings, the block lists and allowlists, the DNS rewrites and
-SafeSearch (below).
+and bootstrap addresses, the cache settings, the block lists and allowlists, the DNS rewrites,
+SafeSearch and the blocked services (below).
 
 - A value saved from the page wins over the same value in this file. The page's rules join your
   `rules`; they never replace them.
@@ -81,16 +81,18 @@ file** goes back to this file's values.
   the budget is refused with 400 "a cache of 16.0 MB would pass the memory budget: the estimate
   would be 51.2 MB of 48.0 MB"; a smaller one always works.
 
-`POST /api/settings` takes any of `upstream`, `cache`, `rewrites` and `safe_search` (`services`
-answers 409 "services is not editable yet"). A value sets it, `null` goes back to this file. The body may be up to 64 KiB. It answers the same as `GET`, 400 with the reason for a
-value that is refused, 409 as above, or 503 when the file cannot be saved; in every refusal
-nothing changes.
+`POST /api/settings` takes any of `upstream`, `cache`, `rewrites`, `safe_search` and
+`services`. A value sets it, `null` goes back to this file. The body may be up to 64 KiB. It
+answers the same as `GET`, 400 with the reason for a value that is refused, 409 as above or for
+blocked services that would pass the memory budget, 502 when the catalog of services cannot be
+downloaded, or 503 when the file cannot be saved; in every refusal nothing changes.
 
 ```json
 {"upstream": {"servers": ["tls://9.9.9.9#dns.quad9.net", "https://1.1.1.1/dns-query"], "bootstrap": ["9.9.9.9"]},
  "cache": null,
  "rewrites": [{"name": "nas.lan", "answer": "192.168.1.10"}, {"name": "*.nas.lan", "answer": "nas.lan"}],
- "safe_search": true}
+ "safe_search": true,
+ "services": ["tiktok"]}
 ```
 
 A change that leaves the saved values as they are writes nothing.
@@ -113,6 +115,35 @@ them.
 - **Check a name** on the Lists tab says "rewritten to X (your rewrite)" or "rewritten to X
   (SafeSearch)" for a rewritten name, before any list. `GET /api/explain` then answers
   `{"decision": "rewritten", "list": "your rewrites" or "SafeSearch", "rule": "rewritten to X (...)"}`.
+
+### Blocked services from the page
+
+The Settings tab has a **Blocked services** card: a switch for each service of the catalog,
+grouped as the catalog groups them, a filter box, "From the config file" or "Set on this page",
+**Save**, and **Use the config file**. It follows [`[services]`](#services) below.
+
+- The catalog is downloaded the first time the Settings tab is opened, and the card says
+  "Loading the list of services" until it is read. If it cannot be downloaded the card says why,
+  and the page asks again a minute later.
+- **Save** puts the services switched on in force at once. Switching one on downloads the catalog
+  (once for the change) and builds that service's list, within the [memory
+  budget](#the-memory-budget); switching one off drops its list and downloads nothing.
+- Refused, with nothing saved or changed: an id the catalog does not have (400 "there is no
+  service "x" in the catalog"), services that would pass the memory budget (409 "the blocked
+  services would pass the memory budget: ..."), or a catalog that cannot be downloaded (502
+  "could not download the catalog of the blocked services: ...").
+
+`GET /api/services` (signed-in only) shows the catalog's services and which are on; the first
+call starts the download:
+
+```json
+{"services": [{"id": "tiktok", "name": "TikTok", "group": "social_network", "on": true}],
+ "loaded_at": 1793491200, "error": null, "loading": false}
+```
+
+`loaded_at` is when the catalog was last read (seconds since 1970), `error` why the last download
+or refresh failed (until one works), and `loading` is true until the catalog, or the lists of the
+services switched on, are read.
 
 ### Lists from the page
 
@@ -176,6 +207,10 @@ estimate = 6 MiB                                    the idle process (binary, ru
          + the largest list's compile again                          a refresh builds a new copy
 ```
 
+The lists of the [blocked services](#services) count as one list: their memory together, and the
+compile of all of them again, since a refresh of the catalog builds the new lists while the old
+ones are in force.
+
 A list's compile is charged 24 bytes for each plain rule, duplicates included (its array grows
 by doubling, so the old and new array live together for a moment), and the estimated cost of
 each slow rule. Building a `/regex/` rule holds more for a moment (about 640 KB of compiler
@@ -187,8 +222,9 @@ any one moment. A compile of the same text again always fits in that charge. The
 measured: the tests compare them with what full stats, a full cache and the real
 lists hold. With the defaults and the three default lists the estimate is about 25 MB.
 
-- **Checked when** a list is added or turned on again, a list from the page is refreshed, and the
-  cache gets larger on the page. A list is compiled within the room the budget leaves and stops
+- **Checked when** a list is added or turned on again, a list from the page is refreshed, the
+  cache gets larger on the page, a blocked service is switched on, and the catalog of services is
+  refreshed (when it does not fit, the lists in force stay). A list is compiled within the room the budget leaves and stops
   at once when it passes it, so a list far too large never fills the memory; then its finished
   copy must fit too.
 - **A list from the page whose refresh grows past the budget** keeps its last good copy, and the
@@ -197,8 +233,8 @@ lists hold. With the defaults and the three default lists the estimate is about 
   setup that works. They keep their own `max_rules` and other caps, and they count in the
   estimate, so the page shows the estimate in red ("over the budget") when they pass it, and
   then nothing more can be added.
-- One change at a time: adds, refreshes and cache changes wait for each other, so two of them
-  never count the same room.
+- One change at a time: adds, refreshes, cache changes and blocked services wait for each other,
+  so two of them never count the same room.
 - The Lists and Settings tabs show "Memory estimate: X MB of Y MB".
 
 ## Top-level keys
@@ -429,6 +465,44 @@ Block and Allow from the status page (below, under `[web]`) take their own place
 - No list's `$badfilter` undoes a Block or an Allow from the page.
 - An Allow from the page for a name also wins over a Block from the page for one of its
   subdomains.
+
+## `[services]`
+
+Blocked services: switch a service on and picoguard blocks every name it uses, from one list of
+rules per service. The list of services and their rules is AdGuard's catalog from
+[HostlistsRegistry](https://github.com/AdguardTeam/HostlistsRegistry) (GPL-3.0). picoguard does
+not ship it: it downloads it at run time, through its own upstreams, with the TLS and redirect
+rules of the list downloads.
+
+```toml
+[services]
+block = ["tiktok", "youtube"]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `block` | `[]` | The ids of the services to block (the catalog's `id`, for example `tiktok`). At most 1000, each 1 to 64 visible characters, none twice. The status page can change it. |
+| `catalog_url` | AdGuard's `services.json` on `adguardteam.github.io` | Where the catalog is downloaded from, `http://` or `https://`. Not on the page. |
+| `refresh_hours` | `24` | How often the catalog is downloaded again while a service is on. Not on the page. |
+
+- With no service switched on, the catalog is never downloaded, except once when the Settings
+  tab is opened, to show the services.
+- At start with services on, the catalog is downloaded once; until it is read, those services are
+  not blocked (the page says "loading"). It is downloaded again every `refresh_hours`; a refresh
+  that fails, or whose lists would pass the [memory budget](#the-memory-budget), keeps the lists
+  in force and tries again later, with the same waits as a list.
+- Each service switched on is a list of its own, named "Blocked service: <name>": **Check a
+  name** names it, a pause turns it off like every list, and an allowlist or an Allow rule wins
+  over it as over any list.
+- No copy of the catalog or of the services' lists is ever written to disk.
+- Caps: a catalog of at most 2 MiB, read once and freed at once; at most 1000 services; an id and
+  a name of at most 64 bytes, a group of at most 32, at most 2000 rules of at most 256 bytes per
+  service (a service over a cap is left out); the services switched on hold at most 20,000 rules
+  together (AdGuard's whole catalog held 2,406 in 2026). Exception rules (`@@`) and rules with
+  `$badfilter` or `$important` are left out: a service only blocks, and never changes other lists.
+- Memory: the index of the catalog (ids, names and groups) holds about 12 KB, and every service
+  of a catalog of AdGuard's size switched on about 100 KB. The index is not part of the memory
+  estimate; the lists are.
 
 ## `[cache]`
 

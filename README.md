@@ -106,8 +106,9 @@ Move your settings from `AdGuardHome.yaml` to `/etc/picoguard/picoguard.toml`:
 | `local_ptr_upstreams`, private domains | `[local] resolver` |
 
 Not included: DHCP (your router does it), serving DoH/DoT to your devices, per-client settings,
-parental control, blocked-services toggles, query log on disk, DNSSEC validation, editing the
-other settings from the web page (edit the TOML file).
+parental control, query log on disk, DNSSEC validation, editing the other settings from the web
+page (edit the TOML file). Blocked services use AdGuard's catalog from its HostlistsRegistry,
+downloaded at run time and never shipped with picoguard.
 
 For redundancy, run two picoguard instances (for example two containers, or a board and a
 container) and give both addresses to your router as primary and secondary DNS.
@@ -131,6 +132,9 @@ container) and give both addresses to your router as primary and secondary DNS.
   name's addresses, also for names under your local domains. SafeSearch: one switch forces safe
   search on Google, Bing and DuckDuckGo and restricted mode on YouTube. Both from the config file
   or the Settings tab.
+- Blocked services: switch off a whole service (TikTok, YouTube, a game, ...) from the Settings
+  tab or the config file; picoguard blocks every name it uses, from AdGuard's catalog of services,
+  downloaded at run time and refreshed daily.
 - The status page shows the version and, once a day, whether a newer release exists, and installs
   it with one click: the release is checked against a built-in signature key, a small root
   installer swaps the binary, and the old version comes back if the new one does not answer DNS.

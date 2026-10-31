@@ -27,7 +27,8 @@
 
 # Names picoguard answers itself, before the lists and while paused: with
 # addresses (A gets the IPv4 ones, AAAA the IPv6 ones), or with the addresses
-# of one other name, looked up without rewrites or blocking. *.name covers the
+# of one other name, looked up without blocking (or the addresses of that
+# name's own address rewrite; nothing further). *.name covers the
 # names under name, not name itself. At most 1000 entries. A [[rewrites]]
 # header ends the top-level keys, so keep these after them. The status page
 # can change both.
@@ -98,6 +99,15 @@ format = "adblock"
 # Lists of names that are never blocked. Same keys as [[lists]].
 # [[allowlists]]
 # path = "/etc/picoguard/allow.txt"
+
+# Blocked services: every name of each service in block is blocked. The
+# catalog of services is AdGuard's (HostlistsRegistry, GPL-3.0), downloaded at
+# run time through the upstreams, never shipped and never written to disk;
+# with block empty it is not downloaded. The status page can change block.
+# [services]
+# block = []
+# catalog_url = "https://adguardteam.github.io/HostlistsRegistry/assets/services.json"
+# refresh_hours = 24
 
 # [cache]
 # max_entries = 10000
