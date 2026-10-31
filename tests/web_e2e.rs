@@ -1727,6 +1727,59 @@ async fn without_a_password_an_unnamed_list_shows_its_host_and_never_its_address
 }
 
 #[tokio::test]
+async fn without_a_password_no_refresh_error_is_shown_not_even_a_relative_redirect() {
+    let list_server = ListServer::start().await;
+    list_server.redirect("/list.txt", "/secret-token-123/a b");
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let named = |config: &mut Config| {
+        config.lists = vec![ListConfig {
+            name: Some("Ads".to_string()),
+            url: Some(list_server.url("/list.txt")),
+            format: ListFormat::Adblock,
+            ..ListConfig::default()
+        }];
+    };
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    named(&mut config);
+    let open = site(config).await;
+    let mut config = local_config(&upstream);
+    named(&mut config);
+    let signed_in = site(config).await;
+
+    for site in [&open, &signed_in] {
+        for _ in 0..200 {
+            if !site.send(get("/api/lists")).await.json()["lists"][0]["last_error"].is_null() {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    let error = signed_in.send(get("/api/lists")).await.json()["lists"][0]["last_error"].clone();
+    assert!(
+        error.as_str().unwrap().contains("secret-token-123"),
+        "the error names the path with a password: {error}"
+    );
+
+    for path in ["/api/lists", "/api/status"] {
+        let reply = open.send(get(path)).await;
+
+        assert!(
+            !reply.body.contains("secret-token-123"),
+            "{path}: {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.json()["lists"][0]["last_error"],
+            "the last refresh failed (set a password to see why)",
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn lists_report_their_state_and_a_refresh_failure() {
     let list_server = ListServer::start().await;
     list_server.serve(

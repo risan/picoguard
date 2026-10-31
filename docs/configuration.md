@@ -156,7 +156,10 @@ The API, all `POST` with a JSON body, signed in. A list is named by its `role` (
 (a URL list), `from` (`"page"` or `"file"`) and `heap_bytes` (the memory its copy holds), and
 the `memory` estimate. Signed in, it also shows each list's `source` (left out without a
 password: an address can carry a private token) and `pending`, the list added last:
-`{"kind", "name", "source", "state"}` with the state above.
+`{"kind", "name", "source", "state"}` with the state above. Without a password, `last_error`
+only says "the last refresh failed (set a password to see why)" (here and in `/api/status`),
+since a reason can quote a part of the address, and a list named by its address shows only
+its host.
 
 ### The memory budget
 

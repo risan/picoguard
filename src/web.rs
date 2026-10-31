@@ -1595,7 +1595,8 @@ struct ListView {
 
 impl ListView {
     /// Without the source, nothing that may hold it is shown either: a name taken from the
-    /// URL becomes its host, and an error that holds an address is replaced.
+    /// URL becomes its host, and an error is never shown, since a part of the address can be
+    /// in any of them (a bad relative redirect names its path).
     fn of(status: ListStatus, with_source: bool) -> ListView {
         let name = if with_source || !status.is_url || status.name != status.source {
             status.name
@@ -1603,7 +1604,7 @@ impl ListView {
             url_host(&status.source).to_string()
         };
         let last_error = status.last_error.map(|error| {
-            if with_source || !(error.contains("://") || error.contains(&status.source)) {
+            if with_source {
                 error
             } else {
                 HIDDEN_LIST_ERROR.to_string()
@@ -1940,7 +1941,7 @@ mod tests {
     }
 
     #[test]
-    fn without_the_source_an_error_that_holds_an_address_is_hidden() {
+    fn without_the_source_no_error_is_shown() {
         let source = "https://lists.example/token/list.txt";
         let hidden = ListView::of(
             status_of(
@@ -1950,14 +1951,17 @@ mod tests {
             ),
             false,
         );
-        let shown = ListView::of(status_of("Ads", source, "HTTP status 503"), false);
+        let named = ListView::of(status_of("Ads", source, "HTTP status 503"), false);
+        let relative = ListView::of(status_of("Ads", source, "invalid list URL: /token"), false);
         let signed_in = ListView::of(status_of(source, source, "invalid list URL"), true);
 
         assert_eq!(hidden.name, "lists.example");
         assert_eq!(hidden.last_error.as_deref(), Some(HIDDEN_LIST_ERROR));
-        assert_eq!(shown.name, "Ads");
-        assert_eq!(shown.last_error.as_deref(), Some("HTTP status 503"));
+        assert_eq!(named.name, "Ads");
+        assert_eq!(named.last_error.as_deref(), Some(HIDDEN_LIST_ERROR));
+        assert_eq!(relative.last_error.as_deref(), Some(HIDDEN_LIST_ERROR));
         assert_eq!(signed_in.name, source);
+        assert_eq!(signed_in.last_error.as_deref(), Some("invalid list URL"));
     }
 
     #[test]
