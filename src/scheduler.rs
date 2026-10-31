@@ -748,7 +748,14 @@ impl Scheduler {
                 };
 
                 downloader
-                    .refresh(&self.worker, url, &previous, &limits, entry.options)
+                    .refresh(
+                        &self.worker,
+                        url,
+                        &previous,
+                        &limits,
+                        entry.options,
+                        usize::MAX,
+                    )
                     .await
             }
 

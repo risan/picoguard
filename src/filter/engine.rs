@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
+use super::compile::{COMPILE_PEAK_BYTES_PER_RULE, SEEN_SLOW_RULE_BYTES, slow_rule_cost};
 use super::parse::{FastKind, ListFormat, NetworkRule, ParseSummary, Parser, Rule, fast_rule};
 use super::pattern::{
     Matcher, for_each_exact_candidate, for_each_strict_suffix_candidate, for_each_suffix_candidate,
@@ -173,6 +174,33 @@ impl CompiledList {
 
     pub fn slow_rule_count(&self) -> usize {
         self.slow.len()
+    }
+
+    /// The heap the list holds: the capacities of its arrays, and its slow rules as the
+    /// slow-rule budget estimates them (plan D6).
+    pub fn heap_bytes(&self) -> usize {
+        let arrays = self
+            .fast
+            .iter()
+            .chain([&self.hosts.entries])
+            .map(|hashes| hashes.capacity() * size_of::<u64>())
+            .sum::<usize>()
+            + self.hosts.ips.capacity() * size_of::<IpAddr>()
+            + self.slow.capacity() * size_of::<SlowRule>();
+
+        arrays + self.slow.iter().map(slow_rule_cost).sum::<usize>()
+    }
+
+    /// What compiling this list again is charged against the memory budget at its peak.
+    pub fn compile_charge(&self) -> usize {
+        let plain = self.rule_count() - self.slow.len();
+
+        plain * COMPILE_PEAK_BYTES_PER_RULE
+            + self
+                .slow
+                .iter()
+                .map(|slow| slow_rule_cost(slow) + SEEN_SLOW_RULE_BYTES)
+                .sum::<usize>()
     }
 
     /// Slow rules dropped because their regular expression does not compile.

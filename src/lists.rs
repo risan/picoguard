@@ -1003,8 +1003,9 @@ impl fmt::Display for RefreshError {
 impl std::error::Error for RefreshError {}
 
 impl Downloader {
-    /// Downloads the list at `url` into a compile job on the worker. Answers
-    /// `NotModified` without compiling when the server says so.
+    /// Downloads the list at `url` into a compile job on the worker, which stops at once past
+    /// `admission_bytes` (see `CompileWorker::start_within`). Answers `NotModified` without
+    /// compiling when the server says so.
     pub async fn refresh(
         &self,
         worker: &CompileWorker,
@@ -1012,6 +1013,7 @@ impl Downloader {
         previous: &Validators,
         limits: &Limits,
         options: CompileOptions,
+        admission_bytes: usize,
     ) -> Result<Refresh, RefreshError> {
         let Fetch::Modified(download) = self
             .fetch(url, previous, limits)
@@ -1022,11 +1024,9 @@ impl Downloader {
         };
 
         let validators = download.validators.clone();
-        let compiled = compile_with(
-            worker,
-            options,
-            |sink| async move { download.pump(&sink).await },
-        )
+        let compiled = compile_with(worker, options, admission_bytes, |sink| async move {
+            download.pump(&sink).await
+        })
         .await?;
 
         Ok(Refresh::Updated(Box::new(Updated {
@@ -1041,13 +1041,14 @@ impl Downloader {
 async fn compile_with<F, Fut>(
     worker: &CompileWorker,
     options: CompileOptions,
+    admission_bytes: usize,
     produce: F,
 ) -> Result<Compiled, RefreshError>
 where
     F: FnOnce(PieceSender) -> Fut,
     Fut: Future<Output = Result<(), FetchError>>,
 {
-    let compilation = worker.start(options);
+    let compilation = worker.start_within(options, admission_bytes);
     let produced = produce(compilation.pieces.clone()).await;
     match produced {
         Ok(()) => {}
@@ -1073,7 +1074,7 @@ pub async fn refresh_file(
     max_bytes: u64,
     options: CompileOptions,
 ) -> Result<Compiled, RefreshError> {
-    compile_with(worker, options, |sink| async move {
+    compile_with(worker, options, usize::MAX, |sink| async move {
         read_file(path, max_bytes, &sink).await
     })
     .await
@@ -2586,6 +2587,7 @@ mod tests {
                 &Validators::default(),
                 &Limits::default(),
                 options,
+                usize::MAX,
             )
             .await
             .unwrap();
@@ -2621,6 +2623,7 @@ mod tests {
                 &previous,
                 &Limits::default(),
                 compile_options(),
+                usize::MAX,
             )
             .await
             .unwrap();
@@ -2644,7 +2647,16 @@ mod tests {
         let downloader = local();
         let url = server.url("/");
         let (previous, limits) = (Validators::default(), Limits::default());
-        let refresh = || downloader.refresh(&worker, &url, &previous, &limits, compile_options());
+        let refresh = || {
+            downloader.refresh(
+                &worker,
+                &url,
+                &previous,
+                &limits,
+                compile_options(),
+                usize::MAX,
+            )
+        };
 
         let truncated = refresh().await;
         let complete = refresh().await;
@@ -2683,7 +2695,7 @@ mod tests {
         let downloader = local();
         let url = server.url("/");
         let (previous, limits) = (Validators::default(), Limits::default());
-        let refresh = || downloader.refresh(&worker, &url, &previous, &limits, options);
+        let refresh = || downloader.refresh(&worker, &url, &previous, &limits, options, usize::MAX);
 
         let heavy = refresh().await;
         let light = refresh().await;
