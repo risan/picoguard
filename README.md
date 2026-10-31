@@ -107,7 +107,7 @@ Move your settings from `AdGuardHome.yaml` to `/etc/picoguard/picoguard.toml`:
 
 Not included: DHCP (your router does it), serving DoH/DoT to your devices, per-client settings,
 DNS rewrites, parental control and safe search, blocked-services toggles, query log on disk,
-DNSSEC validation, editing the lists and other settings from the web page (edit the TOML file).
+DNSSEC validation, editing the other settings from the web page (edit the TOML file).
 
 For redundancy, run two picoguard instances (for example two containers, or a board and a
 container) and give both addresses to your router as primary and secondary DNS.
@@ -124,7 +124,9 @@ container) and give both addresses to your router as primary and secondary DNS.
   servers (answers, failures, average time) and pause only with the password. Block or Allow a
   name from the query log (saved on the device, beside the config file, never in it), and Check a
   name: which list and rule decide it. Change the upstream servers and the cache from the
-  Settings tab; they apply at once, without a restart, and are saved the same way.
+  Settings tab, and add, turn off, remove and reschedule lists from the Lists tab; they apply at
+  once, without a restart, and are saved the same way. A list that would pass the memory budget
+  (`[limits] memory_mb`) is refused before it is used.
 - The status page shows the version and, once a day, whether a newer release exists, and installs
   it with one click: the release is checked against a built-in signature key, a small root
   installer swaps the binary, and the old version comes back if the new one does not answer DNS.

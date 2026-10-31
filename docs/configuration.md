@@ -21,7 +21,7 @@ saved from its own status page in its own `state.dir`.
 What you change on the status page is saved in `settings.json` in `[state] dir`
 (`/var/lib/picoguard/settings.json` by default), never in this file: picoguard cannot write
 `/etc/picoguard`. Today that is the Block and Allow rules from the query log, the upstream servers
-and bootstrap addresses, and the cache settings (below).
+and bootstrap addresses, the cache settings, and the block lists and allowlists (below).
 
 - A value saved from the page wins over the same value in this file. The page's rules join your
   `rules`; they never replace them.
@@ -49,11 +49,13 @@ comes from (`"from": "page"` or `"file"`), and nothing of `[web]`:
  "cache": {"max_entries": 10000, "max_bytes": 4194304, "min_ttl": 0, "max_ttl": 86400, "optimistic": true, "from": "file"},
  "rewrites": {"entries": [], "from": "file"},
  "safe_search": {"on": false, "from": "file"},
- "services": {"block": [], "from": "file"}}
+ "services": {"block": [], "from": "file"},
+ "memory": {"estimate_bytes": 26535936, "budget_bytes": 50331648}}
 ```
 
 `error` is why the saved file was not used at start, until a save replaces it. `can_save` is
-`false` after a save failed, until one works.
+`false` after a save failed, until one works. `memory` is the [memory estimate](#the-memory-budget)
+and the budget it is checked against.
 
 ### Upstream servers and cache from the page
 
@@ -74,7 +76,9 @@ file** goes back to this file's values.
 - **Cache**: `max_entries`, `max_bytes` (256 KiB to 16 MiB from the page; the card asks in
   KiB), `min_ttl`, `max_ttl` and `optimistic`. Saving a change empties the cache, like Clear
   cache, and the new limits and TTLs apply to the next answer. The other `[cache]` keys stay in
-  this file.
+  this file. A larger `max_bytes` that would take the [memory estimate](#the-memory-budget) past
+  the budget is refused with 400 "a cache of 16.0 MB would pass the memory budget: the estimate
+  would be 51.2 MB of 48.0 MB"; a smaller one always works.
 
 `POST /api/settings` takes any of `upstream` and `cache` (`rewrites`, `safe_search` and
 `services` answer 409 "<key> is not editable yet"). A value sets it, `null` goes back to this
@@ -88,6 +92,84 @@ nothing changes.
 ```
 
 A change that leaves the saved values as they are writes nothing.
+
+### Lists from the page
+
+The Lists tab changes the block lists and allowlists that are downloaded (`url` lists). Lists
+read from a file (`path`) stay in this file: the page marks them "from the config file" and
+cannot change them (409).
+
+- **The first change copies this file's lists to the page.** Once a list is added, turned off,
+  renamed, given other refresh hours or removed on the page, the saved settings hold every URL
+  list, and this file's `url` lists are no longer used; its `path` lists still are, first. A page
+  list with the same role and URL as a list of this file keeps that list's `format`,
+  `max_rules`, `max_body_bytes`, `slow_rule_budget` and `allow_redirects`; a list only the page
+  has gets the defaults (`format = "auto"`, no redirects). **Use the config file** removes the
+  page's lists and goes back to this file's.
+- **Each row** has an on switch, the refresh hours (1 to 168) and Remove. A list that is off is
+  not downloaded and holds no memory. A rename or new hours changes nothing else: the list in
+  force is kept. Turning a list on again downloads it.
+- **Add a list**: a name, an `http://` or `https://` address, block list or allowlist, and the
+  refresh hours. The page answers at once, shows the list as "checking" while it is downloaded
+  and compiled, then "added", "refused: <name> needs X MB, Y MB left of Z MB" (it would pass the
+  [memory budget](#the-memory-budget)) or "failed: <name>: <reason>" (the download or the list
+  failed). A refused or failed list is not saved. One list is checked at a time; a second Add
+  meanwhile answers 409. At most 32 block lists and 16 allowlists; one address once per role.
+- A list added from the page is a list like the others: refreshed every `refresh_hours`, the last
+  good copy kept on a failure, and its copy kept on disk under `persist_lists`, so it comes back
+  at start without a download. A refresh of it never writes `settings.json`.
+
+The API, all `POST` with a JSON body, signed in. A list is named by its `role` (`"block"` or
+`"allow"`) and its `source` (the URL, or the path for a file list). Unknown keys, such as `path`,
+`format` or `allow_redirects`, are refused with 400.
+
+| Route | Body | Answer |
+|---|---|---|
+| `/api/lists/add` | `{"role": "block", "name": "HaGeZi Pro", "url": "https://...", "refresh_hours": 24}` | 202 `{"list": "checking"}`; 400 with the reason; 409 while another add is checked |
+| `/api/lists/edit` | `{"role", "source"}` with any of `"name"`, `"refresh_hours"`, `"enabled"` | the lists as `GET /api/lists`; 404 for a list that is not there; 409 for a file list or a list turned on that would pass the budget; 502 when it cannot be downloaded |
+| `/api/lists/remove` | `{"role", "source"}` | the lists, as above |
+| `/api/lists/reset` | `{}` | the lists, back to this file's |
+
+`GET /api/lists` (open without a password, like the list status) shows each list's `name`,
+`kind`, `format`, `rules`, `age_seconds`, `last_error`, `enabled`, `refresh_hours`, `editable`
+(a URL list), `from` (`"page"` or `"file"`) and `heap_bytes` (the memory its copy holds), and
+the `memory` estimate. Signed in, it also shows each list's `source` (left out without a
+password: an address can carry a private token) and `pending`, the list added last:
+`{"kind", "name", "source", "state"}` with the state above.
+
+### The memory budget
+
+`[limits] memory_mb` (default 48, under the 64 MB `MemoryMax` of the systemd unit and the Docker
+compose file) is what picoguard's estimate of its whole memory may reach when something is
+added from the page. The estimate is:
+
+```
+estimate = 6 MiB                                    the idle process (binary, runtime, threads)
+         + pending_bytes + tcp_max_connections x tcp_queue_bytes     buffers under load
+         + query_log_entries x 352 + 3 x top_k x 336                 the stats, when full
+         + cache max_bytes x 1.25                                    the cache, when full
+         + the memory of every list in force                         heap_bytes of each
+         + the largest list's compile again                          a refresh builds a new copy
+```
+
+A list's compile is charged 24 bytes for each plain rule (its array grows by doubling, so the
+old and new array live together for a moment) and the estimated cost of each slow rule. The
+numbers are measured: the tests compare them with what full stats, a full cache and the real
+lists hold. With the defaults and the three default lists the estimate is about 25 MB.
+
+- **Checked when** a list is added or turned on again, a list from the page is refreshed, and the
+  cache gets larger on the page. A list is compiled within the room the budget leaves and stops
+  at once when it passes it, so a list far too large never fills the memory; then its finished
+  copy must fit too.
+- **A list from the page whose refresh grows past the budget** keeps its last good copy, and the
+  list shows "over the memory budget" until a refresh fits again.
+- **Lists of this file are never checked**, at start or on a refresh: an update never stops a
+  setup that works. They keep their own `max_rules` and other caps, and they count in the
+  estimate, so the page shows the estimate in red ("over the budget") when they pass it, and
+  then nothing more can be added.
+- One change at a time: adds, refreshes and cache changes wait for each other, so two of them
+  never count the same room.
+- The Lists and Settings tabs show "Memory estimate: X MB of Y MB".
 
 ## Top-level keys
 
@@ -171,6 +253,7 @@ and once among the `[[allowlists]]`.
 | `max_rules` | `1500000` | A list with more rules is not used: the refresh fails, the status page shows the error and the last good copy stays. One list of 1.5 million rules takes about 12 MB, and the old and the new copy exist together during a refresh, which is what fits the 64 MB limit of the systemd unit. A bigger list, such as HaGeZi TIF (full, about 2.1 million rules), needs `max_rules` raised on purpose (and a unit memory limit to match). |
 | `max_body_bytes` | `67108864` (64 MiB) | A larger download is stopped and not used. |
 | `allow_redirects` | `false` | Hosts lines with a real address (`203.0.113.7 name`) are answered with that address only if this is `true`. Otherwise a downloaded list answers any address except `0.0.0.0`, `::`, `127.0.0.1` and `::1` like `0.0.0.0`, so a list can block names but not send them elsewhere. Lists with `path` and your own `rules` always keep the address (for local names). |
+| `enabled` | `true` | A list that is off is not downloaded and holds no memory. The page can turn lists on and off. |
 | `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A regex is charged the memory it really holds (about 8 KB for `/track[0-9]+/`, close to 1 MB for `/(\pL\|\pN){1,50}x/`), a wildcard rule 64 bytes for each of its parts, and every distinct rule at least 32 bytes more, even a regex that does not compile. A list over it is not used. |
 
 Downloads use `If-None-Match` and `If-Modified-Since`. A failed download keeps the last good list.
@@ -306,6 +389,7 @@ These keep memory fixed. The defaults fit a 256 MB board; you rarely change them
 | `tcp_write_timeout_secs` | `5` | Close a TCP client that does not read its reply in this time. |
 | `upstream_reply_max` | `65536` | Largest upstream reply accepted, in bytes. |
 | `pending_bytes` | `1048576` | One shared budget for replies held for delivery. When used up, new queries get SERVFAIL (TCP) or are dropped (UDP). |
+| `memory_mb` | `48` | The budget of the [memory estimate](#the-memory-budget): a list added or turned on from the page, a refresh of a page list and a larger cache set on the page must keep the estimate within it. Lists of this file are never checked. |
 
 ## `[web]`
 

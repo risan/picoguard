@@ -59,7 +59,9 @@ servers = [
 # refresh_hours = 24, max_rules = 1500000, max_body_bytes = 67108864,
 # slow_rule_budget = 8388608 (estimated bytes for rules that are not plain
 # domains; a list over it is not used), allow_redirects = false (a downloaded
-# hosts line with a real address blocks like 0.0.0.0; true answers with it).
+# hosts line with a real address blocks like 0.0.0.0; true answers with it),
+# enabled = true (false: not downloaded, holds no memory). Lists added on the
+# status page are saved in state.dir and replace the url lists below.
 [[lists]]
 name = "adguard-dns"
 url = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"
@@ -106,6 +108,9 @@ format = "adblock"
 # tcp_write_timeout_secs = 5
 # upstream_reply_max = 65536
 # pending_bytes = 1048576
+# What picoguard's memory estimate may reach when a list or a larger cache is
+# added from the status page. Lists of this file are never checked.
+# memory_mb = 48
 
 # [web]
 # enabled = true
