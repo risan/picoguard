@@ -12,7 +12,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -204,6 +204,8 @@ pub struct PendingList {
     pub url: String,
     /// `None` while it is checked.
     pub outcome: Option<Result<(), ListError>>,
+    /// Which add this is, so an add only ever changes its own row.
+    id: u64,
 }
 
 /// The lists the scheduler is to put in force, and the settings that hold them.
@@ -325,6 +327,7 @@ pub struct ListControl {
     pending_list: Mutex<Option<PendingList>>,
     /// The saved settings hold the lists, so the config file's URL lists are not used.
     lists_on_page: AtomicBool,
+    next_add: AtomicU64,
 }
 
 impl ListControl {
@@ -356,6 +359,7 @@ impl ListControl {
             commands,
             pending_list: Mutex::new(None),
             lists_on_page: AtomicBool::new(false),
+            next_add: AtomicU64::new(0),
         };
 
         (control, received)
@@ -543,6 +547,7 @@ impl ListControl {
             return Err(ListError::NotApplied);
         };
 
+        let id = self.next_add.fetch_add(1, Ordering::Relaxed);
         let previous = {
             let mut pending = self.pending_list.lock().unwrap();
             if pending.as_ref().is_some_and(|list| list.outcome.is_none()) {
@@ -554,11 +559,13 @@ impl ListControl {
                 name: name.clone(),
                 url: url.clone(),
                 outcome: None,
+                id,
             })
         };
         // Until the add is spawned, a caller that goes away takes the reservation with it.
         let mut reserved = Reservation {
             pending: &self.pending_list,
+            id,
             previous: Some(previous),
             spawned: AtomicBool::new(false),
         };
@@ -569,8 +576,8 @@ impl ListControl {
 
                 async move {
                     let outcome = control.apply_lists(edit, Some(answer)).await;
-                    // A refused add has put the row before it back, which keeps its outcome.
                     if let Some(pending) = control.pending_list.lock().unwrap().as_mut()
+                        && pending.id == id
                         && pending.outcome.is_none()
                     {
                         pending.outcome = Some(outcome);
@@ -806,8 +813,10 @@ fn page_list(rules: &[ButtonRule], action: Action) -> Option<Arc<CompiledList>> 
 
 /// The add being checked, held in the pending row from the check of `add_list` until its task
 /// is spawned. Dropped before that, or refused, it puts the row as it was back.
+/// A row that a newer add has replaced meanwhile is left alone.
 struct Reservation<'a> {
     pending: &'a Mutex<Option<PendingList>>,
+    id: u64,
     previous: Option<Option<PendingList>>,
     spawned: AtomicBool,
 }
@@ -818,8 +827,13 @@ impl Drop for Reservation<'_> {
             return;
         }
 
-        if let Some(previous) = self.previous.take() {
-            *self.pending.lock().unwrap() = previous;
+        let Some(previous) = self.previous.take() else {
+            return;
+        };
+
+        let mut pending = self.pending.lock().unwrap();
+        if pending.as_ref().is_some_and(|list| list.id == self.id) {
+            *pending = previous;
         }
     }
 }
@@ -2037,6 +2051,41 @@ mod tests {
                 .add_button_rule("later.example", Action::Block)
                 .await,
             Ok(())
+        );
+    }
+
+    #[test]
+    fn a_refused_add_puts_back_the_row_before_it_only_while_the_row_is_its_own() {
+        let row = |id: u64, url: &str| PendingList {
+            role: ListRole::Block,
+            name: None,
+            url: url.to_string(),
+            outcome: Some(Ok(())),
+            id,
+        };
+        let pending = Mutex::new(Some(row(1, "https://lists.example/refused.txt")));
+        let reservation = |previous| Reservation {
+            pending: &pending,
+            id: 1,
+            previous: Some(previous),
+            spawned: AtomicBool::new(false),
+        };
+
+        drop(reservation(Some(row(
+            0,
+            "https://lists.example/before.txt",
+        ))));
+        assert_eq!(pending.lock().unwrap().as_ref().unwrap().id, 0);
+
+        *pending.lock().unwrap() = Some(row(2, "https://lists.example/newer.txt"));
+        drop(reservation(Some(row(
+            0,
+            "https://lists.example/before.txt",
+        ))));
+        assert_eq!(
+            pending.lock().unwrap().as_ref().unwrap().url,
+            "https://lists.example/newer.txt",
+            "a newer add's row stays"
         );
     }
 
