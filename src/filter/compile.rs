@@ -432,7 +432,11 @@ fn compile(
                     Err(())
                 }
 
-                Err(PatternError::Regex(_)) => Err(()),
+                Err(PatternError::Regex(_, held)) => {
+                    admission.note(floor + SLOW_RULE_BYTES + held);
+
+                    Err(())
+                }
             };
             let charged = budget.charge_seen().and_then(|()| match &compiled {
                 Ok(compiled) => budget.charge(compiled),

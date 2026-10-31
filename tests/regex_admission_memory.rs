@@ -125,4 +125,51 @@ async fn a_regex_is_built_only_within_its_admission_and_its_charge_covers_the_bu
             "held {peak} bytes before it was refused within {admission}"
         );
     }
+
+    // Unicode classes written out one by one: their translation would hold megabytes before
+    // any automaton exists. A few fit their charge; a thousand are too complex at once, valid
+    // or not, and within a limit they are refused before they are translated.
+    let classes = |count: usize, tail: &str| format!("/{}{tail}/\n", "\\pL".repeat(count));
+    for text in [classes(3, ""), classes(3, "\\p{Nope}")] {
+        let (free, peak) = compile(&worker, usize::MAX, &text).await;
+        let charge = free.as_ref().unwrap().compile_charge();
+        println!(
+            "3 classes {}: peak {peak} bytes, compile_charge {charge}",
+            text.len()
+        );
+        assert!(peak <= charge + FIXED_BYTES, "peak {peak}, charge {charge}");
+
+        let (admitted, admitted_peak) = compile(&worker, charge, &text).await;
+        assert!(admitted.is_ok());
+        assert!(admitted_peak <= charge + FIXED_BYTES);
+
+        let (refused, _) = compile(&worker, charge - 1, &text).await;
+        assert_eq!(refused.err(), Some(CompileError::OverMemoryBudget));
+    }
+
+    for text in [classes(1000, ""), classes(1000, "\\p{Nope}")] {
+        let (free, peak) = compile(&worker, usize::MAX, &text).await;
+        let list = free.unwrap();
+        println!(
+            "1000 classes: peak {peak} bytes, charge {}",
+            list.compile_charge()
+        );
+        assert_eq!(list.regex_failed(), 1, "too complex");
+        assert!(peak <= list.compile_charge() + FIXED_BYTES);
+        assert!(
+            peak < 1024 * 1024,
+            "held {peak} bytes for a rule it refused"
+        );
+
+        for admission in [ADMISSION_BYTES, 1024 * 1024, 2 * 1024 * 1024] {
+            let (refused, peak) = compile(&worker, admission, &text).await;
+            println!("1000 classes within {admission}: peak {peak} bytes");
+
+            assert_eq!(refused.err(), Some(CompileError::OverMemoryBudget));
+            assert!(
+                peak <= admission + FIXED_BYTES,
+                "held {peak} bytes before it was refused within {admission}"
+            );
+        }
+    }
 }

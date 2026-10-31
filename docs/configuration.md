@@ -179,8 +179,10 @@ estimate = 6 MiB                                    the idle process (binary, ru
 A list's compile is charged 24 bytes for each plain rule, duplicates included (its array grows
 by doubling, so the old and new array live together for a moment), and the estimated cost of
 each slow rule. Building a `/regex/` rule holds more for a moment (about 640 KB of compiler
-tables, plus five times its automaton at most), so a compile within little room refuses the list
-before it builds such a regex, and the list's compile charge is the most its compile needed at
+tables, its parse, counted from its length and up to 96 KB for each Unicode class such as
+`\pL`, plus five times its automaton at most), so a compile within little room refuses the list
+before it parses or builds such a regex. A regex whose parse alone would pass 4 MB (dozens of
+Unicode classes) is too complex and does not compile. The list's compile charge is the most its compile needed at
 any one moment. A compile of the same text again always fits in that charge. The numbers are
 measured: the tests compare them with what full stats, a full cache and the real
 lists hold. With the defaults and the three default lists the estimate is about 25 MB.
