@@ -544,3 +544,41 @@ async fn rewrites_of_the_user_apply_while_paused_and_safe_search_does_not() {
         ]
     );
 }
+
+#[tokio::test]
+async fn a_target_with_an_address_rewrite_is_answered_from_it_and_a_name_rewrite_is_not_followed() {
+    let upstream = scripted_upstream().await;
+    let server = start_with(
+        &upstream,
+        &[
+            ("*.nas.lan", "nas.lan"),
+            ("nas.lan", "192.168.1.10"),
+            ("alias.lan", "long.example"),
+            ("long.example", "short.example"),
+        ],
+        false,
+        engine_of(&[], &[]),
+        |_| {},
+    )
+    .await;
+
+    for reply in [
+        ask(&server, "a.nas.lan.", RecordType::A).await,
+        ask_tcp(&server, "b.nas.lan.", RecordType::A).await,
+    ] {
+        assert_eq!(values(&reply), ["192.168.1.10"]);
+        assert_eq!(ttls(&reply), [60]);
+    }
+
+    assert!(is_nodata(
+        &ask(&server, "a.nas.lan.", RecordType::AAAA).await
+    ));
+    assert_eq!(upstream.count(), 0);
+
+    assert_eq!(
+        values(&ask(&server, "alias.lan.", RecordType::A).await),
+        ["7.7.7.7"],
+        "a target's own name rewrite is not followed"
+    );
+    assert_eq!(asked_names(&upstream), ["long.example."]);
+}

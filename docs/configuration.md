@@ -247,12 +247,19 @@ answer = "nas.lan"
   records).
 - **Another name**: for `A` and `AAAA`, picoguard looks that name up for the same type the
   usual way (the cache, then the upstreams; a name under `[local] domains` through the local
-  resolver), but without rewrites or blocking, so a rewrite never leads to another rewrite. The
+  resolver), but without rewrites or blocking. The
   answer holds only the addresses at the end of the name's CNAME chain, under the name that was
   asked (no CNAME records), with the smallest TTL on the way, counted down while it is cached,
   and at most 300 seconds. A name that does not exist, or has no such address, gives an empty
   answer; any other failure of the lookup, SERVFAIL. Other types get an empty answer. The
   name's own answer is cached as usual.
+- **Another name that has addresses of its own rewrite** is answered with those addresses, as
+  if they were written on the first name (TTL 60): `*.nas.lan → nas.lan` with
+  `nas.lan → 192.168.1.10` answers `a.nas.lan` with 192.168.1.10. This is one step and only
+  for addresses: when the other name is itself rewritten to a third name, that rewrite is not
+  followed, and the other name is looked up as above, so rewrites never loop. The same holds
+  for the SafeSearch names below: a rewrite of `forcesafesearch.google.com` to an address
+  answers the Google searches with it.
 - Rewrites come before `[local]` and the lists: a rewritten name is never blocked, a name under
   `[local] domains` can be rewritten without a `resolver`, and rewrites still apply while
   blocking is paused.

@@ -88,6 +88,8 @@ type Table = Vec<(Box<[u8]>, Answer)>;
 pub struct Rewrites {
     exact: Table,
     wildcards: Table,
+    /// The SafeSearch names that a rewrite of the user gives addresses.
+    safe_search_addresses: Vec<(&'static str, Box<[IpAddr]>)>,
 }
 
 impl Rewrites {
@@ -146,7 +148,46 @@ impl Rewrites {
             table.push((owner, answer));
         }
 
+        rewrites.answer_targets_with_addresses();
+
         Ok(rewrites)
+    }
+
+    /// A target name that has addresses of its own rewrite is answered with them. One step
+    /// only, against the table as written: a target's own target is never followed, so there
+    /// are no loops.
+    fn answer_targets_with_addresses(&mut self) {
+        let addresses_of = |rewrites: &Rewrites, target: &str| {
+            let name = Name::from_text(target)?;
+
+            match rewrites.find_user(&name)? {
+                Answer::Addresses(addresses) => Some(addresses.clone()),
+                Answer::Target(_) => None,
+            }
+        };
+        let resolved = |rewrites: &Rewrites, table: &Table| -> Vec<Option<Box<[IpAddr]>>> {
+            table
+                .iter()
+                .map(|(_, answer)| match answer {
+                    Answer::Target(target) => addresses_of(rewrites, target),
+                    Answer::Addresses(_) => None,
+                })
+                .collect()
+        };
+        let exact = resolved(self, &self.exact);
+        let wildcards = resolved(self, &self.wildcards);
+        self.safe_search_addresses = [GOOGLE_SAFE, BING_SAFE, DUCKDUCKGO_SAFE, YOUTUBE_SAFE]
+            .into_iter()
+            .filter_map(|target| Some((target, addresses_of(self, target)?)))
+            .collect();
+
+        for (table, resolved) in [(&mut self.exact, exact), (&mut self.wildcards, wildcards)] {
+            for ((_, answer), addresses) in table.iter_mut().zip(resolved) {
+                if let Some(addresses) = addresses {
+                    *answer = Answer::Addresses(addresses);
+                }
+            }
+        }
     }
 
     /// The rewrite of `name`: the user's own first, then SafeSearch when `safe_search` is on.
@@ -160,7 +201,17 @@ impl Rewrites {
             return None;
         }
 
-        safe_search_target(name).map(|target| (Found::Target(target), By::SafeSearch))
+        let target = safe_search_target(name)?;
+        let found = match self
+            .safe_search_addresses
+            .iter()
+            .find(|(safe, _)| *safe == target)
+        {
+            Some((_, addresses)) => Found::Addresses(addresses),
+            None => Found::Target(target),
+        };
+
+        Some((found, By::SafeSearch))
     }
 
     fn find_user(&self, name: &Name) -> Option<&Answer> {
@@ -443,6 +494,63 @@ mod tests {
         assert_eq!(
             rewrites.find(&name("google.de"), true),
             Some((Found::Target(GOOGLE_SAFE), By::SafeSearch))
+        );
+    }
+
+    #[test]
+    fn a_target_with_addresses_of_its_own_rewrite_is_answered_with_them() {
+        let rewrites = table(&[
+            ("*.nas.lan", "nas.lan"),
+            ("nas.lan", "192.168.1.10"),
+            ("nas.lan", "fd00::10"),
+            ("tv.lan", "box.room.lan"),
+            ("*.room.lan", "10.0.0.7"),
+            ("forcesafesearch.google.com", "10.0.0.8"),
+        ]);
+
+        assert_eq!(
+            found(&rewrites, "a.nas.lan", false),
+            Some(Found::Addresses(&[ip("192.168.1.10"), ip("fd00::10")]))
+        );
+        assert_eq!(
+            found(&rewrites, "tv.lan", false),
+            Some(Found::Addresses(&[ip("10.0.0.7")]))
+        );
+        assert_eq!(
+            rewrites.find(&name("www.google.com"), true),
+            Some((Found::Addresses(&[ip("10.0.0.8")]), By::SafeSearch))
+        );
+        assert_eq!(
+            rewrites.find(&name("www.bing.com"), true),
+            Some((Found::Target(BING_SAFE), By::SafeSearch))
+        );
+    }
+
+    #[test]
+    fn a_target_whose_rewrite_is_another_name_is_not_followed() {
+        let rewrites = table(&[
+            ("a.lan", "b.lan"),
+            ("b.lan", "c.lan"),
+            ("c.lan", "10.0.0.3"),
+            ("x.lan", "y.lan"),
+            ("y.lan", "x.lan"),
+        ]);
+
+        assert_eq!(
+            found(&rewrites, "a.lan", false),
+            Some(Found::Target("b.lan"))
+        );
+        assert_eq!(
+            found(&rewrites, "b.lan", false),
+            Some(Found::Addresses(&[ip("10.0.0.3")]))
+        );
+        assert_eq!(
+            found(&rewrites, "x.lan", false),
+            Some(Found::Target("y.lan"))
+        );
+        assert_eq!(
+            found(&rewrites, "y.lan", false),
+            Some(Found::Target("x.lan"))
         );
     }
 
