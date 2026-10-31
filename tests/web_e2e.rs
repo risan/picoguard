@@ -4573,3 +4573,80 @@ async fn without_a_password_the_lists_show_no_source_and_no_pending_add() {
     assert!(lists.json().get("pending").is_none());
     assert!(lists.json()["memory"]["budget_bytes"].as_u64().is_some());
 }
+
+#[tokio::test]
+async fn an_add_a_refresh_and_a_larger_cache_at_once_near_the_budget_never_pass_it() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let idle = site(local_config(&upstream))
+        .await
+        .control
+        .memory()
+        .estimate_bytes;
+    let (site, server, _upstream) =
+        list_site(|config| config.limits.memory_mb = idle / (1024 * 1024) + 2).await;
+    let rules = |prefix: &str| -> String {
+        (0..40_000)
+            .map(|index| format!("||{prefix}{index}.example^\n"))
+            .collect()
+    };
+    server.serve("/a.txt", "||a.example^\n", None);
+    server.serve("/b.txt", &rules("b"), None);
+    site.send(post(
+        "/api/lists/add",
+        &add_body("A", &server.url("/a.txt")),
+    ))
+    .await;
+    assert_eq!(after_the_add(&site).await["pending"]["state"], "added");
+    server.serve("/a.txt", &rules("a"), None);
+    let control = Arc::clone(&site.control);
+    let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let sampling = Arc::clone(&sampling);
+        tokio::spawn(async move {
+            let mut most = 0;
+            while sampling.load(Ordering::Relaxed) {
+                let memory = control.memory();
+                assert!(memory.estimate_bytes <= memory.budget_bytes, "{memory:?}");
+                most = most.max(memory.estimate_bytes);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+
+            most
+        })
+    };
+
+    let (added, refreshed, cache) = tokio::join!(
+        site.send(post(
+            "/api/lists/add",
+            &add_body("B", &server.url("/b.txt"))
+        )),
+        site.send(post("/api/lists/refresh", "")),
+        site.send(post("/api/settings", &cache_of_size(5 * 1024 * 1024))),
+    );
+    assert_eq!(added.status, 202, "{}", added.body);
+    assert_eq!(refreshed.status, 202, "{}", refreshed.body);
+    assert!(cache.status == 200 || cache.status == 400, "{}", cache.body);
+    let lists = after_the_add(&site).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let a = &site.control.statuses()[0];
+        if a.rules > 1 || a.last_error.is_some() {
+            break;
+        }
+
+        assert!(Instant::now() < deadline, "the refresh never ended");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    sampling.store(false, Ordering::Relaxed);
+    let most = sampler.await.unwrap();
+    let memory = site.control.memory();
+    eprintln!(
+        "add: {}, cache: {}, list a: {:?}; most {most} of {} bytes",
+        lists["pending"]["state"],
+        cache.status,
+        site.control.statuses()[0].last_error,
+        memory.budget_bytes
+    );
+    assert!(memory.estimate_bytes <= memory.budget_bytes);
+}
