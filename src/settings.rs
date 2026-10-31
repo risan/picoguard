@@ -483,14 +483,24 @@ pub(crate) async fn apply(
 
     let old_upstream = std::mem::replace(&mut settings.upstream, upstream);
     let old_cache = std::mem::replace(&mut settings.cache, cache);
-    let file = saved.file_config();
-    let prepared = prepare(file, &settings, &old_upstream, &old_cache, pipeline);
+    let prepared = prepare(
+        saved.file_config(),
+        &settings,
+        &old_upstream,
+        &old_cache,
+        pipeline,
+    )
+    .await;
     let saved_change = match prepared {
-        Ok(prepared) => saved
-            .save(&settings)
-            .await
-            .map(|()| prepared)
-            .map_err(ChangeError::NotSaved),
+        Ok(prepared) => match saved.save(&settings).await {
+            Ok(()) => Ok(prepared),
+
+            Err(error) => {
+                drop_off_runtime(prepared).await;
+
+                Err(ChangeError::NotSaved(error))
+            }
+        },
 
         Err(error) => Err(error),
     };
@@ -516,25 +526,31 @@ pub(crate) async fn apply(
     drop_off_runtime((replaced_upstreams, replaced_cache, old_upstream, old_cache)).await;
 }
 
-/// The objects `settings` needs that differ from those in force under the old values.
-fn prepare(
+/// The objects `settings` needs that differ from those in force under the old values. The
+/// checks and the new pool are built off the runtime thread: building TLS settings may read
+/// files (`/proc/cpuinfo` on 32-bit ARM).
+async fn prepare(
     file: &Config,
     settings: &Settings,
     old_upstream: &Option<UpstreamSettings>,
     old_cache: &Option<CacheSettings>,
     pipeline: &Pipeline,
 ) -> Result<Prepared, ChangeError> {
-    let config = merged(file, settings).map_err(ChangeError::Invalid)?;
     let cache_in_force = |page: &Option<CacheSettings>| {
         page.clone()
             .unwrap_or_else(|| CacheSettings::of(&file.cache))
     };
+    let new_upstreams =
+        upstream_in_force(old_upstream, file) != upstream_in_force(&settings.upstream, file);
+    let new_cache = cache_in_force(old_cache) != cache_in_force(&settings.cache);
+    let shared = Arc::clone(pipeline.upstreams());
+    let file = file.clone();
+    let settings = settings.clone();
 
-    let upstreams =
-        if upstream_in_force(old_upstream, file) == upstream_in_force(&settings.upstream, file) {
-            None
-        } else {
-            if !pipeline.upstreams().can_replace() {
+    tokio::task::spawn_blocking(move || {
+        let config = merged(&file, &settings).map_err(ChangeError::Invalid)?;
+        let upstreams = if new_upstreams {
+            if !shared.can_replace() {
                 return Err(ChangeError::UpstreamBusy);
             }
 
@@ -542,11 +558,17 @@ fn prepare(
                 Upstreams::from_config(&config.upstream, &config.limits)
                     .map_err(ChangeError::Invalid)?,
             )
+        } else {
+            None
         };
-    let cache =
-        (cache_in_force(old_cache) != cache_in_force(&settings.cache)).then_some(config.cache);
 
-    Ok(Prepared { upstreams, cache })
+        Ok(Prepared {
+            upstreams,
+            cache: new_cache.then_some(config.cache),
+        })
+    })
+    .await
+    .unwrap_or(Err(ChangeError::NotApplied))
 }
 
 fn upstream_in_force<'a>(
