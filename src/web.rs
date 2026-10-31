@@ -72,6 +72,7 @@ const MAX_PAUSE_MINUTES: u32 = 24 * 60;
 const DEFAULT_QUERY_LOG_LIMIT: usize = 100;
 const PASSWORD_NEEDED: &str = "set web.user and web.password_hash (or web.password) to use this";
 const NOT_A_DOMAIN_NAME: &str = "not a domain name";
+const HIDDEN_LIST_ERROR: &str = "the last refresh failed (set a password to see why)";
 
 /// Everything the handlers read or change.
 pub struct Web {
@@ -1568,14 +1569,29 @@ struct ListView {
 }
 
 impl ListView {
+    /// Without the source, nothing that may hold it is shown either: a name taken from the
+    /// URL becomes its host, and an error that holds an address is replaced.
     fn of(status: ListStatus, with_source: bool) -> ListView {
+        let name = if with_source || !status.is_url || status.name != status.source {
+            status.name
+        } else {
+            url_host(&status.source).to_string()
+        };
+        let last_error = status.last_error.map(|error| {
+            if with_source || !(error.contains("://") || error.contains(&status.source)) {
+                error
+            } else {
+                HIDDEN_LIST_ERROR.to_string()
+            }
+        });
+
         ListView {
-            name: status.name,
+            name,
             kind: status.role,
             format: status.format,
             rules: status.rules,
             age_seconds: status.checked.map(|checked| checked.elapsed().as_secs()),
-            last_error: status.last_error,
+            last_error,
             enabled: status.enabled,
             refresh_hours: status.refresh_hours,
             source: with_source.then_some(status.source),
@@ -1587,6 +1603,23 @@ impl ListView {
             },
             heap_bytes: status.bytes.heap,
         }
+    }
+}
+
+/// The host of a list URL, without a user, port, path or query.
+fn url_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    match host_and_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host_and_port.split(':').next().unwrap_or_default(),
     }
 }
 
@@ -1845,6 +1878,59 @@ mod tests {
         assert!(!check(Some("application/x-www-form-urlencoded")));
         assert!(!check(Some("multipart/form-data; boundary=x")));
         assert!(!check(Some("application/jsonp")));
+    }
+
+    #[test]
+    fn a_list_url_shows_only_its_host() {
+        for (url, host) in [
+            ("https://lists.example/a/token/list.txt", "lists.example"),
+            (
+                "https://user:pass@lists.example:8443/x?key=1",
+                "lists.example",
+            ),
+            ("http://[2001:db8::1]:8080/list", "2001:db8::1"),
+            ("https://lists.example?key=1", "lists.example"),
+        ] {
+            assert_eq!(url_host(url), host, "{url}");
+        }
+    }
+
+    fn status_of(name: &str, source: &str, last_error: &str) -> ListStatus {
+        ListStatus {
+            name: name.to_string(),
+            role: Role::Blocklist,
+            source: source.to_string(),
+            is_url: true,
+            from_page: false,
+            enabled: true,
+            refresh_hours: 24,
+            bytes: Default::default(),
+            format: None,
+            rules: 0,
+            checked: None,
+            last_error: Some(last_error.to_string()),
+        }
+    }
+
+    #[test]
+    fn without_the_source_an_error_that_holds_an_address_is_hidden() {
+        let source = "https://lists.example/token/list.txt";
+        let hidden = ListView::of(
+            status_of(
+                source,
+                source,
+                "invalid redirect to \"https://cdn.example/t\"",
+            ),
+            false,
+        );
+        let shown = ListView::of(status_of("Ads", source, "HTTP status 503"), false);
+        let signed_in = ListView::of(status_of(source, source, "invalid list URL"), true);
+
+        assert_eq!(hidden.name, "lists.example");
+        assert_eq!(hidden.last_error.as_deref(), Some(HIDDEN_LIST_ERROR));
+        assert_eq!(shown.name, "Ads");
+        assert_eq!(shown.last_error.as_deref(), Some("HTTP status 503"));
+        assert_eq!(signed_in.name, source);
     }
 
     #[test]

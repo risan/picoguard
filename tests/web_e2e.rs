@@ -1638,6 +1638,54 @@ async fn without_a_password_no_lookup_starts() {
 }
 
 #[tokio::test]
+async fn without_a_password_an_unnamed_list_shows_its_host_and_never_its_address() {
+    let list_server = ListServer::start().await;
+    list_server.serve("/secret-token-123/list.txt", "||tracker.example^\n", None);
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let url = list_server.url("/secret-token-123/list.txt");
+    let unnamed = |config: &mut Config| {
+        config.lists = vec![ListConfig {
+            url: Some(url.clone()),
+            format: ListFormat::Adblock,
+            ..ListConfig::default()
+        }];
+    };
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    unnamed(&mut config);
+    let open = site(config).await;
+    let mut config = local_config(&upstream);
+    unnamed(&mut config);
+    let signed_in = site(config).await;
+
+    for site in [&open, &signed_in] {
+        for _ in 0..200 {
+            if site.send(get("/api/lists")).await.json()["lists"][0]["rules"] == 1 {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    for path in ["/api/lists", "/api/status"] {
+        let reply = open.send(get(path)).await;
+
+        assert!(
+            !reply.body.contains("secret-token-123"),
+            "{path}: {}",
+            reply.body
+        );
+        assert_eq!(reply.json()["lists"][0]["name"], "127.0.0.1", "{path}");
+        assert_eq!(reply.json()["lists"][0]["rules"], 1, "{path}");
+    }
+
+    let lists = signed_in.send(get("/api/lists")).await.json();
+    assert_eq!(lists["lists"][0]["name"], url.as_str());
+    assert_eq!(lists["lists"][0]["source"], url.as_str());
+}
+
+#[tokio::test]
 async fn lists_report_their_state_and_a_refresh_failure() {
     let list_server = ListServer::start().await;
     list_server.serve(
