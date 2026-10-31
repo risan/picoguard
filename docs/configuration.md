@@ -21,7 +21,8 @@ saved from its own status page in its own `state.dir`.
 What you change on the status page is saved in `settings.json` in `[state] dir`
 (`/var/lib/picoguard/settings.json` by default), never in this file: picoguard cannot write
 `/etc/picoguard`. Today that is the Block and Allow rules from the query log, the upstream servers
-and bootstrap addresses, the cache settings, and the block lists and allowlists (below).
+and bootstrap addresses, the cache settings, the block lists and allowlists, the DNS rewrites and
+SafeSearch (below).
 
 - A value saved from the page wins over the same value in this file. The page's rules join your
   `rules`; they never replace them.
@@ -80,18 +81,38 @@ file** goes back to this file's values.
   the budget is refused with 400 "a cache of 16.0 MB would pass the memory budget: the estimate
   would be 51.2 MB of 48.0 MB"; a smaller one always works.
 
-`POST /api/settings` takes any of `upstream` and `cache` (`rewrites`, `safe_search` and
-`services` answer 409 "<key> is not editable yet"). A value sets it, `null` goes back to this
-file. The body may be up to 64 KiB. It answers the same as `GET`, 400 with the reason for a
+`POST /api/settings` takes any of `upstream`, `cache`, `rewrites` and `safe_search` (`services`
+answers 409 "services is not editable yet"). A value sets it, `null` goes back to this file. The body may be up to 64 KiB. It answers the same as `GET`, 400 with the reason for a
 value that is refused, 409 as above, or 503 when the file cannot be saved; in every refusal
 nothing changes.
 
 ```json
 {"upstream": {"servers": ["tls://9.9.9.9#dns.quad9.net", "https://1.1.1.1/dns-query"], "bootstrap": ["9.9.9.9"]},
- "cache": null}
+ "cache": null,
+ "rewrites": [{"name": "nas.lan", "answer": "192.168.1.10"}, {"name": "*.nas.lan", "answer": "nas.lan"}],
+ "safe_search": true}
 ```
 
 A change that leaves the saved values as they are writes nothing.
+
+### Rewrites and SafeSearch from the page
+
+The Settings tab has a **Rewrites** card (a table of name and answer, Add, Remove) and a
+**SafeSearch** card (one switch), each with "From the config file" or "Set on this page", its
+own **Save**, and **Use the config file**. They follow [`[[rewrites]]` and
+`safe_search`](#rewrites-and-safesearch) below, and apply at once: the next query is answered from
+them.
+
+- The page sends the whole table. Names and name answers are kept lowercase, without spaces or a
+  final dot, and an address is kept in its standard form (`FD00:0::10` becomes `fd00::10`), so
+  `NAS.lan.` and `nas.lan` are the same rewrite and saving it again writes nothing.
+- A table this file would refuse is refused with the same reason (400), for example
+  "rewrites[0] points nas.lan at itself", and nothing is saved.
+- The new table is built off the DNS thread, saved, then put in force whole; the old one is freed
+  off the DNS thread.
+- **Check a name** on the Lists tab says "rewritten to X (your rewrite)" or "rewritten to X
+  (SafeSearch)" for a rewritten name, before any list. `GET /api/explain` then answers
+  `{"decision": "rewritten", "list": "your rewrites" or "SafeSearch", "rule": "rewritten to X (...)"}`.
 
 ### Lists from the page
 
@@ -183,6 +204,8 @@ lists hold. With the defaults and the three default lists the estimate is about 
 | `refuse_any` | `true` | Answer `ANY` queries with NOTIMP. |
 | `blocked_hosts` | `["version.bind", "id.server", "hostname.bind"]` | Names answered with REFUSED. |
 | `rules` | `[]` | Your own rules, one per string: adblock syntax or hosts lines. They join the lists below as one more list. The status page shows them read-only. |
+| `safe_search` | `false` | Force SafeSearch on Google, Bing and DuckDuckGo, and restricted mode on YouTube. See [Rewrites and SafeSearch](#rewrites-and-safesearch). |
+| `[[rewrites]]` | none | Names picoguard answers itself. See [Rewrites and SafeSearch](#rewrites-and-safesearch). |
 
 `rules` example:
 
@@ -192,6 +215,63 @@ rules = [
     "@@||good.example.com^",
 ]
 ```
+
+### Rewrites and SafeSearch
+
+A rewrite makes picoguard answer a name itself, with addresses or with the addresses of another
+name. Each `[[rewrites]]` entry has a `name` and an `answer`:
+
+```toml
+[[rewrites]]
+name = "nas.lan"
+answer = "192.168.1.10"
+
+[[rewrites]]
+name = "nas.lan"
+answer = "fd00::10"
+
+[[rewrites]]
+name = "*.nas.lan"
+answer = "nas.lan"
+```
+
+- `name` is a domain name of at least two labels, or `*.` and one: `*.nas.lan` covers every
+  name under `nas.lan` (`tv.nas.lan`, `a.b.nas.lan`), not `nas.lan` itself. A name of its own
+  beats a wildcard, and a longer wildcard beats a shorter one.
+- `answer` is an IPv4 or IPv6 address, or another domain name. One name has either addresses
+  (as many entries as you like) or exactly one other name, never both; a name may not point at
+  itself. At most 1000 entries. An answer that only looks like an address (`192.168.001.10`)
+  is refused.
+- **Addresses**: an `A` query gets the IPv4 addresses, `AAAA` the IPv6 ones, both with TTL 60.
+  Any other type, or a type with no address of its family, gets an empty answer (NOERROR, no
+  records).
+- **Another name**: for `A` and `AAAA`, picoguard looks that name up for the same type the
+  usual way (the cache, then the upstreams; a name under `[local] domains` through the local
+  resolver), but without rewrites or blocking, so a rewrite never leads to another rewrite. The
+  answer holds only the addresses at the end of the name's CNAME chain, under the name that was
+  asked (no CNAME records), with the smallest TTL on the way, counted down while it is cached,
+  and at most 300 seconds. A name that does not exist, or has no such address, gives an empty
+  answer; any other failure of the lookup, SERVFAIL. Other types get an empty answer. The
+  name's own answer is cached as usual.
+- Rewrites come before `[local]` and the lists: a rewritten name is never blocked, a name under
+  `[local] domains` can be rewritten without a `resolver`, and rewrites still apply while
+  blocking is paused.
+- The query log shows a rewritten query as "rewritten", and `/api/status` counts them in
+  `counters.rewritten`.
+
+`safe_search = true` adds rewrites of its own, the way AdGuard Home does it:
+
+| Names | Answered with the addresses of |
+|---|---|
+| `google.<domain>` and `www.google.<domain>`, for each of Google's 187 search domains (`google.com`, `google.co.uk`, `google.de`, ...) | `forcesafesearch.google.com` |
+| `bing.com`, `www.bing.com` | `strict.bing.com` |
+| `duckduckgo.com`, `www.duckduckgo.com`, `start.duckduckgo.com` | `safe.duckduckgo.com` |
+| `www.youtube.com`, `m.youtube.com`, `youtubei.googleapis.com`, `youtube.googleapis.com`, `www.youtube-nocookie.com` | `restrictmoderate.youtube.com` |
+
+SafeSearch is off while blocking is paused. A rewrite of yours for the same name wins.
+
+Memory: 1000 rewrites of home names hold about 80 KB, and 1000 of the longest names about
+520 KB. They are not part of the memory estimate.
 
 ## `[server]`
 
@@ -536,7 +616,7 @@ rules as every other change:
 | `GET /api/rules` | | `{"rules": [{"name": "ads.example", "action": "block"}], "config_rules": ["@@\|\|good.example^"], "max": 500}` |
 | `POST /api/rules` | `{"name": "...", "action": "block"}` or `"allow"` | the same as `GET`; 400 or 409 |
 | `POST /api/rules/remove` | `{"name": "..."}` | the same as `GET`; 404 `{"error": "no such rule"}` |
-| `GET /api/explain?name=...` | | `{"name": "ads.example", "decision": "blocked", "list": "config rules", "rule": "\|\|ads.example^"}`; `decision` is `blocked`, `allowed` or `none` (then `list` and `rule` are `null`) |
+| `GET /api/explain?name=...` | | `{"name": "ads.example", "decision": "blocked", "list": "config rules", "rule": "\|\|ads.example^"}`; `decision` is `blocked`, `allowed`, `rewritten` (see [Rewrites and SafeSearch from the page](#rewrites-and-safesearch-from-the-page)) or `none` (then `list` and `rule` are `null`) |
 
 The name in `/api/explain` is read as sent, without percent-decoding: a domain name never needs
 it.

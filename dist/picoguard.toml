@@ -21,6 +21,24 @@
 #     "@@||good.example.com^",
 # ]
 
+# Force SafeSearch on Google, Bing and DuckDuckGo, and restricted mode on
+# YouTube (not while blocking is paused).
+# safe_search = false
+
+# Names picoguard answers itself, before the lists and while paused: with
+# addresses (A gets the IPv4 ones, AAAA the IPv6 ones), or with the addresses
+# of one other name, looked up without rewrites or blocking. *.name covers the
+# names under name, not name itself. At most 1000 entries. A [[rewrites]]
+# header ends the top-level keys, so keep these after them. The status page
+# can change both.
+# [[rewrites]]
+# name = "nas.lan"
+# answer = "192.168.1.10"
+#
+# [[rewrites]]
+# name = "*.nas.lan"
+# answer = "nas.lan"
+
 [server]
 # Addresses to listen on; :: is IPv6 only, so both entries can share the port.
 # bind = ["0.0.0.0", "::"]
