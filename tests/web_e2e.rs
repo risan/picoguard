@@ -5527,3 +5527,76 @@ async fn a_larger_cache_and_services_in_one_change_must_fit_the_budget_together(
     assert!(!is_blocked(&site, "n1.big.example.").await);
     assert!(site.control.memory().estimate_bytes <= memory.budget_bytes);
 }
+
+#[tokio::test]
+async fn a_refresh_with_a_service_that_cannot_be_used_keeps_every_service_list() {
+    let (site, catalog, _upstream) = services_site(&["chat", "video"], fast_timing(), |config| {
+        config.services.refresh_hours = 1;
+    })
+    .await;
+    wait_until_blocked(&site, "chat.example.", true).await;
+    wait_until_blocked(&site, "video.example.", true).await;
+
+    catalog.serve(
+        CATALOG_PATH,
+        &CATALOG
+            .replace(
+                "\"||chatcdn.example^\"",
+                "\"||chatcdn.example^\", \"||com^\"",
+            )
+            .replace("||video.example^", "||video2.example^"),
+        None,
+    );
+    let refused_twice = catalog.requested(CATALOG_PATH) + 2;
+    for _ in 0..400 {
+        if catalog.requested(CATALOG_PATH) >= refused_twice {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(catalog.requested(CATALOG_PATH) >= refused_twice);
+
+    let services = site.send(get("/api/services")).await.json();
+    assert_eq!(
+        services["error"], "blocked service Chat: compile failed: BlocksCanary",
+        "{services}"
+    );
+    assert_eq!(switched_on(&services), ["chat", "video"]);
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert!(is_blocked(&site, "video.example.").await);
+    assert!(!is_blocked(&site, "video2.example.").await);
+    assert!(!is_blocked(&site, "other.com.").await);
+
+    catalog.serve(
+        CATALOG_PATH,
+        &CATALOG.replace("||video.example^", "||video2.example^"),
+        None,
+    );
+    wait_until_blocked(&site, "video2.example.", true).await;
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert_eq!(
+        site.send(get("/api/services")).await.json()["error"],
+        Value::Null
+    );
+
+    catalog.serve(
+        CATALOG_PATH,
+        &CATALOG.replace("\"||games.example^\"", "\"||games.example^\", \"||com^\""),
+        None,
+    );
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"chat\", \"video\", \"games\"]}",
+        ))
+        .await;
+    assert_eq!(reply.status, 502, "{}", reply.body);
+    assert_eq!(
+        reply.json()["error"],
+        "blocked service Games: compile failed: BlocksCanary"
+    );
+    assert!(!is_blocked(&site, "games.example.").await);
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert!(saved_settings(&site).is_none());
+}

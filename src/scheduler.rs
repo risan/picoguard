@@ -574,8 +574,9 @@ impl ListControl {
     /// it are held. The set holds at most `MAX_SELECTED_RULES` rules, and with a cache of
     /// `cache_max_bytes` in place of the cache in force it must fit the budget in place of the
     /// services in force, unless that leaves the estimate no higher than now; else the reason.
-    /// A service that does not compile (it blocks a canary name) is left out. The caller holds
-    /// the admission lock.
+    /// A service that does not compile (it blocks a canary name) refuses the whole set, so a
+    /// refresh never drops a service that stays switched on. The caller holds the admission
+    /// lock.
     async fn compile_services(
         &self,
         kept: Vec<ServiceList>,
@@ -632,7 +633,11 @@ impl ListControl {
                 }
 
                 Err(error) => {
-                    log::warn!("blocked service {name}: its rules cannot be used: {error:?}");
+                    worker.discard(lists);
+
+                    return Err(ChangeError::Unavailable(format!(
+                        "blocked service {name}: compile failed: {error:?}"
+                    )));
                 }
             }
         }

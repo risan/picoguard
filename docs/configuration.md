@@ -87,7 +87,7 @@ file** goes back to this file's values.
 `services`. A value sets it, `null` goes back to this file. The body may be up to 64 KiB. It
 answers the same as `GET`, 400 with the reason for a value that is refused, 409 as above or for
 blocked services that would pass the memory budget, 502 when the catalog of services cannot be
-downloaded, or 503 when the file cannot be saved; in every refusal nothing changes.
+downloaded or a service's rules cannot be used, or 503 when the file cannot be saved; in every refusal nothing changes.
 
 ```json
 {"upstream": {"servers": ["tls://9.9.9.9#dns.quad9.net", "https://1.1.1.1/dns-query"], "bootstrap": ["9.9.9.9"]},
@@ -134,8 +134,9 @@ grouped as the catalog groups them, a filter box, "From the config file" or "Set
   service "x" in the catalog"), services that would hold more than 20,000 rules together, those
   already on included (400 "the services switched on would hold 22000 rules, more than 20000"),
   services that would pass the memory budget (409 "the blocked services would pass the memory
-  budget: ..."), or a catalog that cannot be downloaded (502
-  "could not download the catalog of the blocked services: ...").
+  budget: ..."), a catalog that cannot be downloaded (502 "could not download the catalog of
+  the blocked services: ..."), or a service whose rules cannot be used (502 "blocked service
+  Games: compile failed: BlocksCanary").
 
 `GET /api/services` (signed-in only) shows the catalog's services and which are on; the first
 call starts the download:
@@ -495,8 +496,9 @@ block = ["tiktok", "youtube"]
   tab is opened, to show the services.
 - At start with services on, the catalog is downloaded once; until it is read, those services are
   not blocked (the page says "loading"). It is downloaded again every `refresh_hours`; a refresh
-  that fails, or whose lists would pass the [memory budget](#the-memory-budget), keeps the lists
-  in force and tries again later, with the same waits as a list.
+  that fails, whose lists would pass the [memory budget](#the-memory-budget), or with a service
+  whose rules cannot be used (they would block nearly every name) keeps all the lists in force,
+  shows why in `GET /api/services` `error`, and tries again later, with the same waits as a list.
 - Each service switched on is a list of its own, named "Blocked service: <name>": **Check a
   name** names it, a pause turns it off like every list, and an allowlist or an Allow rule wins
   over it as over any list.
