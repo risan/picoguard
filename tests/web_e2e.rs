@@ -517,9 +517,9 @@ async fn the_page_is_served_with_protective_headers() {
 /// binary, no memory at run time.
 const PAGE_HARD_CAP_BYTES: usize = 64 * 1024;
 
-/// This part, the upstream and cache cards; a later part raises it on purpose, never past the
-/// cap.
-const PAGE_BUDGET_BYTES: usize = 40 * 1024;
+/// This part, the list editing and the memory line; a later part raises it on purpose, never
+/// past the cap.
+const PAGE_BUDGET_BYTES: usize = 46 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -735,7 +735,52 @@ async fn the_lists_tab_has_your_rules_and_a_name_check() {
         "\"/api/rules/remove\"",
         "\"/api/explain?name=\" + encodeURIComponent(",
         "Saved on this device.",
-        "\"refresh-row\", \"rules\", \"check\"]",
+        "\"refresh-row\", \"list-add\", \"rules\", \"check\"]",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+/// No browser here: the tab is checked as source, and in the build's browser check.
+#[tokio::test]
+async fn the_lists_tab_turns_lists_on_and_off_adds_removes_and_resets_them_and_shows_the_memory() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "lists-from",
+        "list-memory",
+        "list-add",
+        "list-form",
+        "l-name",
+        "l-url",
+        "l-role",
+        "l-hours",
+        "list-add-note",
+        "lists-reset",
+        "settings-memory",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "\"/api/lists/add\"",
+        "\"/api/lists/\" + change",
+        "\"/api/lists/reset\"",
+        "\"edit\", { enabled: node.checked }",
+        "\"edit\", { refresh_hours: Number(node.value) }",
+        "\"remove\", {}",
+        "showLists(await api(\"/api/lists\"))",
+        "\"from the config file\"",
+        "\"Set on this page\"",
+        ">Use the config file<",
+        "\"Memory estimate: \"",
+        "#list-table td.name { min-width: 12rem; white-space: normal; overflow-wrap: anywhere; }",
+        "confirm(\"Remove this list?\")",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
