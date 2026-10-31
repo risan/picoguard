@@ -744,7 +744,12 @@ async fn the_settings_tab_says_where_settings_are_saved_and_why_they_are_not_use
 
     let page = site.send(get("/")).await.body;
 
-    for id in ["tab-settings", "settings-note", "settings-file", "rules-note"] {
+    for id in [
+        "tab-settings",
+        "settings-note",
+        "settings-file",
+        "rules-note",
+    ] {
         assert!(
             page.contains(&format!("id=\"{id}\"")),
             "the page lacks #{id}"
