@@ -273,6 +273,15 @@ impl StreamClient {
     }
 }
 
+/// The session task holds the state, and with it the writer its write half waits on, so an
+/// idle session would keep its socket until the server closed it. Without the writer the
+/// write half ends, and the session with it: a replaced pool leaves no connection behind.
+impl Drop for StreamClient {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().writer = None;
+    }
+}
+
 struct Unregister<'a> {
     state: &'a Mutex<State>,
     id: u16,

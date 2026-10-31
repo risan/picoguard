@@ -701,7 +701,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
 
     use super::*;
@@ -1536,27 +1536,138 @@ mod tests {
     async fn dot_echo_server(pki: &TestPki) -> TlsServer {
         let config = pki.server_config(&["dot"], rustls::crypto::ring::default_provider());
 
-        TlsServer::start(config, |mut stream| async move {
-            loop {
-                let mut length = [0u8; 2];
-                if stream.read_exact(&mut length).await.is_err() {
-                    break;
-                }
+        TlsServer::start(config, answer_frames).await
+    }
 
-                let mut query = vec![0; usize::from(u16::from_be_bytes(length))];
-                if stream.read_exact(&mut query).await.is_err() {
-                    break;
-                }
-
-                let reply = answer(&query, ANSWER_MARKER, false);
-                let mut frame = (reply.len() as u16).to_be_bytes().to_vec();
-                frame.extend_from_slice(&reply);
-                if stream.write_all(&frame).await.is_err() {
-                    break;
-                }
+    /// Answers framed queries until the client closes; it never closes an idle connection.
+    async fn answer_frames<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
+        loop {
+            let mut length = [0u8; 2];
+            if stream.read_exact(&mut length).await.is_err() {
+                break;
             }
+
+            let mut query = vec![0; usize::from(u16::from_be_bytes(length))];
+            if stream.read_exact(&mut query).await.is_err() {
+                break;
+            }
+
+            let reply = answer(&query, ANSWER_MARKER, false);
+            let mut frame = (reply.len() as u16).to_be_bytes().to_vec();
+            frame.extend_from_slice(&reply);
+            if stream.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Runs `connection`, counted in `open` until it ends.
+    async fn counted(open: Arc<AtomicUsize>, connection: impl Future<Output = ()>) {
+        open.fetch_add(1, Ordering::SeqCst);
+        connection.await;
+        open.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Puts a new pool from `pool` in force 20 times, each queried once, the replaced one
+    /// dropped. Afterwards only the pool in force may hold a connection and its tasks.
+    async fn replace_twenty_times(pool: impl Fn() -> Upstreams, open: &AtomicUsize) {
+        let tasks = || {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        };
+        let settle = || async {
+            for _ in 0..200 {
+                if open.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let shared = SharedUpstreams::new(pool());
+        shared
+            .current()
+            .query(&mut query_for("example.com."))
+            .await
+            .unwrap();
+        settle().await;
+        let one_pool = tasks();
+        assert_eq!(open.load(Ordering::SeqCst), 1);
+
+        for _ in 0..20 {
+            drop(shared.replace(pool()));
+            shared
+                .current()
+                .query(&mut query_for("example.com."))
+                .await
+                .unwrap();
+        }
+
+        settle().await;
+        assert_eq!(open.load(Ordering::SeqCst), 1, "connections still open");
+        assert_eq!(tasks(), one_pool, "tasks still alive");
+    }
+
+    #[tokio::test]
+    async fn a_replaced_tcp_pool_closes_its_idle_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let open = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&open);
+        tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                tokio::spawn(counted(Arc::clone(&counter), answer_frames(connection)));
+            }
+        });
+
+        replace_twenty_times(|| upstreams(vec![format!("tcp://{address}")], 1000), &open).await;
+    }
+
+    fn encrypted_pool(pki: &TestPki, spec: String) -> Upstreams {
+        let config = UpstreamConfig {
+            servers: vec![spec],
+            timeout_ms: 3000,
+            ..UpstreamConfig::default()
+        };
+        let tls = Arc::new(Tls::with_roots(pki.roots(), true));
+        let bootstrap = Arc::new(Bootstrap::at(Vec::new()));
+
+        Upstreams::with_parts(&config, &LimitsConfig::default(), tls, bootstrap).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_replaced_dot_pool_closes_its_idle_connection() {
+        let pki = TestPki::new();
+        let open = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&open);
+        let config = pki.server_config(&["dot"], rustls::crypto::ring::default_provider());
+        let server = TlsServer::start(config, move |stream| {
+            counted(Arc::clone(&counter), answer_frames(stream))
         })
-        .await
+        .await;
+        let spec = format!("tls://127.0.0.1:{}#localhost", server.address.port());
+
+        replace_twenty_times(|| encrypted_pool(&pki, spec.clone()), &open).await;
+    }
+
+    #[tokio::test]
+    async fn a_replaced_doh_pool_closes_its_idle_connection() {
+        let pki = TestPki::new();
+        let open = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&open);
+        let serve = crate::upstream::test_doh::serve_doh(Arc::new(
+            |_: &http::request::Parts, body: &[u8]| respond_with_answer(body),
+        ));
+        let server = TlsServer::start(crate::upstream::test_doh::doh_config(&pki), move |stream| {
+            counted(Arc::clone(&counter), serve(stream))
+        })
+        .await;
+        let spec = format!("https://127.0.0.1:{}/dns-query", server.address.port());
+
+        replace_twenty_times(|| encrypted_pool(&pki, spec.clone()), &open).await;
     }
 
     /// Queries `spec` through a full `Upstreams`, trusting the test CA and
