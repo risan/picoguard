@@ -124,6 +124,16 @@ td button { padding: 1px var(--s2); font-size: var(--t-sm); }
 #check-result { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s1) var(--s3); margin-bottom: 0; }
 #check-result dt { color: var(--muted); }
 #check-result dd { margin: 0; }
+#upstream-list { margin: 0 0 var(--s3); padding-left: var(--s5); }
+#upstream-list li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); padding: var(--s1) 0; }
+#upstream-list code { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
+#upstream-list button { padding: 1px var(--s2); font-size: var(--t-sm); }
+#upstream-new, #bootstrap { flex: 1 1 12rem; width: auto; min-width: 0; }
+.fields { display: grid; gap: var(--s3); margin: var(--s3) 0; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); }
+.fields label { display: grid; gap: var(--s1); font-size: var(--t-sm); color: var(--muted); }
+.fields input { width: 100%; }
+.fields .switch { display: flex; align-items: center; grid-column: 1 / -1; color: var(--text); }
+input[type="checkbox"] { width: auto; margin: 0; }
 @media (max-width: 719px) {
   #queries table { display: block; }
   #queries tr { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; padding: var(--s2) 0;
@@ -270,6 +280,41 @@ td button { padding: 1px var(--s2); font-size: var(--t-sm); }
       <h2>Settings</h2>
       <p id="settings-note" class="empty">Saved on this device.</p>
       <p id="settings-file" class="empty"></p>
+    </section>
+
+    <section id="upstream-card" class="wide">
+      <h2>Upstream servers <small id="upstream-from"></small></h2>
+      <p class="empty">Queries go to these servers (udp, tcp, tls or https addresses); the faster ones get more.</p>
+      <ol id="upstream-list"></ol>
+      <form id="upstream-add" class="actions">
+        <input id="upstream-new" autocapitalize="none" placeholder="tls://9.9.9.9#dns.quad9.net" aria-label="Server to add">
+        <button>Add</button>
+      </form>
+      <div class="fields">
+        <label>Bootstrap (IP addresses that resolve server names) <input id="bootstrap" autocapitalize="none" placeholder="9.9.9.9, 1.1.1.1"></label>
+      </div>
+      <div class="actions">
+        <button id="upstream-save" class="go">Save</button>
+        <button id="upstream-reset">Use the config file</button>
+        <span id="upstream-note"></span>
+      </div>
+    </section>
+
+    <section id="cache-card" class="wide">
+      <h2>Cache <small id="cache-from"></small></h2>
+      <div class="fields">
+        <label>Answers <input id="c-entries" type="number" min="1" step="1" inputmode="numeric"></label>
+        <label>Size (KiB, 256 to 16384) <input id="c-kib" type="number" min="256" max="16384" step="1" inputmode="numeric"></label>
+        <label>Min TTL (s) <input id="c-min" type="number" min="0" step="1" inputmode="numeric"></label>
+        <label>Max TTL (s) <input id="c-max" type="number" min="0" step="1" inputmode="numeric"></label>
+        <label class="switch"><input id="c-optimistic" type="checkbox"> Answer from expired entries while they are refreshed</label>
+      </div>
+      <p class="empty">Saving clears the cache.</p>
+      <div class="actions">
+        <button id="cache-save" class="go">Save</button>
+        <button id="cache-reset">Use the config file</button>
+        <span id="cache-set-note"></span>
+      </div>
     </section>
   </div>
 </main>
@@ -610,6 +655,66 @@ function showSettings(s) {
     $(id).className = notes.length ? "err" : "empty";
   });
   $("settings-file").textContent = "File: " + s.file;
+  showSettingCards(s);
+}
+
+// A card being edited is left alone by the refresh until it is saved or reset.
+const editing = { upstream: false, cache: false };
+const CACHE_FIELDS = [["c-entries", "max_entries", 1], ["c-kib", "max_bytes", 1024],
+  ["c-min", "min_ttl", 1], ["c-max", "max_ttl", 1]];
+let servers = [];
+
+function showSettingCards(s) {
+  [["upstream", s.upstream], ["cache", s.cache]].forEach(([key, value]) => {
+    $(key + "-from").textContent = value.from === "page" ? "Set on this page" : "From the config file";
+    $(key + "-reset").hidden = value.from !== "page";
+  });
+
+  if (!editing.upstream) {
+    servers = s.upstream.servers.slice();
+    $("bootstrap").value = s.upstream.bootstrap.join(", ");
+    showServers();
+  }
+
+  if (!editing.cache) {
+    CACHE_FIELDS.forEach(([id, key, unit]) => { $(id).value = s.cache[key] / unit; });
+    $("c-optimistic").checked = s.cache.optimistic;
+  }
+}
+
+function showServers() {
+  $("upstream-list").replaceChildren(...servers.map((server, i) => {
+    const li = el("li");
+    li.append(el("code", server));
+    [["\u2191", "up", "Move up"], ["\u2193", "down", "Move down"], ["Remove", "remove", "Remove"]].forEach(([text, act, label]) => {
+      const button = el("button", text);
+      button.dataset.act = act;
+      button.dataset.i = i;
+      button.setAttribute("aria-label", label);
+      li.append(button);
+    });
+
+    return li;
+  }));
+}
+
+function editServers(change) {
+  editing.upstream = true;
+  change();
+  showServers();
+}
+
+// `value` null goes back to the config file. A refused change keeps the card as edited.
+function saveSetting(key, value, note) {
+  act("/api/settings", { [key]: value }, (data) => {
+    editing[key] = false;
+    showSettings(data);
+    $(note).textContent = value === null ? "Back to the config file." : "Saved.";
+    $(note).className = "empty";
+  }, (message) => {
+    $(note).textContent = message;
+    $(note).className = "err";
+  });
 }
 
 function showExplain(data) {
@@ -796,7 +901,7 @@ async function update() {
   }
 }
 
-async function act(path, body, done) {
+async function act(path, body, done, failed) {
   const epoch = authEpoch;
 
   try {
@@ -820,8 +925,12 @@ async function act(path, body, done) {
       return;
     }
 
-    $("state").textContent = error.message;
-    $("state").className = "bad";
+    if (failed) {
+      failed(error.message);
+    } else {
+      $("state").textContent = error.message;
+      $("state").className = "bad";
+    }
   }
 
   update();
@@ -886,6 +995,45 @@ $("rule-table").addEventListener("click", (event) => {
     act("/api/rules/remove", { name: button.dataset.name }, showRules);
   }
 });
+$("upstream-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-act]");
+
+  if (!button) {
+    return;
+  }
+
+  const i = Number(button.dataset.i);
+  const to = { up: i - 1, down: i + 1 }[button.dataset.act];
+  editServers(() => {
+    if (button.dataset.act === "remove") {
+      servers.splice(i, 1);
+    } else if (to >= 0 && to < servers.length) {
+      [servers[i], servers[to]] = [servers[to], servers[i]];
+    }
+  });
+});
+$("upstream-add").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const server = $("upstream-new").value.trim();
+
+  if (server) {
+    editServers(() => servers.push(server));
+    $("upstream-new").value = "";
+  }
+});
+$("bootstrap").addEventListener("input", () => { editing.upstream = true; });
+$("cache-card").addEventListener("input", () => { editing.cache = true; });
+$("upstream-save").addEventListener("click", () => saveSetting("upstream", {
+  servers,
+  bootstrap: $("bootstrap").value.split(/[\s,]+/).filter(Boolean),
+}, "upstream-note"));
+$("cache-save").addEventListener("click", () => {
+  const cache = { optimistic: $("c-optimistic").checked };
+  CACHE_FIELDS.forEach(([id, key, unit]) => { cache[key] = Math.round(Number($(id).value) * unit); });
+  saveSetting("cache", cache, "cache-set-note");
+});
+$("upstream-reset").addEventListener("click", () => saveSetting("upstream", null, "upstream-note"));
+$("cache-reset").addEventListener("click", () => saveSetting("cache", null, "cache-set-note"));
 $("check-form").addEventListener("submit", (event) => {
   event.preventDefault();
   checkName();

@@ -513,8 +513,9 @@ async fn the_page_is_served_with_protective_headers() {
 /// binary, no memory at run time.
 const PAGE_HARD_CAP_BYTES: usize = 64 * 1024;
 
-/// This part, the settings tab; a later part raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 34 * 1024;
+/// This part, the upstream and cache cards; a later part raises it on purpose, never past the
+/// cap.
+const PAGE_BUDGET_BYTES: usize = 40 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -764,6 +765,60 @@ async fn the_settings_tab_says_where_settings_are_saved_and_why_they_are_not_use
         "s.can_save",
         "\"tab-log\", \"tab-settings\"",
         "#settings-file { overflow-wrap: anywhere; }",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+/// No browser here: the cards are checked as source, and in the build's browser check. Each
+/// card says where its values come from, goes back to the config file, and saves on its own;
+/// polling leaves a card alone while it is being edited.
+#[tokio::test]
+async fn the_settings_tab_edits_the_upstream_servers_and_the_cache() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "upstream-card",
+        "upstream-from",
+        "upstream-list",
+        "upstream-add",
+        "upstream-new",
+        "bootstrap",
+        "upstream-save",
+        "upstream-reset",
+        "upstream-note",
+        "cache-card",
+        "cache-from",
+        "c-entries",
+        "c-kib",
+        "c-min",
+        "c-max",
+        "c-optimistic",
+        "cache-save",
+        "cache-reset",
+        "cache-set-note",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "\"From the config file\"",
+        "\"Set on this page\"",
+        ">Use the config file<",
+        "Saving clears the cache.",
+        "\"Move up\"",
+        "\"Move down\"",
+        "\"Remove\"",
+        "editing[key]",
+        "{ [key]: value }",
+        "max_bytes",
+        "#upstream-list code",
+        "overflow-wrap: anywhere",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
