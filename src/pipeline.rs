@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,11 +21,14 @@ use tokio::time::timeout;
 use crate::budget::{Budget, Charge};
 use crate::cache::{Cache, CacheKey, EntryToken, Memo, Ttls};
 use crate::config::{CacheConfig, Cidr, Config, is_allowed};
-use crate::dns::build::{self, Protocol, Reply, ReplyParts};
-use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, flags, rcode, rtype};
+use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
+use crate::dns::wire::{
+    Header, Name, Query, QueryError, ResponseInfo, chain_end, flags, rcode, rtype,
+};
 use crate::filter::engine::{BlockedAnswer, Decision, Verdict, blocked_answer};
 use crate::names::DeviceNames;
 use crate::policy::{Policy, PolicyView};
+use crate::rewrites::{ADDRESS_TTL, By, Found, MAX_TARGET_TTL, Rewrites};
 use crate::stats::{Event, QueryResult, Stats, StatsSettings};
 use crate::upstream::{Answered, SharedUpstreams, Tally, UpstreamError, Upstreams};
 
@@ -103,6 +107,19 @@ impl Settled {
             Settled::Static(result) | Settled::Blocked(result) | Settled::Cached(result) => result,
         }
     }
+}
+
+/// How `Pipeline::rewrite` left a rewritten query.
+enum Rewritten {
+    /// The reply is in the output buffer.
+    Answered,
+    /// The reply for the target name is not cached: it is to be looked up.
+    NeedsTarget,
+}
+
+enum RewriteTo {
+    Addresses(Vec<IpAddr>),
+    Target(Box<Name>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -222,6 +239,15 @@ enum Inner {
         asker: Asker,
         delivery: Option<Arc<Delivery>>,
     },
+    /// The compact query of a question rewritten to a target name, and the reply for the
+    /// target it waited for; `None` when the target got no answer. `finish` builds the answer
+    /// from it, never from the policy.
+    Rewritten {
+        request: Vec<u8>,
+        protocol: Protocol,
+        asker: Asker,
+        delivery: Option<Arc<Delivery>>,
+    },
     /// The compact query of a question that got no answer; `finish` writes the SERVFAIL.
     Failed {
         request: Vec<u8>,
@@ -241,9 +267,9 @@ impl Prepared {
         match &self.0 {
             Inner::Final(_) => None,
 
-            Inner::Undecided { request, asker, .. } | Inner::Failed { request, asker, .. } => {
-                Some((request, asker))
-            }
+            Inner::Undecided { request, asker, .. }
+            | Inner::Rewritten { request, asker, .. }
+            | Inner::Failed { request, asker, .. } => Some((request, asker)),
         }
     }
 
@@ -254,6 +280,9 @@ impl Prepared {
             Inner::Final(_) => 0,
 
             Inner::Undecided {
+                request, delivery, ..
+            }
+            | Inner::Rewritten {
                 request, delivery, ..
             } => match delivery {
                 Some(delivery) => delivery.bytes.len(),
@@ -332,6 +361,9 @@ pub struct Pipeline {
     local_resolver: Option<(SocketAddr, Upstreams)>,
     device_names: Option<Arc<DeviceNames>>,
     cache: Mutex<Cache>,
+    /// Looked up under the lock and swapped whole, so no query ever holds the last copy.
+    rewrites: Mutex<Arc<Rewrites>>,
+    safe_search: AtomicBool,
     inflight: Mutex<Inflight>,
     policy: Arc<Policy>,
     budget: Arc<Budget>,
@@ -381,6 +413,8 @@ impl Pipeline {
             local_resolver,
             device_names,
             cache: Mutex::new(Cache::new(&config.cache)),
+            rewrites: Mutex::new(Arc::new(Rewrites::new(&config.rewrites)?)),
+            safe_search: AtomicBool::new(config.safe_search),
             inflight: Mutex::new(Inflight::default()),
             policy,
             budget: Budget::new(config.limits.pending_bytes),
@@ -465,6 +499,33 @@ impl Pipeline {
         let next = cache.successor(config);
 
         std::mem::replace(&mut *cache, next)
+    }
+
+    /// Puts `rewrites` in force and returns the table it replaces, to be freed off the DNS
+    /// thread.
+    pub fn replace_rewrites(&self, rewrites: Arc<Rewrites>) -> Arc<Rewrites> {
+        std::mem::replace(&mut *self.rewrites.lock().unwrap(), rewrites)
+    }
+
+    pub fn set_safe_search(&self, on: bool) {
+        self.safe_search.store(on, Ordering::Relaxed);
+    }
+
+    /// What `name` is rewritten to and by whom, whether or not filtering is paused: the
+    /// addresses or the target name as text.
+    pub fn rewrite_explained(&self, name: &Name) -> Option<(String, By)> {
+        let rewrites = self.rewrites.lock().unwrap();
+        let (found, by) = rewrites.find(name, self.safe_search.load(Ordering::Relaxed))?;
+        let text = match found {
+            Found::Addresses(addresses) => addresses
+                .iter()
+                .map(IpAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            Found::Target(target) => target.to_string(),
+        };
+
+        Some((text, by))
     }
 
     /// The budget for replies held for delivery. Queued TCP replies draw on it.
@@ -566,6 +627,20 @@ impl Pipeline {
         }
 
         let query = Query::parse(&compact).ok()?;
+        if let Some(target) = self.target_of(&query) {
+            let outcome = self.resolve_target(&query, &target).await;
+            if matches!(outcome, Err(Failure::Overloaded)) {
+                return self.shed(compact, protocol, asker);
+            }
+
+            return Some(Prepared(Inner::Rewritten {
+                request: compact,
+                protocol,
+                asker,
+                delivery: outcome.ok(),
+            }));
+        }
+
         let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
             return self.shed(compact, protocol, asker);
         };
@@ -630,6 +705,23 @@ impl Pipeline {
                 Err(Quick::NeedsUpstream) => self.resume(request, *protocol, out).await,
             },
 
+            Inner::Rewritten {
+                request,
+                protocol,
+                delivery,
+                ..
+            } => {
+                let query = Query::parse(request).ok()?;
+                let reply = Reply::new(&query, self.udp_size, *protocol);
+
+                Some(Finished(Some(self.deliver_rewritten(
+                    &query,
+                    &reply,
+                    delivery.as_deref(),
+                    out,
+                ))))
+            }
+
             Inner::Failed {
                 request, protocol, ..
             } => self
@@ -659,6 +751,25 @@ impl Pipeline {
     ) -> Option<Finished> {
         let query = Query::parse(request).ok()?;
         let reply = Reply::new(&query, self.udp_size, protocol);
+        if let Some(target) = self.target_of(&query) {
+            let delivery =
+                match timeout(self.resume_limit, self.resolve_target(&query, &target)).await {
+                    Ok(Err(Failure::Overloaded)) => {
+                        return self.shed_now(&reply, protocol, out);
+                    }
+
+                    Ok(outcome) => outcome.ok(),
+                    Err(_) => None,
+                };
+
+            return Some(Finished(Some(self.deliver_rewritten(
+                &query,
+                &reply,
+                delivery.as_deref(),
+                out,
+            ))));
+        }
+
         let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
             return self.shed_now(&reply, protocol, out);
         };
@@ -689,6 +800,9 @@ impl Pipeline {
             }
 
             Inner::Undecided {
+                request, protocol, ..
+            }
+            | Inner::Rewritten {
                 request, protocol, ..
             }
             | Inner::Failed {
@@ -767,14 +881,30 @@ impl Pipeline {
             return Ok(Settled::Static(record(QueryResult::BlockedRequest)));
         }
 
-        if self.route_of(name) == Route::Local && self.local_resolver.is_none() {
+        // A rewrite answers before `[local]` and the block lists, and while paused (plan D7).
+        let view = self.policy.view(self.policy.now());
+        match self.rewrite(&query, &reply, view.paused, out) {
+            Some(Rewritten::Answered) => {
+                return Ok(Settled::Static(record(counted_as(
+                    out,
+                    QueryResult::Rewritten,
+                ))));
+            }
+
+            Some(Rewritten::NeedsTarget) => {
+                return Err(Quick::NeedsUpstream);
+            }
+
+            None => {}
+        }
+
+        if self.has_no_resolver(name) {
             reply.error(rcode::NXDOMAIN, out);
 
             return Ok(Settled::Static(record(QueryResult::Error)));
         }
 
         let now = Instant::now();
-        let view = self.policy.view(self.policy.now());
         let request_verdict = view.check_request(&query);
         if let Verdict::Block { ips } = &request_verdict {
             self.write_blocked(&reply, query.question.qtype, ips, out);
@@ -825,6 +955,125 @@ impl Pipeline {
         }
 
         Ok(Settled::Cached(record(counted_as(out, result))))
+    }
+
+    /// The rewrite of `name` in force, SafeSearch only while not `paused`.
+    fn rewrite_to(&self, name: &Name, paused: bool) -> Option<RewriteTo> {
+        let safe_search = !paused && self.safe_search.load(Ordering::Relaxed);
+        let rewrites = self.rewrites.lock().unwrap();
+
+        match rewrites.find(name, safe_search)?.0 {
+            Found::Addresses(addresses) => Some(RewriteTo::Addresses(addresses.to_vec())),
+            Found::Target(target) => {
+                Name::from_text(target).map(|target| RewriteTo::Target(Box::new(target)))
+            }
+        }
+    }
+
+    /// Answers a rewritten name (plan D7): from its addresses, or from the cached reply for
+    /// its target name, without the policy. `None` when no rewrite applies.
+    fn rewrite(
+        self: &Arc<Pipeline>,
+        query: &Query<'_>,
+        reply: &Reply<'_, '_>,
+        paused: bool,
+        out: &mut Vec<u8>,
+    ) -> Option<Rewritten> {
+        let qtype = query.question.qtype;
+        let asks_addresses = matches!(qtype, rtype::A | rtype::AAAA);
+        let target = match self.rewrite_to(&query.question.name, paused)? {
+            RewriteTo::Addresses(addresses) if asks_addresses => {
+                reply.addresses(&addresses, ADDRESS_TTL, out);
+
+                return Some(Rewritten::Answered);
+            }
+
+            RewriteTo::Target(target) if asks_addresses && !self.has_no_resolver(&target) => target,
+
+            // No such records, or a target that does not exist here.
+            _ => {
+                reply.error(rcode::NOERROR, out);
+
+                return Some(Rewritten::Answered);
+            }
+        };
+
+        let request = build::query_for(query, &target);
+        let Ok(target_query) = Query::parse(&request) else {
+            reply.error(rcode::SERVFAIL, out);
+
+            return Some(Rewritten::Answered);
+        };
+        let mut cache = self.cache.lock().unwrap();
+        let ttls = cache.ttls();
+        let Some(hit) = cache.get(&CacheKey::new(&target_query), Instant::now()) else {
+            return Some(Rewritten::NeedsTarget);
+        };
+
+        let stale = hit.stale;
+        write_flattened(reply, qtype, hit.parts, ttls.rule(hit.age_secs, stale), out);
+        // The inflight lock is never taken while the cache lock is held.
+        drop(cache);
+
+        if stale {
+            self.refresh(&target_query);
+        }
+
+        Some(Rewritten::Answered)
+    }
+
+    /// The target name an A or AAAA question is rewritten to now, when its answer comes from
+    /// the target's reply.
+    fn target_of(&self, query: &Query<'_>) -> Option<Name> {
+        if !matches!(query.question.qtype, rtype::A | rtype::AAAA) {
+            return None;
+        }
+
+        let paused = self.policy.view(self.policy.now()).paused;
+        match self.rewrite_to(&query.question.name, paused)? {
+            RewriteTo::Target(target) if !self.has_no_resolver(&target) => Some(*target),
+            _ => None,
+        }
+    }
+
+    /// Steps 4 and 5 for the target of a rewritten query: its reply is cached and coalesced
+    /// under its own question, like a client asking for the target itself.
+    async fn resolve_target(self: &Arc<Pipeline>, query: &Query<'_>, target: &Name) -> Outcome {
+        let request = build::query_for(query, target);
+        let target_query = Query::parse(&request).map_err(|_| Failure::Upstream)?;
+        let (_waiting, receiver) = self.join_or_start(&target_query)?;
+
+        receiver.await.unwrap_or(Err(Failure::Upstream))
+    }
+
+    /// The answer to a rewritten query from the reply for its target, or SERVFAIL without one.
+    fn deliver_rewritten(
+        &self,
+        query: &Query<'_>,
+        reply: &Reply<'_, '_>,
+        delivery: Option<&Delivery>,
+        out: &mut Vec<u8>,
+    ) -> Counted {
+        match delivery {
+            Some(delivery) => {
+                let ttl_rule = delivery.ttls.rule(delivery.age_secs(), delivery.is_stale());
+                write_flattened(reply, query.question.qtype, delivery.parts(), ttl_rule, out);
+            }
+
+            None => {
+                reply.error(rcode::SERVFAIL, out);
+            }
+        }
+
+        Counted {
+            result: counted_as(out, QueryResult::Rewritten),
+            server: delivery.and_then(|delivery| delivery.source.server()),
+        }
+    }
+
+    /// A name under `[local]` with no local resolver: it does not exist here.
+    fn has_no_resolver(&self, name: &Name) -> bool {
+        self.route_of(name) == Route::Local && self.local_resolver.is_none()
     }
 
     /// A copy of the cached reply to `query`, charged to the pending-bytes budget. `None`
@@ -1131,6 +1380,61 @@ impl Pipeline {
         Ok(Arc::new(Delivery::new(
             bytes, info, cached_as, 0, source, ttls, charge,
         )))
+    }
+}
+
+/// The answer to a rewritten A or AAAA question from the reply for its target (plan D7): the
+/// addresses at the end of the target's CNAME chain under the asked name, with the smallest
+/// TTL on the way, at most `MAX_TARGET_TTL`. A target that does not exist or has no such
+/// address gives no records; any other rcode, a truncated reply or a broken chain SERVFAIL.
+fn write_flattened(
+    reply: &Reply<'_, '_>,
+    qtype: u16,
+    parts: ReplyParts<'_>,
+    ttl_rule: TtlRule,
+    out: &mut Vec<u8>,
+) {
+    let Ok(header) = Header::parse(parts.bytes) else {
+        reply.error(rcode::SERVFAIL, out);
+
+        return;
+    };
+
+    if header.truncated() || parts.extended_rcode() != 0 {
+        reply.error(rcode::SERVFAIL, out);
+
+        return;
+    }
+
+    match header.rcode() {
+        rcode::NOERROR => {}
+
+        rcode::NXDOMAIN => {
+            reply.error(rcode::NOERROR, out);
+
+            return;
+        }
+
+        _ => {
+            reply.error(rcode::SERVFAIL, out);
+
+            return;
+        }
+    }
+
+    match chain_end(parts.bytes, qtype) {
+        Ok(Some(end)) if end.addresses.is_empty() => {
+            reply.error(rcode::NOERROR, out);
+        }
+
+        Ok(Some(end)) => {
+            let ttl = ttl_rule.apply(end.min_ttl.unwrap_or(0)).min(MAX_TARGET_TTL);
+            reply.addresses(&end.addresses, ttl, out);
+        }
+
+        _ => {
+            reply.error(rcode::SERVFAIL, out);
+        }
     }
 }
 

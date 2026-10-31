@@ -31,6 +31,11 @@ impl FakeUpstream {
     pub fn count(&self) -> usize {
         self.received.lock().unwrap().len()
     }
+
+    /// The queries that reached the upstream, in order.
+    pub fn received(&self) -> Vec<Message> {
+        self.received.lock().unwrap().clone()
+    }
 }
 
 pub async fn fake_upstream(

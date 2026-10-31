@@ -902,6 +902,66 @@ fn is_negative(msg: &[u8], header: &Header) -> Result<bool, WireError> {
     Ok(reached_the_end && !has_answer_for(msg, &current)?)
 }
 
+/// The addresses at the end of a reply's CNAME chain, and the smallest TTL on the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainEnd {
+    /// The records of the asked type owned by the last name of the chain, in order.
+    pub addresses: Vec<IpAddr>,
+    /// The smallest TTL of every CNAME followed and every address taken.
+    pub min_ttl: Option<u32>,
+}
+
+/// Follows the answer section's CNAME chain by owner name from the question name, and takes
+/// the A or AAAA records (`qtype`) of its last name only. `None` when the chain is longer than
+/// `MAX_CNAME_HOPS`, which a loop always is.
+pub fn chain_end(msg: &[u8], qtype: u16) -> Result<Option<ChainEnd>, WireError> {
+    let (question, _) = read_question(msg, HEADER_LEN)?;
+    let mut owner = question.name;
+    let mut chain_ttl: Option<u32> = None;
+
+    for _ in 0..=MAX_CNAME_HOPS {
+        let mut next = None;
+        let mut addresses = Vec::new();
+        let mut address_ttl: Option<u32> = None;
+        for record in answers(msg)? {
+            let record = record?;
+            if read_name(msg, record.start)?.0 != owner {
+                continue;
+            }
+
+            let address = match record.data(msg)? {
+                RData::Cname(target) if next.is_none() => {
+                    next = Some((*target, record.ttl));
+
+                    continue;
+                }
+
+                RData::A(address) if qtype == rtype::A => IpAddr::V4(address),
+                RData::Aaaa(address) if qtype == rtype::AAAA => IpAddr::V6(address),
+                _ => continue,
+            };
+
+            addresses.push(address);
+            address_ttl = Some(address_ttl.map_or(record.ttl, |min| min.min(record.ttl)));
+        }
+
+        // A name with a CNAME has no other data: only the chain's last name gives addresses.
+        let Some((target, ttl)) = next else {
+            let min_ttl = match (chain_ttl, address_ttl) {
+                (Some(chain), Some(address)) => Some(chain.min(address)),
+                (chain, address) => chain.or(address),
+            };
+
+            return Ok(Some(ChainEnd { addresses, min_ttl }));
+        };
+
+        owner = target;
+        chain_ttl = Some(chain_ttl.map_or(ttl, |min| min.min(ttl)));
+    }
+
+    Ok(None)
+}
+
 fn answers(msg: &[u8]) -> Result<impl Iterator<Item = Result<Record, WireError>>, WireError> {
     Ok(Records::new(msg)?.take_while(|record| {
         record
@@ -1561,6 +1621,92 @@ mod tests {
 
             assert_eq!(info.is_negative, expected, "{label}");
         }
+    }
+
+    fn chain_of(answers: Vec<hickory_proto::rr::Record>, rtype: RecordType) -> Option<ChainEnd> {
+        let bytes = ResponseSpec {
+            answers,
+            ..ResponseSpec::default()
+        }
+        .bytes(&QuerySpec::new("www.example.com.", rtype));
+
+        chain_end(&bytes, u16::from(rtype)).unwrap()
+    }
+
+    #[test]
+    fn the_chain_end_has_the_last_names_addresses_and_the_smallest_ttl_on_the_way() {
+        let end = chain_of(
+            vec![
+                a("other.example.", 5, [6, 6, 6, 6].into()),
+                cname("www.example.com.", 200, "mid.example.net."),
+                a("edge.example.net.", 250, [192, 0, 2, 1].into()),
+                cname("mid.example.net.", 100, "edge.example.net."),
+                aaaa("edge.example.net.", 10, "2001:db8::1".parse().unwrap()),
+                a("edge.example.net.", 300, [192, 0, 2, 2].into()),
+            ],
+            RecordType::A,
+        )
+        .unwrap();
+
+        assert_eq!(
+            end.addresses,
+            [
+                "192.0.2.1".parse::<IpAddr>().unwrap(),
+                "192.0.2.2".parse().unwrap()
+            ]
+        );
+        assert_eq!(end.min_ttl, Some(100));
+
+        let direct = chain_of(
+            vec![aaaa("WWW.example.com.", 30, "2001:db8::2".parse().unwrap())],
+            RecordType::AAAA,
+        )
+        .unwrap();
+        assert_eq!(direct.addresses, ["2001:db8::2".parse::<IpAddr>().unwrap()]);
+        assert_eq!(direct.min_ttl, Some(30));
+    }
+
+    #[test]
+    fn a_chain_without_addresses_is_empty_and_a_loop_has_no_end() {
+        let empty = chain_of(
+            vec![cname("www.example.com.", 60, "edge.example.net.")],
+            RecordType::A,
+        )
+        .unwrap();
+        assert!(empty.addresses.is_empty());
+
+        // A name with a CNAME has no addresses of its own.
+        let beside = chain_of(
+            vec![
+                a("www.example.com.", 60, [192, 0, 2, 9].into()),
+                cname("www.example.com.", 60, "edge.example.net."),
+            ],
+            RecordType::A,
+        )
+        .unwrap();
+        assert!(beside.addresses.is_empty());
+
+        let looped = chain_of(
+            vec![
+                cname("www.example.com.", 60, "a.example.net."),
+                cname("a.example.net.", 60, "www.example.com."),
+            ],
+            RecordType::A,
+        );
+        assert_eq!(looped, None);
+
+        let long: Vec<_> = (0..=MAX_CNAME_HOPS)
+            .map(|hop| {
+                let owner = if hop == 0 {
+                    "www.example.com.".to_string()
+                } else {
+                    format!("h{hop}.example.")
+                };
+
+                cname(&owner, 60, &format!("h{}.example.", hop + 1))
+            })
+            .collect();
+        assert_eq!(chain_of(long, RecordType::A), None);
     }
 
     #[test]
