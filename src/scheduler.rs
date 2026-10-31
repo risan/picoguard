@@ -517,12 +517,14 @@ impl ListControl {
     /// The lists of the blocked services `new` in place of those of `old`. A service switched
     /// on downloads the catalog once and compiles the services that have no list yet, within
     /// the room the memory budget leaves while the lists in force are held, and the new set
-    /// must fit with the others (plan D8); one switched off drops its list. Nothing is in force
-    /// before `put_services_in_force`. The caller holds the settings and admission locks.
+    /// must fit with the others and a cache of `cache_max_bytes`, the cache of the same change
+    /// (plan D8); one switched off drops its list. Nothing is in force before
+    /// `put_services_in_force`. The caller holds the settings and admission locks.
     pub(crate) async fn prepare_services(
         &self,
         old: &[String],
         new: &[String],
+        cache_max_bytes: usize,
     ) -> Result<Vec<ServiceList>, ChangeError> {
         let added: Vec<&String> = new.iter().filter(|id| !old.contains(id)).collect();
         let unknown = |state: &services::State| {
@@ -544,36 +546,41 @@ impl ListControl {
             .filter_map(|id| in_force.iter().find(|list| *list.id == **id).cloned())
             .collect();
         drop(in_force);
-        if added.is_empty() {
-            return Ok(kept);
-        }
+        let wanted = if added.is_empty() {
+            Vec::new()
+        } else {
+            let missing: Vec<String> = new
+                .iter()
+                .filter(|id| !kept.iter().any(|list| *list.id == ***id))
+                .cloned()
+                .collect();
+            let wanted = self.services.fetch(&missing).await.map_err(|error| {
+                ChangeError::Unavailable(format!(
+                    "could not download the catalog of the blocked services: {error}"
+                ))
+            })?;
+            if let Some(error) = unknown(&self.services.state.lock().unwrap()) {
+                return Err(error);
+            }
 
-        let missing: Vec<String> = new
-            .iter()
-            .filter(|id| !kept.iter().any(|list| *list.id == ***id))
-            .cloned()
-            .collect();
-        let wanted = self.services.fetch(&missing).await.map_err(|error| {
-            ChangeError::Unavailable(format!(
-                "could not download the catalog of the blocked services: {error}"
-            ))
-        })?;
-        if let Some(error) = unknown(&self.services.state.lock().unwrap()) {
-            return Err(error);
-        }
+            wanted
+        };
 
-        self.compile_services(kept, wanted).await
+        self.compile_services(kept, wanted, cache_max_bytes).await
     }
 
     /// `kept` and the lists of `wanted`, each compiled within the room the budget leaves while
-    /// the lists in force, the services in force and those compiled before it are held. The
-    /// set holds at most `MAX_SELECTED_RULES` rules and must fit the budget in place of the
-    /// services in force; else the reason. A service that does not compile (it blocks a
-    /// canary name) is left out. The caller holds the admission lock.
+    /// the lists in force, the cache in force, the services in force and those compiled before
+    /// it are held. The set holds at most `MAX_SELECTED_RULES` rules, and with a cache of
+    /// `cache_max_bytes` in place of the cache in force it must fit the budget in place of the
+    /// services in force, unless that leaves the estimate no higher than now; else the reason.
+    /// A service that does not compile (it blocks a canary name) is left out. The caller holds
+    /// the admission lock.
     async fn compile_services(
         &self,
         kept: Vec<ServiceList>,
         wanted: Vec<Wanted>,
+        cache_max_bytes: usize,
     ) -> Result<Vec<ServiceList>, ChangeError> {
         let Some(worker) = self.services.worker() else {
             return Err(ChangeError::Unavailable(
@@ -632,12 +639,17 @@ impl ListControl {
 
         let mut after = self.list_bytes();
         *after.last_mut().expect("the services are counted last") = group_bytes(&lists);
-        let estimate = memory::estimate(fixed, cache, &after);
-        if estimate > self.budget_bytes {
+        let estimate = memory::estimate(fixed, cache_max_bytes, &after);
+        if estimate > self.budget_bytes && estimate > self.memory().estimate_bytes {
             worker.discard(lists);
+            let with_cache = if cache_max_bytes > cache {
+                format!(" and a cache of {}", memory::megabytes(cache_max_bytes))
+            } else {
+                String::new()
+            };
 
             return Err(ChangeError::OverBudget(format!(
-                "the blocked services would pass the memory budget: the estimate would be {} of {}",
+                "the blocked services{with_cache} would pass the memory budget: the estimate would be {} of {}",
                 memory::megabytes(estimate),
                 memory::megabytes(self.budget_bytes)
             )));
@@ -697,7 +709,11 @@ impl ListControl {
 
         let refreshed = match self.services.fetch(&selection).await {
             Ok(wanted) => self
-                .compile_services(Vec::new(), wanted)
+                .compile_services(
+                    Vec::new(),
+                    wanted,
+                    self.cache_max_bytes.load(Ordering::Relaxed),
+                )
                 .await
                 .map_err(|error| match error {
                     ChangeError::Invalid(reason)

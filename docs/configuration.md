@@ -79,7 +79,9 @@ file** goes back to this file's values.
   cache, and the new limits and TTLs apply to the next answer. The other `[cache]` keys stay in
   this file. A larger `max_bytes` that would take the [memory estimate](#the-memory-budget) past
   the budget is refused with 400 "a cache of 16.0 MB would pass the memory budget: the estimate
-  would be 51.2 MB of 48.0 MB"; a smaller one always works.
+  would be 51.2 MB of 48.0 MB"; a smaller one always works. Sent in one change with `services`,
+  the cache is checked together with the services of that change, and passing the budget answers
+  409 "the blocked services and a cache of 16.0 MB would pass the memory budget: ...".
 
 `POST /api/settings` takes any of `upstream`, `cache`, `rewrites`, `safe_search` and
 `services`. A value sets it, `null` goes back to this file. The body may be up to 64 KiB. It
@@ -226,7 +228,9 @@ lists hold. With the defaults and the three default lists the estimate is about 
 
 - **Checked when** a list is added or turned on again, a list from the page is refreshed, the
   cache gets larger on the page, a blocked service is switched on, and the catalog of services is
-  refreshed (when it does not fit, the lists in force stay). A list is compiled within the room the budget leaves and stops
+  refreshed (when it does not fit, the lists in force stay). A change of the cache and the
+  services together is checked as one, and a change of the services that leaves the estimate
+  no higher, such as switching one off, is never refused. A list is compiled within the room the budget leaves and stops
   at once when it passes it, so a list far too large never fills the memory; then its finished
   copy must fit too.
 - **A list from the page whose refresh grows past the budget** keeps its last good copy, and the

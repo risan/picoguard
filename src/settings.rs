@@ -521,7 +521,9 @@ pub(crate) async fn apply(
     } else {
         Some(control.admission().await)
     };
+    // With services changed too, the cache is checked with the services of the change.
     if new_max_bytes > old_max_bytes
+        && !services_change
         && let Err(reason) = control.cache_fits(new_max_bytes)
     {
         let _ = answer.send(Err(ChangeError::Invalid(reason)));
@@ -538,7 +540,10 @@ pub(crate) async fn apply(
     };
     let prepared = match prepare(saved.file_config(), &settings, &old, pipeline).await {
         Ok(prepared) if services_change => {
-            match control.prepare_services(&old_services, &new_services).await {
+            match control
+                .prepare_services(&old_services, &new_services, new_max_bytes)
+                .await
+            {
                 Ok(lists) => Ok((prepared, Some(lists))),
 
                 Err(error) => {

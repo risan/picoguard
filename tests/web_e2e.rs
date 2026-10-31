@@ -5460,3 +5460,70 @@ async fn services_switched_on_one_change_at_a_time_stay_within_20000_rules() {
     assert!(is_blocked(&site, "r0.s10.example.").await);
     assert!(!is_blocked(&site, "r0.s0.example.").await);
 }
+
+#[tokio::test]
+async fn a_larger_cache_and_services_in_one_change_must_fit_the_budget_together() {
+    let big: Vec<String> = (0..2000)
+        .map(|n| format!("\"||n{n}.big.example^\""))
+        .collect();
+    let catalog_text = CATALOG.replace(
+        "\"rules\": [\"||games.example^\"]",
+        &format!("\"rules\": [{}]", big.join(", ")),
+    );
+    let (probe, _catalog, _upstream) = services_site(&[], day_long_timing(), |_| {}).await;
+    // A budget that leaves about 8 MiB, so the larger cache stays within its 16 MiB cap.
+    let memory_mb = probe.control.memory().estimate_bytes / (1024 * 1024) + 8;
+    drop(probe);
+    let (probe, probe_catalog, _upstream) = services_site(&[], day_long_timing(), |config| {
+        config.limits.memory_mb = memory_mb;
+    })
+    .await;
+    probe_catalog.serve(CATALOG_PATH, &catalog_text, None);
+    let without = probe.control.memory();
+    let reply = probe
+        .send(post("/api/settings", "{\"services\": [\"games\"]}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let services = probe.control.memory().estimate_bytes - without.estimate_bytes;
+    drop(probe);
+    // Room for the services, or for a cache that counts as much more, but not for both.
+    let room = services * 3 / 2;
+    let cache_max_bytes = Config::default().cache.max_bytes
+        + (without.budget_bytes - without.estimate_bytes - room) / 125 * 100;
+    let larger_cache = cache_max_bytes + services / 125 * 100;
+    let (site, catalog, _upstream) = services_site(&[], day_long_timing(), |config| {
+        config.limits.memory_mb = memory_mb;
+        config.cache.max_bytes = cache_max_bytes;
+    })
+    .await;
+    catalog.serve(CATALOG_PATH, &catalog_text, None);
+    let memory = site.control.memory();
+    let mut both: Value = serde_json::from_str(&cache_of_size(larger_cache)).unwrap();
+    both["services"] = serde_json::json!(["games"]);
+
+    let reply = site.send(post("/api/settings", &both.to_string())).await;
+
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.json()["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the blocked services and a cache of "),
+        "{}",
+        reply.body
+    );
+    assert!(!is_blocked(&site, "n1.big.example.").await);
+    assert!(saved_settings(&site).is_none());
+    assert_eq!(site.control.memory(), memory);
+
+    let reply = site
+        .send(post("/api/settings", "{\"services\": [\"games\"]}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(is_blocked(&site, "n1.big.example.").await);
+    both["services"] = serde_json::json!([]);
+    let reply = site.send(post("/api/settings", &both.to_string())).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(!is_blocked(&site, "n1.big.example.").await);
+    assert!(site.control.memory().estimate_bytes <= memory.budget_bytes);
+}
