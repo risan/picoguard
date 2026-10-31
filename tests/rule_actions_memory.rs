@@ -16,7 +16,7 @@ use common::http::ListServer;
 use picoguard::config::{Config, ListConfig, ListFormat};
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
-use picoguard::lists::{Downloader, MAX_PIECE_BYTES, PIECE_QUEUE};
+use picoguard::lists::{Downloader, MAX_PIECE_BYTES, Names, PIECE_QUEUE};
 use picoguard::policy::Policy;
 use picoguard::scheduler::{
     Action, ListControl, MAX_PENDING_CHANGES, RuleError, Scheduler, Timing,
@@ -209,7 +209,9 @@ async fn finish_flips(
 
 fn downloader() -> Downloader {
     Downloader::new(
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     )
 }

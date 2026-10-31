@@ -25,7 +25,7 @@ use picoguard::config::{Config, ListConfig, ListFormat};
 use picoguard::dns::wire::Name;
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
-use picoguard::lists::Downloader;
+use picoguard::lists::{Downloader, Names};
 use picoguard::password::PasswordHash;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ListControl, Scheduler, Timing};
@@ -284,7 +284,9 @@ impl Site {
 
 fn no_dns() -> Downloader {
     Downloader::new(
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     )
 }
@@ -449,7 +451,9 @@ async fn site_saving(mut config: Config, kind: SiteKind, saved: Option<&str>) ->
             },
         },
         Arc::clone(&updates),
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     );
     let web_state = Web::new(
@@ -2254,7 +2258,9 @@ async fn a_hanging_check_holds_up_neither_dns_nor_the_page() {
     let check = update::start(
         &Config::default(),
         &github.url("/latest"),
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
         Arc::clone(&site.updates),
         timing,

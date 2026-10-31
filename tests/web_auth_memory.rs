@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use picoguard::config::Config;
+use picoguard::lists::Names;
 use picoguard::password::PasswordHash;
 use picoguard::pipeline::Pipeline;
 use picoguard::policy::Policy;
@@ -89,7 +90,9 @@ fn parts() -> Parts {
             timing: StageTiming::default(),
         },
         Arc::clone(&updates),
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     );
     let listeners = WebListeners::bind(&config.web).unwrap();

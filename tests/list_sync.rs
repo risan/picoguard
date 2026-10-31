@@ -19,7 +19,7 @@ use picoguard::dns::wire::Query;
 use picoguard::filter::compile::{CompileOptions, CompileWorker};
 use picoguard::filter::engine::Verdict;
 use picoguard::filter::snapshot::{self, SnapshotStore};
-use picoguard::lists::{Downloader, resolver_over};
+use picoguard::lists::{Downloader, Names};
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ButtonRule, Explained, Role, RuleError, Scheduler, Timing};
 use picoguard::settings::{self, SaveError, Saved, Settings};
@@ -141,7 +141,9 @@ fn config_of(dir: &StateDir, lists: Vec<ListConfig>) -> Config {
 
 fn downloader() -> Downloader {
     Downloader::new(
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     )
 }
@@ -868,7 +870,7 @@ async fn list_hosts_are_resolved_through_the_upstream_pool() {
         &Config::default().limits,
     );
     let downloader = Downloader::new(
-        resolver_over(Arc::new(SharedUpstreams::new(upstreams))),
+        Names::Upstreams(Arc::new(SharedUpstreams::new(upstreams))),
         Arc::new(Tls::with_webpki_roots()),
     );
     let url = format!("http://lists.example:{}/l.txt", server.address.port());

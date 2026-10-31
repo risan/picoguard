@@ -1432,6 +1432,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::lists::Names;
     use crate::settings::{Saved, Settings};
     use crate::stage::{StageSetup, StageTiming};
     use crate::update::Build;
@@ -1460,7 +1461,9 @@ mod tests {
                 timing: StageTiming::default(),
             },
             Arc::clone(&updates),
-            Arc::new(|_| Box::pin(async { Err(std::io::Error::other("no DNS in this test")) })),
+            Names::Resolver(Arc::new(|_| {
+                Box::pin(async { Err(std::io::Error::other("no DNS in this test")) })
+            })),
             Arc::new(Tls::with_webpki_roots()),
         );
 

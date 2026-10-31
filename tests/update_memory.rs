@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::http::ListServer;
-use picoguard::lists::Downloader;
+use picoguard::lists::{Downloader, Names};
 use picoguard::update::{Build, Checker, Outcome, Updates};
 use picoguard::upstream::tls::Tls;
 
@@ -72,7 +72,9 @@ async fn settle() {
 
 fn checker(url: &str) -> Checker {
     let downloader = Downloader::new(
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     );
 

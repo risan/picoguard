@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 pub use crate::release::{MAX_BINARY_BYTES, MAX_SUMS_BYTES};
 
 use crate::lists::{
-    Downloader, Fetch, FetchError, Limits, PIECE_QUEUE, Piece, Resolver, Validators,
+    Downloader, Fetch, FetchError, Limits, Names, PIECE_QUEUE, Piece, Resolver, Validators,
 };
 use crate::release::{
     InstallerResult, Outcome, Reading, Request, SumsError, asset, expected_hash, read_regular,
@@ -252,7 +252,7 @@ impl Stager {
     pub fn new(
         setup: StageSetup,
         updates: Arc<Updates>,
-        resolver: Resolver,
+        names: Names,
         tls: Arc<Tls>,
     ) -> Arc<Stager> {
         let installer_present = fs::metadata(&setup.installer_dir)
@@ -262,7 +262,7 @@ impl Stager {
         Arc::new(Stager {
             setup,
             updates,
-            downloader: Downloader::new(resolver, tls),
+            downloader: Downloader::new(names, tls),
             installer_present,
             state: Mutex::new(None),
         })
@@ -524,12 +524,20 @@ impl Stager {
     ) -> Result<(), StageError> {
         let version = &request.version;
         let base = format!("{}/v{version}", self.setup.base_url);
+        // One upstream pool looks up every host of the staging, whatever the page changes.
+        let resolver = self.downloader.resolver();
 
         let sums = self
-            .fetch_small(&format!("{base}/SHA256SUMS"), "SHA256SUMS", MAX_SUMS_BYTES)
+            .fetch_small(
+                &resolver,
+                &format!("{base}/SHA256SUMS"),
+                "SHA256SUMS",
+                MAX_SUMS_BYTES,
+            )
             .await?;
         let signature = self
             .fetch_small(
+                &resolver,
                 &format!("{base}/SHA256SUMS.sig"),
                 "SHA256SUMS.sig",
                 SIGNATURE_CAP_BYTES,
@@ -579,7 +587,7 @@ impl Stager {
         let downloading = async {
             let fetched = self
                 .downloader
-                .fetch(&url, &Validators::default(), &limits)
+                .fetch_with(&resolver, &url, &Validators::default(), &limits)
                 .await?;
 
             match fetched {
@@ -616,6 +624,7 @@ impl Stager {
     /// A small file, collected in memory like the update check's answer.
     async fn fetch_small(
         &self,
+        resolver: &Resolver,
         url: &str,
         file: &'static str,
         cap: u64,
@@ -628,7 +637,7 @@ impl Stager {
         };
         let download = match self
             .downloader
-            .fetch(url, &Validators::default(), &limits)
+            .fetch_with(resolver, url, &Validators::default(), &limits)
             .await
         {
             Ok(Fetch::Modified(download)) => download,

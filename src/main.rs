@@ -8,7 +8,7 @@ use std::time::Duration;
 use picoguard::dns_check;
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
-use picoguard::lists::{Downloader, resolver_over};
+use picoguard::lists::{Downloader, Names};
 use picoguard::password::{DEFAULT_ITERATIONS, PasswordHash};
 use picoguard::pipeline::Pipeline;
 use picoguard::release::{self, Refusal, VerifySetup};
@@ -439,7 +439,7 @@ fn serve(loaded: Loaded) -> Result<(), String> {
                 timing: StageTiming::default(),
             },
             Arc::clone(&updates),
-            resolver_over(Arc::clone(pipeline.upstreams())),
+            Names::Upstreams(Arc::clone(pipeline.upstreams())),
             Arc::clone(&tls),
         );
         // The page may be off; what an earlier update left behind is removed all the same.
@@ -467,7 +467,7 @@ fn serve(loaded: Loaded) -> Result<(), String> {
         }
 
         let downloader = Downloader::new(
-            resolver_over(Arc::clone(pipeline.upstreams())),
+            Names::Upstreams(Arc::clone(pipeline.upstreams())),
             Arc::clone(&tls),
         );
         let (stop_refreshing, stopped) = oneshot::channel::<()>();
@@ -478,7 +478,7 @@ fn serve(loaded: Loaded) -> Result<(), String> {
         let _ = update::start(
             &config,
             update::RELEASES_URL,
-            resolver_over(Arc::clone(pipeline.upstreams())),
+            Names::Upstreams(Arc::clone(pipeline.upstreams())),
             tls,
             updates,
             CheckTiming::default(),
