@@ -21,6 +21,7 @@ use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::Downloader;
 use picoguard::scheduler::{ListControl, Scheduler, Timing};
+use picoguard::settings::{Saved, Settings};
 use picoguard::stage::{StageSetup, StageTiming, Stager};
 use picoguard::update::{Build, Latest, Updates};
 use picoguard::upstream::tls::Tls;
@@ -151,6 +152,7 @@ async fn a_list_refresh_during_an_update_download_stays_within_the_memory_limit(
     let store = Arc::new(SnapshotStore::open(&config.state.dir).unwrap());
     let scheduler = Scheduler::boot(
         &config,
+        Arc::new(Saved::new(config.clone(), Settings::default(), None)),
         CompileWorker::spawn().unwrap(),
         Arc::clone(&store),
         Timing {

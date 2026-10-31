@@ -7,6 +7,7 @@ mod common;
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,6 +29,7 @@ use picoguard::lists::Downloader;
 use picoguard::password::PasswordHash;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ListControl, Scheduler, Timing};
+use picoguard::settings;
 use picoguard::stage::{StageSetup, StageTiming, Stager};
 use picoguard::stats::{Event, QueryResult};
 use picoguard::update::{self, Build, CheckTiming, Latest, Updates};
@@ -237,6 +239,8 @@ struct Site {
     stager: Arc<Stager>,
     /// Sends the administrator's credentials with every request that has none of its own.
     signs_in: bool,
+    /// Where the settings file is saved.
+    state: PathBuf,
 }
 
 impl Site {
@@ -392,8 +396,25 @@ async fn full_site(config: Config) -> Site {
 }
 
 async fn site_with(config: Config, kind: SiteKind) -> Site {
+    site_saving(config, kind, None).await
+}
+
+/// A site whose state folder holds `saved` as its settings file before it starts. The state
+/// folder is the stager's, as in the server.
+async fn site_saving(mut config: Config, kind: SiteKind, saved: Option<&str>) -> Site {
+    let root = scratch(&format!("web-e2e-{}", SITES.fetch_add(1, Ordering::SeqCst)));
+    let state = root.join("state");
+    std::fs::create_dir(&state).unwrap();
+    if let Some(saved) = saved {
+        std::fs::write(state.join(settings::FILE_NAME), saved).unwrap();
+    }
+
+    config.state.dir = state.clone();
+    let loaded = settings::with_saved(config);
+    let config = loaded.config;
     let scheduler = Scheduler::boot(
         &config,
+        Arc::new(loaded.saved),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
         day_long_timing(),
@@ -408,8 +429,6 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
     let listeners = WebListeners::bind(&config.web).unwrap();
     let address = listeners.addresses()[0];
     let updates = Arc::new(Updates::new(kind.build));
-    let root = scratch(&format!("web-e2e-{}", SITES.fetch_add(1, Ordering::SeqCst)));
-    std::fs::create_dir(root.join("state")).unwrap();
     if kind.installer {
         std::fs::create_dir(root.join("installer")).unwrap();
     }
@@ -420,7 +439,7 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
         StageSetup {
             target: kind.release_target.then_some(TARGET),
             base_url: release.url("/download"),
-            state_dir: root.join("state"),
+            state_dir: state.clone(),
             installer_dir: root.join("installer"),
             key: test_key(),
             max_binary_bytes: 1024 * 1024,
@@ -453,6 +472,7 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
         release,
         stager,
         signs_in: config.web.user.is_some(),
+        state,
     }
 }
 
@@ -3555,4 +3575,86 @@ async fn a_change_while_paused_is_kept_and_applies_on_resume() {
     assert_eq!(resumed.status, 200);
     let after = ask(&site.dns, "b.example.", RecordType::A).await;
     assert_eq!(addresses(&after), ["0.0.0.0"]);
+}
+
+fn saved_settings(site: &Site) -> Option<Value> {
+    let text = std::fs::read_to_string(site.state.join(settings::FILE_NAME)).ok()?;
+
+    Some(serde_json::from_str(&text).unwrap())
+}
+
+#[tokio::test]
+async fn a_rule_from_the_page_is_saved_for_the_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (site, _upstream) = plain_site().await;
+
+    let reply = site
+        .send(post("/api/rules", &rule_body("saved.example", "block")))
+        .await;
+
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({
+            "version": 1,
+            "page_rules": [{"name": "saved.example", "action": "block"}],
+        })
+    );
+    let mode = std::fs::metadata(site.state.join(settings::FILE_NAME))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[tokio::test]
+async fn a_rule_that_cannot_be_saved_answers_503_and_changes_nothing() {
+    let (site, _upstream) = plain_site().await;
+    std::fs::remove_dir_all(&site.state).unwrap();
+
+    let reply = site
+        .send(post("/api/rules", &rule_body("kept.example", "block")))
+        .await;
+
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert!(
+        reply.json()["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("could not save settings: "),
+        "{}",
+        reply.body
+    );
+    assert!(no_page_rules(&site).await);
+    let answer = ask(&site.dns, "kept.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_during_a_save_leaves_the_file_and_the_rules_in_agreement() {
+    let (site, _upstream) = plain_site().await;
+    let held = site.control.saved().lock().await;
+    let request = post("/api/rules", &rule_body("left.example", "block")).signed_in(ADMIN);
+    let mut stream = TcpStream::connect(site.web).await.unwrap();
+    stream.write_all(&request.bytes(site.web)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(held);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while no_page_rules(&site).await {
+        assert!(Instant::now() < deadline, "the change was dropped");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let in_force = site.send(get("/api/rules")).await.json()["rules"].clone();
+    assert_eq!(
+        in_force,
+        serde_json::json!([{"name": "left.example", "action": "block"}])
+    );
+    assert_eq!(saved_settings(&site).unwrap()["page_rules"], in_force);
+    let answer = ask(&site.dns, "left.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["0.0.0.0"]);
 }

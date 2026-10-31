@@ -22,6 +22,7 @@ use picoguard::filter::snapshot::{self, SnapshotStore};
 use picoguard::lists::{Downloader, resolver_over};
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ButtonRule, Explained, Role, RuleError, Scheduler, Timing};
+use picoguard::settings::{self, SaveError, Saved, Settings};
 use picoguard::upstream::Upstreams;
 use picoguard::upstream::tls::Tls;
 
@@ -145,10 +146,19 @@ fn downloader() -> Downloader {
     )
 }
 
+/// The saved settings in the state folder of `config`, as a start reads them.
+fn saved_of(config: &Config) -> Arc<Saved> {
+    let loaded = settings::with_saved(config.clone());
+    assert_eq!(&loaded.config, config, "these tests save page rules only");
+
+    Arc::new(loaded.saved)
+}
+
 async fn boot_with(config: &Config, store: SnapshotStore) -> (Scheduler, Arc<SnapshotStore>) {
     let store = Arc::new(store);
     let scheduler = Scheduler::boot(
         config,
+        saved_of(config),
         CompileWorker::spawn().unwrap(),
         Arc::clone(&store),
         quick_timing(),
@@ -1272,6 +1282,7 @@ async fn asking_for_a_refresh_checks_every_list_once_and_one_at_a_time() {
     let config = config_of(&dir, lists);
     let scheduler = Scheduler::boot(
         &config,
+        saved_of(&config),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
         slow_timing(),
@@ -1315,6 +1326,7 @@ async fn repeated_requests_during_a_refresh_still_refresh_every_list() {
     let config = config_of(&dir, lists);
     let scheduler = Scheduler::boot(
         &config,
+        saved_of(&config),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
         slow_timing(),
@@ -1535,6 +1547,7 @@ async fn a_rule_change_during_a_slow_download_is_applied_at_once_and_both_stay()
     let config = config_of(&dir, vec![url_list("slow", server.url("/slow.txt"))]);
     let scheduler = Scheduler::boot(
         &config,
+        saved_of(&config),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
         slow_timing(),
@@ -1762,27 +1775,148 @@ async fn bad_names_are_refused_before_anything_changes() {
     assert!(page_rules(&control).await.is_empty());
 }
 
+fn settings_file(dir: &StateDir) -> Option<Settings> {
+    settings::read(&dir.file(settings::FILE_NAME)).unwrap()
+}
+
 #[tokio::test]
-async fn page_rules_are_gone_after_a_restart_and_nothing_is_written() {
+async fn page_rules_come_back_after_a_restart_and_only_their_file_is_written() {
     let dir = StateDir::new();
     fs::write(dir.file("block.txt"), "||list.example^\n").unwrap();
     let config = config_of(&dir, vec![path_list(dir.file("block.txt"))]);
     let (scheduler, _) = boot(&config).await;
     let control = scheduler.control();
+    let before = every_file(dir.path());
     for name in ["a.example", "b.example", "c.example"] {
         control.add_button_rule(name, Action::Block).await.unwrap();
     }
 
     assert!(blocked(&scheduler.policy(), "b.example."));
     let files = every_file(dir.path());
+    let written: Vec<_> = files
+        .iter()
+        .filter(|file| !before.contains(file))
+        .map(|(path, _)| path.clone())
+        .collect();
+    assert_eq!(written, [dir.file(settings::FILE_NAME)]);
+    assert_eq!(files.len(), before.len() + 1);
     drop(scheduler);
 
     let (restarted, _) = boot(&config).await;
 
-    assert!(page_rules(&restarted.control()).await.is_empty());
-    assert!(!blocked(&restarted.policy(), "b.example."));
+    assert_eq!(
+        page_rules(&restarted.control()).await,
+        [
+            rule("a.example", Action::Block),
+            rule("b.example", Action::Block),
+            rule("c.example", Action::Block)
+        ]
+    );
+    assert_eq!(generation(&restarted.policy()), 0);
+    assert!(blocked(&restarted.policy(), "b.example."));
     assert!(blocked(&restarted.policy(), "list.example."));
     assert_eq!(every_file(dir.path()), files);
+}
+
+#[tokio::test]
+async fn saved_page_rules_win_over_the_lists_from_the_first_engine_on() {
+    let dir = StateDir::new();
+    fs::write(dir.file("block.txt"), "||ads.example^\n").unwrap();
+    let config = config_of(&dir, vec![path_list(dir.file("block.txt"))]);
+    fs::write(
+        dir.file(settings::FILE_NAME),
+        "{\"version\": 1, \"page_rules\": [\
+         {\"name\": \"ads.example\", \"action\": \"allow\"},\
+         {\"name\": \"b.example\", \"action\": \"block\"}]}",
+    )
+    .unwrap();
+
+    let (scheduler, _) = boot(&config).await;
+
+    let policy = scheduler.policy();
+    assert_eq!(generation(&policy), 0);
+    assert_eq!(decision(&policy, "ads.example."), Verdict::Allow);
+    assert!(blocked(&policy, "x.b.example."));
+}
+
+#[tokio::test]
+async fn every_rule_change_is_saved_whole() {
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let control = scheduler.control();
+
+    control
+        .add_button_rule("a.example", Action::Block)
+        .await
+        .unwrap();
+    control
+        .add_button_rule("b.example", Action::Allow)
+        .await
+        .unwrap();
+    control
+        .add_button_rule("a.example", Action::Allow)
+        .await
+        .unwrap();
+    control.remove_button_rule("b.example").await.unwrap();
+
+    let saved = settings_file(&dir).unwrap();
+    assert_eq!(saved.page_rules, [rule("a.example", Action::Allow)]);
+    assert_eq!(saved.page_rules, page_rules(&control).await);
+}
+
+#[tokio::test]
+async fn a_change_that_changes_nothing_writes_nothing() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = StateDir::new();
+    let (scheduler, _) = boot(&config_of(&dir, Vec::new())).await;
+    let control = scheduler.control();
+    control
+        .add_button_rule("a.example", Action::Block)
+        .await
+        .unwrap();
+    let file = dir.file(settings::FILE_NAME);
+    let identity = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+
+        (metadata.ino(), metadata.mtime(), metadata.mtime_nsec())
+    };
+    let written = identity(&file);
+    let before = generation(&scheduler.policy());
+
+    assert_eq!(
+        control.add_button_rule("A.example.", Action::Block).await,
+        Ok(())
+    );
+    assert_eq!(
+        control.remove_button_rule("other.example").await,
+        Err(RuleError::NoSuchRule)
+    );
+
+    assert_eq!(identity(&file), written);
+    assert_eq!(generation(&scheduler.policy()), before);
+}
+
+#[tokio::test]
+async fn a_rule_that_cannot_be_saved_is_not_applied() {
+    let dir = StateDir::new();
+    let mut config = config_of(&dir, Vec::new());
+    config.state.dir = dir.file("missing");
+    let (scheduler, _) = boot_with(&config, SnapshotStore::disabled()).await;
+    let (policy, control) = (scheduler.policy(), scheduler.control());
+    let before = generation(&policy);
+
+    let refused = control.add_button_rule("b.example", Action::Block).await;
+
+    assert!(
+        matches!(&refused, Err(RuleError::NotSaved(SaveError::Failed(_)))),
+        "{refused:?}"
+    );
+    assert!(!blocked(&policy, "b.example."));
+    assert_eq!(generation(&policy), before);
+    assert!(page_rules(&control).await.is_empty());
+    assert!(!control.saved().can_save());
+    assert!(!dir.file("missing").exists());
 }
 
 #[tokio::test]

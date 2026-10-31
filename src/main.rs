@@ -393,7 +393,8 @@ fn run(config_path: &Path) -> ExitCode {
 }
 
 fn serve(loaded: Loaded) -> Result<(), String> {
-    let config = loaded.config;
+    let Loaded { config, saved } = loaded;
+    let saved = Arc::new(saved);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -410,8 +411,14 @@ fn serve(loaded: Loaded) -> Result<(), String> {
             SnapshotStore::disabled()
         };
         let store = Arc::new(store);
-        let scheduler =
-            Scheduler::boot(&config, worker, Arc::clone(&store), Timing::default()).await?;
+        let scheduler = Scheduler::boot(
+            &config,
+            saved,
+            worker,
+            Arc::clone(&store),
+            Timing::default(),
+        )
+        .await?;
         let pipeline = Pipeline::new(&config, scheduler.policy())?;
         let listeners = Listeners::bind(&config.server)?;
         let status_page = if config.web.enabled {

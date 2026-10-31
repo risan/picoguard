@@ -14,6 +14,7 @@
 //!   cannot send, and a cross-site script can only send after a CORS preflight that is never
 //!   answered), carry no `Origin` other than the page's own, and have a body of at most 1 KiB.
 
+use std::borrow::Cow;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -40,6 +41,7 @@ use crate::scheduler::{
     Action, ButtonRule, ListControl, ListStatus, MAX_BUTTON_RULES, Role, RuleError, normalized_name,
 };
 use crate::server::bind_tcp;
+use crate::settings::SaveError;
 use crate::stage::{Refused, Stager};
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, TopEntry};
 use crate::update::{Tag, UpdateView, Updates, parse_tag};
@@ -291,15 +293,15 @@ impl Route {
 /// A request that is answered with an error and nothing else.
 struct Rejection {
     status: StatusCode,
-    message: &'static str,
+    message: Cow<'static, str>,
     header: Option<(HeaderName, &'static str)>,
 }
 
 impl Rejection {
-    fn new(status: StatusCode, message: &'static str) -> Rejection {
+    fn new(status: StatusCode, message: impl Into<Cow<'static, str>>) -> Rejection {
         Rejection {
             status,
-            message,
+            message: message.into(),
             header: None,
         }
     }
@@ -312,14 +314,14 @@ impl Rejection {
 
     fn into_response(self) -> Response<Full<Bytes>> {
         #[derive(Serialize)]
-        struct Body {
-            error: &'static str,
+        struct Body<'a> {
+            error: &'a str,
         }
 
         let mut response = json(
             self.status,
             &Body {
-                error: self.message,
+                error: &self.message,
             },
         );
         if let Some((name, value)) = self.header {
@@ -1004,7 +1006,18 @@ fn rule_rejection(error: RuleError) -> Rejection {
             StatusCode::INTERNAL_SERVER_ERROR,
             "the change could not be applied",
         ),
+        RuleError::NotSaved(error) => save_rejection(&error),
     }
+}
+
+/// A change that cannot be saved is not applied either.
+fn save_rejection(error: &SaveError) -> Rejection {
+    let status = match error {
+        SaveError::TooLarge => StatusCode::BAD_REQUEST,
+        SaveError::Failed(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    Rejection::new(status, error.to_string())
 }
 
 /// The `name` of the query, normalized; `None` when missing or not a domain name. The value is
@@ -1191,6 +1204,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::settings::{Saved, Settings};
     use crate::stage::{StageSetup, StageTiming};
     use crate::update::Build;
     use crate::upstream::tls::Tls;
@@ -1204,7 +1218,8 @@ mod tests {
 
     fn web_for(config: &Config) -> Web {
         let policy = Arc::new(Policy::new());
-        let lists = Arc::new(ListControl::new(Arc::clone(&policy)));
+        let saved = Saved::new(config.clone(), Settings::default(), None);
+        let lists = Arc::new(ListControl::new(Arc::clone(&policy), Arc::new(saved)));
         let updates = Arc::new(Updates::new(Build::current()));
         let stager = Stager::new(
             StageSetup {

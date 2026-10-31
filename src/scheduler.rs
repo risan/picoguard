@@ -5,10 +5,10 @@
 //! snapshot to be written before the next refresh starts, so at most the current and one
 //! new copy are in memory (D13). Any failure keeps the copy in force.
 //!
-//! The rules added from the status page live in [`ListControl`], in memory only. A change
-//! rebuilds only those rules and keeps the engine's list rule sets. Every swap after boot, a
-//! refresh's or a rule change's, holds one lock there, so each builds on the other's latest
-//! result.
+//! The rules added from the status page are saved with the page's settings ([`Saved`]) and put
+//! in force by [`ListControl`]. A change rebuilds only those rules and keeps the engine's list
+//! rule sets, and is saved before it is put in force. Every swap after boot, a refresh's or a
+//! rule change's, holds one lock there, so each builds on the other's latest result.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -26,6 +26,7 @@ use crate::filter::parse::{FastKind, ListFormat, Rule};
 use crate::filter::snapshot::{Snapshot, SnapshotStore};
 use crate::lists::{Downloader, Limits, Refresh, RefreshError, Updated, Validators, refresh_file};
 use crate::policy::Policy;
+use crate::settings::{SaveError, Saved};
 use crate::upstream::random_u64;
 
 /// How far an interval is moved, up or down, so lists do not refresh in step.
@@ -115,13 +116,15 @@ pub struct ButtonRule {
     pub action: Action,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleError {
     NotADomainName,
     TooMany,
     NoSuchRule,
     /// The task that applies the change ended without an answer.
     NotApplied,
+    /// The change was not saved, so it is not in force either.
+    NotSaved(SaveError),
 }
 
 /// The rule that decides a name, and the list that holds it.
@@ -150,8 +153,6 @@ struct Assembly {
     /// The list of each engine position, as the scheduler last put the lists in force.
     main_ids: Vec<ListId>,
     allow_ids: Vec<ListId>,
-    /// In the order first added.
-    rules: Vec<ButtonRule>,
     /// The page lists in force; `None` for a side without rules.
     block: Option<Arc<CompiledList>>,
     allow: Option<Arc<CompiledList>>,
@@ -162,50 +163,47 @@ enum Edit {
     Remove(String),
 }
 
-impl Assembly {
-    /// The rules after `edit`, or `None` when it changes nothing.
-    fn edited(&self, edit: &Edit) -> Result<Option<Vec<ButtonRule>>, RuleError> {
-        match edit {
-            Edit::Add(name, action) => {
-                match self.rules.iter().position(|rule| rule.name == *name) {
-                    Some(at) if self.rules[at].action == *action => Ok(None),
+/// `rules` (in the order first added) after `edit`, or `None` when it changes nothing.
+fn edited(rules: &[ButtonRule], edit: &Edit) -> Result<Option<Vec<ButtonRule>>, RuleError> {
+    match edit {
+        Edit::Add(name, action) => match rules.iter().position(|rule| rule.name == *name) {
+            Some(at) if rules[at].action == *action => Ok(None),
 
-                    Some(at) => {
-                        let mut rules = self.rules.clone();
-                        rules[at].action = *action;
-
-                        Ok(Some(rules))
-                    }
-
-                    None if self.rules.len() >= MAX_BUTTON_RULES => Err(RuleError::TooMany),
-
-                    None => {
-                        let mut rules = Vec::with_capacity(self.rules.len() + 1);
-                        rules.extend_from_slice(&self.rules);
-                        rules.push(ButtonRule {
-                            name: name.clone(),
-                            action: *action,
-                        });
-
-                        Ok(Some(rules))
-                    }
-                }
-            }
-
-            Edit::Remove(name) => {
-                let at = self
-                    .rules
-                    .iter()
-                    .position(|rule| rule.name == *name)
-                    .ok_or(RuleError::NoSuchRule)?;
-                let mut rules = self.rules.clone();
-                rules.remove(at);
+            Some(at) => {
+                let mut rules = rules.to_vec();
+                rules[at].action = *action;
 
                 Ok(Some(rules))
             }
+
+            None if rules.len() >= MAX_BUTTON_RULES => Err(RuleError::TooMany),
+
+            None => {
+                let mut edited = Vec::with_capacity(rules.len() + 1);
+                edited.extend_from_slice(rules);
+                edited.push(ButtonRule {
+                    name: name.clone(),
+                    action: *action,
+                });
+
+                Ok(Some(edited))
+            }
+        },
+
+        Edit::Remove(name) => {
+            let at = rules
+                .iter()
+                .position(|rule| rule.name == *name)
+                .ok_or(RuleError::NoSuchRule)?;
+            let mut rules = rules.to_vec();
+            rules.remove(at);
+
+            Ok(Some(rules))
         }
     }
+}
 
+impl Assembly {
     fn page_lists(&self) -> (Vec<Arc<CompiledList>>, Vec<Arc<CompiledList>>) {
         (
             self.block.iter().cloned().collect(),
@@ -215,25 +213,33 @@ impl Assembly {
 }
 
 /// The scheduler seen from outside: what the lists look like, a way to ask for a refresh, and
-/// the rules added from the status page, which it also puts in force.
+/// the rules added from the status page, which it saves and puts in force.
 pub struct ListControl {
     statuses: Mutex<Vec<ListStatus>>,
     refresh_requested: Notify,
     policy: Arc<Policy>,
+    /// Holds the page rules; its lock comes before the assembly lock.
+    saved: Arc<Saved>,
     assembly: tokio::sync::Mutex<Assembly>,
     pending: Arc<Semaphore>,
 }
 
 impl ListControl {
-    /// A control without lists or rules, swapping engines into `policy`.
-    pub fn new(policy: Arc<Policy>) -> ListControl {
+    /// A control without lists or page lists, swapping engines into `policy` and saving rule
+    /// changes to `saved`.
+    pub fn new(policy: Arc<Policy>, saved: Arc<Saved>) -> ListControl {
         ListControl {
             statuses: Mutex::new(Vec::new()),
             refresh_requested: Notify::new(),
             policy,
+            saved,
             assembly: tokio::sync::Mutex::new(Assembly::default()),
             pending: Arc::new(Semaphore::new(MAX_PENDING_CHANGES)),
         }
+    }
+
+    pub fn saved(&self) -> &Arc<Saved> {
+        &self.saved
     }
 
     /// Blocklists first, then allowlists, in config order.
@@ -250,7 +256,7 @@ impl ListControl {
     /// Calls `f` with the rules from the status page, in the order added. The rules are only
     /// borrowed: nothing is copied out.
     pub async fn with_button_rules<R>(&self, f: impl FnOnce(&[ButtonRule]) -> R) -> R {
-        f(&self.assembly.lock().await.rules)
+        f(&self.saved.lock().await.page_rules)
     }
 
     /// Which list and rule decide `name` asked as `A`, with blocking on. The engine and the list
@@ -320,11 +326,12 @@ impl ListControl {
         answered.await.unwrap_or(Err(RuleError::NotApplied))
     }
 
-    /// Holds the lock from the check until the replaced engine and lists are freed, so changes
-    /// never stack more than one extra copy of the page rules.
+    /// Holds the locks from the check until the replaced engine and lists are freed, so changes
+    /// never stack more than one extra copy of the page rules. The engine is built first, then
+    /// the rules are saved, and only a saved change is put in force.
     async fn apply(&self, edit: Edit, answer: oneshot::Sender<Result<(), RuleError>>) {
-        let mut assembly = self.assembly.lock().await;
-        let rules = match assembly.edited(&edit) {
+        let mut settings = self.saved.lock().await;
+        let rules = match edited(&settings.page_rules, &edit) {
             Ok(Some(rules)) => rules,
 
             Ok(None) => {
@@ -340,6 +347,7 @@ impl ListControl {
             }
         };
 
+        let mut assembly = self.assembly.lock().await;
         let current = self.policy.engine();
         // The engine goes into its `Arc` here: the struct is over a kilobyte, and returned by
         // value it would be one more copy in the task's output and in this future.
@@ -361,8 +369,16 @@ impl ListControl {
             return;
         };
 
+        let old_rules = std::mem::replace(&mut settings.page_rules, rules);
+        if let Err(error) = self.saved.save(&settings).await {
+            let unsaved = std::mem::replace(&mut settings.page_rules, old_rules);
+            let _ = answer.send(Err(RuleError::NotSaved(error)));
+            drop_off_runtime((unsaved, block, allow, engine)).await;
+
+            return;
+        }
+
         let old_engine = self.policy.swap_engine(engine);
-        let old_rules = std::mem::replace(&mut assembly.rules, rules);
         let old_block = std::mem::replace(&mut assembly.block, block);
         let old_allow = std::mem::replace(&mut assembly.allow, allow);
         let _ = answer.send(Ok(()));
@@ -479,6 +495,7 @@ impl Scheduler {
     /// A list without a usable snapshot starts empty and is refreshed first.
     pub async fn boot(
         config: &Config,
+        saved: Arc<Saved>,
         worker: CompileWorker,
         store: Arc<SnapshotStore>,
         timing: Timing,
@@ -494,7 +511,10 @@ impl Scheduler {
 
         let placeholder = Arc::new(Policy::new());
         let mut scheduler = Scheduler {
-            control: Arc::new(ListControl::new(Arc::clone(&placeholder))),
+            control: Arc::new(ListControl::new(
+                Arc::clone(&placeholder),
+                Arc::clone(&saved),
+            )),
             policy: placeholder,
             worker,
             store,
@@ -510,18 +530,32 @@ impl Scheduler {
         let (main, allow) = scheduler.lists_in_force(None);
         let (main_ids, main): (Vec<ListId>, Vec<Arc<CompiledList>>) = main.into_iter().unzip();
         let (allow_ids, allow): (Vec<ListId>, Vec<Arc<CompiledList>>) = allow.into_iter().unzip();
+        let (page_block, page_allow) = {
+            let settings = saved.lock().await;
+
+            (
+                page_list(&settings.page_rules, Action::Block),
+                page_list(&settings.page_rules, Action::Allow),
+            )
+        };
+        let (pinned_block, pinned_allow) = (
+            page_block.iter().cloned().collect(),
+            page_allow.iter().cloned().collect(),
+        );
         let engine = scheduler
             .worker
-            .assemble(main, allow)
+            .run(move || Engine::new(main, allow).with_pinned(pinned_block, pinned_allow))
             .await
             .map_err(|error| format!("cannot build the filter: {error:?}"))?;
 
         // The first engine is generation 0, so the policy is made with it, not swapped.
         scheduler.policy = Arc::new(Policy::with_engine(Arc::new(engine)));
-        let mut control = ListControl::new(scheduler.policy());
+        let mut control = ListControl::new(scheduler.policy(), saved);
         let assembly = control.assembly.get_mut();
         assembly.main_ids = main_ids;
         assembly.allow_ids = allow_ids;
+        assembly.block = page_block;
+        assembly.allow = page_allow;
         scheduler.control = Arc::new(control);
         scheduler.publish_all();
 
@@ -1035,6 +1069,8 @@ pub(crate) fn jittered(interval: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
+    use crate::test_dir::TestDir;
 
     #[test]
     fn failures_wait_longer_up_to_an_hour() {
@@ -1082,9 +1118,17 @@ mod tests {
         assert_ne!(dropped_on, std::thread::current().id());
     }
 
+    fn saved_in(dir: &TestDir) -> Arc<Saved> {
+        let mut config = Config::default();
+        config.state.dir = dir.path().to_path_buf();
+
+        Arc::new(Saved::new(config, Settings::default(), None))
+    }
+
     #[tokio::test]
     async fn waiting_changes_are_bounded_and_cancellable() {
-        let control = Arc::new(ListControl::new(Arc::new(Policy::new())));
+        let dir = TestDir::new("scheduler-waiting");
+        let control = Arc::new(ListControl::new(Arc::new(Policy::new()), saved_in(&dir)));
         let held = control.assembly.lock().await;
 
         for index in 0..50 {
@@ -1128,8 +1172,9 @@ mod tests {
 
     #[test]
     fn a_change_cut_off_at_shutdown_changes_nothing_and_frees_its_permit() {
+        let dir = TestDir::new("scheduler-cut-off");
         let policy = Arc::new(Policy::new());
-        let control = Arc::new(ListControl::new(Arc::clone(&policy)));
+        let control = Arc::new(ListControl::new(Arc::clone(&policy), saved_in(&dir)));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1156,7 +1201,12 @@ mod tests {
         drop(runtime);
 
         assert_eq!(policy.view(std::time::Instant::now()).generation, 0);
-        assert!(control.assembly.try_lock().unwrap().rules.is_empty());
+        let rules = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(control.with_button_rules(<[ButtonRule]>::len));
+        assert_eq!(rules, 0);
+        assert!(!dir.path().join(crate::settings::FILE_NAME).exists());
         assert_eq!(control.pending.available_permits(), MAX_PENDING_CHANGES);
     }
 
