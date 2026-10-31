@@ -168,6 +168,7 @@ td button { padding: 1px var(--s2); font-size: var(--t-sm); }
     <button role="tab" id="tab-dashboard" data-tab="dashboard" aria-controls="panel-dashboard" aria-selected="true">Dashboard</button>
     <button role="tab" id="tab-log" data-tab="log" aria-controls="panel-log" aria-selected="false">Query log</button>
     <button role="tab" id="tab-lists" data-tab="lists" aria-controls="panel-lists" aria-selected="false">Lists</button>
+    <button role="tab" id="tab-settings" data-tab="settings" aria-controls="panel-settings" aria-selected="false">Settings</button>
   </nav>
 
   <div class="grid" role="tabpanel" id="panel-dashboard" data-panel="dashboard" aria-labelledby="tab-dashboard">
@@ -249,7 +250,7 @@ td button { padding: 1px var(--s2); font-size: var(--t-sm); }
 
     <section id="rules" class="wide">
       <h2>Your rules <small id="rule-count"></small></h2>
-      <p class="empty">Kept in memory only: a restart or an update clears them.</p>
+      <p id="rules-note" class="empty">Saved on this device.</p>
       <div class="scroll" id="rule-table"></div>
       <div id="config-rules"></div>
     </section>
@@ -261,6 +262,14 @@ td button { padding: 1px var(--s2); font-size: var(--t-sm); }
         <button class="go">Check</button>
       </form>
       <dl id="check-result"></dl>
+    </section>
+  </div>
+
+  <div class="grid" role="tabpanel" id="panel-settings" data-panel="settings" aria-labelledby="tab-settings" hidden>
+    <section class="wide">
+      <h2>Settings</h2>
+      <p id="settings-note" class="empty">Saved on this device.</p>
+      <p id="settings-file" class="empty"></p>
     </section>
   </div>
 </main>
@@ -584,6 +593,25 @@ function showRules(data) {
     ...(data.config_rules.length ? data.config_rules.map((rule) => el("code", rule)) : [el("p", "None.", "empty")]));
 }
 
+// Whether page changes are saved, on the Settings tab and under Your rules.
+function showSettings(s) {
+  const notes = [];
+
+  if (s.error) {
+    notes.push("Saved settings could not be used: " + s.error + ". Saving from this page replaces them.");
+  }
+
+  if (!s.can_save) {
+    notes.push("The last save failed: picoguard must be able to write its state folder.");
+  }
+
+  ["settings-note", "rules-note"].forEach((id) => {
+    $(id).textContent = notes.join(" ") || "Saved on this device.";
+    $(id).className = notes.length ? "err" : "empty";
+  });
+  $("settings-file").textContent = "File: " + s.file;
+}
+
 function showExplain(data) {
   const lines = [["Name", data.name], ["Decision", el("span", data.decision, "badge d-" + data.decision)]];
 
@@ -703,7 +731,7 @@ function showInstall(update) {
 function showLimited(note) {
   $("limited-note").textContent = note || "";
   $("limited").hidden = !note;
-  ["pause", "tops", "upstreams", "cache", "tab-log", "refresh-row", "rules", "check"].forEach((id) => { $(id).hidden = Boolean(note); });
+  ["pause", "tops", "upstreams", "cache", "tab-log", "tab-settings", "refresh-row", "rules", "check"].forEach((id) => { $(id).hidden = Boolean(note); });
   showTab();
 }
 
@@ -736,6 +764,7 @@ async function update() {
       showCache(status.cache);
       const log = await api("/api/querylog?limit=50");
       const rules = await api("/api/rules");
+      const saved = await api("/api/settings");
 
       if (epoch !== authEpoch) {
         return;
@@ -746,6 +775,7 @@ async function update() {
       showTop("top-clients", "a-clients", status.top_clients, "Client");
       showQueries(log.entries);
       showRules(rules);
+      showSettings(saved);
     }
 
     $("state").textContent = "updated " + new Date().toLocaleTimeString();

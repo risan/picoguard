@@ -509,11 +509,12 @@ async fn the_page_is_served_with_protective_headers() {
     assert!(reply.header("access-control-allow-origin").is_none());
 }
 
-/// The page's ceiling for every slice of release 1.
-const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
+/// The page's ceiling for release 2, raised on purpose for the settings: static bytes in the
+/// binary, no memory at run time.
+const PAGE_HARD_CAP_BYTES: usize = 64 * 1024;
 
-/// This slice, device names; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 33 * 1024;
+/// This part, the settings tab; a later part raises it on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 34 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -604,7 +605,7 @@ async fn the_page_signs_in_with_its_own_form_and_never_asks_for_the_browser_prom
 /// No browser here: the tab code is checked as source. A tab is a `[data-tab]` button and a
 /// `[data-panel]` panel, and no element id equals a tab name, so a fragment never scrolls.
 #[tokio::test]
-async fn the_page_has_three_tabs_kept_in_the_url_fragment() {
+async fn the_page_has_four_tabs_kept_in_the_url_fragment() {
     let (site, _upstream) = plain_site().await;
 
     let page = site.send(get("/")).await.body;
@@ -613,7 +614,7 @@ async fn the_page_has_three_tabs_kept_in_the_url_fragment() {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
 
-    for tab in ["dashboard", "log", "lists"] {
+    for tab in ["dashboard", "log", "lists", "settings"] {
         assert!(page.contains(&format!("data-tab=\"{tab}\"")), "{tab}");
         assert!(page.contains(&format!("id=\"panel-{tab}\"")), "{tab}");
         assert!(
@@ -728,8 +729,35 @@ async fn the_lists_tab_has_your_rules_and_a_name_check() {
     for needed in [
         "\"/api/rules/remove\"",
         "\"/api/explain?name=\" + encodeURIComponent(",
-        "Kept in memory only",
+        "Saved on this device.",
         "\"refresh-row\", \"rules\", \"check\"]",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+/// No browser here: the tab is checked as source. Its cards come with the parts that apply
+/// them; this part shows where settings are saved and why a saved file is not used.
+#[tokio::test]
+async fn the_settings_tab_says_where_settings_are_saved_and_why_they_are_not_used() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in ["tab-settings", "settings-note", "settings-file", "rules-note"] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "api(\"/api/settings\")",
+        "showSettings(",
+        "\"Saved settings could not be used: \"",
+        "\". Saving from this page replaces them.\"",
+        "s.can_save",
+        "\"tab-log\", \"tab-settings\"",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
