@@ -10,7 +10,7 @@ use std::time::Instant;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::CacheConfig;
-use crate::dns::build::ReplyParts;
+use crate::dns::build::{ReplyParts, TtlRule};
 use crate::dns::wire::{HEADER_LEN, Name, Query, ResponseInfo, flags, rcode};
 use crate::filter::engine::Decision;
 
@@ -279,6 +279,36 @@ pub struct Cache {
     max_response_size: usize,
     /// How long past its lifetime an entry is still served, when optimism is on.
     max_stale_secs: Option<u32>,
+    optimistic_answer_ttl: u32,
+}
+
+/// How the TTLs of a cached answer are written for a client. They belong to the cache that
+/// held the answer, so a lookup and the TTLs it gives out always follow the same settings.
+#[derive(Debug, Clone, Copy)]
+pub struct Ttls {
+    min: u32,
+    max: u32,
+    optimistic_answer: u32,
+}
+
+impl Ttls {
+    /// A stale answer carries the optimistic answer TTL in every record, the SOA of a
+    /// negative answer included; a fresh one is clamped and aged.
+    pub fn rule(self, age: u32, stale: bool) -> TtlRule {
+        if stale {
+            return TtlRule {
+                min: self.optimistic_answer,
+                max: self.optimistic_answer,
+                age: 0,
+            };
+        }
+
+        TtlRule {
+            min: self.min,
+            max: self.max,
+            age,
+        }
+    }
 }
 
 impl Cache {
@@ -297,6 +327,24 @@ impl Cache {
             max_ttl: config.max_ttl,
             max_response_size: config.max_response_size,
             max_stale_secs: config.optimistic.then_some(config.optimistic_max_age_secs),
+            optimistic_answer_ttl: config.optimistic_answer_ttl_secs,
+        }
+    }
+
+    /// An empty cache built from `config` whose tokens go on from this one's, so a token
+    /// handed out by this cache never names an entry of the new one.
+    pub fn successor(&self, config: &CacheConfig) -> Cache {
+        Cache {
+            next_token: self.next_token,
+            ..Cache::new(config)
+        }
+    }
+
+    pub fn ttls(&self) -> Ttls {
+        Ttls {
+            min: self.min_ttl,
+            max: self.max_ttl,
+            optimistic_answer: self.optimistic_answer_ttl,
         }
     }
 
@@ -1649,6 +1697,58 @@ mod tests {
             },
         );
         assert_eq!(cache.get(&key, start).unwrap().memo, None);
+    }
+
+    #[test]
+    fn a_successor_is_empty_takes_its_own_settings_and_continues_the_tokens() {
+        let mut cache = Cache::new(&config());
+        let start = Instant::now();
+        let fixture = Fixture::new("next.example.");
+        let old_token = insert_entry(&mut cache, &fixture, &fixture.positive(60), start).unwrap();
+        let settings = CacheConfig {
+            max_entries: 7,
+            min_ttl: 120,
+            max_ttl: 600,
+            optimistic: true,
+            optimistic_answer_ttl_secs: 9,
+            ..config()
+        };
+
+        let mut next = cache.successor(&settings);
+
+        assert!(next.is_empty());
+        assert_eq!(next.max_entries, 7);
+        assert_eq!(
+            next.ttls().rule(10, false),
+            TtlRule {
+                min: 120,
+                max: 600,
+                age: 10
+            }
+        );
+        assert_eq!(
+            next.ttls().rule(10, true),
+            TtlRule {
+                min: 9,
+                max: 9,
+                age: 0
+            }
+        );
+        assert_eq!(cache.len(), 1, "the replaced cache is left as it was");
+
+        let new_token = insert_entry(&mut next, &fixture, &fixture.positive(60), start).unwrap();
+        assert_ne!(new_token, old_token);
+        let query = fixture.query();
+        let key = CacheKey::new(&query);
+        next.set_memo(
+            &key,
+            old_token,
+            Memo {
+                generation: 1,
+                decision: Decision::Pass,
+            },
+        );
+        assert_eq!(next.get(&key, start).unwrap().memo, None);
     }
 
     #[test]

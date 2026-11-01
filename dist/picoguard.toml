@@ -21,6 +21,25 @@
 #     "@@||good.example.com^",
 # ]
 
+# Force SafeSearch on Google, Bing and DuckDuckGo, and restricted mode on
+# YouTube (not while blocking is paused).
+# safe_search = false
+
+# Names picoguard answers itself, before the lists and while paused: with
+# addresses (A gets the IPv4 ones, AAAA the IPv6 ones), or with the addresses
+# of one other name, looked up without blocking (or the addresses of that
+# name's own address rewrite; nothing further). *.name covers the
+# names under name, not name itself. At most 1000 entries. A [[rewrites]]
+# header ends the top-level keys, so keep these after them. The status page
+# can change both.
+# [[rewrites]]
+# name = "nas.lan"
+# answer = "192.168.1.10"
+#
+# [[rewrites]]
+# name = "*.nas.lan"
+# answer = "nas.lan"
+
 [server]
 # Addresses to listen on; :: is IPv6 only, so both entries can share the port.
 # bind = ["0.0.0.0", "::"]
@@ -59,7 +78,9 @@ servers = [
 # refresh_hours = 24, max_rules = 1500000, max_body_bytes = 67108864,
 # slow_rule_budget = 8388608 (estimated bytes for rules that are not plain
 # domains; a list over it is not used), allow_redirects = false (a downloaded
-# hosts line with a real address blocks like 0.0.0.0; true answers with it).
+# hosts line with a real address blocks like 0.0.0.0; true answers with it),
+# enabled = true (false: not downloaded, holds no memory). Lists added on the
+# status page are saved in state.dir and replace the url lists below.
 [[lists]]
 name = "adguard-dns"
 url = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"
@@ -78,6 +99,15 @@ format = "adblock"
 # Lists of names that are never blocked. Same keys as [[lists]].
 # [[allowlists]]
 # path = "/etc/picoguard/allow.txt"
+
+# Blocked services: every name of each service in block is blocked. The
+# catalog of services is AdGuard's (HostlistsRegistry, GPL-3.0), downloaded at
+# run time through the upstreams, never shipped and never written to disk;
+# with block empty it is not downloaded. The status page can change block.
+# [services]
+# block = []
+# catalog_url = "https://adguardteam.github.io/HostlistsRegistry/assets/services.json"
+# refresh_hours = 24
 
 # [cache]
 # max_entries = 10000
@@ -106,6 +136,9 @@ format = "adblock"
 # tcp_write_timeout_secs = 5
 # upstream_reply_max = 65536
 # pending_bytes = 1048576
+# What picoguard's memory estimate may reach when a list or a larger cache is
+# added from the status page. Lists of this file are never checked.
+# memory_mb = 48
 
 # [web]
 # enabled = true

@@ -35,8 +35,8 @@ use tokio_rustls::client::TlsStream;
 
 use crate::dns::wire::{CLASS_IN, Name, RData, Records, Section, rtype};
 use crate::filter::compile::{CompileError, CompileOptions, CompileWorker, Compiled};
-use crate::upstream::Upstreams;
 use crate::upstream::tls::{Alpn, Tls, lacks_shared_cipher};
+use crate::upstream::{SharedUpstreams, Upstreams};
 
 pub const MAX_PIECE_BYTES: usize = 64 * 1024;
 
@@ -220,10 +220,30 @@ impl std::error::Error for FetchError {}
 pub type ResolveFuture = Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>>;
 pub type Resolver = Arc<dyn Fn(String) -> ResolveFuture + Send + Sync>;
 
-/// The production [`Resolver`]: list host names go through picoguard's own upstream pool,
-/// unfiltered. A and AAAA are asked together; IPv4 addresses come first, because a board
-/// often has no IPv6 route.
-pub fn resolver_over(upstreams: Arc<Upstreams>) -> Resolver {
+/// Where the host names of one operation (a download with its redirects and retries, an update
+/// check, the staging of an update) are looked up. The operation takes one [`Resolver`] at its
+/// start and keeps it to its end.
+#[derive(Clone)]
+pub enum Names {
+    /// Through picoguard's own upstream pool in force when the operation starts, unfiltered.
+    Upstreams(Arc<SharedUpstreams>),
+    /// Through a resolver of its own.
+    Resolver(Resolver),
+}
+
+impl Names {
+    /// The resolver for an operation that starts now.
+    pub fn resolver(&self) -> Resolver {
+        match self {
+            Names::Upstreams(shared) => resolver_on(shared.current()),
+            Names::Resolver(resolver) => Arc::clone(resolver),
+        }
+    }
+}
+
+/// Looks host names up through `upstreams`. A and AAAA are asked together; IPv4 addresses come
+/// first, because a board often has no IPv6 route.
+pub fn resolver_on(upstreams: Arc<Upstreams>) -> Resolver {
     Arc::new(move |host: String| {
         let upstreams = Arc::clone(&upstreams);
 
@@ -462,7 +482,7 @@ fn remove_dot_segments(path_and_query: &str) -> String {
 }
 
 pub struct Downloader {
-    resolver: Resolver,
+    names: Names,
     tls: Arc<Tls>,
     /// Hosts that refused the ChaCha20-only offer of a CPU without AES (plan D10).
     full_suites: Mutex<HashSet<String>>,
@@ -501,9 +521,9 @@ impl Drop for ConnectionTask {
 }
 
 impl Downloader {
-    pub fn new(resolver: Resolver, tls: Arc<Tls>) -> Downloader {
+    pub fn new(names: Names, tls: Arc<Tls>) -> Downloader {
         Downloader {
-            resolver,
+            names,
             tls,
             full_suites: Mutex::new(HashSet::new()),
             is_local: is_local_address,
@@ -519,15 +539,37 @@ impl Downloader {
         previous: &Validators,
         limits: &Limits,
     ) -> Result<Fetch, FetchError> {
+        self.fetch_with(&self.resolver(), url, previous, limits)
+            .await
+    }
+
+    /// The resolver for an operation of several downloads that starts now.
+    pub fn resolver(&self) -> Resolver {
+        self.names.resolver()
+    }
+
+    /// `fetch`, with the host names looked up by `resolver`, which an operation of several
+    /// downloads keeps for all of them.
+    pub async fn fetch_with(
+        &self,
+        resolver: &Resolver,
+        url: &str,
+        previous: &Validators,
+        limits: &Limits,
+    ) -> Result<Fetch, FetchError> {
         let deadline = Instant::now() + limits.total_timeout;
 
-        timeout_at(deadline, self.follow(url, previous, limits, deadline))
-            .await
-            .map_err(|_| FetchError::DeadlinePassed)?
+        timeout_at(
+            deadline,
+            self.follow(resolver, url, previous, limits, deadline),
+        )
+        .await
+        .map_err(|_| FetchError::DeadlinePassed)?
     }
 
     async fn follow(
         &self,
+        resolver: &Resolver,
         url: &str,
         previous: &Validators,
         limits: &Limits,
@@ -545,7 +587,7 @@ impl Downloader {
                 connection,
                 is_local,
             } = self
-                .request(&target, previous, limits, refuse_local)
+                .request(resolver, &target, previous, limits, refuse_local)
                 .await?;
             if redirects == 0 {
                 refuse_local = !is_local;
@@ -580,6 +622,7 @@ impl Downloader {
 
     async fn request(
         &self,
+        resolver: &Resolver,
         target: &Target,
         previous: &Validators,
         limits: &Limits,
@@ -589,7 +632,9 @@ impl Downloader {
         let idle = limits.idle_timeout;
 
         if target.https {
-            let stream = self.connect_tls(target, idle, refuse_local).await?;
+            let stream = self
+                .connect_tls(resolver, target, idle, refuse_local)
+                .await?;
             let is_local = self.is_server_local(stream.get_ref().0);
 
             return exchange(stream, request, idle, is_local).await;
@@ -597,7 +642,7 @@ impl Downloader {
 
         let stream = timeout(
             idle,
-            self.connect_tcp(&target.host, target.port, refuse_local),
+            self.connect_tcp(resolver, &target.host, target.port, refuse_local),
         )
         .await
         .map_err(|_| FetchError::Timeout)??;
@@ -617,6 +662,7 @@ impl Downloader {
     /// error, so a name that is made to resolve there is no way in.
     async fn connect_tcp(
         &self,
+        resolver: &Resolver,
         host: &str,
         port: u16,
         refuse_local: bool,
@@ -624,7 +670,7 @@ impl Downloader {
         let mut addresses = match host.parse::<IpAddr>() {
             Ok(address) => vec![address],
 
-            Err(_) => (self.resolver)(host.to_string())
+            Err(_) => resolver(host.to_string())
                 .await
                 .map_err(|error| FetchError::Resolve(format!("{host}: {error}")))?,
         };
@@ -652,6 +698,7 @@ impl Downloader {
 
     async fn connect_tls(
         &self,
+        resolver: &Resolver,
         target: &Target,
         idle: Duration,
         refuse_local: bool,
@@ -659,7 +706,7 @@ impl Downloader {
         let full_suites = self.full_suites.lock().unwrap().contains(&target.host);
 
         match self
-            .handshake(target, full_suites, idle, refuse_local)
+            .handshake(resolver, target, full_suites, idle, refuse_local)
             .await
         {
             Err(FetchError::Tls(error)) if !full_suites && lacks_shared_cipher(&error) => {
@@ -671,7 +718,8 @@ impl Downloader {
                     );
                 }
 
-                self.handshake(target, true, idle, refuse_local).await
+                self.handshake(resolver, target, true, idle, refuse_local)
+                    .await
             }
 
             result => result,
@@ -680,6 +728,7 @@ impl Downloader {
 
     async fn handshake(
         &self,
+        resolver: &Resolver,
         target: &Target,
         full_suites: bool,
         idle: Duration,
@@ -691,7 +740,7 @@ impl Downloader {
 
         let connect = async {
             let tcp = self
-                .connect_tcp(&target.host, target.port, refuse_local)
+                .connect_tcp(resolver, &target.host, target.port, refuse_local)
                 .await?;
 
             connector.connect(name, tcp).await.map_err(FetchError::Tls)
@@ -954,8 +1003,9 @@ impl fmt::Display for RefreshError {
 impl std::error::Error for RefreshError {}
 
 impl Downloader {
-    /// Downloads the list at `url` into a compile job on the worker. Answers
-    /// `NotModified` without compiling when the server says so.
+    /// Downloads the list at `url` into a compile job on the worker, which stops at once past
+    /// `admission_bytes` (see `CompileWorker::start_within`). Answers `NotModified` without
+    /// compiling when the server says so.
     pub async fn refresh(
         &self,
         worker: &CompileWorker,
@@ -963,6 +1013,7 @@ impl Downloader {
         previous: &Validators,
         limits: &Limits,
         options: CompileOptions,
+        admission_bytes: usize,
     ) -> Result<Refresh, RefreshError> {
         let Fetch::Modified(download) = self
             .fetch(url, previous, limits)
@@ -973,11 +1024,9 @@ impl Downloader {
         };
 
         let validators = download.validators.clone();
-        let compiled = compile_with(
-            worker,
-            options,
-            |sink| async move { download.pump(&sink).await },
-        )
+        let compiled = compile_with(worker, options, admission_bytes, |sink| async move {
+            download.pump(&sink).await
+        })
         .await?;
 
         Ok(Refresh::Updated(Box::new(Updated {
@@ -992,13 +1041,14 @@ impl Downloader {
 async fn compile_with<F, Fut>(
     worker: &CompileWorker,
     options: CompileOptions,
+    admission_bytes: usize,
     produce: F,
 ) -> Result<Compiled, RefreshError>
 where
     F: FnOnce(PieceSender) -> Fut,
     Fut: Future<Output = Result<(), FetchError>>,
 {
-    let compilation = worker.start(options);
+    let compilation = worker.start_within(options, admission_bytes);
     let produced = produce(compilation.pieces.clone()).await;
     match produced {
         Ok(()) => {}
@@ -1024,7 +1074,7 @@ pub async fn refresh_file(
     max_bytes: u64,
     options: CompileOptions,
 ) -> Result<Compiled, RefreshError> {
-    compile_with(worker, options, |sink| async move {
+    compile_with(worker, options, usize::MAX, |sink| async move {
         read_file(path, max_bytes, &sink).await
     })
     .await
@@ -1098,7 +1148,7 @@ fn read_up_to(file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::net::SocketAddr;
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -1230,7 +1280,10 @@ mod tests {
     fn downloader(resolver: Resolver) -> Downloader {
         let roots = Arc::new(RootCertStore::empty());
 
-        Downloader::new(resolver, Arc::new(Tls::with_roots(roots, true)))
+        Downloader::new(
+            Names::Resolver(resolver),
+            Arc::new(Tls::with_roots(roots, true)),
+        )
     }
 
     fn quick() -> Limits {
@@ -2366,7 +2419,7 @@ mod tests {
 
     fn https_downloader(pki: &TestPki, has_aes: bool) -> Downloader {
         Downloader::new(
-            localhost_resolver(),
+            Names::Resolver(localhost_resolver()),
             Arc::new(Tls::with_roots(pki.roots(), has_aes)),
         )
     }
@@ -2387,7 +2440,7 @@ mod tests {
         );
 
         let untrusted = Downloader::new(
-            localhost_resolver(),
+            Names::Resolver(localhost_resolver()),
             Arc::new(Tls::with_roots(Arc::new(RootCertStore::empty()), true)),
         );
         let error = fetch_error(&untrusted, &url, &Limits::default()).await;
@@ -2534,6 +2587,7 @@ mod tests {
                 &Validators::default(),
                 &Limits::default(),
                 options,
+                usize::MAX,
             )
             .await
             .unwrap();
@@ -2569,6 +2623,7 @@ mod tests {
                 &previous,
                 &Limits::default(),
                 compile_options(),
+                usize::MAX,
             )
             .await
             .unwrap();
@@ -2592,7 +2647,16 @@ mod tests {
         let downloader = local();
         let url = server.url("/");
         let (previous, limits) = (Validators::default(), Limits::default());
-        let refresh = || downloader.refresh(&worker, &url, &previous, &limits, compile_options());
+        let refresh = || {
+            downloader.refresh(
+                &worker,
+                &url,
+                &previous,
+                &limits,
+                compile_options(),
+                usize::MAX,
+            )
+        };
 
         let truncated = refresh().await;
         let complete = refresh().await;
@@ -2631,7 +2695,7 @@ mod tests {
         let downloader = local();
         let url = server.url("/");
         let (previous, limits) = (Validators::default(), Limits::default());
-        let refresh = || downloader.refresh(&worker, &url, &previous, &limits, options);
+        let refresh = || downloader.refresh(&worker, &url, &previous, &limits, options, usize::MAX);
 
         let heavy = refresh().await;
         let light = refresh().await;
@@ -2671,18 +2735,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_download_keeps_the_upstream_pool_it_started_with_through_a_late_redirect() {
+        let before = fake_dns(vec![Ipv4Addr::LOCALHOST], Vec::new()).await;
+        let after = fake_dns(Vec::new(), Vec::new()).await;
+        let pool = |dns: &crate::upstream::test_dns::FakeDns| {
+            Upstreams::plain(
+                dns.address,
+                &UpstreamConfig::default(),
+                &LimitsConfig::default(),
+            )
+        };
+        let shared = Arc::new(SharedUpstreams::new(pool(&before)));
+        let server = Server::start(|_, request, mut stream| async move {
+            if request.path == "/start" {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let port = request.server.port();
+                let location = format!("http://cdn.example:{port}/list");
+                respond(&mut stream, "302 Found", &[("Location", &location)], b"").await;
+            } else {
+                respond(&mut stream, "200 OK", &[], b"||ads.example^\n").await;
+            }
+        })
+        .await;
+        let downloader = Downloader::new(
+            Names::Upstreams(Arc::clone(&shared)),
+            Arc::new(Tls::with_roots(Arc::new(RootCertStore::empty()), true)),
+        );
+
+        let url = server.url("/start");
+        let limits = Limits::default();
+        let (pumped, replaced) = tokio::join!(fetch_body(&downloader, &url, &limits), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            shared.replace(pool(&after))
+        });
+
+        assert!(pumped.result.is_ok(), "{:?}", pumped.result);
+        assert_eq!(pumped.text(), b"||ads.example^\n");
+        assert_eq!(after.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&replaced), 1);
+    }
+
+    #[tokio::test]
     async fn list_hosts_resolve_through_the_upstream_pool_ipv4_first() {
         let dns = fake_dns(
             vec!["192.0.2.7".parse().unwrap()],
             vec!["2001:db8::7".parse().unwrap()],
         )
         .await;
-        let upstreams = Arc::new(Upstreams::plain(
+        let upstreams = Arc::new(SharedUpstreams::new(Upstreams::plain(
             dns.address,
             &UpstreamConfig::default(),
             &LimitsConfig::default(),
-        ));
-        let resolver = resolver_over(upstreams);
+        )));
+        let resolver = resolver_on(upstreams.current());
 
         let addresses = resolver("lists.example".to_string()).await.unwrap();
 
@@ -2703,16 +2808,16 @@ mod tests {
             vec!["2001:db8::7".parse().unwrap()],
         )
         .await;
-        let upstreams = Arc::new(Upstreams::plain(
+        let upstreams = Arc::new(SharedUpstreams::new(Upstreams::plain(
             dns.address,
             &UpstreamConfig::default(),
             &LimitsConfig::default(),
-        ));
-        let resolver = resolver_over(Arc::clone(&upstreams));
+        )));
+        let resolver = resolver_on(upstreams.current());
 
         resolver("lists.example".to_string()).await.unwrap();
 
-        let (_, tally) = upstreams.tallies().next().unwrap();
+        let (_, tally) = upstreams.current().tallies().next().unwrap();
         assert_eq!((tally.answered, tally.failed), (2, 0));
     }
 
@@ -2723,12 +2828,12 @@ mod tests {
             timeout_ms: 200,
             ..UpstreamConfig::default()
         };
-        let empty = resolver_over(Arc::new(Upstreams::plain(
+        let empty = resolver_on(Arc::new(Upstreams::plain(
             dns.address,
             &config,
             &LimitsConfig::default(),
         )));
-        let dead = resolver_over(Arc::new(Upstreams::plain(
+        let dead = resolver_on(Arc::new(Upstreams::plain(
             "127.0.0.1:9".parse().unwrap(),
             &config,
             &LimitsConfig::default(),

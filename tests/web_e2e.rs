@@ -7,6 +7,7 @@ mod common;
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,10 +25,11 @@ use picoguard::config::{Config, ListConfig, ListFormat};
 use picoguard::dns::wire::Name;
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
-use picoguard::lists::Downloader;
+use picoguard::lists::{Downloader, Names};
 use picoguard::password::PasswordHash;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ListControl, Scheduler, Timing};
+use picoguard::settings;
 use picoguard::stage::{StageSetup, StageTiming, Stager};
 use picoguard::stats::{Event, QueryResult};
 use picoguard::update::{self, Build, CheckTiming, Latest, Updates};
@@ -237,6 +239,8 @@ struct Site {
     stager: Arc<Stager>,
     /// Sends the administrator's credentials with every request that has none of its own.
     signs_in: bool,
+    /// Where the settings file is saved.
+    state: PathBuf,
 }
 
 impl Site {
@@ -280,7 +284,9 @@ impl Site {
 
 fn no_dns() -> Downloader {
     Downloader::new(
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     )
 }
@@ -392,11 +398,38 @@ async fn full_site(config: Config) -> Site {
 }
 
 async fn site_with(config: Config, kind: SiteKind) -> Site {
+    site_saving(config, kind, None).await
+}
+
+/// A site whose state folder holds `saved` as its settings file before it starts. The state
+/// folder is the stager's, as in the server.
+async fn site_saving(config: Config, kind: SiteKind, saved: Option<&str>) -> Site {
+    site_timed(config, kind, saved, day_long_timing()).await
+}
+
+/// `site_saving` with the scheduler on `timing`.
+async fn site_timed(
+    mut config: Config,
+    kind: SiteKind,
+    saved: Option<&str>,
+    timing: Timing,
+) -> Site {
+    let root = scratch(&format!("web-e2e-{}", SITES.fetch_add(1, Ordering::SeqCst)));
+    let state = root.join("state");
+    std::fs::create_dir(&state).unwrap();
+    if let Some(saved) = saved {
+        std::fs::write(state.join(settings::FILE_NAME), saved).unwrap();
+    }
+
+    config.state.dir = state.clone();
+    let loaded = settings::with_saved(config);
+    let config = loaded.config;
     let scheduler = Scheduler::boot(
         &config,
+        Arc::new(loaded.saved),
         CompileWorker::spawn().unwrap(),
         Arc::new(SnapshotStore::disabled()),
-        day_long_timing(),
+        timing,
     )
     .await
     .unwrap();
@@ -408,8 +441,6 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
     let listeners = WebListeners::bind(&config.web).unwrap();
     let address = listeners.addresses()[0];
     let updates = Arc::new(Updates::new(kind.build));
-    let root = scratch(&format!("web-e2e-{}", SITES.fetch_add(1, Ordering::SeqCst)));
-    std::fs::create_dir(root.join("state")).unwrap();
     if kind.installer {
         std::fs::create_dir(root.join("installer")).unwrap();
     }
@@ -420,7 +451,7 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
         StageSetup {
             target: kind.release_target.then_some(TARGET),
             base_url: release.url("/download"),
-            state_dir: root.join("state"),
+            state_dir: state.clone(),
             installer_dir: root.join("installer"),
             key: test_key(),
             max_binary_bytes: 1024 * 1024,
@@ -430,7 +461,9 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
             },
         },
         Arc::clone(&updates),
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     );
     let web_state = Web::new(
@@ -453,6 +486,7 @@ async fn site_with(config: Config, kind: SiteKind) -> Site {
         release,
         stager,
         signs_in: config.web.user.is_some(),
+        state,
     }
 }
 
@@ -489,11 +523,12 @@ async fn the_page_is_served_with_protective_headers() {
     assert!(reply.header("access-control-allow-origin").is_none());
 }
 
-/// The page's ceiling for every slice of release 1.
-const PAGE_HARD_CAP_BYTES: usize = 40 * 1024;
+/// The page's ceiling for release 2, raised on purpose for the settings: static bytes in the
+/// binary, no memory at run time.
+const PAGE_HARD_CAP_BYTES: usize = 64 * 1024;
 
-/// This slice, device names; a later slice raises it on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 33 * 1024;
+/// The last part, the blocked services; raised on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 54 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -584,7 +619,7 @@ async fn the_page_signs_in_with_its_own_form_and_never_asks_for_the_browser_prom
 /// No browser here: the tab code is checked as source. A tab is a `[data-tab]` button and a
 /// `[data-panel]` panel, and no element id equals a tab name, so a fragment never scrolls.
 #[tokio::test]
-async fn the_page_has_three_tabs_kept_in_the_url_fragment() {
+async fn the_page_has_four_tabs_kept_in_the_url_fragment() {
     let (site, _upstream) = plain_site().await;
 
     let page = site.send(get("/")).await.body;
@@ -593,7 +628,7 @@ async fn the_page_has_three_tabs_kept_in_the_url_fragment() {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
 
-    for tab in ["dashboard", "log", "lists"] {
+    for tab in ["dashboard", "log", "lists", "settings"] {
         assert!(page.contains(&format!("data-tab=\"{tab}\"")), "{tab}");
         assert!(page.contains(&format!("id=\"panel-{tab}\"")), "{tab}");
         assert!(
@@ -708,8 +743,214 @@ async fn the_lists_tab_has_your_rules_and_a_name_check() {
     for needed in [
         "\"/api/rules/remove\"",
         "\"/api/explain?name=\" + encodeURIComponent(",
-        "Kept in memory only",
-        "\"refresh-row\", \"rules\", \"check\"]",
+        "Saved on this device.",
+        "\"refresh-row\", \"list-add\", \"rules\", \"check\"]",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+/// No browser here: the tab is checked as source, and in the build's browser check.
+#[tokio::test]
+async fn the_lists_tab_turns_lists_on_and_off_adds_removes_and_resets_them_and_shows_the_memory() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "lists-from",
+        "list-memory",
+        "list-add",
+        "list-form",
+        "l-name",
+        "l-url",
+        "l-role",
+        "l-hours",
+        "list-add-note",
+        "lists-reset",
+        "settings-memory",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "\"/api/lists/add\"",
+        "\"/api/lists/\" + change",
+        "\"/api/lists/reset\"",
+        "\"edit\", { enabled: node.checked }",
+        "\"edit\", { refresh_hours: Number(node.value) }",
+        "\"remove\", {}",
+        "showLists(await api(\"/api/lists\"))",
+        "\"from the config file\"",
+        "\"Set on this page\"",
+        ">Use the config file<",
+        "\"Memory estimate: \"",
+        "#list-table td.name { min-width: 12rem; white-space: normal; overflow-wrap: anywhere; }",
+        "confirm(\"Remove this list?\")",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+/// No browser here: the tab is checked as source. Its cards come with the parts that apply
+/// them; this part shows where settings are saved and why a saved file is not used.
+#[tokio::test]
+async fn the_settings_tab_says_where_settings_are_saved_and_why_they_are_not_used() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "tab-settings",
+        "settings-note",
+        "settings-file",
+        "rules-note",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "api(\"/api/settings\")",
+        "showSettings(",
+        "\"Saved settings could not be used: \"",
+        "\". Saving from this page replaces them.\"",
+        "s.can_save",
+        "\"tab-log\", \"tab-settings\"",
+        "#settings-file { overflow-wrap: anywhere; }",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+/// No browser here: the cards are checked as source, and in the build's browser check. Each
+/// card says where its values come from, goes back to the config file, and saves on its own;
+/// polling leaves a card alone while it is being edited.
+#[tokio::test]
+async fn the_settings_tab_edits_the_upstream_servers_and_the_cache() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "upstream-card",
+        "upstream-from",
+        "upstream-list",
+        "upstream-add",
+        "upstream-new",
+        "bootstrap",
+        "upstream-save",
+        "upstream-reset",
+        "upstream-note",
+        "cache-card",
+        "cache-from",
+        "c-entries",
+        "c-kib",
+        "c-min",
+        "c-max",
+        "c-optimistic",
+        "cache-save",
+        "cache-reset",
+        "cache-set-note",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "\"From the config file\"",
+        "\"Set on this page\"",
+        ">Use the config file<",
+        "Saving clears the cache.",
+        "\"Move up\"",
+        "\"Move down\"",
+        "\"Remove\"",
+        "editing[key]",
+        "{ [key]: value }",
+        "max_bytes",
+        "#upstream-list code",
+        "overflow-wrap: anywhere",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+#[tokio::test]
+async fn the_settings_tab_edits_the_rewrites_and_safe_search() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "rewrites-card",
+        "rewrites-from",
+        "rewrite-table",
+        "rewrite-add",
+        "rewrite-name",
+        "rewrite-answer",
+        "rewrites-save",
+        "rewrites-reset",
+        "rewrites-note",
+        "safe-search-card",
+        "safe_search-from",
+        "safe-search",
+        "safe_search-save",
+        "safe_search-reset",
+        "safe_search-note",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "[\"rewrites\", s.rewrites]",
+        "[\"safe_search\", s.safe_search]",
+        "rewritten: \"rewritten\"",
+        "data.decision === \"rewritten\"",
+        "counters.rewritten",
+        "#rewrite-table td",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+#[tokio::test]
+async fn the_settings_tab_switches_blocked_services_by_group_with_a_filter() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for id in [
+        "services-card",
+        "services-from",
+        "service-filter",
+        "services-state",
+        "service-groups",
+        "services-save",
+        "services-reset",
+        "services-note",
+    ] {
+        assert!(
+            page.contains(&format!("id=\"{id}\"")),
+            "the page lacks #{id}"
+        );
+    }
+
+    for needed in [
+        "[\"services\", s.services]",
+        "api(\"/api/services\")",
+        "saveSetting(\"services\"",
+        "editing.services",
+        "AdGuard",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
@@ -1480,6 +1721,107 @@ async fn without_a_password_no_lookup_starts() {
 }
 
 #[tokio::test]
+async fn without_a_password_an_unnamed_list_shows_its_host_and_never_its_address() {
+    let list_server = ListServer::start().await;
+    list_server.serve("/secret-token-123/list.txt", "||tracker.example^\n", None);
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let url = list_server.url("/secret-token-123/list.txt");
+    let unnamed = |config: &mut Config| {
+        config.lists = vec![ListConfig {
+            url: Some(url.clone()),
+            format: ListFormat::Adblock,
+            ..ListConfig::default()
+        }];
+    };
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    unnamed(&mut config);
+    let open = site(config).await;
+    let mut config = local_config(&upstream);
+    unnamed(&mut config);
+    let signed_in = site(config).await;
+
+    for site in [&open, &signed_in] {
+        for _ in 0..200 {
+            if site.send(get("/api/lists")).await.json()["lists"][0]["rules"] == 1 {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    for path in ["/api/lists", "/api/status"] {
+        let reply = open.send(get(path)).await;
+
+        assert!(
+            !reply.body.contains("secret-token-123"),
+            "{path}: {}",
+            reply.body
+        );
+        assert_eq!(reply.json()["lists"][0]["name"], "127.0.0.1", "{path}");
+        assert_eq!(reply.json()["lists"][0]["rules"], 1, "{path}");
+    }
+
+    let lists = signed_in.send(get("/api/lists")).await.json();
+    assert_eq!(lists["lists"][0]["name"], url.as_str());
+    assert_eq!(lists["lists"][0]["source"], url.as_str());
+}
+
+#[tokio::test]
+async fn without_a_password_no_refresh_error_is_shown_not_even_a_relative_redirect() {
+    let list_server = ListServer::start().await;
+    list_server.redirect("/list.txt", "/secret-token-123/a b");
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let named = |config: &mut Config| {
+        config.lists = vec![ListConfig {
+            name: Some("Ads".to_string()),
+            url: Some(list_server.url("/list.txt")),
+            format: ListFormat::Adblock,
+            ..ListConfig::default()
+        }];
+    };
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    named(&mut config);
+    let open = site(config).await;
+    let mut config = local_config(&upstream);
+    named(&mut config);
+    let signed_in = site(config).await;
+
+    for site in [&open, &signed_in] {
+        for _ in 0..200 {
+            if !site.send(get("/api/lists")).await.json()["lists"][0]["last_error"].is_null() {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    let error = signed_in.send(get("/api/lists")).await.json()["lists"][0]["last_error"].clone();
+    assert!(
+        error.as_str().unwrap().contains("secret-token-123"),
+        "the error names the path with a password: {error}"
+    );
+
+    for path in ["/api/lists", "/api/status"] {
+        let reply = open.send(get(path)).await;
+
+        assert!(
+            !reply.body.contains("secret-token-123"),
+            "{path}: {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.json()["lists"][0]["last_error"],
+            "the last refresh failed (set a password to see why)",
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn lists_report_their_state_and_a_refresh_failure() {
     let list_server = ListServer::start().await;
     list_server.serve(
@@ -2145,7 +2487,9 @@ async fn a_hanging_check_holds_up_neither_dns_nor_the_page() {
     let check = update::start(
         &Config::default(),
         &github.url("/latest"),
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
         Arc::clone(&site.updates),
         timing,
@@ -2226,6 +2570,12 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
         ("remove a rule", post("/api/rules/remove", REMOVE_BODY)),
         ("the rules", get("/api/rules")),
         ("explain", get("/api/explain?name=ads.example")),
+        ("the settings", get("/api/settings")),
+        ("a settings change", post("/api/settings", "{}")),
+        ("add a list", post("/api/lists/add", "{}")),
+        ("edit a list", post("/api/lists/edit", "{}")),
+        ("remove a list", post("/api/lists/remove", "{}")),
+        ("reset the lists", post("/api/lists/reset", "{}")),
     ] {
         let reply = site.send(request).await;
 
@@ -2323,11 +2673,19 @@ async fn a_get_of_a_mutation_names_the_method_that_works() {
             ..post("/api/rules", RULE_BODY)
         })
         .await;
+    let settings = site
+        .send(Request {
+            method: "PUT",
+            ..post("/api/settings", "{}")
+        })
+        .await;
 
     assert_eq!(reply.header("allow"), Some("POST"));
     assert_eq!(read.header("allow"), Some("GET"));
     assert_eq!(removal.header("allow"), Some("POST"));
     assert_eq!(rules.header("allow"), Some("GET, POST"));
+    assert_eq!(settings.status, 405);
+    assert_eq!(settings.header("allow"), Some("GET, POST"));
 }
 
 #[tokio::test]
@@ -3555,4 +3913,1690 @@ async fn a_change_while_paused_is_kept_and_applies_on_resume() {
     assert_eq!(resumed.status, 200);
     let after = ask(&site.dns, "b.example.", RecordType::A).await;
     assert_eq!(addresses(&after), ["0.0.0.0"]);
+}
+
+fn saved_settings(site: &Site) -> Option<Value> {
+    let text = std::fs::read_to_string(site.state.join(settings::FILE_NAME)).ok()?;
+
+    Some(serde_json::from_str(&text).unwrap())
+}
+
+#[tokio::test]
+async fn a_rule_from_the_page_is_saved_for_the_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (site, _upstream) = plain_site().await;
+
+    let reply = site
+        .send(post("/api/rules", &rule_body("saved.example", "block")))
+        .await;
+
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({
+            "version": 1,
+            "page_rules": [{"name": "saved.example", "action": "block"}],
+        })
+    );
+    let mode = std::fs::metadata(site.state.join(settings::FILE_NAME))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[tokio::test]
+async fn a_rule_that_cannot_be_saved_answers_503_and_changes_nothing() {
+    let (site, _upstream) = plain_site().await;
+    std::fs::remove_dir_all(&site.state).unwrap();
+
+    let reply = site
+        .send(post("/api/rules", &rule_body("kept.example", "block")))
+        .await;
+
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert!(
+        reply.json()["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("could not save settings: "),
+        "{}",
+        reply.body
+    );
+    assert!(no_page_rules(&site).await);
+    let answer = ask(&site.dns, "kept.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_during_a_save_leaves_the_file_and_the_rules_in_agreement() {
+    let (site, _upstream) = plain_site().await;
+    // The save says when its file is written, then waits to be let rename it. Every wait is
+    // bounded, and a failed test drops `release`, which lets the save go on at once.
+    let (reached, reached_here) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    site.control.saved().run_before_rename(move || {
+        let _ = reached.send(());
+        let _ = released
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10));
+    });
+    let request = post("/api/rules", &rule_body("left.example", "block")).signed_in(ADMIN);
+    let mut stream = TcpStream::connect(site.web).await.unwrap();
+    stream.write_all(&request.bytes(site.web)).await.unwrap();
+
+    tokio::task::spawn_blocking(move || reached_here.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("the save never reached the rename");
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = ask(&site.dns, "left.example.", RecordType::A).await;
+    assert_eq!(
+        addresses(&before),
+        ["9.9.9.9"],
+        "in force before it was saved"
+    );
+    release.send(()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while no_page_rules(&site).await {
+        assert!(Instant::now() < deadline, "the change was dropped");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let in_force = site.send(get("/api/rules")).await.json()["rules"].clone();
+    assert_eq!(
+        in_force,
+        serde_json::json!([{"name": "left.example", "action": "block"}])
+    );
+    assert_eq!(saved_settings(&site).unwrap()["page_rules"], in_force);
+    let answer = ask(&site.dns, "left.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["0.0.0.0"]);
+}
+
+/// A site with a password whose state folder holds `saved` before it starts.
+async fn site_with_saved(saved: &str) -> (Site, common::harness::FakeUpstream) {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let kind = SiteKind {
+        build: Build::current(),
+        installer: true,
+        release_target: true,
+    };
+    let site = site_saving(local_config(&upstream), kind, Some(saved)).await;
+
+    (site, upstream)
+}
+
+#[tokio::test]
+async fn the_settings_show_each_value_with_where_it_comes_from_and_no_web_value() {
+    let (site, upstream) = site_with_saved(
+        "{\"version\": 1, \"safe_search\": true, \"cache\": {\"max_entries\": 500, \
+         \"max_bytes\": 1048576, \"min_ttl\": 5, \"max_ttl\": 600, \"optimistic\": false}}",
+    )
+    .await;
+
+    let reply = site.send(get("/api/settings")).await;
+
+    assert_eq!(reply.status, 200);
+    let file = site.state.join(settings::FILE_NAME);
+    assert_eq!(
+        reply.json(),
+        serde_json::json!({
+            "file": file.display().to_string(),
+            "error": null,
+            "can_save": true,
+            "upstream": {
+                "servers": [format!("udp://{}", upstream.address)],
+                "bootstrap": ["9.9.9.9", "1.1.1.1"],
+                "from": "file",
+            },
+            "cache": {
+                "max_entries": 500,
+                "max_bytes": 1048576,
+                "min_ttl": 5,
+                "max_ttl": 600,
+                "optimistic": false,
+                "from": "page",
+            },
+            "rewrites": {"entries": [], "from": "file"},
+            "safe_search": {"on": true, "from": "page"},
+            "services": {"block": [], "from": "file"},
+            "memory": {
+                "estimate_bytes": site.control.memory().estimate_bytes,
+                "budget_bytes": 48 * 1024 * 1024,
+            },
+        })
+    );
+    for secret in ["s3cret", "admin", "password", "user"] {
+        assert!(!reply.body.contains(secret), "{secret}: {}", reply.body);
+    }
+}
+
+#[tokio::test]
+async fn the_settings_say_why_the_saved_file_is_not_used_until_a_save_replaces_it() {
+    let (site, _upstream) = site_with_saved("{\"version\": 1, \"safe_search\": tru").await;
+
+    let reply = site.send(get("/api/settings")).await.json();
+
+    assert!(
+        reply["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("EOF while parsing")),
+        "{reply}"
+    );
+    assert_eq!(
+        reply["safe_search"],
+        serde_json::json!({"on": false, "from": "file"})
+    );
+
+    let added = site
+        .send(post("/api/rules", &rule_body("ads.example", "allow")))
+        .await;
+
+    assert_eq!(added.status, 200);
+    let reply = site.send(get("/api/settings")).await.json();
+    assert_eq!(reply["error"], Value::Null);
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({
+            "version": 1,
+            "page_rules": [{"name": "ads.example", "action": "allow"}],
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_settings_change_that_is_not_valid_is_refused_and_nothing_is_written() {
+    let (site, _upstream) = plain_site().await;
+
+    for body in [
+        "{\"services\": [\"a b\"]}",
+        "{\"services\": [\"tiktok\", \"tiktok\"]}",
+        "{\"services\": \"tiktok\"}",
+        "{\"web\": {}}",
+        "{\"page_rules\": []}",
+        "{\"lists\": null}",
+        "{\"safe_search\": \"yes\"}",
+        "[]",
+        "",
+    ] {
+        let reply = site.send(post("/api/settings", body)).await;
+
+        assert_eq!(reply.status, 400, "{body}: {}", reply.body);
+    }
+
+    assert!(saved_settings(&site).is_none());
+}
+
+#[tokio::test]
+async fn a_settings_change_of_nothing_writes_nothing_and_answers_the_settings() {
+    let (site, _upstream) = plain_site().await;
+
+    let changed = site.send(post("/api/settings", "{}")).await;
+
+    assert_eq!(changed.status, 200);
+    assert_eq!(changed.json(), site.send(get("/api/settings")).await.json());
+    assert!(saved_settings(&site).is_none());
+}
+
+#[tokio::test]
+async fn only_the_settings_route_takes_a_body_of_64_kib() {
+    let (site, _upstream) = plain_site().await;
+    let padded = |length: usize| format!("{{}}{}", " ".repeat(length - 2));
+
+    for length in [2048, 64 * 1024] {
+        let reply = site.send(post("/api/settings", &padded(length))).await;
+
+        assert_eq!(reply.status, 200, "{length}: {}", reply.body);
+    }
+
+    let over = site
+        .send(post("/api/settings", &padded(64 * 1024 + 1)))
+        .await;
+    let chunked = padded(64 * 1024 + 1);
+    let over_unannounced = site
+        .send(Request {
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ],
+            body: format!("{:x}\r\n{chunked}\r\n0\r\n\r\n", chunked.len()).into_bytes(),
+            ..post("/api/settings", "")
+        })
+        .await;
+    let rule = site
+        .send(post(
+            "/api/rules",
+            &format!(
+                "{{\"name\": \"a.example\", \"action\": \"block\"}}{}",
+                " ".repeat(1024)
+            ),
+        ))
+        .await;
+
+    for reply in [&over, &over_unannounced] {
+        assert_eq!(reply.status, 413);
+        assert_eq!(reply.json()["error"], "the body is limited to 64 KiB");
+    }
+
+    assert_eq!(rule.status, 413);
+    assert_eq!(rule.json()["error"], "the body is limited to 1 KiB");
+    assert!(no_page_rules(&site).await);
+}
+
+fn rewrite_body(entries: &[(&str, &str)]) -> String {
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|(name, answer)| serde_json::json!({"name": name, "answer": answer}))
+        .collect();
+
+    serde_json::json!({ "rewrites": entries }).to_string()
+}
+
+#[tokio::test]
+async fn rewrites_and_safe_search_apply_at_once_and_a_reset_goes_back_to_the_config_file() {
+    let (site, upstream) = plain_site().await;
+    let body = serde_json::json!({
+        "rewrites": [
+            {"name": " NAS.lan. ", "answer": "192.168.1.10"},
+            {"name": "*.NAS.lan", "answer": "FD00:0::10"},
+        ],
+        "safe_search": true,
+    })
+    .to_string();
+
+    let changed = site.send(post("/api/settings", &body)).await;
+
+    assert_eq!(changed.status, 200, "{}", changed.body);
+    let kept = serde_json::json!([
+        {"name": "nas.lan", "answer": "192.168.1.10"},
+        {"name": "*.nas.lan", "answer": "fd00::10"},
+    ]);
+    assert_eq!(
+        changed.json()["rewrites"],
+        serde_json::json!({"entries": kept, "from": "page"})
+    );
+    assert_eq!(
+        changed.json()["safe_search"],
+        serde_json::json!({"on": true, "from": "page"})
+    );
+    let saved = saved_settings(&site).unwrap();
+    assert_eq!(saved["rewrites"], kept);
+    assert_eq!(saved["safe_search"], true);
+    let answer = ask(&site.dns, "nas.lan.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["192.168.1.10"]);
+    let answer = ask(&site.dns, "tv.nas.lan.", RecordType::AAAA).await;
+    assert_eq!(addresses(&answer), ["fd00::10"]);
+    let answer = ask(&site.dns, "www.google.com.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+    let asked: Vec<String> = upstream
+        .received()
+        .iter()
+        .map(|query| query.queries[0].name().to_string())
+        .collect();
+    assert_eq!(asked, ["forcesafesearch.google.com."]);
+
+    let explained = site.send(get("/api/explain?name=nas.lan")).await.json();
+    assert_eq!(
+        explained,
+        serde_json::json!({"name": "nas.lan", "decision": "rewritten", "list": "your rewrites",
+                           "rule": "rewritten to 192.168.1.10 (your rewrite)"})
+    );
+    let explained = site.send(get("/api/explain?name=google.de")).await.json();
+    assert_eq!(explained["list"], "SafeSearch");
+    assert_eq!(
+        explained["rule"],
+        "rewritten to forcesafesearch.google.com (SafeSearch)"
+    );
+
+    let reset = site
+        .send(post(
+            "/api/settings",
+            "{\"rewrites\": null, \"safe_search\": null}",
+        ))
+        .await;
+
+    assert_eq!(reset.status, 200, "{}", reset.body);
+    assert_eq!(reset.json()["rewrites"]["from"], "file");
+    assert_eq!(reset.json()["safe_search"]["on"], false);
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({"version": 1})
+    );
+    let answer = ask(&site.dns, "nas.lan.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+    let explained = site.send(get("/api/explain?name=google.de")).await.json();
+    assert_eq!(explained["decision"], "none");
+}
+
+#[tokio::test]
+async fn the_same_rewrites_again_write_nothing() {
+    let (site, _upstream) = plain_site().await;
+    let file = site.state.join(settings::FILE_NAME);
+    let body = rewrite_body(&[("nas.lan", "192.168.1.10")]);
+    assert_eq!(site.send(post("/api/settings", &body)).await.status, 200);
+    std::fs::remove_file(&file).unwrap();
+
+    for body in [
+        body,
+        rewrite_body(&[("NAS.lan.", " 192.168.1.10")]),
+        "{\"safe_search\": null}".to_string(),
+    ] {
+        let reply = site.send(post("/api/settings", &body)).await;
+
+        assert_eq!(reply.status, 200, "{body}: {}", reply.body);
+        assert!(!file.exists(), "{body} wrote the file");
+    }
+}
+
+#[tokio::test]
+async fn rewrites_that_cannot_be_used_are_refused_with_the_reason_and_nothing_changes() {
+    let (site, _upstream) = plain_site().await;
+    let too_many: Vec<(String, &str)> = (0..1001)
+        .map(|index| (format!("n{index}.lan"), "10.0.0.1"))
+        .collect();
+    let too_many: Vec<(&str, &str)> = too_many
+        .iter()
+        .map(|(name, answer)| (name.as_str(), *answer))
+        .collect();
+
+    for (body, expected) in [
+        (
+            rewrite_body(&[("nas", "10.0.0.1")]),
+            "rewrites[0].name must be a domain name",
+        ),
+        (
+            rewrite_body(&[("nas.lan", "nas.lan")]),
+            "rewrites[0] points nas.lan at itself",
+        ),
+        (
+            rewrite_body(&[("a.lan", "10.0.0.1"), ("a.lan", "b.lan")]),
+            "rewrites[1]: a.lan has addresses and a name",
+        ),
+        (
+            rewrite_body(&[("a.lan", "192.168.001.10")]),
+            "rewrites[0].answer must be an IP address or a domain name",
+        ),
+        (rewrite_body(&too_many), "rewrites: at most 1000 entries"),
+    ] {
+        let reply = site.send(post("/api/settings", &body)).await;
+
+        assert_eq!(reply.status, 400, "{expected}: {}", reply.body);
+        assert!(
+            reply.json()["error"].as_str().unwrap().contains(expected),
+            "{expected}: {}",
+            reply.body
+        );
+    }
+
+    for body in [
+        "{\"rewrites\": [{\"name\": \"a.lan\"}]}",
+        "{\"rewrites\": [{\"name\": \"a.lan\", \"answer\": \"10.0.0.1\", \"ttl\": 5}]}",
+        "{\"safe_search\": \"yes\"}",
+    ] {
+        let reply = site.send(post("/api/settings", body)).await;
+
+        assert_eq!(reply.status, 400, "{body}: {}", reply.body);
+    }
+
+    assert!(saved_settings(&site).is_none());
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(settings["rewrites"]["from"], "file");
+    let answer = ask(&site.dns, "a.lan.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+}
+
+fn upstream_body(servers: &[String]) -> String {
+    serde_json::json!({"upstream": {"servers": servers, "bootstrap": ["9.9.9.9"]}}).to_string()
+}
+
+fn udp(upstream: &common::harness::FakeUpstream) -> String {
+    format!("udp://{}", upstream.address)
+}
+
+fn upstream_counts(status: &Value) -> Vec<(String, u64)> {
+    upstream_entries(status)
+        .iter()
+        .map(|entry| {
+            (
+                entry["label"].as_str().unwrap().to_string(),
+                entry["answered"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn new_upstream_servers_answer_at_once_and_a_reset_goes_back_to_the_config_file() {
+    let (site, first) = plain_site().await;
+    let second = answering_upstream([8, 8, 8, 8], Duration::ZERO).await;
+    let before = ask(&site.dns, "one.example.", RecordType::A).await;
+    assert_eq!(addresses(&before), ["9.9.9.9"]);
+
+    let changed = site
+        .send(post(
+            "/api/settings",
+            &upstream_body(&[udp(&second), udp(&first)]),
+        ))
+        .await;
+
+    assert_eq!(changed.status, 200, "{}", changed.body);
+    assert_eq!(
+        changed.json()["upstream"],
+        serde_json::json!({
+            "servers": [udp(&second), udp(&first)],
+            "bootstrap": ["9.9.9.9"],
+            "from": "page",
+        })
+    );
+    assert_eq!(
+        saved_settings(&site).unwrap()["upstream"],
+        serde_json::json!({"servers": [udp(&second), udp(&first)], "bootstrap": ["9.9.9.9"]})
+    );
+    let status = site.send(get("/api/status")).await.json();
+    assert_eq!(
+        upstream_counts(&status),
+        [(udp(&second), 0), (udp(&first), 1)],
+        "a server kept keeps its counts"
+    );
+    for index in 0..20 {
+        let reply = ask(&site.dns, &format!("n{index}.example."), RecordType::A).await;
+        assert_eq!(reply.response_code, ResponseCode::NoError);
+    }
+    assert!(second.count() > 0, "the new server is used");
+
+    let reset = site
+        .send(post("/api/settings", "{\"upstream\": null}"))
+        .await;
+
+    assert_eq!(reset.status, 200, "{}", reset.body);
+    assert_eq!(reset.json()["upstream"]["from"], "file");
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({"version": 1})
+    );
+    let asked = second.count();
+    for index in 0..5 {
+        let reply = ask(&site.dns, &format!("back{index}.example."), RecordType::A).await;
+        assert_eq!(addresses(&reply), ["9.9.9.9"]);
+    }
+    assert_eq!(second.count(), asked);
+}
+
+#[tokio::test]
+async fn a_server_that_cannot_be_used_is_refused_with_the_reason_and_nothing_changes() {
+    let (site, first) = plain_site().await;
+
+    for (body, expected) in [
+        (upstream_body(&[]), "upstream.servers: 1 to 8 servers"),
+        (
+            upstream_body(&["9.9.9.9".to_string()]),
+            "upstream.servers[0] must start with one of",
+        ),
+        (
+            serde_json::json!({"upstream": {"servers": [udp(&first)], "bootstrap": ["x"]}})
+                .to_string(),
+            "",
+        ),
+        (
+            serde_json::json!({"cache": {"max_entries": 100, "max_bytes": 1024, "min_ttl": 0,
+                                         "max_ttl": 60, "optimistic": true}})
+            .to_string(),
+            "cache.max_bytes must be from 262144 to 16777216",
+        ),
+    ] {
+        let reply = site.send(post("/api/settings", &body)).await;
+
+        assert_eq!(reply.status, 400, "{body}: {}", reply.body);
+        assert!(
+            reply.json()["error"].as_str().unwrap().contains(expected),
+            "{body}: {}",
+            reply.body
+        );
+    }
+
+    assert!(saved_settings(&site).is_none());
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(settings["upstream"]["from"], "file");
+    assert_eq!(settings["cache"]["from"], "file");
+}
+
+fn cache_of_size(max_bytes: usize) -> String {
+    serde_json::json!({"cache": {"max_entries": 10000, "max_bytes": max_bytes, "min_ttl": 0,
+                                 "max_ttl": 86400, "optimistic": true}})
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_larger_cache_that_would_pass_the_memory_budget_is_refused_and_a_smaller_one_is_not() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let probe = site(local_config(&upstream)).await;
+    let estimate = probe.control.memory().estimate_bytes;
+    let mut config = local_config(&upstream);
+    // Room for the default cache and about 2 MiB more.
+    config.limits.memory_mb = estimate / (1024 * 1024) + 2;
+    let site = site(config).await;
+
+    let larger = site
+        .send(post("/api/settings", &cache_of_size(16 * 1024 * 1024)))
+        .await;
+
+    assert_eq!(larger.status, 400, "{}", larger.body);
+    let error = larger.json()["error"].as_str().unwrap().to_string();
+    assert!(
+        error
+            .starts_with("a cache of 16.0 MB would pass the memory budget: the estimate would be "),
+        "{error}"
+    );
+    assert!(saved_settings(&site).is_none());
+    let memory = site.send(get("/api/settings")).await.json()["memory"].clone();
+    assert_eq!(memory["estimate_bytes"], estimate);
+
+    let smaller = site
+        .send(post("/api/settings", &cache_of_size(1024 * 1024)))
+        .await;
+
+    assert_eq!(smaller.status, 200, "{}", smaller.body);
+    let memory = &smaller.json()["memory"];
+    assert!(memory["estimate_bytes"].as_u64().unwrap() < estimate as u64);
+    assert!(memory["estimate_bytes"].as_u64() <= memory["budget_bytes"].as_u64());
+}
+
+#[tokio::test]
+async fn the_file_is_written_only_when_a_setting_in_force_changes() {
+    let (site, first) = plain_site().await;
+    let body = upstream_body(&[udp(&first)]);
+    let file = site.state.join(settings::FILE_NAME);
+
+    assert_eq!(site.send(post("/api/settings", &body)).await.status, 200);
+    assert!(file.exists());
+    std::fs::remove_file(&file).unwrap();
+
+    for body in [
+        body.as_str(),
+        "{}",
+        "{\"cache\": null}",
+        "{\"rewrites\": null, \"safe_search\": null, \"services\": null}",
+    ] {
+        let reply = site.send(post("/api/settings", body)).await;
+
+        assert_eq!(reply.status, 200, "{body}: {}", reply.body);
+        assert!(!file.exists(), "{body} wrote the file");
+    }
+}
+
+/// Upstreams that answer after a while, so queries are still waiting when the servers change.
+async fn slow_upstreams() -> [common::harness::FakeUpstream; 2] {
+    [
+        answering_upstream([1, 1, 1, 1], Duration::from_millis(1500)).await,
+        answering_upstream([2, 2, 2, 2], Duration::from_millis(1500)).await,
+    ]
+}
+
+fn ask_later(site: &Site, name: String) -> tokio::task::JoinHandle<hickory_proto::op::Message> {
+    let dns = site.dns.clone();
+
+    tokio::spawn(async move { ask(&dns, &name, RecordType::A).await })
+}
+
+#[tokio::test]
+async fn queries_waiting_through_upstream_changes_all_get_their_answer() {
+    let upstreams = slow_upstreams().await;
+    let mut config = local_config(&upstreams[0]);
+    // A busy test machine must not turn a slow answer into a timeout.
+    config.upstream.timeout_ms = 6000;
+    let site = site(config).await;
+    let generations = || site.dns.pipeline.upstreams().generations();
+    let mut waiting = Vec::new();
+
+    for round in 0..2 {
+        waiting.extend((0..5).map(|index| ask_later(&site, format!("r{round}-{index}.example."))));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let next = upstream_body(&[udp(&upstreams[(round + 1) % 2])]);
+
+        assert_eq!(site.send(post("/api/settings", &next)).await.status, 200);
+    }
+
+    assert_eq!(generations(), 3);
+    let refused = site
+        .send(post("/api/settings", &upstream_body(&[udp(&upstreams[1])])))
+        .await;
+    assert_eq!(refused.status, 409, "{}", refused.body);
+    assert_eq!(
+        refused.json()["error"],
+        "the previous upstream change is still finishing; try again in a few seconds"
+    );
+
+    for round in 2..8 {
+        waiting.extend((0..3).map(|index| ask_later(&site, format!("r{round}-{index}.example."))));
+        let next = upstream_body(&[udp(&upstreams[round % 2])]);
+        loop {
+            let reply = site.send(post("/api/settings", &next)).await;
+            assert!(generations() <= 3);
+            if reply.status == 200 {
+                break;
+            }
+
+            assert_eq!(reply.status, 409, "{}", reply.body);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    let total = waiting.len();
+    for query in waiting {
+        let reply = query.await.unwrap();
+        assert_eq!(reply.response_code, ResponseCode::NoError);
+        assert_eq!(reply.answers.len(), 1);
+    }
+
+    assert_eq!(total, 28);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while generations() > 1 {
+        assert!(Instant::now() < deadline, "replaced pools are still alive");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn cache_body(min_ttl: u32) -> String {
+    serde_json::json!({"cache": {"max_entries": 500, "max_bytes": 1048576, "min_ttl": min_ttl,
+                                  "max_ttl": 86400, "optimistic": false}})
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_cache_change_empties_the_cache_and_its_ttls_apply_at_once() {
+    let (site, upstream) = plain_site().await;
+    let first = ask(&site.dns, "ttl.example.", RecordType::A).await;
+    assert_eq!(first.answers[0].ttl, 300);
+    assert_eq!(site.dns.pipeline.cache_size().entries, 1);
+
+    let changed = site.send(post("/api/settings", &cache_body(900))).await;
+
+    assert_eq!(changed.status, 200, "{}", changed.body);
+    assert_eq!(
+        changed.json()["cache"],
+        serde_json::json!({"max_entries": 500, "max_bytes": 1048576, "min_ttl": 900,
+                           "max_ttl": 86400, "optimistic": false, "from": "page"})
+    );
+    assert_eq!(saved_settings(&site).unwrap()["cache"]["min_ttl"], 900);
+    assert_eq!(site.dns.pipeline.cache_size().entries, 0);
+    let asked = upstream.count();
+    let again = ask(&site.dns, "ttl.example.", RecordType::A).await;
+    assert_eq!(upstream.count(), asked + 1, "the old answer is gone");
+    assert_eq!(again.answers[0].ttl, 900);
+
+    let reset = site.send(post("/api/settings", "{\"cache\": null}")).await;
+
+    assert_eq!(reset.status, 200, "{}", reset.body);
+    assert_eq!(reset.json()["cache"]["from"], "file");
+    assert_eq!(site.dns.pipeline.cache_size().entries, 0);
+    let after = ask(&site.dns, "ttl.example.", RecordType::A).await;
+    assert_eq!(after.answers[0].ttl, 300);
+}
+
+#[tokio::test]
+async fn a_settings_change_that_cannot_be_saved_answers_503_and_keeps_what_is_in_force() {
+    let (site, first) = plain_site().await;
+    let second = answering_upstream([8, 8, 8, 8], Duration::ZERO).await;
+    ask(&site.dns, "kept.example.", RecordType::A).await;
+    std::fs::remove_dir_all(&site.state).unwrap();
+
+    let body = serde_json::json!({
+        "upstream": {"servers": [udp(&second)], "bootstrap": []},
+        "cache": {"max_entries": 10, "max_bytes": 262144, "min_ttl": 0, "max_ttl": 60,
+                  "optimistic": false},
+    })
+    .to_string();
+    let reply = site.send(post("/api/settings", &body)).await;
+
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(site.dns.pipeline.cache_size().entries, 1);
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(
+        settings["upstream"]["servers"],
+        serde_json::json!([udp(&first)])
+    );
+    assert_eq!(settings["cache"]["from"], "file");
+    let answer = ask(&site.dns, "other.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+    assert_eq!(second.count(), 0);
+}
+
+/// A site with no list of the config file, and a server for the lists the page adds.
+async fn list_site(
+    configure: impl FnOnce(&mut Config),
+) -> (Site, ListServer, common::harness::FakeUpstream) {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    configure(&mut config);
+    let site = site(config).await;
+
+    (site, ListServer::start().await, upstream)
+}
+
+fn add_body(name: &str, url: &str) -> String {
+    serde_json::json!({"role": "block", "name": name, "url": url, "refresh_hours": 12}).to_string()
+}
+
+/// `/api/lists` once the add in flight has ended.
+async fn after_the_add(site: &Site) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let lists = site.send(get("/api/lists")).await.json();
+        if lists["pending"]["state"] != "checking" {
+            return lists;
+        }
+
+        assert!(Instant::now() < deadline, "the add never ended");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_list_added_from_the_page_is_checked_then_added_and_blocks() {
+    let (site, server, _upstream) = list_site(|_| {}).await;
+    server.serve("/list.txt", "||added.example^\n", None);
+    server.set_delay(Duration::from_millis(300));
+    let url = server.url("/list.txt");
+
+    let reply = site
+        .send(post("/api/lists/add", &add_body("Added", &url)))
+        .await;
+
+    assert_eq!(reply.status, 202, "{}", reply.body);
+    assert_eq!(reply.json(), serde_json::json!({"list": "checking"}));
+    let checking = site.send(get("/api/lists")).await.json();
+    assert_eq!(
+        checking["pending"],
+        serde_json::json!({"kind": "blocklist", "name": "Added", "source": url, "state": "checking"})
+    );
+    let second = site
+        .send(post(
+            "/api/lists/add",
+            &add_body("Second", &server.url("/b.txt")),
+        ))
+        .await;
+    assert_eq!(second.status, 409, "{}", second.body);
+
+    let lists = after_the_add(&site).await;
+
+    assert_eq!(lists["pending"]["state"], "added");
+    let row = &lists["lists"][0];
+    assert_eq!(row["name"], "Added");
+    assert_eq!(row["source"], url);
+    assert_eq!(row["enabled"], true);
+    assert_eq!(row["refresh_hours"], 12);
+    assert_eq!(row["editable"], true);
+    assert_eq!(row["from"], "page");
+    assert_eq!(row["rules"], 1);
+    assert!(row["heap_bytes"].as_u64().unwrap() > 0);
+    let memory = &lists["memory"];
+    assert!(memory["estimate_bytes"].as_u64() <= memory["budget_bytes"].as_u64());
+    let answer = ask(&site.dns, "added.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["0.0.0.0"]);
+    assert_eq!(
+        saved_settings(&site).unwrap()["lists"],
+        serde_json::json!([{"role": "block", "name": "Added", "url": url, "refresh_hours": 12, "enabled": true}])
+    );
+}
+
+#[tokio::test]
+async fn an_add_that_would_pass_the_budget_or_cannot_be_downloaded_says_why_and_saves_nothing() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let estimate = site(local_config(&upstream))
+        .await
+        .control
+        .memory()
+        .estimate_bytes;
+    let (site, server, _upstream) =
+        list_site(|config| config.limits.memory_mb = estimate / (1024 * 1024) + 1).await;
+    let big: String = (0..200_000)
+        .map(|index| format!("||n{index}.example^\n"))
+        .collect();
+    server.serve("/big.txt", &big, None);
+    server.fail("/gone.txt", 404);
+
+    site.send(post(
+        "/api/lists/add",
+        &add_body("Big", &server.url("/big.txt")),
+    ))
+    .await;
+    let refused = after_the_add(&site).await;
+    site.send(post(
+        "/api/lists/add",
+        &add_body("Gone", &server.url("/gone.txt")),
+    ))
+    .await;
+    let failed = after_the_add(&site).await;
+
+    let refused = refused["pending"]["state"].as_str().unwrap().to_string();
+    assert!(
+        refused.starts_with("refused: Big needs more than ") && refused.contains(" MB left of "),
+        "{refused}"
+    );
+    let failed = failed["pending"]["state"].as_str().unwrap().to_string();
+    assert!(
+        failed.starts_with("failed: Gone: ") && failed.contains("404"),
+        "{failed}"
+    );
+    assert!(saved_settings(&site).is_none());
+    assert_eq!(
+        site.send(get("/api/lists")).await.json()["lists"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test]
+async fn a_list_change_from_the_page_never_sets_a_path_redirects_or_anything_unknown() {
+    let local = scratch("web-e2e-path-list").join("mine.txt");
+    std::fs::write(&local, "||mine.example^\n").unwrap();
+    let path = local.clone();
+    let (site, server, _upstream) = list_site(move |config| {
+        config.lists = vec![ListConfig {
+            name: Some("Mine".to_string()),
+            path: Some(path),
+            ..ListConfig::default()
+        }];
+    })
+    .await;
+    let url = server.url("/a.txt");
+
+    for (body, status) in [
+        (
+            serde_json::json!({"role": "block", "url": url, "refresh_hours": 12, "allow_redirects": true}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "block", "path": "/etc/passwd", "refresh_hours": 12}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "block", "url": "file:///etc/passwd", "refresh_hours": 12}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "block", "url": url, "refresh_hours": 0}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "block", "url": url, "refresh_hours": 169}),
+            400,
+        ),
+        (
+            serde_json::json!({"role": "deny", "url": url, "refresh_hours": 12}),
+            400,
+        ),
+    ] {
+        let reply = site.send(post("/api/lists/add", &body.to_string())).await;
+
+        assert_eq!(reply.status, status, "{body}: {}", reply.body);
+    }
+
+    let source = local.display().to_string();
+    let edit = site
+        .send(post(
+            "/api/lists/edit",
+            &serde_json::json!({"role": "block", "source": source, "enabled": false}).to_string(),
+        ))
+        .await;
+    let remove = site
+        .send(post(
+            "/api/lists/remove",
+            &serde_json::json!({"role": "block", "source": source}).to_string(),
+        ))
+        .await;
+    let missing = site
+        .send(post(
+            "/api/lists/remove",
+            &serde_json::json!({"role": "block", "source": url}).to_string(),
+        ))
+        .await;
+
+    assert_eq!(edit.status, 409, "{}", edit.body);
+    assert_eq!(remove.status, 409, "{}", remove.body);
+    assert_eq!(missing.status, 404, "{}", missing.body);
+    assert!(saved_settings(&site).is_none());
+    let lists = site.send(get("/api/lists")).await.json();
+    assert_eq!(lists["lists"][0]["editable"], false);
+    assert_eq!(lists["lists"][0]["from"], "file");
+    assert_eq!(server.requests(), 0);
+}
+
+#[tokio::test]
+async fn page_lists_are_edited_removed_and_reset_through_the_api() {
+    let (site, server, _upstream) = list_site(|_| {}).await;
+    server.serve("/list.txt", "||edited.example^\n", None);
+    let url = server.url("/list.txt");
+    site.send(post("/api/lists/add", &add_body("Edited", &url)))
+        .await;
+    assert_eq!(after_the_add(&site).await["pending"]["state"], "added");
+
+    let off = site
+        .send(post(
+            "/api/lists/edit",
+            &serde_json::json!({"role": "block", "source": url, "enabled": false, "name": "Off", "refresh_hours": 3})
+                .to_string(),
+        ))
+        .await;
+
+    assert_eq!(off.status, 200, "{}", off.body);
+    let row = &off.json()["lists"][0];
+    assert_eq!(
+        (
+            &row["name"],
+            &row["enabled"],
+            &row["refresh_hours"],
+            &row["rules"]
+        ),
+        (
+            &Value::from("Off"),
+            &Value::from(false),
+            &Value::from(3),
+            &Value::from(0)
+        )
+    );
+    let answer = ask(&site.dns, "edited.example.", RecordType::A).await;
+    assert_eq!(addresses(&answer), ["9.9.9.9"]);
+
+    let removed = site
+        .send(post(
+            "/api/lists/remove",
+            &serde_json::json!({"role": "block", "source": url}).to_string(),
+        ))
+        .await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert_eq!(removed.json()["lists"], serde_json::json!([]));
+    assert_eq!(removed.json()["from"], "page", "no lists, set on the page");
+    assert_eq!(
+        saved_settings(&site).unwrap()["lists"],
+        serde_json::json!([])
+    );
+
+    let reset = site.send(post("/api/lists/reset", "{}")).await;
+    assert_eq!(reset.status, 200, "{}", reset.body);
+    assert_eq!(reset.json()["from"], "file");
+    assert_eq!(
+        saved_settings(&site).unwrap(),
+        serde_json::json!({"version": 1})
+    );
+}
+
+#[tokio::test]
+async fn without_a_password_the_lists_show_no_source_and_no_pending_add() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    config.lists = vec![ListConfig {
+        name: Some("Private".to_string()),
+        url: Some("https://lists.example/list.txt?token=secret".to_string()),
+        ..ListConfig::default()
+    }];
+    let site = site(config).await;
+
+    let lists = site.send(get("/api/lists")).await;
+
+    assert_eq!(lists.status, 200);
+    assert!(!lists.body.contains("secret"), "{}", lists.body);
+    assert!(lists.json().get("pending").is_none());
+    assert!(lists.json()["memory"]["budget_bytes"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn an_add_a_refresh_and_a_larger_cache_at_once_near_the_budget_never_pass_it() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let idle = site(local_config(&upstream))
+        .await
+        .control
+        .memory()
+        .estimate_bytes;
+    let (site, server, _upstream) =
+        list_site(|config| config.limits.memory_mb = idle / (1024 * 1024) + 2).await;
+    let rules = |prefix: &str| -> String {
+        (0..40_000)
+            .map(|index| format!("||{prefix}{index}.example^\n"))
+            .collect()
+    };
+    server.serve("/a.txt", "||a.example^\n", None);
+    server.serve("/b.txt", &rules("b"), None);
+    site.send(post(
+        "/api/lists/add",
+        &add_body("A", &server.url("/a.txt")),
+    ))
+    .await;
+    assert_eq!(after_the_add(&site).await["pending"]["state"], "added");
+    server.serve("/a.txt", &rules("a"), None);
+    let control = Arc::clone(&site.control);
+    let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let sampling = Arc::clone(&sampling);
+        tokio::spawn(async move {
+            let mut most = 0;
+            while sampling.load(Ordering::Relaxed) {
+                let memory = control.memory();
+                assert!(memory.estimate_bytes <= memory.budget_bytes, "{memory:?}");
+                most = most.max(memory.estimate_bytes);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+
+            most
+        })
+    };
+
+    let (added, refreshed, cache) = tokio::join!(
+        site.send(post(
+            "/api/lists/add",
+            &add_body("B", &server.url("/b.txt"))
+        )),
+        site.send(post("/api/lists/refresh", "")),
+        site.send(post("/api/settings", &cache_of_size(5 * 1024 * 1024))),
+    );
+    assert_eq!(added.status, 202, "{}", added.body);
+    assert_eq!(refreshed.status, 202, "{}", refreshed.body);
+    assert!(cache.status == 200 || cache.status == 400, "{}", cache.body);
+    let lists = after_the_add(&site).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let a = &site.control.statuses()[0];
+        if a.rules > 1 || a.last_error.is_some() {
+            break;
+        }
+
+        assert!(Instant::now() < deadline, "the refresh never ended");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    sampling.store(false, Ordering::Relaxed);
+    let most = sampler.await.unwrap();
+    let memory = site.control.memory();
+    eprintln!(
+        "add: {}, cache: {}, list a: {:?}; most {most} of {} bytes",
+        lists["pending"]["state"],
+        cache.status,
+        site.control.statuses()[0].last_error,
+        memory.budget_bytes
+    );
+    assert!(memory.estimate_bytes <= memory.budget_bytes);
+}
+
+// ---- Blocked services (plan D8) ----
+
+/// A small catalog in the shape of AdGuard's `services.json`, written for these tests.
+const CATALOG: &str = r#"{
+  "blocked_services": [
+    {"id": "chat", "name": "Chat", "group": "messenger", "icon_svg": "<svg>chat</svg>",
+     "rules": ["||chat.example^", "||chatcdn.example^"]},
+    {"id": "video", "name": "Video", "group": "streaming", "icon_svg": "<svg>video</svg>",
+     "rules": ["||video.example^"]},
+    {"id": "games", "name": "Games", "group": "gaming", "rules": ["||games.example^"]}
+  ],
+  "groups": [{"id": "messenger"}, {"id": "streaming"}, {"id": "gaming"}]
+}"#;
+
+const CATALOG_PATH: &str = "/services.json";
+
+fn fast_timing() -> Timing {
+    Timing {
+        hour: Duration::from_millis(300),
+        retries: [Duration::from_millis(200); 4],
+        first_check: Duration::from_secs(3600),
+    }
+}
+
+/// A site whose catalog of services is served by the returned server.
+async fn services_site(
+    block: &[&str],
+    timing: Timing,
+    change: impl FnOnce(&mut Config),
+) -> (Site, ListServer, common::harness::FakeUpstream) {
+    let catalog = ListServer::start().await;
+    catalog.serve(CATALOG_PATH, CATALOG, None);
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    config.services.catalog_url = catalog.url(CATALOG_PATH);
+    config.services.block = block.iter().map(|id| id.to_string()).collect();
+    change(&mut config);
+    let kind = SiteKind {
+        build: Build::current(),
+        installer: true,
+        release_target: true,
+    };
+    let site = site_timed(config, kind, None, timing).await;
+
+    (site, catalog, upstream)
+}
+
+async fn is_blocked(site: &Site, name: &str) -> bool {
+    addresses(&ask(&site.dns, name, RecordType::A).await) == ["0.0.0.0"]
+}
+
+/// Waits until `name` is blocked or not, as `blocked` says.
+async fn wait_until_blocked(site: &Site, name: &str, blocked: bool) {
+    for _ in 0..400 {
+        if is_blocked(site, name).await == blocked {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!(
+        "{name} never became {}",
+        if blocked { "blocked" } else { "allowed" }
+    );
+}
+
+/// `GET /api/services` once it is no longer loading.
+async fn loaded_services(site: &Site) -> Value {
+    for _ in 0..400 {
+        let reply = site.send(get("/api/services")).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let services = reply.json();
+        if services["loading"] == false {
+            return services;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("the services never loaded");
+}
+
+fn switched_on(services: &Value) -> Vec<String> {
+    services["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|service| service["on"] == true)
+        .map(|service| service["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn blocked_services_are_switched_on_and_off_and_reset_from_the_page() {
+    let (site, catalog, _upstream) = services_site(&[], day_long_timing(), |_| {}).await;
+
+    let services = loaded_services(&site).await;
+    assert_eq!(
+        services["services"],
+        serde_json::json!([
+            {"id": "chat", "name": "Chat", "group": "messenger", "on": false},
+            {"id": "video", "name": "Video", "group": "streaming", "on": false},
+            {"id": "games", "name": "Games", "group": "gaming", "on": false},
+        ])
+    );
+    assert!(services["loaded_at"].as_u64().unwrap() > 1_700_000_000);
+    assert_eq!(services["error"], Value::Null);
+    assert!(!services.to_string().contains("svg"));
+    assert_eq!(catalog.requested(CATALOG_PATH), 1);
+    assert!(!is_blocked(&site, "chat.example.").await);
+
+    let reply = site
+        .send(post("/api/settings", "{\"services\": [\"chat\"]}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(
+        reply.json()["services"],
+        serde_json::json!({"block": ["chat"], "from": "page"})
+    );
+    assert_eq!(catalog.requested(CATALOG_PATH), 2);
+    for name in ["chat.example.", "www.chat.example.", "chatcdn.example."] {
+        assert!(is_blocked(&site, name).await, "{name}");
+    }
+    assert!(!is_blocked(&site, "video.example.").await);
+    let explained = site
+        .send(get("/api/explain?name=chat.example"))
+        .await
+        .json();
+    assert_eq!(explained["decision"], "blocked");
+    assert_eq!(explained["list"], "Blocked service: Chat");
+    assert_eq!(switched_on(&loaded_services(&site).await), ["chat"]);
+    assert_eq!(
+        saved_settings(&site).unwrap()["services"],
+        serde_json::json!(["chat"])
+    );
+
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"chat\", \"video\"]}",
+        ))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(is_blocked(&site, "video.example.").await);
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert_eq!(catalog.requested(CATALOG_PATH), 3);
+    let file = site.state.join(settings::FILE_NAME);
+    std::fs::remove_file(&file).unwrap();
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"chat\", \"video\"]}",
+        ))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(!file.exists(), "the same services again write nothing");
+    assert_eq!(catalog.requested(CATALOG_PATH), 3);
+
+    let reply = site
+        .send(post("/api/settings", "{\"services\": [\"video\"]}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(!is_blocked(&site, "chat.example.").await);
+    assert!(is_blocked(&site, "video.example.").await);
+    assert_eq!(
+        catalog.requested(CATALOG_PATH),
+        3,
+        "switching off downloads nothing"
+    );
+
+    let before = saved_settings(&site);
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"video\", \"nope\"]}",
+        ))
+        .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert_eq!(
+        reply.json()["error"],
+        "there is no service \"nope\" in the catalog"
+    );
+    assert_eq!(saved_settings(&site), before);
+    assert_eq!(
+        catalog.requested(CATALOG_PATH),
+        3,
+        "an unknown id downloads nothing"
+    );
+
+    let reply = site
+        .send(post("/api/settings", "{\"services\": null}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(
+        reply.json()["services"],
+        serde_json::json!({"block": [], "from": "file"})
+    );
+    assert!(!is_blocked(&site, "video.example.").await);
+    assert!(saved_settings(&site).unwrap().get("services").is_none());
+    assert_eq!(catalog.requested(CATALOG_PATH), 3);
+}
+
+#[tokio::test]
+async fn services_from_the_config_file_are_loaded_once_at_start_and_pause_turns_them_off() {
+    let (site, catalog, _upstream) = {
+        let catalog_delay = Duration::from_millis(300);
+        let (site, catalog, upstream) = services_site(&["video"], day_long_timing(), |_| {}).await;
+        catalog.set_delay(catalog_delay);
+
+        (site, catalog, upstream)
+    };
+
+    wait_until_blocked(&site, "video.example.", true).await;
+    let services = loaded_services(&site).await;
+    assert_eq!(switched_on(&services), ["video"]);
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(
+        settings["services"],
+        serde_json::json!({"block": ["video"], "from": "file"})
+    );
+    assert_eq!(catalog.requested(CATALOG_PATH), 1);
+
+    let reply = site.send(post("/api/pause", "{\"minutes\": 5}")).await;
+    assert_eq!(reply.status, 200);
+    assert!(!is_blocked(&site, "video.example.").await);
+    let reply = site.send(post("/api/resume", "{}")).await;
+    assert_eq!(reply.status, 200);
+    assert!(is_blocked(&site, "video.example.").await);
+
+    assert!(saved_settings(&site).is_none(), "nothing was written");
+}
+
+#[tokio::test]
+async fn until_the_catalog_is_read_the_page_says_loading() {
+    let catalog = ListServer::start().await;
+    catalog.serve(CATALOG_PATH, CATALOG, None);
+    catalog.set_delay(Duration::from_millis(500));
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    config.services.catalog_url = catalog.url(CATALOG_PATH);
+    config.services.block = vec!["chat".to_string()];
+    let site = site(config).await;
+
+    let services = site.send(get("/api/services")).await.json();
+
+    assert_eq!(services["loading"], true);
+    assert_eq!(services["services"], serde_json::json!([]));
+    assert!(!is_blocked(&site, "chat.example.").await);
+    wait_until_blocked(&site, "chat.example.", true).await;
+    assert_eq!(loaded_services(&site).await["loading"], false);
+}
+
+#[tokio::test]
+async fn a_failed_refresh_keeps_the_service_lists_and_no_refresh_writes_a_file() {
+    let (site, catalog, _upstream) = services_site(&["chat"], fast_timing(), |config| {
+        config.services.refresh_hours = 1;
+    })
+    .await;
+    wait_until_blocked(&site, "chat.example.", true).await;
+
+    catalog.fail(CATALOG_PATH, 503);
+    let failed_once = catalog.requested(CATALOG_PATH) + 2;
+    for _ in 0..400 {
+        if catalog.requested(CATALOG_PATH) >= failed_once {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(catalog.requested(CATALOG_PATH) >= failed_once);
+    let services = site.send(get("/api/services")).await.json();
+    assert!(
+        services["error"].as_str().unwrap().contains("503"),
+        "{services}"
+    );
+    assert!(is_blocked(&site, "chat.example.").await, "the lists stay");
+
+    catalog.serve(
+        CATALOG_PATH,
+        &CATALOG.replace("||chatcdn.example^", "||chat2.example^"),
+        None,
+    );
+    wait_until_blocked(&site, "chat2.example.", true).await;
+    assert!(!is_blocked(&site, "chatcdn.example.").await);
+    assert_eq!(
+        site.send(get("/api/services")).await.json()["error"],
+        Value::Null
+    );
+
+    let written: Vec<_> = std::fs::read_dir(&site.state).unwrap().collect();
+    assert!(written.is_empty(), "{written:?}");
+}
+
+#[tokio::test]
+async fn no_catalog_is_downloaded_without_a_service_switched_on() {
+    let (site, catalog, _upstream) = services_site(&[], fast_timing(), |config| {
+        config.services.refresh_hours = 1;
+    })
+    .await;
+
+    let reply = site.send(post("/api/settings", "{\"services\": []}")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(
+        saved_settings(&site).unwrap()["services"],
+        serde_json::json!([])
+    );
+    let reply = site.send(post("/api/lists/refresh", "{}")).await;
+    assert_eq!(reply.status, 202);
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    assert_eq!(catalog.requests(), 0);
+}
+
+#[tokio::test]
+async fn services_that_would_pass_the_memory_budget_are_refused_and_the_lists_stay() {
+    let big: Vec<String> = (0..2000)
+        .map(|n| format!("\"||n{n}.big.example^\""))
+        .collect();
+    let catalog_text = CATALOG.replace(
+        "\"rules\": [\"||games.example^\"]",
+        &format!("\"rules\": [{}]", big.join(", ")),
+    );
+    let (probe, _catalog, _upstream) = services_site(&[], day_long_timing(), |_| {}).await;
+    let memory = probe.control.memory();
+    drop(probe);
+    // A cache that leaves 20 KB of the budget: room for the small services, not for 2000
+    // rules.
+    let left = 20 * 1024;
+    let budget = memory.budget_bytes;
+    let cache_max_bytes =
+        Config::default().cache.max_bytes + (budget - memory.estimate_bytes - left) / 125 * 100;
+    let (site, catalog, _upstream) = services_site(&["chat"], day_long_timing(), |config| {
+        config.cache.max_bytes = cache_max_bytes;
+    })
+    .await;
+    catalog.serve(CATALOG_PATH, &catalog_text, None);
+    wait_until_blocked(&site, "chat.example.", true).await;
+    let memory = site.control.memory();
+    assert!(
+        memory.budget_bytes - memory.estimate_bytes < 40 * 1024,
+        "{memory:?}"
+    );
+
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"chat\", \"games\"]}",
+        ))
+        .await;
+
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.json()["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the blocked services would pass the memory budget"),
+        "{}",
+        reply.body
+    );
+    assert!(!is_blocked(&site, "n1.big.example.").await);
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert!(saved_settings(&site).is_none());
+    assert_eq!(site.control.memory(), memory);
+}
+
+/// A catalog of `count` services `s0`, `s1`, ..., each with `rules` rules.
+fn catalog_of(count: usize, rules: usize) -> String {
+    let entries: Vec<String> = (0..count)
+        .map(|service| {
+            let rules: Vec<String> = (0..rules)
+                .map(|rule| format!("\"||r{rule}.s{service}.example^\""))
+                .collect();
+
+            format!(
+                "{{\"id\": \"s{service}\", \"name\": \"S{service}\", \"group\": \"g\", \
+                 \"rules\": [{}]}}",
+                rules.join(", ")
+            )
+        })
+        .collect();
+
+    format!("{{\"blocked_services\": [{}]}}", entries.join(", "))
+}
+
+fn services_body(ids: std::ops::Range<usize>) -> String {
+    let ids: Vec<String> = ids.map(|id| format!("\"s{id}\"")).collect();
+
+    format!("{{\"services\": [{}]}}", ids.join(", "))
+}
+
+#[tokio::test]
+async fn services_switched_on_one_change_at_a_time_stay_within_20000_rules() {
+    let (site, catalog, _upstream) = services_site(&[], day_long_timing(), |_| {}).await;
+    catalog.serve(CATALOG_PATH, &catalog_of(11, 2000), None);
+    let refused = |reply: &Reply| {
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert_eq!(
+            reply.json()["error"],
+            "the services switched on would hold 22000 rules, more than 20000"
+        );
+    };
+
+    refused(
+        &site
+            .send(post("/api/settings", &services_body(0..11)))
+            .await,
+    );
+    assert!(saved_settings(&site).is_none());
+
+    let reply = site.send(post("/api/settings", &services_body(0..9))).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let reply = site
+        .send(post("/api/settings", &services_body(0..10)))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(is_blocked(&site, "r1999.s9.example.").await);
+    let memory = site.control.memory();
+    let before = saved_settings(&site);
+
+    refused(
+        &site
+            .send(post("/api/settings", &services_body(0..11)))
+            .await,
+    );
+    assert!(!is_blocked(&site, "r0.s10.example.").await);
+    assert!(is_blocked(&site, "r0.s0.example.").await);
+    assert_eq!(saved_settings(&site), before);
+    assert_eq!(site.control.memory(), memory);
+    assert_eq!(loaded_services(&site).await["error"], Value::Null);
+
+    let reply = site
+        .send(post("/api/settings", &services_body(1..11)))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(is_blocked(&site, "r0.s10.example.").await);
+    assert!(!is_blocked(&site, "r0.s0.example.").await);
+}
+
+#[tokio::test]
+async fn a_larger_cache_and_services_in_one_change_must_fit_the_budget_together() {
+    let big: Vec<String> = (0..2000)
+        .map(|n| format!("\"||n{n}.big.example^\""))
+        .collect();
+    let catalog_text = CATALOG.replace(
+        "\"rules\": [\"||games.example^\"]",
+        &format!("\"rules\": [{}]", big.join(", ")),
+    );
+    let (probe, _catalog, _upstream) = services_site(&[], day_long_timing(), |_| {}).await;
+    // A budget that leaves about 8 MiB, so the larger cache stays within its 16 MiB cap.
+    let memory_mb = probe.control.memory().estimate_bytes / (1024 * 1024) + 8;
+    drop(probe);
+    let (probe, probe_catalog, _upstream) = services_site(&[], day_long_timing(), |config| {
+        config.limits.memory_mb = memory_mb;
+    })
+    .await;
+    probe_catalog.serve(CATALOG_PATH, &catalog_text, None);
+    let without = probe.control.memory();
+    let reply = probe
+        .send(post("/api/settings", "{\"services\": [\"games\"]}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let services = probe.control.memory().estimate_bytes - without.estimate_bytes;
+    drop(probe);
+    // Room for the services, or for a cache that counts as much more, but not for both.
+    let room = services * 3 / 2;
+    let cache_max_bytes = Config::default().cache.max_bytes
+        + (without.budget_bytes - without.estimate_bytes - room) / 125 * 100;
+    let larger_cache = cache_max_bytes + services / 125 * 100;
+    let (site, catalog, _upstream) = services_site(&[], day_long_timing(), |config| {
+        config.limits.memory_mb = memory_mb;
+        config.cache.max_bytes = cache_max_bytes;
+    })
+    .await;
+    catalog.serve(CATALOG_PATH, &catalog_text, None);
+    let memory = site.control.memory();
+    let mut both: Value = serde_json::from_str(&cache_of_size(larger_cache)).unwrap();
+    both["services"] = serde_json::json!(["games"]);
+
+    let reply = site.send(post("/api/settings", &both.to_string())).await;
+
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.json()["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("the blocked services and a cache of "),
+        "{}",
+        reply.body
+    );
+    assert!(!is_blocked(&site, "n1.big.example.").await);
+    assert!(saved_settings(&site).is_none());
+    assert_eq!(site.control.memory(), memory);
+
+    let reply = site
+        .send(post("/api/settings", "{\"services\": [\"games\"]}"))
+        .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(is_blocked(&site, "n1.big.example.").await);
+    both["services"] = serde_json::json!([]);
+    let reply = site.send(post("/api/settings", &both.to_string())).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(!is_blocked(&site, "n1.big.example.").await);
+    assert!(site.control.memory().estimate_bytes <= memory.budget_bytes);
+}
+
+#[tokio::test]
+async fn a_refresh_with_a_service_that_cannot_be_used_keeps_every_service_list() {
+    let (site, catalog, _upstream) = services_site(&["chat", "video"], fast_timing(), |config| {
+        config.services.refresh_hours = 1;
+    })
+    .await;
+    wait_until_blocked(&site, "chat.example.", true).await;
+    wait_until_blocked(&site, "video.example.", true).await;
+
+    catalog.serve(
+        CATALOG_PATH,
+        &CATALOG
+            .replace(
+                "\"||chatcdn.example^\"",
+                "\"||chatcdn.example^\", \"||com^\"",
+            )
+            .replace("||video.example^", "||video2.example^"),
+        None,
+    );
+    let refused_twice = catalog.requested(CATALOG_PATH) + 2;
+    for _ in 0..400 {
+        if catalog.requested(CATALOG_PATH) >= refused_twice {
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(catalog.requested(CATALOG_PATH) >= refused_twice);
+
+    let services = site.send(get("/api/services")).await.json();
+    assert_eq!(
+        services["error"], "blocked service Chat: compile failed: BlocksCanary",
+        "{services}"
+    );
+    assert_eq!(switched_on(&services), ["chat", "video"]);
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert!(is_blocked(&site, "video.example.").await);
+    assert!(!is_blocked(&site, "video2.example.").await);
+    assert!(!is_blocked(&site, "other.com.").await);
+
+    catalog.serve(
+        CATALOG_PATH,
+        &CATALOG.replace("||video.example^", "||video2.example^"),
+        None,
+    );
+    wait_until_blocked(&site, "video2.example.", true).await;
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert_eq!(
+        site.send(get("/api/services")).await.json()["error"],
+        Value::Null
+    );
+
+    catalog.serve(
+        CATALOG_PATH,
+        &CATALOG.replace("\"||games.example^\"", "\"||games.example^\", \"||com^\""),
+        None,
+    );
+    let reply = site
+        .send(post(
+            "/api/settings",
+            "{\"services\": [\"chat\", \"video\", \"games\"]}",
+        ))
+        .await;
+    assert_eq!(reply.status, 502, "{}", reply.body);
+    assert_eq!(
+        reply.json()["error"],
+        "blocked service Games: compile failed: BlocksCanary"
+    );
+    assert!(!is_blocked(&site, "games.example.").await);
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert!(saved_settings(&site).is_none());
 }

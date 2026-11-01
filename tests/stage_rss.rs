@@ -19,8 +19,9 @@ use common::stream::{Route, StreamServer, pattern_hash};
 use picoguard::config::{ListConfig, ListFormat};
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
-use picoguard::lists::Downloader;
+use picoguard::lists::{Downloader, Names};
 use picoguard::scheduler::{ListControl, Scheduler, Timing};
+use picoguard::settings::{Saved, Settings};
 use picoguard::stage::{StageSetup, StageTiming, Stager};
 use picoguard::update::{Build, Latest, Updates};
 use picoguard::upstream::tls::Tls;
@@ -36,7 +37,9 @@ const EXTRA_RULE: &str = "\n||stage-rss-extra.example^\n";
 
 fn no_dns() -> Downloader {
     Downloader::new(
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     )
 }
@@ -151,6 +154,7 @@ async fn a_list_refresh_during_an_update_download_stays_within_the_memory_limit(
     let store = Arc::new(SnapshotStore::open(&config.state.dir).unwrap());
     let scheduler = Scheduler::boot(
         &config,
+        Arc::new(Saved::new(config.clone(), Settings::default(), None)),
         CompileWorker::spawn().unwrap(),
         Arc::clone(&store),
         Timing {
@@ -185,7 +189,9 @@ async fn a_list_refresh_during_an_update_download_stays_within_the_memory_limit(
             },
         },
         Arc::clone(&updates),
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     );
     let listeners = WebListeners::bind(&config.web).unwrap();

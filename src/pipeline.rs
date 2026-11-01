@@ -10,23 +10,28 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 
 use crate::budget::{Budget, Charge};
-use crate::cache::{Cache, CacheKey, EntryToken, Memo};
-use crate::config::{Cidr, Config, is_allowed};
+use crate::cache::{Cache, CacheKey, EntryToken, Memo, Ttls};
+use crate::config::{CacheConfig, Cidr, Config, is_allowed};
 use crate::dns::build::{self, Protocol, Reply, ReplyParts, TtlRule};
-use crate::dns::wire::{Header, Name, Query, QueryError, ResponseInfo, flags, rcode, rtype};
+use crate::dns::wire::{
+    Header, Name, Query, QueryError, ResponseInfo, chain_end, flags, rcode, rtype,
+};
 use crate::filter::engine::{BlockedAnswer, Decision, Verdict, blocked_answer};
 use crate::names::DeviceNames;
 use crate::policy::{Policy, PolicyView};
+use crate::rewrites::{ADDRESS_TTL, By, Found, MAX_TARGET_TTL, Rewrites};
 use crate::stats::{Event, QueryResult, Stats, StatsSettings};
-use crate::upstream::{Answered, Tally, UpstreamError, Upstreams};
+use crate::upstream::{Answered, SharedUpstreams, Tally, UpstreamError, Upstreams};
 
 /// Reverse lookups of these ranges go to the local resolver.
 const PRIVATE_NETWORKS: [&str; 7] = [
@@ -55,6 +60,10 @@ const PRIVATE_REVERSE_ZONES: [&str; 11] = [
 ];
 const IPV4_REVERSE_LABELS: usize = 6;
 const IPV6_REVERSE_LABELS: usize = 34;
+/// The lookups a reply settled again when it is written may wait for, each started because
+/// the rewrites, SafeSearch or a pause changed what the question needs while the one before
+/// waited.
+const MAX_LOOKUPS: usize = 3;
 
 /// What the steps that need no waiting settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +112,19 @@ impl Settled {
             Settled::Static(result) | Settled::Blocked(result) | Settled::Cached(result) => result,
         }
     }
+}
+
+/// How `Pipeline::rewrite` left a rewritten query.
+enum Rewritten {
+    /// The reply is in the output buffer.
+    Answered,
+    /// The reply for the target name is not cached: it is to be looked up.
+    NeedsTarget,
+}
+
+enum RewriteTo {
+    Addresses(Vec<IpAddr>),
+    Target(Box<Name>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +180,9 @@ struct Delivery {
     age_secs_when_received: u32,
     received: Instant,
     source: Source,
+    /// The TTL settings of the cache the bytes were taken from or put into, read under the
+    /// same lock, so a cache replaced meanwhile cannot mix its settings into this reply.
+    ttls: Ttls,
     _charge: Charge,
 }
 
@@ -168,6 +193,7 @@ impl Delivery {
         cached_as: Option<EntryToken>,
         age_secs_when_received: u32,
         source: Source,
+        ttls: Ttls,
         charge: Charge,
     ) -> Delivery {
         Delivery {
@@ -177,6 +203,7 @@ impl Delivery {
             age_secs_when_received,
             received: Instant::now(),
             source,
+            ttls,
             _charge: charge,
         }
     }
@@ -217,6 +244,16 @@ enum Inner {
         asker: Asker,
         delivery: Option<Arc<Delivery>>,
     },
+    /// The compact query of a question rewritten to `target`, and the reply for the target
+    /// it waited for; `None` when the target got no answer. `finish` builds the answer from
+    /// it, never from the policy, while the question is still rewritten to that target.
+    Rewritten {
+        request: Vec<u8>,
+        protocol: Protocol,
+        asker: Asker,
+        target: Box<Name>,
+        delivery: Option<Arc<Delivery>>,
+    },
     /// The compact query of a question that got no answer; `finish` writes the SERVFAIL.
     Failed {
         request: Vec<u8>,
@@ -236,9 +273,9 @@ impl Prepared {
         match &self.0 {
             Inner::Final(_) => None,
 
-            Inner::Undecided { request, asker, .. } | Inner::Failed { request, asker, .. } => {
-                Some((request, asker))
-            }
+            Inner::Undecided { request, asker, .. }
+            | Inner::Rewritten { request, asker, .. }
+            | Inner::Failed { request, asker, .. } => Some((request, asker)),
         }
     }
 
@@ -249,6 +286,9 @@ impl Prepared {
             Inner::Final(_) => 0,
 
             Inner::Undecided {
+                request, delivery, ..
+            }
+            | Inner::Rewritten {
                 request, delivery, ..
             } => match delivery {
                 Some(delivery) => delivery.bytes.len(),
@@ -315,9 +355,6 @@ pub struct Pipeline {
     udp_size: u16,
     resume_limit: Duration,
     refuse_any: bool,
-    cache_min_ttl: u32,
-    cache_max_ttl: u32,
-    optimistic_answer_ttl: u32,
     blocked_ttl: u32,
     max_inflight_queries: usize,
     max_waiting_clients: usize,
@@ -326,10 +363,13 @@ pub struct Pipeline {
     local_domains: Vec<Name>,
     private_reverse_zones: Vec<Name>,
     private_networks: Vec<Cidr>,
-    upstreams: Arc<Upstreams>,
+    upstreams: Arc<SharedUpstreams>,
     local_resolver: Option<(SocketAddr, Upstreams)>,
     device_names: Option<Arc<DeviceNames>>,
     cache: Mutex<Cache>,
+    /// Looked up under the lock and swapped whole, so no query ever holds the last copy.
+    rewrites: Mutex<Arc<Rewrites>>,
+    safe_search: AtomicBool,
     inflight: Mutex<Inflight>,
     policy: Arc<Policy>,
     budget: Arc<Budget>,
@@ -338,7 +378,10 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(config: &Config, policy: Arc<Policy>) -> Result<Arc<Pipeline>, String> {
-        let upstreams = Arc::new(Upstreams::from_config(&config.upstream, &config.limits)?);
+        let upstreams = Arc::new(SharedUpstreams::new(Upstreams::from_config(
+            &config.upstream,
+            &config.limits,
+        )?));
         let local_resolver = config.local.resolver.map(|resolver| {
             (
                 resolver,
@@ -361,9 +404,6 @@ impl Pipeline {
             udp_size: config.server.udp_size,
             resume_limit: Duration::from_millis(config.upstream.timeout_ms),
             refuse_any: config.refuse_any,
-            cache_min_ttl: config.cache.min_ttl,
-            cache_max_ttl: config.cache.max_ttl,
-            optimistic_answer_ttl: config.cache.optimistic_answer_ttl_secs,
             blocked_ttl: config.blocked_ttl,
             max_inflight_queries: config.limits.max_inflight_queries,
             max_waiting_clients: config.limits.max_waiting_clients,
@@ -379,6 +419,8 @@ impl Pipeline {
             local_resolver,
             device_names,
             cache: Mutex::new(Cache::new(&config.cache)),
+            rewrites: Mutex::new(Arc::new(Rewrites::new(&config.rewrites)?)),
+            safe_search: AtomicBool::new(config.safe_search),
             inflight: Mutex::new(Inflight::default()),
             policy,
             budget: Budget::new(config.limits.pending_bytes),
@@ -394,15 +436,16 @@ impl Pipeline {
         &self.stats
     }
 
-    /// The upstream pool, shared with the list downloader, which resolves list hosts through
-    /// it.
-    pub fn upstreams(&self) -> &Arc<Upstreams> {
+    /// The upstream pool in force, shared with the list downloader, the stager and the update
+    /// check, which resolve their hosts through it.
+    pub fn upstreams(&self) -> &Arc<SharedUpstreams> {
         &self.upstreams
     }
 
     /// The configured servers in config order, then the local resolver when there is one.
     pub fn upstream_tallies(&self) -> Vec<ServerTally> {
-        let servers = self.upstreams.tallies().map(|(label, tally)| ServerTally {
+        let upstreams = self.upstreams.current();
+        let servers = upstreams.tallies().map(|(label, tally)| ServerTally {
             label: label.to_string(),
             kind: ServerKind::Upstream,
             tally,
@@ -452,6 +495,43 @@ impl Pipeline {
     /// cancelled: their answers are cached when they land.
     pub fn clear_cache(&self) -> usize {
         self.cache.lock().unwrap().clear()
+    }
+
+    /// Puts an empty cache built from `config` in place of the one in force, with its TTL
+    /// settings, and returns the replaced cache to be freed off the DNS thread. Lookups in
+    /// flight are not cancelled: their answers go into the new cache when they land.
+    pub fn replace_cache(&self, config: &CacheConfig) -> Cache {
+        let mut cache = self.cache.lock().unwrap();
+        let next = cache.successor(config);
+
+        std::mem::replace(&mut *cache, next)
+    }
+
+    /// Puts `rewrites` in force and returns the table it replaces, to be freed off the DNS
+    /// thread.
+    pub fn replace_rewrites(&self, rewrites: Arc<Rewrites>) -> Arc<Rewrites> {
+        std::mem::replace(&mut *self.rewrites.lock().unwrap(), rewrites)
+    }
+
+    pub fn set_safe_search(&self, on: bool) {
+        self.safe_search.store(on, Ordering::Relaxed);
+    }
+
+    /// What `name` is rewritten to and by whom, whether or not filtering is paused: the
+    /// addresses or the target name as text.
+    pub fn rewrite_explained(&self, name: &Name) -> Option<(String, By)> {
+        let rewrites = self.rewrites.lock().unwrap();
+        let (found, by) = rewrites.find(name, self.safe_search.load(Ordering::Relaxed))?;
+        let text = match found {
+            Found::Addresses(addresses) => addresses
+                .iter()
+                .map(IpAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            Found::Target(target) => target.to_string(),
+        };
+
+        Some((text, by))
     }
 
     /// The budget for replies held for delivery. Queued TCP replies draw on it.
@@ -553,6 +633,21 @@ impl Pipeline {
         }
 
         let query = Query::parse(&compact).ok()?;
+        if let Some(target) = self.target_of(&query) {
+            let outcome = self.resolve_target(&query, &target).await;
+            if matches!(outcome, Err(Failure::Overloaded)) {
+                return self.shed(compact, protocol, asker);
+            }
+
+            return Some(Prepared(Inner::Rewritten {
+                request: compact,
+                protocol,
+                asker,
+                target: Box::new(target),
+                delivery: outcome.ok(),
+            }));
+        }
+
         let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
             return self.shed(compact, protocol, asker);
         };
@@ -600,6 +695,11 @@ impl Pipeline {
                 ..
             } => {
                 let query = Query::parse(request).ok()?;
+                // A rewrite added, or SafeSearch back after a pause, since it was prepared.
+                if self.is_rewritten(&query.question.name) {
+                    return self.settle_now(request, *protocol, out).await;
+                }
+
                 let reply = Reply::new(&query, self.udp_size, *protocol);
 
                 Some(Finished(Some(self.deliver(&query, &reply, delivery, out))))
@@ -610,18 +710,42 @@ impl Pipeline {
                 protocol,
                 delivery: None,
                 ..
-            } => match self.settle(request, *protocol, None, out) {
-                Ok(settled) => Some(Finished(Some(Counted::of(settled.result())))),
-                Err(Quick::Replied) => Some(Finished(None)),
-                Err(Quick::Dropped) => None,
-                Err(Quick::NeedsUpstream) => self.resume(request, *protocol, out).await,
-            },
+            } => self.settle_now(request, *protocol, out).await,
+
+            Inner::Rewritten {
+                request,
+                protocol,
+                target,
+                delivery,
+                ..
+            } => {
+                let query = Query::parse(request).ok()?;
+                if self.target_of(&query).as_ref() != Some(&**target) {
+                    return self.settle_now(request, *protocol, out).await;
+                }
+
+                let reply = Reply::new(&query, self.udp_size, *protocol);
+
+                Some(Finished(Some(self.deliver_rewritten(
+                    &query,
+                    &reply,
+                    delivery.as_deref(),
+                    out,
+                ))))
+            }
 
             Inner::Failed {
                 request, protocol, ..
-            } => self
-                .servfail(request, *protocol, out)
-                .then_some(Finished(Some(Counted::of(QueryResult::Error)))),
+            } => {
+                // A rewrite added since answers it.
+                if Query::parse(request).is_ok_and(|query| self.is_rewritten(&query.question.name))
+                {
+                    return self.settle_now(request, *protocol, out).await;
+                }
+
+                self.servfail(request, *protocol, out)
+                    .then_some(Finished(Some(Counted::of(QueryResult::Error))))
+            }
         }
     }
 
@@ -638,7 +762,12 @@ impl Pipeline {
         }
     }
 
-    async fn resume(
+    /// Steps 2 to 6 again under the policy and rewrites of this moment, for a question whose
+    /// prepared answer does not hold any more. A lookup is checked again when it ends, and
+    /// the question settled once more when what it needs changed meanwhile; after
+    /// `MAX_LOOKUPS` lookups or the upstream timeout, an answer that needs a lookup is a
+    /// SERVFAIL.
+    async fn settle_now(
         self: &Arc<Pipeline>,
         request: &[u8],
         protocol: Protocol,
@@ -646,23 +775,87 @@ impl Pipeline {
     ) -> Option<Finished> {
         let query = Query::parse(request).ok()?;
         let reply = Reply::new(&query, self.udp_size, protocol);
-        let Ok((_waiting, receiver)) = self.join_or_start(&query) else {
-            return self.shed_now(&reply, protocol, out);
-        };
+        let deadline = Instant::now() + self.resume_limit;
+        let mut lookups = 0;
 
-        match timeout(self.resume_limit, receiver).await {
-            Ok(Ok(Ok(delivery))) => {
-                Some(Finished(Some(self.deliver(&query, &reply, &delivery, out))))
+        loop {
+            match self.settle(request, protocol, None, out) {
+                Ok(settled) => return Some(Finished(Some(Counted::of(settled.result())))),
+                Err(Quick::Replied) => return Some(Finished(None)),
+                Err(Quick::Dropped) => return None,
+                Err(Quick::NeedsUpstream) => {}
             }
 
-            Ok(Ok(Err(Failure::Overloaded))) => self.shed_now(&reply, protocol, out),
+            if lookups == MAX_LOOKUPS || Instant::now() >= deadline {
+                reply.error(rcode::SERVFAIL, out);
+
+                return Some(Finished(Some(Counted::of(QueryResult::Error))));
+            }
+
+            lookups += 1;
+            if let ControlFlow::Break(finished) =
+                self.resume(&query, &reply, protocol, deadline, out).await
+            {
+                return finished;
+            }
+        }
+    }
+
+    /// Steps 4 to 6 for what the question needs now, waiting until `deadline` at most.
+    /// `Continue` when the rewrites, SafeSearch or a pause changed what it needs meanwhile.
+    async fn resume(
+        self: &Arc<Pipeline>,
+        query: &Query<'_>,
+        reply: &Reply<'_, '_>,
+        protocol: Protocol,
+        deadline: Instant,
+        out: &mut Vec<u8>,
+    ) -> ControlFlow<Option<Finished>> {
+        if let Some(target) = self.target_of(query) {
+            let outcome = timeout_at(deadline.into(), self.resolve_target(query, &target)).await;
+            if self.target_of(query).as_ref() != Some(&target) {
+                return ControlFlow::Continue(());
+            }
+
+            let delivery = match outcome {
+                Ok(Err(Failure::Overloaded)) => {
+                    return ControlFlow::Break(self.shed_now(reply, protocol, out));
+                }
+
+                Ok(outcome) => outcome.ok(),
+                Err(_) => None,
+            };
+
+            return ControlFlow::Break(Some(Finished(Some(self.deliver_rewritten(
+                query,
+                reply,
+                delivery.as_deref(),
+                out,
+            )))));
+        }
+
+        let Ok((_waiting, receiver)) = self.join_or_start(query) else {
+            return ControlFlow::Break(self.shed_now(reply, protocol, out));
+        };
+
+        let outcome = timeout_at(deadline.into(), receiver).await;
+        if self.is_rewritten(&query.question.name) {
+            return ControlFlow::Continue(());
+        }
+
+        ControlFlow::Break(match outcome {
+            Ok(Ok(Ok(delivery))) => {
+                Some(Finished(Some(self.deliver(query, reply, &delivery, out))))
+            }
+
+            Ok(Ok(Err(Failure::Overloaded))) => self.shed_now(reply, protocol, out),
 
             _ => {
                 reply.error(rcode::SERVFAIL, out);
 
                 Some(Finished(Some(Counted::of(QueryResult::Error))))
             }
-        }
+        })
     }
 
     /// A SERVFAIL in place of `prepared`, for a reply that cannot be queued or written. A
@@ -676,6 +869,9 @@ impl Pipeline {
             }
 
             Inner::Undecided {
+                request, protocol, ..
+            }
+            | Inner::Rewritten {
                 request, protocol, ..
             }
             | Inner::Failed {
@@ -754,14 +950,30 @@ impl Pipeline {
             return Ok(Settled::Static(record(QueryResult::BlockedRequest)));
         }
 
-        if self.route_of(name) == Route::Local && self.local_resolver.is_none() {
+        // A rewrite answers before `[local]` and the block lists, and while paused (plan D7).
+        let view = self.policy.view(self.policy.now());
+        match self.rewrite(&query, &reply, view.paused, out) {
+            Some(Rewritten::Answered) => {
+                return Ok(Settled::Static(record(counted_as(
+                    out,
+                    QueryResult::Rewritten,
+                ))));
+            }
+
+            Some(Rewritten::NeedsTarget) => {
+                return Err(Quick::NeedsUpstream);
+            }
+
+            None => {}
+        }
+
+        if self.has_no_resolver(name) {
             reply.error(rcode::NXDOMAIN, out);
 
             return Ok(Settled::Static(record(QueryResult::Error)));
         }
 
         let now = Instant::now();
-        let view = self.policy.view(self.policy.now());
         let request_verdict = view.check_request(&query);
         if let Verdict::Block { ips } = &request_verdict {
             self.write_blocked(&reply, query.question.qtype, ips, out);
@@ -774,6 +986,7 @@ impl Pipeline {
 
         let key = CacheKey::new(&query);
         let mut cache = self.cache.lock().unwrap();
+        let ttls = cache.ttls();
         let Some(hit) = cache.get(&key, now) else {
             return Err(Quick::NeedsUpstream);
         };
@@ -790,7 +1003,7 @@ impl Pipeline {
         };
         let result = match &decision {
             Decision::Pass => {
-                reply.from_upstream(hit.parts, self.ttl_rule(hit.age_secs, hit.stale), out);
+                reply.from_upstream(hit.parts, ttls.rule(hit.age_secs, hit.stale), out);
 
                 QueryResult::Cached
             }
@@ -813,6 +1026,137 @@ impl Pipeline {
         Ok(Settled::Cached(record(counted_as(out, result))))
     }
 
+    /// The rewrite of `name` in force, SafeSearch only while not `paused`.
+    fn rewrite_to(&self, name: &Name, paused: bool) -> Option<RewriteTo> {
+        let safe_search = !paused && self.safe_search.load(Ordering::Relaxed);
+        let rewrites = self.rewrites.lock().unwrap();
+
+        match rewrites.find(name, safe_search)?.0 {
+            Found::Addresses(addresses) => Some(RewriteTo::Addresses(addresses.to_vec())),
+            Found::Target(target) => {
+                Name::from_text(target).map(|target| RewriteTo::Target(Box::new(target)))
+            }
+        }
+    }
+
+    /// Answers a rewritten name (plan D7): from its addresses, or from the cached reply for
+    /// its target name, without the policy. `None` when no rewrite applies.
+    fn rewrite(
+        self: &Arc<Pipeline>,
+        query: &Query<'_>,
+        reply: &Reply<'_, '_>,
+        paused: bool,
+        out: &mut Vec<u8>,
+    ) -> Option<Rewritten> {
+        let qtype = query.question.qtype;
+        let asks_addresses = matches!(qtype, rtype::A | rtype::AAAA);
+        let target = match self.rewrite_to(&query.question.name, paused)? {
+            RewriteTo::Addresses(addresses) if asks_addresses => {
+                reply.addresses(&addresses, ADDRESS_TTL, out);
+
+                return Some(Rewritten::Answered);
+            }
+
+            RewriteTo::Target(target) if asks_addresses && !self.has_no_resolver(&target) => target,
+
+            // No such records, or a target that does not exist here.
+            _ => {
+                reply.error(rcode::NOERROR, out);
+
+                return Some(Rewritten::Answered);
+            }
+        };
+
+        let request = build::query_for(query, &target);
+        let Ok(target_query) = Query::parse(&request) else {
+            reply.error(rcode::SERVFAIL, out);
+
+            return Some(Rewritten::Answered);
+        };
+        let mut cache = self.cache.lock().unwrap();
+        let ttls = cache.ttls();
+        let Some(hit) = cache.get(&CacheKey::new(&target_query), Instant::now()) else {
+            return Some(Rewritten::NeedsTarget);
+        };
+
+        let stale = hit.stale;
+        write_flattened(reply, qtype, hit.parts, ttls.rule(hit.age_secs, stale), out);
+        // The inflight lock is never taken while the cache lock is held.
+        drop(cache);
+
+        if stale {
+            self.refresh(&target_query);
+        }
+
+        Some(Rewritten::Answered)
+    }
+
+    /// Whether a rewrite answers `name` now.
+    fn is_rewritten(&self, name: &Name) -> bool {
+        let paused = self.policy.view(self.policy.now()).paused;
+        let safe_search = !paused && self.safe_search.load(Ordering::Relaxed);
+
+        self.rewrites
+            .lock()
+            .unwrap()
+            .find(name, safe_search)
+            .is_some()
+    }
+
+    /// The target name an A or AAAA question is rewritten to now, when its answer comes from
+    /// the target's reply.
+    fn target_of(&self, query: &Query<'_>) -> Option<Name> {
+        if !matches!(query.question.qtype, rtype::A | rtype::AAAA) {
+            return None;
+        }
+
+        let paused = self.policy.view(self.policy.now()).paused;
+        match self.rewrite_to(&query.question.name, paused)? {
+            RewriteTo::Target(target) if !self.has_no_resolver(&target) => Some(*target),
+            _ => None,
+        }
+    }
+
+    /// Steps 4 and 5 for the target of a rewritten query: its reply is cached and coalesced
+    /// under its own question, like a client asking for the target itself.
+    async fn resolve_target(self: &Arc<Pipeline>, query: &Query<'_>, target: &Name) -> Outcome {
+        let request = build::query_for(query, target);
+        let target_query = Query::parse(&request).map_err(|_| Failure::Upstream)?;
+        let (_waiting, receiver) = self.join_or_start(&target_query)?;
+
+        receiver.await.unwrap_or(Err(Failure::Upstream))
+    }
+
+    /// The answer to a rewritten query from the reply for its target, or SERVFAIL without one.
+    fn deliver_rewritten(
+        &self,
+        query: &Query<'_>,
+        reply: &Reply<'_, '_>,
+        delivery: Option<&Delivery>,
+        out: &mut Vec<u8>,
+    ) -> Counted {
+        match delivery {
+            Some(delivery) => {
+                let ttl_rule = delivery.ttls.rule(delivery.age_secs(), delivery.is_stale());
+                write_flattened(reply, query.question.qtype, delivery.parts(), ttl_rule, out);
+            }
+
+            None => {
+                reply.error(rcode::SERVFAIL, out);
+            }
+        }
+
+        Counted {
+            result: counted_as(out, QueryResult::Rewritten),
+            server: delivery.and_then(|delivery| delivery.source.server()),
+        }
+    }
+
+    /// A name under `[local]` with no local resolver: it does not exist here.
+    fn has_no_resolver(&self, name: &Name) -> bool {
+        self.route_of(name) == Route::Local && self.local_resolver.is_none()
+    }
+
     /// A copy of the cached reply to `query`, charged to the pending-bytes budget. `None`
     /// when there is no such entry or the budget cannot hold the copy.
     fn hold_cache_hit(&self, query: &Query<'_>) -> Option<Arc<Delivery>> {
@@ -828,6 +1172,7 @@ impl Pipeline {
             Some(hit.token),
             hit.age_secs,
             Source::Cache { stale: hit.stale },
+            cache.ttls(),
             charge,
         )))
     }
@@ -867,7 +1212,7 @@ impl Pipeline {
 
         let result = match decision {
             Decision::Pass => {
-                let ttl_rule = self.ttl_rule(delivery.age_secs(), delivery.is_stale());
+                let ttl_rule = delivery.ttls.rule(delivery.age_secs(), delivery.is_stale());
                 reply.from_upstream(delivery.parts(), ttl_rule, out);
 
                 match delivery.source {
@@ -915,24 +1260,6 @@ impl Pipeline {
             BlockedAnswer::Empty => reply.error(rcode::NOERROR, out),
             BlockedAnswer::NoData => reply.blocked(self.blocked_ttl, out),
             BlockedAnswer::TooMany => reply.too_big(out),
-        }
-    }
-
-    /// A stale answer carries the optimistic answer TTL in every record, the SOA of a
-    /// negative answer included; a fresh one is clamped and aged.
-    fn ttl_rule(&self, age: u32, stale: bool) -> TtlRule {
-        if stale {
-            return TtlRule {
-                min: self.optimistic_answer_ttl,
-                max: self.optimistic_answer_ttl,
-                age: 0,
-            };
-        }
-
-        TtlRule {
-            min: self.cache_min_ttl,
-            max: self.cache_max_ttl,
-            age,
         }
     }
 
@@ -1084,13 +1411,15 @@ impl Pipeline {
     }
 
     async fn fetch(&self, mut request: Vec<u8>, route: Route) -> Outcome {
+        let current;
         let upstreams = if route == Route::Local {
             self.local_resolver
                 .as_ref()
                 .map(|(_, resolver)| resolver)
                 .ok_or(Failure::Upstream)?
         } else {
-            &self.upstreams
+            current = self.upstreams.current();
+            &*current
         };
         let Answered {
             reply: mut bytes,
@@ -1114,6 +1443,7 @@ impl Pipeline {
         let key = CacheKey::new(&query);
         let mut cache = self.cache.lock().unwrap();
         let cached_as = cache.insert(&key, &bytes, &info, Instant::now());
+        let ttls = cache.ttls();
         // A final answer the cache refuses (TTL 0, no SOA, too big) is what the upstream says
         // now, so a stale entry for the question is no longer the best answer.
         if cached_as.is_none() && is_final_answer(&info) {
@@ -1129,8 +1459,63 @@ impl Pipeline {
         });
 
         Ok(Arc::new(Delivery::new(
-            bytes, info, cached_as, 0, source, charge,
+            bytes, info, cached_as, 0, source, ttls, charge,
         )))
+    }
+}
+
+/// The answer to a rewritten A or AAAA question from the reply for its target (plan D7): the
+/// addresses at the end of the target's CNAME chain under the asked name, with the smallest
+/// TTL on the way, at most `MAX_TARGET_TTL`. A target that does not exist or has no such
+/// address gives no records; any other rcode, a truncated reply or a broken chain SERVFAIL.
+fn write_flattened(
+    reply: &Reply<'_, '_>,
+    qtype: u16,
+    parts: ReplyParts<'_>,
+    ttl_rule: TtlRule,
+    out: &mut Vec<u8>,
+) {
+    let Ok(header) = Header::parse(parts.bytes) else {
+        reply.error(rcode::SERVFAIL, out);
+
+        return;
+    };
+
+    if header.truncated() || parts.extended_rcode() != 0 {
+        reply.error(rcode::SERVFAIL, out);
+
+        return;
+    }
+
+    match header.rcode() {
+        rcode::NOERROR => {}
+
+        rcode::NXDOMAIN => {
+            reply.error(rcode::NOERROR, out);
+
+            return;
+        }
+
+        _ => {
+            reply.error(rcode::SERVFAIL, out);
+
+            return;
+        }
+    }
+
+    match chain_end(parts.bytes, qtype) {
+        Ok(Some(end)) if end.addresses.is_empty() => {
+            reply.error(rcode::NOERROR, out);
+        }
+
+        Ok(Some(end)) => {
+            let ttl = ttl_rule.apply(end.min_ttl.unwrap_or(0)).min(MAX_TARGET_TTL);
+            reply.addresses(&end.addresses, ttl, out);
+        }
+
+        _ => {
+            reply.error(rcode::SERVFAIL, out);
+        }
     }
 }
 
@@ -1494,6 +1879,7 @@ mod tests {
             old_token,
             0,
             Source::Upstream(None),
+            pipeline.cache.lock().unwrap().ttls(),
             pipeline.budget.try_charge(1).unwrap(),
         );
 
@@ -1541,6 +1927,7 @@ mod tests {
                 token,
                 0,
                 Source::Upstream(None),
+                pipeline.cache.lock().unwrap().ttls(),
                 pipeline.budget.try_charge(1).unwrap(),
             );
             let reply = Reply::new(&query, pipeline.udp_size, Protocol::Udp);
@@ -1598,6 +1985,7 @@ mod tests {
             token,
             0,
             Source::Upstream(None),
+            pipeline.cache.lock().unwrap().ttls(),
             pipeline.budget.try_charge(1).unwrap(),
         );
         let reply = Reply::new(&query, pipeline.udp_size, Protocol::Tcp);
@@ -2143,6 +2531,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_replaced_cache_is_empty_and_its_ttls_apply_at_once() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("ttl.example.", RecordType::A);
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 10).unwrap();
+        let mut out = Vec::new();
+        ask_quickly(&pipeline, &spec, &mut out);
+        assert_eq!(answer_ttls(&out), [290]);
+
+        let replaced = pipeline.replace_cache(&CacheConfig {
+            min_ttl: 600,
+            max_ttl: 3600,
+            ..CacheConfig::default()
+        });
+
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(pipeline.cache_size().entries, 0);
+        assert_eq!(
+            ask_quickly(&pipeline, &spec, &mut out),
+            Quick::NeedsUpstream
+        );
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 10).unwrap();
+        ask_quickly(&pipeline, &spec, &mut out);
+        assert_eq!(answer_ttls(&out), [590]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_delivered_after_the_cache_is_replaced_never_marks_a_new_entry() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("late.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let bytes = reply_with_address(&spec, [9, 9, 9, 9]);
+        let old_token = insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0);
+        let delivery = Delivery::new(
+            bytes.clone(),
+            ResponseInfo::parse(&bytes).unwrap(),
+            old_token,
+            0,
+            Source::Upstream(None),
+            pipeline.cache.lock().unwrap().ttls(),
+            pipeline.budget.try_charge(1).unwrap(),
+        );
+
+        drop(pipeline.replace_cache(&CacheConfig::default()));
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0).unwrap();
+        let reply = Reply::new(&query, pipeline.udp_size, Protocol::Udp);
+        let mut out = Vec::new();
+        pipeline.deliver(&query, &reply, &delivery, &mut out);
+
+        let mut cache = pipeline.cache.lock().unwrap();
+        let hit = cache.get(&CacheKey::new(&query), Instant::now()).unwrap();
+        assert_ne!(Some(hit.token), old_token);
+        assert_eq!(hit.memo, None);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_held_across_a_cache_replacement_keeps_the_ttl_settings_of_its_lookup() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("held.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0).unwrap();
+        let held = pipeline.hold_cache_hit(&query).unwrap();
+
+        drop(pipeline.replace_cache(&CacheConfig {
+            max_ttl: 60,
+            ..CacheConfig::default()
+        }));
+        let reply = Reply::new(&query, pipeline.udp_size, Protocol::Udp);
+        let mut out = Vec::new();
+        pipeline.deliver(&query, &reply, &held, &mut out);
+
+        assert_eq!(answer_ttls(&out), [300]);
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0).unwrap();
+        ask_quickly(&pipeline, &spec, &mut out);
+        assert_eq!(answer_ttls(&out), [60]);
+    }
+
     const PRIVATE_CLIENTS: [&str; 8] = [
         "10.0.0.1",
         "172.16.0.1",
@@ -2200,7 +2667,7 @@ mod tests {
     async fn ask_printer(pipeline: &Arc<Pipeline>) -> Vec<String> {
         let request = QuerySpec::new("printer.lan.", RecordType::A).bytes();
         let mut out = Vec::new();
-        let answered = timeout(
+        let answered = tokio::time::timeout(
             Duration::from_secs(1),
             pipeline.answer(request, Protocol::Udp, CLIENT, &mut out),
         )

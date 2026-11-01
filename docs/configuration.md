@@ -13,7 +13,236 @@ It prints `OK` or the first error. Unknown keys are errors, so a typo cannot hid
 Top-level keys (`blocked_ttl`, `rules`, ...) must come before the first `[section]` header. This
 is a TOML rule.
 
-Two instances can use the same file. They do not sync with each other.
+Two instances can use the same file. They do not sync with each other, and each keeps what is
+saved from its own status page in its own `state.dir`.
+
+## Settings saved from the status page
+
+What you change on the status page is saved in `settings.json` in `[state] dir`
+(`/var/lib/picoguard/settings.json` by default), never in this file: picoguard cannot write
+`/etc/picoguard`. Today that is the Block and Allow rules from the query log, the upstream servers
+and bootstrap addresses, the cache settings, the block lists and allowlists, the DNS rewrites,
+SafeSearch and the blocked services (below).
+
+- A value saved from the page wins over the same value in this file. The page's rules join your
+  `rules`; they never replace them.
+- The file is written only when you save a change on the page: never at start, on a timer or on a
+  list refresh, and not for a change that changes nothing. It is written whole, as
+  `settings.json.part` first and then renamed, readable by picoguard's user only.
+- picoguard never deletes or rewrites the file on its own. To go back to this file alone, stop
+  picoguard and delete `settings.json`.
+- A saved file that cannot be used (unreadable, a link or anything but a plain file, larger than
+  256 KiB, not valid, or a value that makes the config invalid) never stops picoguard. It starts on
+  this file alone, logs one warning, and the page says "Saved settings could not be used:
+  <reason>. Saving from this page replaces them."
+- `picoguard --check` checks the saved file too. When it would be ignored, it prints
+  `warning: saved settings in <path> will be ignored: <reason>`, and still `OK` with exit code 0:
+  picoguard would start.
+- A save that fails (for example a read-only state folder) answers 503
+  `{"error": "could not save settings: <reason>"}`, and the change is not applied either.
+
+`GET /api/settings` (signed-in only) shows what the page can change, each value with where it
+comes from (`"from": "page"` or `"file"`), and nothing of `[web]`:
+
+```json
+{"file": "/var/lib/picoguard/settings.json", "error": null, "can_save": true,
+ "upstream": {"servers": ["https://1.1.1.1/dns-query"], "bootstrap": ["9.9.9.9", "1.1.1.1"], "from": "file"},
+ "cache": {"max_entries": 10000, "max_bytes": 4194304, "min_ttl": 0, "max_ttl": 86400, "optimistic": true, "from": "file"},
+ "rewrites": {"entries": [], "from": "file"},
+ "safe_search": {"on": false, "from": "file"},
+ "services": {"block": [], "from": "file"},
+ "memory": {"estimate_bytes": 26535936, "budget_bytes": 50331648}}
+```
+
+`error` is why the saved file was not used at start, until a save replaces it. `can_save` is
+`false` after a save failed, until one works. `memory` is the [memory estimate](#the-memory-budget)
+and the budget it is checked against.
+
+### Upstream servers and cache from the page
+
+The Settings tab has a card for each. The card says "From the config file" or "Set on this page";
+**Save** saves the card and puts it in force at once, without a restart, and **Use the config
+file** goes back to this file's values.
+
+- **Upstream servers**: `[upstream] servers` (1 to 8, in order; add, remove, move up and down)
+  and `bootstrap` (0 to 4 addresses). A server this file would refuse is refused with the same
+  reason, and nothing is saved. `timeout_ms` stays in this file. Queries already waiting finish on
+  the servers they started on; the new servers answer every query after the save. A server kept
+  by its exact address keeps its counts on the dashboard's Upstreams card, and a new one starts at
+  0; answers that queries in flight get from the old servers after the save are not counted. The
+  query log's "Via" column (`#0`, `#1`, ...) is the position in the list in force at the time.
+- Replaced servers close their connections once the queries that started on them have ended, within
+  `timeout_ms`. If two earlier changes are still finishing, a further change answers 409 "the
+  previous upstream change is still finishing; try again in a few seconds".
+- **Cache**: `max_entries`, `max_bytes` (256 KiB to 16 MiB from the page; the card asks in
+  KiB), `min_ttl`, `max_ttl` and `optimistic`. Saving a change empties the cache, like Clear
+  cache, and the new limits and TTLs apply to the next answer. The other `[cache]` keys stay in
+  this file. A larger `max_bytes` that would take the [memory estimate](#the-memory-budget) past
+  the budget is refused with 400 "a cache of 16.0 MB would pass the memory budget: the estimate
+  would be 51.2 MB of 48.0 MB"; a smaller one always works. Sent in one change with `services`,
+  the cache is checked together with the services of that change, and passing the budget answers
+  409 "the blocked services and a cache of 16.0 MB would pass the memory budget: ...".
+
+`POST /api/settings` takes any of `upstream`, `cache`, `rewrites`, `safe_search` and
+`services`. A value sets it, `null` goes back to this file. The body may be up to 64 KiB. It
+answers the same as `GET`, 400 with the reason for a value that is refused, 409 as above or for
+blocked services that would pass the memory budget, 502 when the catalog of services cannot be
+downloaded or a service's rules cannot be used, or 503 when the file cannot be saved; in every refusal nothing changes.
+
+```json
+{"upstream": {"servers": ["tls://9.9.9.9#dns.quad9.net", "https://1.1.1.1/dns-query"], "bootstrap": ["9.9.9.9"]},
+ "cache": null,
+ "rewrites": [{"name": "nas.lan", "answer": "192.168.1.10"}, {"name": "*.nas.lan", "answer": "nas.lan"}],
+ "safe_search": true,
+ "services": ["tiktok"]}
+```
+
+A change that leaves the saved values as they are writes nothing.
+
+### Rewrites and SafeSearch from the page
+
+The Settings tab has a **Rewrites** card (a table of name and answer, Add, Remove) and a
+**SafeSearch** card (one switch), each with "From the config file" or "Set on this page", its
+own **Save**, and **Use the config file**. They follow [`[[rewrites]]` and
+`safe_search`](#rewrites-and-safesearch) below, and apply at once: the next query is answered from
+them.
+
+- The page sends the whole table. Names and name answers are kept lowercase, without spaces or a
+  final dot, and an address is kept in its standard form (`FD00:0::10` becomes `fd00::10`), so
+  `NAS.lan.` and `nas.lan` are the same rewrite and saving it again writes nothing.
+- A table this file would refuse is refused with the same reason (400), for example
+  "rewrites[0] points nas.lan at itself", and nothing is saved.
+- The new table is built off the DNS thread, saved, then put in force whole; the old one is freed
+  off the DNS thread.
+- **Check a name** on the Lists tab says "rewritten to X (your rewrite)" or "rewritten to X
+  (SafeSearch)" for a rewritten name, before any list. `GET /api/explain` then answers
+  `{"decision": "rewritten", "list": "your rewrites" or "SafeSearch", "rule": "rewritten to X (...)"}`.
+
+### Blocked services from the page
+
+The Settings tab has a **Blocked services** card: a switch for each service of the catalog,
+grouped as the catalog groups them, a filter box, "From the config file" or "Set on this page",
+**Save**, and **Use the config file**. It follows [`[services]`](#services) below.
+
+- The catalog is downloaded the first time the Settings tab is opened, and the card says
+  "Loading the list of services" until it is read. If it cannot be downloaded the card says why,
+  and the page asks again a minute later.
+- **Save** puts the services switched on in force at once. Switching one on downloads the catalog
+  (once for the change) and builds that service's list, within the [memory
+  budget](#the-memory-budget); switching one off drops its list and downloads nothing.
+- Refused, with nothing saved or changed: an id the catalog does not have (400 "there is no
+  service "x" in the catalog"), services that would hold more than 20,000 rules together, those
+  already on included (400 "the services switched on would hold 22000 rules, more than 20000"),
+  services that would pass the memory budget (409 "the blocked services would pass the memory
+  budget: ..."), a catalog that cannot be downloaded (502 "could not download the catalog of
+  the blocked services: ..."), or a service whose rules cannot be used (502 "blocked service
+  Games: compile failed: BlocksCanary").
+
+`GET /api/services` (signed-in only) shows the catalog's services and which are on; the first
+call starts the download:
+
+```json
+{"services": [{"id": "tiktok", "name": "TikTok", "group": "social_network", "on": true}],
+ "loaded_at": 1793491200, "error": null, "loading": false}
+```
+
+`loaded_at` is when the catalog was last read (seconds since 1970), `error` why the last download
+or refresh failed (until one works), and `loading` is true until the catalog, or the lists of the
+services switched on, are read.
+
+### Lists from the page
+
+The Lists tab changes the block lists and allowlists that are downloaded (`url` lists). Lists
+read from a file (`path`) stay in this file: the page marks them "from the config file" and
+cannot change them (409).
+
+- **The first change copies this file's lists to the page.** Once a list is added, turned off,
+  renamed, given other refresh hours or removed on the page, the saved settings hold every URL
+  list, and this file's `url` lists are no longer used; its `path` lists still are, first. A page
+  list with the same role and URL as a list of this file keeps that list's `format`,
+  `max_rules`, `max_body_bytes`, `slow_rule_budget` and `allow_redirects`; a list only the page
+  has gets the defaults (`format = "auto"`, no redirects). **Use the config file** removes the
+  page's lists and goes back to this file's.
+- **Each row** has an on switch, the refresh hours (1 to 168) and Remove. A list that is off is
+  not downloaded and holds no memory. A rename or new hours changes nothing else: the list in
+  force is kept. Turning a list on again downloads it.
+- **Add a list**: a name, an `http://` or `https://` address, block list or allowlist, and the
+  refresh hours. The page answers at once, shows the list as "checking" while it is downloaded
+  and compiled, then "added", "refused: <name> needs X MB, Y MB left of Z MB" (it would pass the
+  [memory budget](#the-memory-budget)) or "failed: <name>: <reason>" (the download or the list
+  failed). A refused or failed list is not saved. One list is checked at a time; a second Add
+  meanwhile answers 409. At most 32 block lists and 16 allowlists; one address once per role.
+- A list added from the page is a list like the others: refreshed every `refresh_hours`, the last
+  good copy kept on a failure, and its copy kept on disk under `persist_lists`, so it comes back
+  at start without a download. A refresh of it never writes `settings.json`.
+
+The API, all `POST` with a JSON body, signed in. A list is named by its `role` (`"block"` or
+`"allow"`) and its `source` (the URL, or the path for a file list). Unknown keys, such as `path`,
+`format` or `allow_redirects`, are refused with 400.
+
+| Route | Body | Answer |
+|---|---|---|
+| `/api/lists/add` | `{"role": "block", "name": "HaGeZi Pro", "url": "https://...", "refresh_hours": 24}` | 202 `{"list": "checking"}`; 400 with the reason; 409 while another add is checked |
+| `/api/lists/edit` | `{"role", "source"}` with any of `"name"`, `"refresh_hours"`, `"enabled"` | the lists as `GET /api/lists`; 404 for a list that is not there; 409 for a file list or a list turned on that would pass the budget; 502 when it cannot be downloaded |
+| `/api/lists/remove` | `{"role", "source"}` | the lists, as above |
+| `/api/lists/reset` | `{}` | the lists, back to this file's |
+
+`GET /api/lists` (open without a password, like the list status) shows each list's `name`,
+`kind`, `format`, `rules`, `age_seconds`, `last_error`, `enabled`, `refresh_hours`, `editable`
+(a URL list), `from` (`"page"` or `"file"`) and `heap_bytes` (the memory its copy holds), and
+the `memory` estimate. Signed in, it also shows each list's `source` (left out without a
+password: an address can carry a private token) and `pending`, the list added last:
+`{"kind", "name", "source", "state"}` with the state above. Without a password, `last_error`
+only says "the last refresh failed (set a password to see why)" (here and in `/api/status`),
+since a reason can quote a part of the address, and a list named by its address shows only
+its host.
+
+### The memory budget
+
+`[limits] memory_mb` (default 48, under the 64 MB `MemoryMax` of the systemd unit and the Docker
+compose file) is what picoguard's estimate of its whole memory may reach when something is
+added from the page. The estimate is:
+
+```
+estimate = 6 MiB                                    the idle process (binary, runtime, threads)
+         + pending_bytes + tcp_max_connections x tcp_queue_bytes     buffers under load
+         + query_log_entries x 352 + 3 x top_k x 336                 the stats, when full
+         + cache max_bytes x 1.25                                    the cache, when full
+         + the memory of every list in force                         heap_bytes of each
+         + the largest list's compile again                          a refresh builds a new copy
+```
+
+The lists of the [blocked services](#services) count as one list: their memory together, and the
+compile of all of them again, since a refresh of the catalog builds the new lists while the old
+ones are in force.
+
+A list's compile is charged 24 bytes for each plain rule, duplicates included (its array grows
+by doubling, so the old and new array live together for a moment), and the estimated cost of
+each slow rule. Building a `/regex/` rule holds more for a moment (about 640 KB of compiler
+tables, its parse, counted from its length and up to 96 KB for each Unicode class such as
+`\pL`, plus five times its automaton at most), so a compile within little room refuses the list
+before it parses or builds such a regex. A regex whose parse alone would pass 4 MB (dozens of
+Unicode classes) is too complex and does not compile. The list's compile charge is the most its compile needed at
+any one moment. A compile of the same text again always fits in that charge. The numbers are
+measured: the tests compare them with what full stats, a full cache and the real
+lists hold. With the defaults and the three default lists the estimate is about 25 MB.
+
+- **Checked when** a list is added or turned on again, a list from the page is refreshed, the
+  cache gets larger on the page, a blocked service is switched on, and the catalog of services is
+  refreshed (when it does not fit, the lists in force stay). A change of the cache and the
+  services together is checked as one, and a change of the services that leaves the estimate
+  no higher, such as switching one off, is never refused. A list is compiled within the room the budget leaves and stops
+  at once when it passes it, so a list far too large never fills the memory; then its finished
+  copy must fit too.
+- **A list from the page whose refresh grows past the budget** keeps its last good copy, and the
+  list shows "over the memory budget" until a refresh fits again.
+- **Lists of this file are never checked**, at start or on a refresh: an update never stops a
+  setup that works. They keep their own `max_rules` and other caps, and they count in the
+  estimate, so the page shows the estimate in red ("over the budget") when they pass it, and
+  then nothing more can be added.
+- One change at a time: adds, refreshes, cache changes and blocked services wait for each other,
+  so two of them never count the same room.
+- The Lists and Settings tabs show "Memory estimate: X MB of Y MB".
 
 ## Top-level keys
 
@@ -23,6 +252,8 @@ Two instances can use the same file. They do not sync with each other.
 | `refuse_any` | `true` | Answer `ANY` queries with NOTIMP. |
 | `blocked_hosts` | `["version.bind", "id.server", "hostname.bind"]` | Names answered with REFUSED. |
 | `rules` | `[]` | Your own rules, one per string: adblock syntax or hosts lines. They join the lists below as one more list. The status page shows them read-only. |
+| `safe_search` | `false` | Force SafeSearch on Google, Bing and DuckDuckGo, and restricted mode on YouTube. See [Rewrites and SafeSearch](#rewrites-and-safesearch). |
+| `[[rewrites]]` | none | Names picoguard answers itself. See [Rewrites and SafeSearch](#rewrites-and-safesearch). |
 
 `rules` example:
 
@@ -32,6 +263,77 @@ rules = [
     "@@||good.example.com^",
 ]
 ```
+
+### Rewrites and SafeSearch
+
+A rewrite makes picoguard answer a name itself, with addresses or with the addresses of another
+name. Each `[[rewrites]]` entry has a `name` and an `answer`:
+
+```toml
+[[rewrites]]
+name = "nas.lan"
+answer = "192.168.1.10"
+
+[[rewrites]]
+name = "nas.lan"
+answer = "fd00::10"
+
+[[rewrites]]
+name = "*.nas.lan"
+answer = "nas.lan"
+```
+
+- `name` is a domain name of at least two labels, or `*.` and one: `*.nas.lan` covers every
+  name under `nas.lan` (`tv.nas.lan`, `a.b.nas.lan`), not `nas.lan` itself. A name of its own
+  beats a wildcard, and a longer wildcard beats a shorter one.
+- `answer` is an IPv4 or IPv6 address, or another domain name. One name has either addresses
+  (as many entries as you like) or exactly one other name, never both; a name may not point at
+  itself. At most 1000 entries. An answer that only looks like an address (`192.168.001.10`)
+  is refused.
+- **Addresses**: an `A` query gets the IPv4 addresses, `AAAA` the IPv6 ones, both with TTL 60.
+  Any other type, or a type with no address of its family, gets an empty answer (NOERROR, no
+  records).
+- **Another name**: for `A` and `AAAA`, picoguard looks that name up for the same type the
+  usual way (the cache, then the upstreams; a name under `[local] domains` through the local
+  resolver), but without rewrites or blocking. The
+  answer holds only the addresses at the end of the name's CNAME chain, under the name that was
+  asked (no CNAME records), with the smallest TTL on the way, counted down while it is cached,
+  and at most 300 seconds. A name that does not exist, or has no such address, gives an empty
+  answer; any other failure of the lookup, SERVFAIL. Other types get an empty answer. The
+  name's own answer is cached as usual.
+- **Another name that has addresses of its own rewrite** is answered with those addresses, as
+  if they were written on the first name (TTL 60): `*.nas.lan → nas.lan` with
+  `nas.lan → 192.168.1.10` answers `a.nas.lan` with 192.168.1.10. This is one step and only
+  for addresses: when the other name is itself rewritten to a third name, that rewrite is not
+  followed, and the other name is looked up as above, so rewrites never loop. The same holds
+  for the SafeSearch names below: a rewrite of `forcesafesearch.google.com` to an address
+  answers the Google searches with it.
+- Rewrites come before `[local]` and the lists: a rewritten name is never blocked, a name under
+  `[local] domains` can be rewritten without a `resolver`, and rewrites still apply while
+  blocking is paused.
+- A reply that waits to be written (a slow TCP client) follows the rewrites, SafeSearch and
+  pause in force when it is written: a rewrite changed or a pause started or ended meanwhile
+  answers the question the new way, and so does a rewrite added for a question that got no
+  answer. A lookup this needs is checked again when it ends; if they changed once more while
+  it waited, the question is answered the newest way, with at most three lookups within the
+  upstream `timeout_ms`, then SERVFAIL.
+- The query log shows a rewritten query as "rewritten", and `/api/status` counts them in
+  `counters.rewritten`.
+
+`safe_search = true` adds rewrites of its own, the way AdGuard Home does it:
+
+| Names | Answered with the addresses of |
+|---|---|
+| `google.<domain>` and `www.google.<domain>`, for each of Google's 187 search domains (`google.com`, `google.co.uk`, `google.de`, ...) | `forcesafesearch.google.com` |
+| `bing.com`, `www.bing.com` | `strict.bing.com` |
+| `duckduckgo.com`, `www.duckduckgo.com`, `start.duckduckgo.com` | `safe.duckduckgo.com` |
+| `www.youtube.com`, `m.youtube.com`, `youtubei.googleapis.com`, `youtube.googleapis.com`, `www.youtube-nocookie.com` | `restrictmoderate.youtube.com` |
+
+SafeSearch is off while blocking is paused. A rewrite of yours for the same name wins.
+
+Memory: 1000 rewrites of home names hold about 80 KB, and 1000 of the longest names about
+520 KB. A name rewritten to a name with addresses shares them, so 500 addresses on one name and
+500 names rewritten to it hold about 40 KB. They are not part of the memory estimate.
 
 ## `[server]`
 
@@ -84,7 +386,8 @@ seconds. Loopback and public addresses are never looked up.
 Blocklists are `[[lists]]` tables. Allowlists (names that are never blocked) are
 `[[allowlists]]` with the same keys. If the file has no `[[lists]]` at all, picoguard uses the
 AdGuard DNS filter, HaGeZi Pro and HaGeZi Threat Intelligence mini. As soon as you write one
-`[[lists]]`, only your lists are used.
+`[[lists]]`, only your lists are used. One `url` or `path` may appear once among the `[[lists]]`,
+and once among the `[[allowlists]]`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -96,6 +399,7 @@ AdGuard DNS filter, HaGeZi Pro and HaGeZi Threat Intelligence mini. As soon as y
 | `max_rules` | `1500000` | A list with more rules is not used: the refresh fails, the status page shows the error and the last good copy stays. One list of 1.5 million rules takes about 12 MB, and the old and the new copy exist together during a refresh, which is what fits the 64 MB limit of the systemd unit. A bigger list, such as HaGeZi TIF (full, about 2.1 million rules), needs `max_rules` raised on purpose (and a unit memory limit to match). |
 | `max_body_bytes` | `67108864` (64 MiB) | A larger download is stopped and not used. |
 | `allow_redirects` | `false` | Hosts lines with a real address (`203.0.113.7 name`) are answered with that address only if this is `true`. Otherwise a downloaded list answers any address except `0.0.0.0`, `::`, `127.0.0.1` and `::1` like `0.0.0.0`, so a list can block names but not send them elsewhere. Lists with `path` and your own `rules` always keep the address (for local names). |
+| `enabled` | `true` | A list that is off is not downloaded and holds no memory. The page can turn lists on and off. |
 | `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A regex is charged the memory it really holds (about 8 KB for `/track[0-9]+/`, close to 1 MB for `/(\pL\|\pN){1,50}x/`), a wildcard rule 64 bytes for each of its parts, and every distinct rule at least 32 bytes more, even a regex that does not compile. A list over it is not used. |
 
 Downloads use `If-None-Match` and `If-Modified-Since`. A failed download keeps the last good list.
@@ -173,6 +477,45 @@ Block and Allow from the status page (below, under `[web]`) take their own place
 - An Allow from the page for a name also wins over a Block from the page for one of its
   subdomains.
 
+## `[services]`
+
+Blocked services: switch a service on and picoguard blocks every name it uses, from one list of
+rules per service. The list of services and their rules is AdGuard's catalog from
+[HostlistsRegistry](https://github.com/AdguardTeam/HostlistsRegistry) (GPL-3.0). picoguard does
+not ship it: it downloads it at run time, through its own upstreams, with the TLS and redirect
+rules of the list downloads.
+
+```toml
+[services]
+block = ["tiktok", "youtube"]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `block` | `[]` | The ids of the services to block (the catalog's `id`, for example `tiktok`). At most 1000, each 1 to 64 visible characters, none twice. The status page can change it. |
+| `catalog_url` | AdGuard's `services.json` on `adguardteam.github.io` | Where the catalog is downloaded from, `http://` or `https://`. Not on the page. |
+| `refresh_hours` | `24` | How often the catalog is downloaded again while a service is on. Not on the page. |
+
+- With no service switched on, the catalog is never downloaded, except once when the Settings
+  tab is opened, to show the services.
+- At start with services on, the catalog is downloaded once; until it is read, those services are
+  not blocked (the page says "loading"). It is downloaded again every `refresh_hours`; a refresh
+  that fails, whose lists would pass the [memory budget](#the-memory-budget), or with a service
+  whose rules cannot be used (they would block nearly every name) keeps all the lists in force,
+  shows why in `GET /api/services` `error`, and tries again later, with the same waits as a list.
+- Each service switched on is a list of its own, named "Blocked service: <name>": **Check a
+  name** names it, a pause turns it off like every list, and an allowlist or an Allow rule wins
+  over it as over any list.
+- No copy of the catalog or of the services' lists is ever written to disk.
+- Caps: a catalog of at most 2 MiB, read once and freed at once; at most 1000 services; an id and
+  a name of at most 64 bytes, a group of at most 32, at most 2000 rules of at most 256 bytes per
+  service (a service over a cap is left out); the services switched on hold at most 20,000 rules
+  together (AdGuard's whole catalog held 2,406 in 2026). Exception rules (`@@`) and rules with
+  `$badfilter` or `$important` are left out: a service only blocks, and never changes other lists.
+- Memory: the index of the catalog (ids, names and groups) holds about 12 KB, and every service
+  of a catalog of AdGuard's size switched on about 100 KB. The index is not part of the memory
+  estimate; the lists are.
+
 ## `[cache]`
 
 | Key | Default | Meaning |
@@ -231,6 +574,7 @@ These keep memory fixed. The defaults fit a 256 MB board; you rarely change them
 | `tcp_write_timeout_secs` | `5` | Close a TCP client that does not read its reply in this time. |
 | `upstream_reply_max` | `65536` | Largest upstream reply accepted, in bytes. |
 | `pending_bytes` | `1048576` | One shared budget for replies held for delivery. When used up, new queries get SERVFAIL (TCP) or are dropped (UDP). |
+| `memory_mb` | `48` | The budget of the [memory estimate](#the-memory-budget): a list added or turned on from the page, a refresh of a page list and a larger cache set on the page must keep the estimate within it. Lists of this file are never checked. |
 
 ## `[web]`
 
@@ -240,8 +584,8 @@ can pause blocking for a set time, refresh the lists, clear the DNS cache, block
 and check which rule decides a name.
 
 Without a password the page is read-only and limited: it shows totals and list status only. The
-query log, pause, resume, refresh, Clear cache, `/api/rules`, `/api/rules/remove` and
-`/api/explain` answer 403 ("set web.user and web.password_hash (or web.password) to use this"),
+query log, pause, resume, refresh, Clear cache, `/api/rules`, `/api/rules/remove`,
+`/api/explain` and `/api/settings` answer 403 ("set web.user and web.password_hash (or web.password) to use this"),
 and the page says so. The top lists, the
 upstream servers and the cache size are left out of `/api/status`, and the page hides them.
 picoguard logs one warning at start when no password is set. Every device that may open the page
@@ -332,8 +676,9 @@ Each row of the query log has **Block** (or **Allow** when the query was blocked
 Block and Allow add a rule for that name and its subdomains; the Lists tab shows them in the card
 **Your rules**, each with **Remove**, and your config `rules` read-only below them.
 
-- The rules are kept in memory only. A restart or an update clears them, and nothing is written
-  to disk. Add a rule you want to keep to `rules` in the config.
+- The rules are saved on the device (see "Settings saved from the status page") and are back
+  after a restart or an update. A change is saved before it is in force; one that cannot be saved
+  answers 503 and changes nothing.
 - At most 500 names.
 - A name is trimmed, lowercased and loses one trailing dot. It must then be 1 to 253 characters in
   at least two labels of 1 to 63 letters, digits, hyphens or underscores, none starting with a
@@ -372,7 +717,7 @@ rules as every other change:
 | `GET /api/rules` | | `{"rules": [{"name": "ads.example", "action": "block"}], "config_rules": ["@@\|\|good.example^"], "max": 500}` |
 | `POST /api/rules` | `{"name": "...", "action": "block"}` or `"allow"` | the same as `GET`; 400 or 409 |
 | `POST /api/rules/remove` | `{"name": "..."}` | the same as `GET`; 404 `{"error": "no such rule"}` |
-| `GET /api/explain?name=...` | | `{"name": "ads.example", "decision": "blocked", "list": "config rules", "rule": "\|\|ads.example^"}`; `decision` is `blocked`, `allowed` or `none` (then `list` and `rule` are `null`) |
+| `GET /api/explain?name=...` | | `{"name": "ads.example", "decision": "blocked", "list": "config rules", "rule": "\|\|ads.example^"}`; `decision` is `blocked`, `allowed`, `rewritten` (see [Rewrites and SafeSearch from the page](#rewrites-and-safesearch-from-the-page)) or `none` (then `list` and `rule` are `null`) |
 
 The name in `/api/explain` is read as sent, without percent-decoding: a domain name never needs
 it.
@@ -390,8 +735,8 @@ Statistics and the query log live in memory only and are lost on restart.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `dir` | `"/var/lib/picoguard"` | Where list snapshots go. The systemd unit creates this directory (`StateDirectory=picoguard`). |
-| `persist_lists` | `true` | Keep a copy of each changed list on disk. This is the only routine write. When `false`, nothing is written; lists live in memory and download again at every start. |
+| `dir` | `"/var/lib/picoguard"` | Where list snapshots and the settings saved from the status page (`settings.json`) go. The systemd unit creates this directory (`StateDirectory=picoguard`). |
+| `persist_lists` | `true` | Keep a copy of each changed list on disk. This is the only routine write; `settings.json` is written only when you save a change on the page. When `false`, no list is written; lists live in memory and download again at every start. |
 
 ## `[update]`
 

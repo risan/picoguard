@@ -46,6 +46,8 @@ pub enum QueryResult {
     /// The answer (a CNAME target or an address) matched a rule.
     BlockedResponse,
     Cached,
+    /// Answered from a rewrite or SafeSearch (plan D7).
+    Rewritten,
     /// SERVFAIL or no usable answer.
     Error,
 }
@@ -69,6 +71,7 @@ pub struct Counters {
     pub blocked_response: u64,
     pub cached: u64,
     pub upstream: u64,
+    pub rewritten: u64,
     pub errors: u64,
     /// Queries shed under overload. They are not part of `total`.
     pub dropped: u64,
@@ -340,6 +343,7 @@ impl Stats {
             QueryResult::BlockedRequest => inner.counters.blocked_request += 1,
             QueryResult::BlockedResponse => inner.counters.blocked_response += 1,
             QueryResult::Cached => inner.counters.cached += 1,
+            QueryResult::Rewritten => inner.counters.rewritten += 1,
             QueryResult::Error => inner.counters.errors += 1,
         }
 
@@ -509,6 +513,7 @@ mod tests {
             (QueryResult::BlockedRequest, 2),
             (QueryResult::BlockedResponse, 4),
             (QueryResult::Cached, 5),
+            (QueryResult::Rewritten, 6),
             (QueryResult::Error, 1),
         ];
         for (result, times) in results {
@@ -523,11 +528,12 @@ mod tests {
         assert_eq!(
             stats.snapshot().counters,
             Counters {
-                total: 15,
+                total: 21,
                 blocked_request: 2,
                 blocked_response: 4,
                 cached: 5,
                 upstream: 3,
+                rewritten: 6,
                 errors: 1,
                 dropped: 2,
             }

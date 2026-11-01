@@ -15,6 +15,7 @@ use super::engine::{
     CompiledList, Decision, Engine, ListBuilder, MAX_HOST_GROUPS, SlowRule, TYPE_A,
 };
 use super::parse::{ListFormat, ParseSummary, Parser, Rule};
+use super::pattern::{PatternError, too_complex_build_bytes};
 use super::snapshot::{self, Snapshot, SnapshotError};
 use crate::lists::{PIECE_QUEUE, Piece, PieceSender};
 
@@ -71,7 +72,12 @@ const SLOW_RULE_BYTES: usize = 512;
 
 /// What the compiler's duplicate check keeps for every distinct slow rule it sees, valid or
 /// not: a `u128` hash and the table slack around it.
-const SEEN_SLOW_RULE_BYTES: usize = 32;
+pub(super) const SEEN_SLOW_RULE_BYTES: usize = 32;
+
+/// What a plain or host rule holds at the peak of a compile: its hash in an array that grows
+/// by doubling (the old and new array both live while it moves) and that is trimmed at the end.
+/// Measured on real lists in `tests/list_heap_memory.rs`.
+pub const COMPILE_PEAK_BYTES_PER_RULE: usize = 24;
 pub(super) const TEXT_BYTE_COST: usize = 4;
 
 /// What each name of a modifier (`$denyallow`, `$client`, `$ctag`) costs besides its text.
@@ -181,6 +187,8 @@ pub enum CompileError {
     OverRuleCap,
     /// The list blocks a canary name, so it would block (nearly) everything.
     BlocksCanary,
+    /// The compile passed the bytes it was admitted with (plan D6).
+    OverMemoryBudget,
 }
 
 /// A compile job that is waiting for text. Send the pieces, then `Piece::End`, then await
@@ -203,6 +211,7 @@ impl Compilation {
 enum Job {
     Compile {
         options: CompileOptions,
+        admission_bytes: usize,
         pieces: mpsc::Receiver<Piece>,
         reply: oneshot::Sender<Result<Compiled, CompileError>>,
     },
@@ -214,6 +223,7 @@ enum Job {
     Run(Box<dyn FnOnce() + Send>),
 }
 
+#[derive(Clone)]
 pub struct CompileWorker {
     jobs: std_mpsc::Sender<Job>,
 }
@@ -230,10 +240,18 @@ impl CompileWorker {
 
     /// Starts a compile job; the worker then waits for its pieces.
     pub fn start(&self, options: CompileOptions) -> Compilation {
+        self.start_within(options, usize::MAX)
+    }
+
+    /// `start`, for a compile that stops at once when its rules are charged more than
+    /// `admission_bytes` (`compile_charge` of the result). The bytes are not an option of the
+    /// list: a list compiled within them is exactly the list `start` gives, fingerprint and all.
+    pub fn start_within(&self, options: CompileOptions, admission_bytes: usize) -> Compilation {
         let (pieces, receiver) = mpsc::channel(PIECE_QUEUE);
         let (reply, result) = oneshot::channel();
         let _ = self.jobs.send(Job::Compile {
             options,
+            admission_bytes,
             pieces: receiver,
             reply,
         });
@@ -301,10 +319,11 @@ fn run(queue: std_mpsc::Receiver<Job>) {
         match job {
             Job::Compile {
                 options,
+                admission_bytes,
                 pieces,
                 reply,
             } => {
-                let _ = reply.send(compile(options, pieces));
+                let _ = reply.send(compile(options, admission_bytes, pieces));
             }
 
             Job::Load {
@@ -322,8 +341,51 @@ fn run(queue: std_mpsc::Receiver<Job>) {
     }
 }
 
+/// What a compile is charged against its admission limit (plan D6): every rule as it comes,
+/// duplicates included, and the most it needed at one moment, while a regex was built. A
+/// compile of the same text again needs exactly `charge` (`CompiledList::compile_charge`).
+struct Admission {
+    left: usize,
+    charged: usize,
+    peak: usize,
+}
+
+impl Admission {
+    fn new(limit: usize) -> Admission {
+        Admission {
+            left: limit,
+            charged: 0,
+            peak: 0,
+        }
+    }
+
+    /// Records `bytes` held for a moment on top of what is charged; the caller made sure they
+    /// fit.
+    fn note(&mut self, bytes: usize) {
+        self.peak = self.peak.max(self.charged + bytes);
+    }
+
+    /// Charges `bytes` for good; false when they do not fit.
+    fn take(&mut self, bytes: usize) -> bool {
+        let Some(left) = self.left.checked_sub(bytes) else {
+            return false;
+        };
+
+        self.left = left;
+        self.charged += bytes;
+        self.peak = self.peak.max(self.charged);
+
+        true
+    }
+
+    fn charge(&self) -> usize {
+        self.peak
+    }
+}
+
 fn compile(
     options: CompileOptions,
+    admission_bytes: usize,
     mut pieces: mpsc::Receiver<Piece>,
 ) -> Result<Compiled, CompileError> {
     let mut builder = ListBuilder::new();
@@ -331,10 +393,12 @@ fn compile(
         .allow_redirects(options.allow_redirects);
     let mut hasher = Xxh3::new();
     let mut budget = SlowRuleBudget::new(options.slow_rule_budget);
+    let mut admission = Admission::new(admission_bytes);
     let mut seen_slow_rules = HashSet::new();
     let over_budget = Cell::new(false);
+    let over_admission = Cell::new(false);
     let mut sink = |rule: Rule<'_>| {
-        if over_budget.get() {
+        if over_budget.get() || over_admission.get() {
             return;
         }
 
@@ -344,8 +408,37 @@ fn compile(
                 return;
             }
 
+            // Every slow rule is charged at least `floor`, a failed one exactly that. What the
+            // admission leaves after it and the rule's own part bounds its regex while it is
+            // built, so a refused rule never holds its automaton first.
             let pattern_len = slow.pattern.len();
-            let compiled = SlowRule::compile(slow);
+            let floor = SEEN_SLOW_RULE_BYTES + TEXT_BYTE_COST * pattern_len;
+            let room = admission.left.saturating_sub(floor + SLOW_RULE_BYTES);
+            let compiled = match SlowRule::compile_within(slow, room) {
+                Ok(compiled) => {
+                    admission.note(floor + SLOW_RULE_BYTES + compiled.build_bytes());
+
+                    Ok(compiled)
+                }
+
+                Err(PatternError::TooBig) => {
+                    over_admission.set(true);
+
+                    return;
+                }
+
+                Err(PatternError::TooComplex) => {
+                    admission.note(floor + SLOW_RULE_BYTES + too_complex_build_bytes());
+
+                    Err(())
+                }
+
+                Err(PatternError::Regex(_, held)) => {
+                    admission.note(floor + SLOW_RULE_BYTES + held);
+
+                    Err(())
+                }
+            };
             let charged = budget.charge_seen().and_then(|()| match &compiled {
                 Ok(compiled) => budget.charge(compiled),
                 Err(()) => budget.charge_failed(pattern_len),
@@ -356,7 +449,23 @@ fn compile(
                 return;
             }
 
+            let charge = SEEN_SLOW_RULE_BYTES
+                + compiled
+                    .as_ref()
+                    .map_or(TEXT_BYTE_COST * pattern_len, slow_rule_cost);
+            if !admission.take(charge) {
+                over_admission.set(true);
+
+                return;
+            }
+
             builder.add_slow(compiled);
+
+            return;
+        }
+
+        if !admission.take(COMPILE_PEAK_BYTES_PER_RULE) {
+            over_admission.set(true);
 
             return;
         }
@@ -381,6 +490,10 @@ fn compile(
                 if over_budget.get() {
                     return Err(CompileError::OverBudget);
                 }
+
+                if over_admission.get() {
+                    return Err(CompileError::OverMemoryBudget);
+                }
             }
 
             Some(Piece::End) => break,
@@ -394,12 +507,18 @@ fn compile(
         return Err(CompileError::OverBudget);
     }
 
+    if over_admission.get() {
+        return Err(CompileError::OverMemoryBudget);
+    }
+
     if summary.counters.over_cap > 0 {
         return Err(CompileError::OverRuleCap);
     }
 
     let content_hash = hasher.digest128();
-    let list = Arc::new(builder.finish(summary.format));
+    let mut list = builder.finish(summary.format);
+    list.compile_charge = admission.charge();
+    let list = Arc::new(list);
     if options.check_canaries && blocks_a_canary(&list) {
         return Err(CompileError::BlocksCanary);
     }
@@ -723,6 +842,107 @@ mod tests {
 
         assert_eq!(at_the_cap.list.rule_count(), 2);
         assert_eq!(over_the_cap.err(), Some(CompileError::OverRuleCap));
+        let next = compile_in_pieces(&worker, options(ListFormat::Auto), LIST.as_bytes(), 100)
+            .await
+            .unwrap();
+        assert!(blocked(&next.list, "ads.example"));
+    }
+
+    async fn compile_within(
+        worker: &CompileWorker,
+        admission_bytes: usize,
+        text: &[u8],
+    ) -> Result<Compiled, CompileError> {
+        let compilation = worker.start_within(options(ListFormat::Auto), admission_bytes);
+        for piece in text.chunks(64) {
+            if compilation
+                .pieces
+                .send(Piece::Data(piece.to_vec()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        let _ = compilation.pieces.send(Piece::End).await;
+
+        compilation.result().await
+    }
+
+    #[tokio::test]
+    async fn a_list_admitted_within_its_charge_is_the_list_compiled_without_a_limit() {
+        let worker = CompileWorker::spawn().unwrap();
+        let free = compile_in_pieces(&worker, options(ListFormat::Auto), LIST.as_bytes(), 64)
+            .await
+            .unwrap();
+        let charge = free.list.compile_charge();
+
+        let admitted = compile_within(&worker, charge, LIST.as_bytes())
+            .await
+            .unwrap();
+        let refused = compile_within(&worker, charge - 1, LIST.as_bytes()).await;
+
+        assert_eq!(admitted.fingerprint, free.fingerprint);
+        assert_eq!(admitted.list.rule_count(), free.list.rule_count());
+        assert_eq!(admitted.list.heap_bytes(), free.list.heap_bytes());
+        assert_eq!(refused.err(), Some(CompileError::OverMemoryBudget));
+    }
+
+    #[tokio::test]
+    async fn every_copy_of_a_rule_is_in_the_charge_so_the_same_list_is_admitted_again() {
+        const COPIES: usize = 100_000;
+        let worker = CompileWorker::spawn().unwrap();
+        let text = "||same.example^\n".repeat(COPIES);
+        let uncapped = CompileOptions {
+            max_rules: COPIES as u32,
+            ..options(ListFormat::Auto)
+        };
+        let free = compile_in_pieces(&worker, uncapped, text.as_bytes(), 64 * 1024)
+            .await
+            .unwrap();
+        let charge = free.list.compile_charge();
+
+        assert_eq!(free.list.rule_count(), 1);
+        assert_eq!(charge, COPIES * COMPILE_PEAK_BYTES_PER_RULE);
+        let again = worker.start_within(uncapped, charge);
+        again
+            .pieces
+            .send(Piece::Data(text.as_bytes().to_vec()))
+            .await
+            .unwrap();
+        again.pieces.send(Piece::End).await.unwrap();
+        assert_eq!(again.result().await.unwrap().list.compile_charge(), charge);
+    }
+
+    #[tokio::test]
+    async fn a_list_past_its_admission_stops_at_once_and_the_worker_goes_on() {
+        let worker = CompileWorker::spawn().unwrap();
+        let text: String = (0..100_000).map(|i| format!("||n{i}.example^\n")).collect();
+        let compilation =
+            worker.start_within(options(ListFormat::Auto), 100 * COMPILE_PEAK_BYTES_PER_RULE);
+        let mut sent = 0;
+        for piece in text.as_bytes().chunks(1024) {
+            if compilation
+                .pieces
+                .send(Piece::Data(piece.to_vec()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+
+            sent += piece.len();
+        }
+
+        assert_eq!(
+            compilation.result().await.err(),
+            Some(CompileError::OverMemoryBudget)
+        );
+        assert!(
+            sent < text.len() / 10,
+            "{sent} bytes were taken before it stopped"
+        );
         let next = compile_in_pieces(&worker, options(ListFormat::Auto), LIST.as_bytes(), 100)
             .await
             .unwrap();

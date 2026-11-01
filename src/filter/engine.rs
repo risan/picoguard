@@ -17,9 +17,11 @@ use std::sync::Arc;
 
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
+use super::compile::{COMPILE_PEAK_BYTES_PER_RULE, SEEN_SLOW_RULE_BYTES, slow_rule_cost};
 use super::parse::{FastKind, ListFormat, NetworkRule, ParseSummary, Parser, Rule, fast_rule};
 use super::pattern::{
-    Matcher, for_each_exact_candidate, for_each_strict_suffix_candidate, for_each_suffix_candidate,
+    Matcher, PatternError, for_each_exact_candidate, for_each_strict_suffix_candidate,
+    for_each_suffix_candidate,
 };
 
 pub const TYPE_A: u16 = 1;
@@ -106,13 +108,27 @@ pub(super) struct SlowRule {
 impl SlowRule {
     /// Fails when the pattern is a regular expression the `regex` crate rejects.
     pub(super) fn compile(rule: NetworkRule) -> Result<SlowRule, ()> {
-        let matcher = Matcher::compile(&rule.pattern).map_err(|_| ())?;
+        SlowRule::compile_within(rule, usize::MAX).map_err(|_| ())
+    }
+
+    /// `compile` with a regex that may hold at most `size_limit` bytes while it is built (see
+    /// `Matcher::compile_within`).
+    pub(super) fn compile_within(
+        rule: NetworkRule,
+        size_limit: usize,
+    ) -> Result<SlowRule, PatternError> {
+        let matcher = Matcher::compile_within(&rule.pattern, size_limit)?;
 
         Ok(SlowRule {
             identity: identity_hash(&rule),
             matcher,
             rule,
         })
+    }
+
+    /// The most that building the matcher held at once.
+    pub(super) fn build_bytes(&self) -> usize {
+        self.matcher.build_bytes()
     }
 
     /// What the compiled matcher costs in the slow-rule budget.
@@ -128,6 +144,9 @@ pub struct CompiledList {
     pub(super) hosts: HostRules,
     pub(super) slow: Vec<SlowRule>,
     pub(super) regex_failed: u64,
+    /// What a compile of the same text is charged against the memory budget at its peak
+    /// (see `compile_charge`).
+    pub(super) compile_charge: usize,
 }
 
 impl CompiledList {
@@ -175,6 +194,28 @@ impl CompiledList {
         self.slow.len()
     }
 
+    /// The heap the list holds: the capacities of its arrays, and its slow rules as the
+    /// slow-rule budget estimates them (plan D6).
+    pub fn heap_bytes(&self) -> usize {
+        let arrays = self
+            .fast
+            .iter()
+            .chain([&self.hosts.entries])
+            .map(|hashes| hashes.capacity() * size_of::<u64>())
+            .sum::<usize>()
+            + self.hosts.ips.capacity() * size_of::<IpAddr>()
+            + self.slow.capacity() * size_of::<SlowRule>();
+
+        arrays + self.slow.iter().map(slow_rule_cost).sum::<usize>()
+    }
+
+    /// What compiling this list again is charged against the memory budget at its peak: every
+    /// plain rule of the text, duplicates included, its slow rules, and the most a regex held
+    /// while it was built (plan D6). A compile within exactly this many bytes is admitted.
+    pub fn compile_charge(&self) -> usize {
+        self.compile_charge
+    }
+
     /// Slow rules dropped because their regular expression does not compile.
     pub fn regex_failed(&self) -> u64 {
         self.regex_failed
@@ -188,6 +229,8 @@ pub struct ListBuilder {
     host_index: HashMap<IpAddr, usize>,
     slow: Vec<SlowRule>,
     regex_failed: u64,
+    /// Plain and host rules added, duplicates included.
+    plain_added: usize,
 }
 
 impl Default for ListBuilder {
@@ -204,6 +247,7 @@ impl ListBuilder {
             host_index: HashMap::new(),
             slow: Vec::new(),
             regex_failed: 0,
+            plain_added: 0,
         }
     }
 
@@ -215,6 +259,10 @@ impl ListBuilder {
     /// Adds a rule. A host rule that would start a group past `MAX_HOST_GROUPS` is left out;
     /// the compile worker refuses such a list before it gets here.
     pub fn add(&mut self, rule: Rule<'_>) {
+        if !matches!(rule, Rule::Slow(_)) {
+            self.plain_added += 1;
+        }
+
         match rule {
             Rule::Host { ip, name } => {
                 let group = match self.host_index.get(&ip) {
@@ -259,11 +307,20 @@ impl ListBuilder {
         self.hosts.ips.shrink_to_fit();
         self.slow.shrink_to_fit();
 
+        // The compile worker charges each rule as it comes and replaces this.
+        let compile_charge = self.plain_added * COMPILE_PEAK_BYTES_PER_RULE
+            + self
+                .slow
+                .iter()
+                .map(|slow| slow_rule_cost(slow) + SEEN_SLOW_RULE_BYTES + slow.build_bytes())
+                .sum::<usize>();
+
         CompiledList {
             fast: self.fast,
             hosts: self.hosts,
             slow: self.slow,
             regex_failed: self.regex_failed,
+            compile_charge,
         }
     }
 

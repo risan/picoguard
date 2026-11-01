@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use common::http::ListServer;
 use common::release::{Files, TARGET, scratch, sign_with, sums_line, test_key};
+use picoguard::lists::Names;
 use picoguard::release::Request;
 use picoguard::stage::{InstallView, Refused, StageSetup, StageTiming, Stager};
 use picoguard::update::{Build, Latest, Updates};
@@ -85,7 +86,9 @@ fn stager_from(setup: StageSetup, updates: Arc<Updates>) -> Arc<Stager> {
     Stager::new(
         setup,
         updates,
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     )
 }

@@ -1,8 +1,8 @@
 use std::net::IpAddr;
 
 use super::wire::{
-    CLASS_IN, HEADER_LEN, Header, MAX_MESSAGE_LEN, MAX_NAME_LEN, Query, flags, rcode, remove_opt,
-    rtype,
+    CLASS_IN, HEADER_LEN, Header, MAX_MESSAGE_LEN, MAX_NAME_LEN, Name, Query, flags, rcode,
+    remove_opt, rtype,
 };
 
 const CLASSIC_UDP_LIMIT: u16 = 512;
@@ -56,6 +56,16 @@ pub struct ReplyParts<'a> {
     pub bytes: &'a [u8],
     pub ttl_offsets: &'a [u16],
     pub opt_start: Option<u16>,
+}
+
+impl ReplyParts<'_> {
+    /// The upper 8 bits of the RCODE, from the OPT record (0 without one).
+    pub fn extended_rcode(&self) -> u8 {
+        self.opt_start
+            .and_then(|start| self.bytes.get(usize::from(start) + OPT_EXTENDED_RCODE_AT))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// Writes the reply to one client query.
@@ -178,11 +188,7 @@ impl<'q, 'a> Reply<'q, 'a> {
 
         // The upper 8 bits of the RCODE live in the OPT record's TTL field. Only
         // a client that sent an OPT can be given them.
-        let extended_rcode = parts
-            .opt_start
-            .and_then(|start| parts.bytes.get(usize::from(start) + OPT_EXTENDED_RCODE_AT))
-            .copied()
-            .unwrap_or(0);
+        let extended_rcode = parts.extended_rcode();
         if extended_rcode != 0 && self.query.edns.is_none() {
             self.error(rcode::SERVFAIL, out);
 
@@ -365,6 +371,32 @@ pub fn compact_query(query: &Query<'_>) -> Vec<u8> {
     out.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
     out.extend_from_slice(&u16::from(query.edns.is_some()).to_be_bytes());
     out.extend_from_slice(question);
+
+    if let Some(edns) = query.edns {
+        push_opt_record(&mut out, edns.udp_size, query.dnssec_ok(), 0);
+    }
+
+    out
+}
+
+/// `compact_query` with `name` asked in place of the client's name: the same type, flags and
+/// EDNS, so it is cached and coalesced like a client asking for `name` itself.
+pub fn query_for(query: &Query<'_>, name: &Name) -> Vec<u8> {
+    let wire = name.as_wire();
+    let opt_len = if query.edns.is_some() {
+        OPT_RECORD_LEN
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(HEADER_LEN + wire.len() + 4 + opt_len);
+
+    out.extend_from_slice(&query.id().to_be_bytes());
+    out.extend_from_slice(&query.header.flags.to_be_bytes());
+    out.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
+    out.extend_from_slice(&u16::from(query.edns.is_some()).to_be_bytes());
+    out.extend_from_slice(wire);
+    out.extend_from_slice(&query.question.qtype.to_be_bytes());
+    out.extend_from_slice(&query.question.qclass.to_be_bytes());
 
     if let Some(edns) = query.edns {
         push_opt_record(&mut out, edns.udp_size, query.dnssec_ok(), 0);

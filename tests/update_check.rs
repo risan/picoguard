@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::http::ListServer;
 use picoguard::config::{Config, UpdateConfig, WebConfig};
-use picoguard::lists::Downloader;
+use picoguard::lists::{Downloader, Names};
 use picoguard::update::{
     Build, CheckTiming, Checker, Failure, Latest, Outcome, Updates, parse_running, start,
 };
@@ -25,7 +25,9 @@ const PATH: &str = "/latest";
 
 fn checker(url: &str) -> Checker {
     let downloader = Downloader::new(
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
     );
 
@@ -362,7 +364,9 @@ fn started(config: &Config, url: &str, timing: CheckTiming) -> Option<tokio::tas
     start(
         config,
         url,
-        Arc::new(|_| Box::pin(async { Err(io::Error::other("no DNS in this test")) })),
+        Names::Resolver(Arc::new(|_| {
+            Box::pin(async { Err(io::Error::other("no DNS in this test")) })
+        })),
         Arc::new(Tls::with_webpki_roots()),
         Arc::new(updates()),
         timing,

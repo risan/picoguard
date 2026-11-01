@@ -200,3 +200,71 @@ fn a_session_survives_a_restart_of_the_binary_without_writing_to_disk() {
     assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
     drop(server);
 }
+
+/// `admin` and `s3cret`.
+const ADMIN: &str = "YWRtaW46czNjcmV0";
+
+fn admin_config(dns_port: u16, web_port: u16, state_dir: &Path) -> String {
+    config_in(dns_port, web_port, true, state_dir).replace(
+        "[web]\n",
+        "[web]\nuser = \"admin\"\npassword = \"s3cret\"\n",
+    )
+}
+
+fn as_admin(port: u16, method: &str, path: &str, body: &str) -> String {
+    exchange(
+        port,
+        &format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Basic {ADMIN}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .expect("an answer")
+}
+
+fn modified(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
+}
+
+#[test]
+fn saved_rules_are_in_force_after_a_restart_and_a_start_writes_nothing() {
+    let state = common::release::scratch("web-binary-saved-rules");
+    let web_port = free_tcp_port();
+
+    let server = Stopped(start("web-saved-rules.toml", |port| {
+        admin_config(port, web_port, &state)
+    }));
+    let added = as_admin(
+        web_port,
+        "POST",
+        "/api/rules",
+        "{\"name\": \"saved.example\", \"action\": \"block\"}",
+    );
+    assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+    drop(server);
+    let file = state.join("settings.json");
+    let files = listing(&state);
+    let written = modified(&file);
+
+    let server = Stopped(start("web-saved-rules.toml", |port| {
+        admin_config(port, web_port, &state)
+    }));
+    let rules = as_admin(web_port, "GET", "/api/rules", "");
+    let explained = as_admin(web_port, "GET", "/api/explain?name=a.saved.example", "");
+    let settings = as_admin(web_port, "GET", "/api/settings", "");
+
+    assert!(
+        rules.contains("{\"name\":\"saved.example\",\"action\":\"block\"}"),
+        "{rules}"
+    );
+    assert!(
+        explained.contains("\"decision\":\"blocked\"") && explained.contains("\"your rules\""),
+        "{explained}"
+    );
+    assert!(settings.contains("\"error\":null"), "{settings}");
+    assert!(!settings.contains("s3cret"), "{settings}");
+    assert_eq!(listing(&state), files);
+    assert_eq!(modified(&file), written);
+    drop(server);
+}

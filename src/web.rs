@@ -1,5 +1,5 @@
-//! The status page and its JSON API (plan D16). One HTML page, six reads, seven mutations, and
-//! sign-in and sign-out. A web page on another device of the LAN must not be able to pause
+//! The status page and its JSON API (plan D16). One HTML page, seven reads, twelve mutations,
+//! and sign-in and sign-out. A web page on another device of the LAN must not be able to pause
 //! blocking, so every request passes the access policy before it reaches a handler:
 //!
 //! - a peer outside `web.allow_from` is closed before a byte is read;
@@ -12,8 +12,10 @@
 //!   log and every change answer 403;
 //! - a mutation must be `POST` with `Content-Type: application/json` (which a cross-site form
 //!   cannot send, and a cross-site script can only send after a CORS preflight that is never
-//!   answered), carry no `Origin` other than the page's own, and have a body of at most 1 KiB.
+//!   answered), carry no `Origin` other than the page's own, and have a body of at most 1 KiB
+//!   (64 KiB for the settings).
 
+use std::borrow::Cow;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -33,13 +35,20 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
-use crate::config::{Cidr, Config, ListFormat, WebConfig, is_allowed};
+use crate::config::{Cidr, Config, ListFormat, Rewrite, WebConfig, is_allowed};
+use crate::dns::wire::Name;
+use crate::memory::{self, Memory};
 use crate::pipeline::{CacheSize, Pipeline, ServerKind, ServerTally};
 use crate::policy::Policy;
+use crate::rewrites::{By, normalized};
 use crate::scheduler::{
-    Action, ButtonRule, ListControl, ListStatus, MAX_BUTTON_RULES, Role, RuleError, normalized_name,
+    Action, ButtonRule, ListControl, ListEdit, ListError, ListStatus, MAX_BUTTON_RULES,
+    PendingList, Role, RuleError, normalized_name,
 };
 use crate::server::bind_tcp;
+use crate::settings::{
+    CacheSettings, ChangeError, ListRole, PageChange, SaveError, UpstreamSettings,
+};
 use crate::stage::{Refused, Stager};
 use crate::stats::{Counters, HourlyBucket, QueryLogEntry, TopEntry};
 use crate::update::{Tag, UpdateView, Updates, parse_tag};
@@ -49,6 +58,8 @@ mod auth;
 const PAGE: &str = include_str!("web/index.html");
 
 const MAX_BODY_BYTES: usize = 1024;
+/// A settings change carries whole lists (upstreams, rewrites, services).
+const MAX_SETTINGS_BODY_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 /// The smallest buffer hyper accepts; it bounds the request line and headers together.
 const MAX_HEAD_BYTES: usize = 8 * 1024;
@@ -63,6 +74,7 @@ const MAX_PAUSE_MINUTES: u32 = 24 * 60;
 const DEFAULT_QUERY_LOG_LIMIT: usize = 100;
 const PASSWORD_NEEDED: &str = "set web.user and web.password_hash (or web.password) to use this";
 const NOT_A_DOMAIN_NAME: &str = "not a domain name";
+const HIDDEN_LIST_ERROR: &str = "the last refresh failed (set a password to see why)";
 
 /// Everything the handlers read or change.
 pub struct Web {
@@ -219,6 +231,8 @@ enum Read {
     Lists,
     Rules,
     Explain,
+    Settings,
+    Services,
 }
 
 /// Answered to `POST` only.
@@ -233,6 +247,20 @@ enum Change {
     Logout,
     AddRule,
     RemoveRule,
+    Settings,
+    AddList,
+    EditList,
+    RemoveList,
+    ResetLists,
+}
+
+impl Change {
+    fn max_body_bytes(self) -> usize {
+        match self {
+            Change::Settings => MAX_SETTINGS_BODY_BYTES,
+            _ => MAX_BODY_BYTES,
+        }
+    }
 }
 
 enum Route {
@@ -241,13 +269,16 @@ enum Route {
 }
 
 impl Route {
-    /// `/api/rules` is the one path with a read and a change: `GET` lists, `POST` adds.
+    /// `/api/rules` and `/api/settings` have a read and a change: `GET` reads, `POST` changes.
     fn of(path: &str, method: &Method) -> Option<Route> {
         match path {
             "/api/rules" if method == Method::POST => Some(Route::Change(Change::AddRule)),
             "/api/rules" => Some(Route::Read(Read::Rules)),
+            "/api/settings" if method == Method::POST => Some(Route::Change(Change::Settings)),
+            "/api/settings" => Some(Route::Read(Read::Settings)),
             "/api/rules/remove" => Some(Route::Change(Change::RemoveRule)),
             "/api/explain" => Some(Route::Read(Read::Explain)),
+            "/api/services" => Some(Route::Read(Read::Services)),
             "/" => Some(Route::Read(Read::Page)),
             "/api/status" => Some(Route::Read(Read::Status)),
             "/api/querylog" => Some(Route::Read(Read::QueryLog)),
@@ -255,6 +286,10 @@ impl Route {
             "/api/pause" => Some(Route::Change(Change::Pause)),
             "/api/resume" => Some(Route::Change(Change::Resume)),
             "/api/lists/refresh" => Some(Route::Change(Change::RefreshLists)),
+            "/api/lists/add" => Some(Route::Change(Change::AddList)),
+            "/api/lists/edit" => Some(Route::Change(Change::EditList)),
+            "/api/lists/remove" => Some(Route::Change(Change::RemoveList)),
+            "/api/lists/reset" => Some(Route::Change(Change::ResetLists)),
             "/api/cache/clear" => Some(Route::Change(Change::ClearCache)),
             "/api/update" => Some(Route::Change(Change::Install)),
             "/api/login" => Some(Route::Change(Change::Login)),
@@ -266,7 +301,8 @@ impl Route {
     /// What a 405 names in `Allow`.
     fn allowed_methods(&self) -> &'static str {
         match self {
-            Route::Read(Read::Rules) | Route::Change(Change::AddRule) => "GET, POST",
+            Route::Read(Read::Rules | Read::Settings)
+            | Route::Change(Change::AddRule | Change::Settings) => "GET, POST",
             Route::Read(_) => "GET",
             Route::Change(_) => "POST",
         }
@@ -279,10 +315,13 @@ impl Route {
     }
 
     /// Whether the page shows this only to a signed-in user: the query log, the top lists,
-    /// the page's rules, the name check and every change.
+    /// the page's rules, the name check, the settings and every change.
     fn needs_password(&self) -> bool {
         match self {
-            Route::Read(Read::QueryLog | Read::Rules | Read::Explain) | Route::Change(_) => true,
+            Route::Read(
+                Read::QueryLog | Read::Rules | Read::Explain | Read::Settings | Read::Services,
+            )
+            | Route::Change(_) => true,
             Route::Read(Read::Page | Read::Status | Read::Lists) => false,
         }
     }
@@ -291,15 +330,15 @@ impl Route {
 /// A request that is answered with an error and nothing else.
 struct Rejection {
     status: StatusCode,
-    message: &'static str,
+    message: Cow<'static, str>,
     header: Option<(HeaderName, &'static str)>,
 }
 
 impl Rejection {
-    fn new(status: StatusCode, message: &'static str) -> Rejection {
+    fn new(status: StatusCode, message: impl Into<Cow<'static, str>>) -> Rejection {
         Rejection {
             status,
-            message,
+            message: message.into(),
             header: None,
         }
     }
@@ -312,14 +351,14 @@ impl Rejection {
 
     fn into_response(self) -> Response<Full<Bytes>> {
         #[derive(Serialize)]
-        struct Body {
-            error: &'static str,
+        struct Body<'a> {
+            error: &'a str,
         }
 
         let mut response = json(
             self.status,
             &Body {
-                error: self.message,
+                error: &self.message,
             },
         );
         if let Some((name, value)) = self.header {
@@ -380,7 +419,7 @@ impl Web {
 
                 check_origin(&head.headers, host)?;
                 check_json_content_type(&head.headers)?;
-                let body = read_body(&head.headers, body).await?;
+                let body = read_body(&head.headers, body, change.max_body_bytes()).await?;
 
                 self.change(change, &body, &head.headers, peer).await
             }
@@ -499,18 +538,37 @@ impl Web {
                 ))
             }
 
-            Read::Lists => Ok(json(
-                StatusCode::OK,
-                &ListsView {
-                    lists: self.list_views(),
-                },
-            )),
+            Read::Lists => Ok(self.lists_response()),
 
             Read::Rules => Ok(self.rules_response().await),
+
+            Read::Settings => Ok(self.settings_response().await),
+
+            Read::Services => Ok(json(StatusCode::OK, &self.lists.services_view())),
 
             Read::Explain => {
                 let name = name_param(query)
                     .ok_or_else(|| Rejection::new(StatusCode::BAD_REQUEST, NOT_A_DOMAIN_NAME))?;
+                // A rewrite answers before any list.
+                let rewritten =
+                    Name::from_text(&name).and_then(|wire| self.pipeline.rewrite_explained(&wire));
+                if let Some((to, by)) = rewritten {
+                    let (list, by) = match by {
+                        By::User => ("your rewrites", "your rewrite"),
+                        By::SafeSearch => ("SafeSearch", "SafeSearch"),
+                    };
+
+                    return Ok(json(
+                        StatusCode::OK,
+                        &ExplainView {
+                            name,
+                            decision: "rewritten",
+                            list: Some(list.to_string()),
+                            rule: Some(format!("rewritten to {to} ({by})")),
+                        },
+                    ));
+                }
+
                 let explained = self.lists.explain(&name).await;
                 let decision = match &explained {
                     Some(explained) if explained.allowed => "allowed",
@@ -549,6 +607,60 @@ impl Web {
                 )
             })
             .await
+    }
+
+    /// Each value in force with where it comes from, read under the settings lock. Nothing of
+    /// `web` is ever part of it.
+    async fn settings_response(&self) -> Response<Full<Bytes>> {
+        let saved = self.lists.saved();
+        let settings = saved.lock().await;
+        let file = saved.file_config();
+        let upstream = match &settings.upstream {
+            Some(upstream) => UpstreamSetting {
+                servers: &upstream.servers,
+                bootstrap: &upstream.bootstrap,
+                from: Source::Page,
+            },
+            None => UpstreamSetting {
+                servers: &file.upstream.servers,
+                bootstrap: &file.upstream.bootstrap,
+                from: Source::File,
+            },
+        };
+        let cache = match &settings.cache {
+            Some(cache) => CacheSetting {
+                values: cache.clone(),
+                from: Source::Page,
+            },
+            None => CacheSetting {
+                values: CacheSettings::of(&file.cache),
+                from: Source::File,
+            },
+        };
+
+        json(
+            StatusCode::OK,
+            &SettingsView {
+                file: saved.path().display().to_string(),
+                error: saved.error(),
+                can_save: saved.can_save(),
+                upstream,
+                cache,
+                rewrites: RewritesSetting {
+                    entries: settings.rewrites.as_deref().unwrap_or(&file.rewrites),
+                    from: Source::of(&settings.rewrites),
+                },
+                safe_search: SafeSearchSetting {
+                    on: settings.safe_search.unwrap_or(file.safe_search),
+                    from: Source::of(&settings.safe_search),
+                },
+                services: ServicesSetting {
+                    block: settings.services.as_deref().unwrap_or(&file.services.block),
+                    from: Source::of(&settings.services),
+                },
+                memory: self.lists.memory(),
+            },
+        )
     }
 
     async fn change(
@@ -678,7 +790,105 @@ impl Web {
 
                 Ok(self.rules_response().await)
             }
+
+            Change::AddList => {
+                let request: AddListRequest = object_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"role\": \"block\" or \"allow\", \"name\": \"...\", \"url\": \"...\", \"refresh_hours\": 1 to 168}",
+                    )
+                })?;
+                let edit = ListEdit::Add {
+                    role: request.role,
+                    name: list_name(request.name)?,
+                    url: request.url,
+                    refresh_hours: request.refresh_hours,
+                };
+                self.lists
+                    .add_list(edit)
+                    .await
+                    .map_err(|error| list_rejection(&error))?;
+
+                Ok(json(StatusCode::ACCEPTED, &AddStarted { list: "checking" }))
+            }
+
+            Change::EditList => {
+                let request: EditListRequest = object_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"role\", \"source\"} with any of \"name\", \"refresh_hours\" and \"enabled\"",
+                    )
+                })?;
+                let edit = ListEdit::Edit {
+                    role: request.role,
+                    source: request.source,
+                    name: match request.name {
+                        Some(name) => Some(list_name(Some(name))?.unwrap_or_default()),
+                        None => None,
+                    },
+                    refresh_hours: request.refresh_hours,
+                    enabled: request.enabled,
+                };
+
+                self.change_lists(edit).await
+            }
+
+            Change::RemoveList => {
+                let request: ListSourceRequest = object_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send {\"role\": \"block\" or \"allow\", \"source\": \"...\"}",
+                    )
+                })?;
+                let edit = ListEdit::Remove {
+                    role: request.role,
+                    source: request.source,
+                };
+
+                self.change_lists(edit).await
+            }
+
+            Change::ResetLists => {
+                let _: Empty = object_request(body)
+                    .ok_or_else(|| Rejection::new(StatusCode::BAD_REQUEST, "send {}"))?;
+
+                self.change_lists(ListEdit::Reset).await
+            }
+
+            Change::Settings => {
+                let request = settings_request(body).ok_or_else(|| {
+                    Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "send an object of upstream, cache, rewrites, safe_search and services",
+                    )
+                })?;
+
+                let change = PageChange {
+                    upstream: request.upstream,
+                    cache: request.cache,
+                    rewrites: request
+                        .rewrites
+                        .map(|rewrites| rewrites.map(|list| list.iter().map(normalized).collect())),
+                    safe_search: request.safe_search,
+                    services: request.services,
+                };
+                self.lists
+                    .change_settings(&self.pipeline, change)
+                    .await
+                    .map_err(|error| change_rejection(&error))?;
+
+                Ok(self.settings_response().await)
+            }
         }
+    }
+
+    async fn change_lists(&self, edit: ListEdit) -> Result<Response<Full<Bytes>>, Rejection> {
+        self.lists
+            .change_lists(edit)
+            .await
+            .map_err(|error| list_rejection(&error))?;
+
+        Ok(self.lists_response())
     }
 
     /// Every change needs a password, so a change handler always has one.
@@ -731,12 +941,38 @@ impl Web {
         }
     }
 
+    /// The source of a list is left out without a password, like the upstream servers: a
+    /// URL can carry a private token.
     fn list_views(&self) -> Vec<ListView> {
+        let signed_in = self.auth.is_some();
+
         self.lists
             .statuses()
             .into_iter()
-            .map(ListView::of)
+            .map(|status| ListView::of(status, signed_in))
             .collect()
+    }
+
+    fn lists_response(&self) -> Response<Full<Bytes>> {
+        let signed_in = self.auth.is_some();
+
+        json(
+            StatusCode::OK,
+            &ListsView {
+                from: if self.lists.lists_on_page() {
+                    Source::Page
+                } else {
+                    Source::File
+                },
+                lists: self.list_views(),
+                pending: self
+                    .lists
+                    .pending_list()
+                    .filter(|_| signed_in)
+                    .map(PendingView::of),
+                memory: self.lists.memory(),
+            },
+        )
     }
 }
 
@@ -844,11 +1080,15 @@ fn check_json_content_type(headers: &HeaderMap) -> Result<(), Rejection> {
     ))
 }
 
-async fn read_body(headers: &HeaderMap, body: Incoming) -> Result<Bytes, Rejection> {
+async fn read_body(
+    headers: &HeaderMap,
+    body: Incoming,
+    max_bytes: usize,
+) -> Result<Bytes, Rejection> {
     let too_large = || {
         Rejection::new(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "the body is limited to 1 KiB",
+            format!("the body is limited to {} KiB", max_bytes / 1024),
         )
     };
 
@@ -856,11 +1096,11 @@ async fn read_body(headers: &HeaderMap, body: Incoming) -> Result<Bytes, Rejecti
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok());
-    if declared.is_some_and(|length| length > MAX_BODY_BYTES) {
+    if declared.is_some_and(|length| length > max_bytes) {
         return Err(too_large());
     }
 
-    match Limited::new(body, MAX_BODY_BYTES).collect().await {
+    match Limited::new(body, max_bytes).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
 
         Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => Err(too_large()),
@@ -923,7 +1163,8 @@ fn login_request(body: &[u8]) -> Option<LoginRequest> {
     serde_json::from_slice(body).ok()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Empty {}
 
 fn with_cookie(mut response: Response<Full<Bytes>>, cookie: &str) -> Response<Full<Bytes>> {
@@ -992,6 +1233,148 @@ fn remove_request(body: &[u8]) -> Option<RemoveRequest> {
     serde_json::from_slice(body).ok()
 }
 
+/// The longest name of a list the page may give.
+const MAX_LIST_NAME_CHARS: usize = 100;
+
+/// A JSON object of `T` and nothing else; the first byte must open an object, as for
+/// `install_version`.
+fn object_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+
+    serde_json::from_slice(body).ok()
+}
+
+/// A list name from the page, trimmed; `None` when it is empty.
+fn list_name(name: Option<String>) -> Result<Option<String>, Rejection> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let name = name.trim();
+    if name.chars().count() > MAX_LIST_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err(Rejection::new(
+            StatusCode::BAD_REQUEST,
+            "a list name has at most 100 characters and no control characters",
+        ));
+    }
+
+    Ok((!name.is_empty()).then(|| name.to_string()))
+}
+
+/// A list from the page is always a URL list; its format and caps come from the config file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddListRequest {
+    role: ListRole,
+    #[serde(default)]
+    name: Option<String>,
+    url: String,
+    refresh_hours: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditListRequest {
+    role: ListRole,
+    source: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    refresh_hours: Option<u32>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListSourceRequest {
+    role: ListRole,
+    source: String,
+}
+
+fn list_rejection(error: &ListError) -> Rejection {
+    match error {
+        ListError::Invalid(reason) => Rejection::new(StatusCode::BAD_REQUEST, reason.clone()),
+        ListError::NoSuchList => Rejection::new(StatusCode::NOT_FOUND, "no such list"),
+        ListError::ConfigFileOnly => Rejection::new(
+            StatusCode::CONFLICT,
+            "this list is read from a file: change it in the config file",
+        ),
+        ListError::AddInFlight => Rejection::new(
+            StatusCode::CONFLICT,
+            "a list is being added; try again when it is done",
+        ),
+        ListError::OverBudget { .. } => Rejection::new(StatusCode::CONFLICT, list_outcome(error)),
+        ListError::Failed { .. } => Rejection::new(StatusCode::BAD_GATEWAY, list_outcome(error)),
+        ListError::NotSaved(error) => save_rejection(error),
+        ListError::NotApplied => Rejection::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the change could not be applied",
+        ),
+    }
+}
+
+/// How a list change from the page ended, as the page shows it.
+fn list_outcome(error: &ListError) -> String {
+    match error {
+        ListError::OverBudget {
+            name,
+            needs,
+            left,
+            budget,
+        } => {
+            let needs = match needs {
+                Some(needs) => memory::megabytes(*needs),
+                None => format!("more than {}", memory::megabytes(*left)),
+            };
+
+            format!(
+                "refused: {name} needs {needs}, {} left of {}",
+                memory::megabytes(*left),
+                memory::megabytes(*budget)
+            )
+        }
+
+        ListError::Failed { name, reason } => format!("failed: {name}: {reason}"),
+        other => format!("failed: {}", list_rejection(other).message),
+    }
+}
+
+/// A key sent as `null` is `Some(None)`: back to the config file's value.
+fn set_or_reset<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// What a settings change may send: each key set to a value or to `null`, or left out.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsRequest {
+    #[serde(default, deserialize_with = "set_or_reset")]
+    upstream: Option<Option<UpstreamSettings>>,
+    #[serde(default, deserialize_with = "set_or_reset")]
+    cache: Option<Option<CacheSettings>>,
+    #[serde(default, deserialize_with = "set_or_reset")]
+    rewrites: Option<Option<Vec<Rewrite>>>,
+    #[serde(default, deserialize_with = "set_or_reset")]
+    safe_search: Option<Option<bool>>,
+    #[serde(default, deserialize_with = "set_or_reset")]
+    services: Option<Option<Vec<String>>>,
+}
+
+/// Like `rule_request`, the first byte must open an object.
+fn settings_request(body: &[u8]) -> Option<SettingsRequest> {
+    if body.trim_ascii_start().first() != Some(&b'{') {
+        return None;
+    }
+
+    serde_json::from_slice(body).ok()
+}
+
 fn rule_rejection(error: RuleError) -> Rejection {
     match error {
         RuleError::NotADomainName => Rejection::new(StatusCode::BAD_REQUEST, NOT_A_DOMAIN_NAME),
@@ -1004,7 +1387,35 @@ fn rule_rejection(error: RuleError) -> Rejection {
             StatusCode::INTERNAL_SERVER_ERROR,
             "the change could not be applied",
         ),
+        RuleError::NotSaved(error) => save_rejection(&error),
     }
+}
+
+fn change_rejection(error: &ChangeError) -> Rejection {
+    match error {
+        ChangeError::Invalid(reason) => Rejection::new(StatusCode::BAD_REQUEST, reason.clone()),
+        ChangeError::UpstreamBusy => Rejection::new(
+            StatusCode::CONFLICT,
+            "the previous upstream change is still finishing; try again in a few seconds",
+        ),
+        ChangeError::NotSaved(error) => save_rejection(error),
+        ChangeError::NotApplied => Rejection::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the change could not be applied",
+        ),
+        ChangeError::OverBudget(reason) => Rejection::new(StatusCode::CONFLICT, reason.clone()),
+        ChangeError::Unavailable(reason) => Rejection::new(StatusCode::BAD_GATEWAY, reason.clone()),
+    }
+}
+
+/// A change that cannot be saved is not applied either.
+fn save_rejection(error: &SaveError) -> Rejection {
+    let status = match error {
+        SaveError::TooLarge => StatusCode::BAD_REQUEST,
+        SaveError::Failed(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    Rejection::new(status, error.to_string())
 }
 
 /// The `name` of the query, normalized; `None` when missing or not a domain name. The value is
@@ -1023,10 +1434,74 @@ struct RulesView<'a> {
     max: usize,
 }
 
+/// Where a value in force comes from.
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Source {
+    Page,
+    File,
+}
+
+impl Source {
+    fn of<T>(page_value: &Option<T>) -> Source {
+        match page_value {
+            Some(_) => Source::Page,
+            None => Source::File,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SettingsView<'a> {
+    file: String,
+    /// Why the saved file was not used at start, until a save replaces it.
+    error: Option<String>,
+    can_save: bool,
+    upstream: UpstreamSetting<'a>,
+    cache: CacheSetting,
+    rewrites: RewritesSetting<'a>,
+    safe_search: SafeSearchSetting,
+    services: ServicesSetting<'a>,
+    /// The estimate of the whole process and the budget it is admitted against (plan D6).
+    memory: Memory,
+}
+
+#[derive(Serialize)]
+struct UpstreamSetting<'a> {
+    servers: &'a [String],
+    bootstrap: &'a [IpAddr],
+    from: Source,
+}
+
+#[derive(Serialize)]
+struct CacheSetting {
+    #[serde(flatten)]
+    values: CacheSettings,
+    from: Source,
+}
+
+#[derive(Serialize)]
+struct RewritesSetting<'a> {
+    entries: &'a [Rewrite],
+    from: Source,
+}
+
+#[derive(Serialize)]
+struct SafeSearchSetting {
+    on: bool,
+    from: Source,
+}
+
+#[derive(Serialize)]
+struct ServicesSetting<'a> {
+    block: &'a [String],
+    from: Source,
+}
+
 #[derive(Serialize)]
 struct ExplainView {
     name: String,
-    /// `blocked`, `allowed` or `none`.
+    /// `rewritten`, `blocked`, `allowed` or `none`.
     decision: &'static str,
     list: Option<String>,
     rule: Option<String>,
@@ -1101,19 +1576,105 @@ struct ListView {
     /// Seconds since the copy in force was loaded or last confirmed current.
     age_seconds: Option<u64>,
     last_error: Option<String>,
+    enabled: bool,
+    refresh_hours: u32,
+    /// The URL or path; with `kind`, what names the list in a change. Left out without a
+    /// password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    /// A URL list, which the page may change; a path list is changed in the config file.
+    editable: bool,
+    from: Source,
+    heap_bytes: usize,
 }
 
 impl ListView {
-    fn of(status: ListStatus) -> ListView {
+    /// Without the source, nothing that may hold it is shown either: a name taken from the
+    /// URL becomes its host, and an error is never shown, since a part of the address can be
+    /// in any of them (a bad relative redirect names its path).
+    fn of(status: ListStatus, with_source: bool) -> ListView {
+        let name = if with_source || !status.is_url || status.name != status.source {
+            status.name
+        } else {
+            url_host(&status.source).to_string()
+        };
+        let last_error = status.last_error.map(|error| {
+            if with_source {
+                error
+            } else {
+                HIDDEN_LIST_ERROR.to_string()
+            }
+        });
+
         ListView {
-            name: status.name,
+            name,
             kind: status.role,
             format: status.format,
             rules: status.rules,
             age_seconds: status.checked.map(|checked| checked.elapsed().as_secs()),
-            last_error: status.last_error,
+            last_error,
+            enabled: status.enabled,
+            refresh_hours: status.refresh_hours,
+            source: with_source.then_some(status.source),
+            editable: status.is_url,
+            from: if status.from_page {
+                Source::Page
+            } else {
+                Source::File
+            },
+            heap_bytes: status.bytes.heap,
         }
     }
+}
+
+/// The host of a list URL, without a user, port, path or query.
+fn url_host(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    match host_and_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host_and_port.split(':').next().unwrap_or_default(),
+    }
+}
+
+/// The list added last from the page: `checking`, then `added`, `refused: ...` or
+/// `failed: ...`.
+#[derive(Serialize)]
+struct PendingView {
+    kind: Role,
+    name: Option<String>,
+    source: String,
+    state: String,
+}
+
+impl PendingView {
+    fn of(list: PendingList) -> PendingView {
+        PendingView {
+            kind: match list.role {
+                ListRole::Block => Role::Blocklist,
+                ListRole::Allow => Role::Allowlist,
+            },
+            name: list.name,
+            source: list.url,
+            state: match &list.outcome {
+                None => "checking".to_string(),
+                Some(Ok(())) => "added".to_string(),
+                Some(Err(error)) => list_outcome(error),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AddStarted {
+    list: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1140,7 +1701,12 @@ impl UpstreamView {
 
 #[derive(Serialize)]
 struct ListsView {
+    /// `page` when the saved settings hold the lists, even none at all.
+    from: Source,
     lists: Vec<ListView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending: Option<PendingView>,
+    memory: Memory,
 }
 
 #[derive(Serialize)]
@@ -1191,6 +1757,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::lists::Names;
+    use crate::settings::{Saved, Settings};
     use crate::stage::{StageSetup, StageTiming};
     use crate::update::Build;
     use crate::upstream::tls::Tls;
@@ -1204,7 +1772,8 @@ mod tests {
 
     fn web_for(config: &Config) -> Web {
         let policy = Arc::new(Policy::new());
-        let lists = Arc::new(ListControl::new(Arc::clone(&policy)));
+        let saved = Saved::new(config.clone(), Settings::default(), None);
+        let lists = Arc::new(ListControl::new(Arc::clone(&policy), Arc::new(saved)));
         let updates = Arc::new(Updates::new(Build::current()));
         let stager = Stager::new(
             StageSetup {
@@ -1217,7 +1786,9 @@ mod tests {
                 timing: StageTiming::default(),
             },
             Arc::clone(&updates),
-            Arc::new(|_| Box::pin(async { Err(std::io::Error::other("no DNS in this test")) })),
+            Names::Resolver(Arc::new(|_| {
+                Box::pin(async { Err(std::io::Error::other("no DNS in this test")) })
+            })),
             Arc::new(Tls::with_webpki_roots()),
         );
 
@@ -1330,6 +1901,62 @@ mod tests {
         assert!(!check(Some("application/x-www-form-urlencoded")));
         assert!(!check(Some("multipart/form-data; boundary=x")));
         assert!(!check(Some("application/jsonp")));
+    }
+
+    #[test]
+    fn a_list_url_shows_only_its_host() {
+        for (url, host) in [
+            ("https://lists.example/a/token/list.txt", "lists.example"),
+            (
+                "https://user:pass@lists.example:8443/x?key=1",
+                "lists.example",
+            ),
+            ("http://[2001:db8::1]:8080/list", "2001:db8::1"),
+            ("https://lists.example?key=1", "lists.example"),
+        ] {
+            assert_eq!(url_host(url), host, "{url}");
+        }
+    }
+
+    fn status_of(name: &str, source: &str, last_error: &str) -> ListStatus {
+        ListStatus {
+            name: name.to_string(),
+            role: Role::Blocklist,
+            source: source.to_string(),
+            is_url: true,
+            from_page: false,
+            enabled: true,
+            refresh_hours: 24,
+            bytes: Default::default(),
+            format: None,
+            rules: 0,
+            checked: None,
+            last_error: Some(last_error.to_string()),
+        }
+    }
+
+    #[test]
+    fn without_the_source_no_error_is_shown() {
+        let source = "https://lists.example/token/list.txt";
+        let hidden = ListView::of(
+            status_of(
+                source,
+                source,
+                "invalid redirect to \"https://cdn.example/t\"",
+            ),
+            false,
+        );
+        let named = ListView::of(status_of("Ads", source, "HTTP status 503"), false);
+        let relative = ListView::of(status_of("Ads", source, "invalid list URL: /token"), false);
+        let signed_in = ListView::of(status_of(source, source, "invalid list URL"), true);
+
+        assert_eq!(hidden.name, "lists.example");
+        assert_eq!(hidden.last_error.as_deref(), Some(HIDDEN_LIST_ERROR));
+        assert_eq!(named.name, "Ads");
+        assert_eq!(named.last_error.as_deref(), Some(HIDDEN_LIST_ERROR));
+        assert_eq!(relative.last_error.as_deref(), Some(HIDDEN_LIST_ERROR));
+        assert_eq!(signed_in.name, source);
+        assert_eq!(signed_in.last_error.as_deref(), Some("invalid list URL"));
     }
 
     #[test]
