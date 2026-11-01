@@ -97,8 +97,8 @@ The workflow has four jobs:
 - `preflight` reads the tag through the API and fails unless it is annotated, points to the
   commit being built and matches `Cargo.toml`.
 - `build` runs `scripts/check.sh` and `scripts/build-release.sh` with pinned Rust, zig and
-  `cargo-zigbuild`, and fails if the build would change `Cargo.lock` or the ARMv7 binary is over
-  4 MiB. It uploads the files as an artifact.
+  `cargo-zigbuild`, and fails if the build would change `Cargo.lock` or the ARMv7 binary (built
+  for size; the others for speed) is over 4 MiB. It uploads the files as an artifact.
 - `release` downloads the artifact, signs `SHA256SUMS` (only this job sees the key), checks the
   signature and creates the release as a draft. It publishes the draft only when all seven assets
   are attached, so `releases/latest` never shows a half-made release.

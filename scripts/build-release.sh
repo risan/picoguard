@@ -15,7 +15,15 @@ armv7_size_limit=$((4 * 1024 * 1024))
 target_dir="$PWD/target"
 
 for target in "${targets[@]}"; do
-    cargo zigbuild --locked --release --target "$target" --target-dir "$target_dir"
+    opt_level=3
+    # armv7 boards are the smallest: optimising that build for size keeps it under its limit
+    # and costs about 0.2 us per filter check.
+    if [ "$target" = "$armv7_target" ]; then
+        opt_level=s
+    fi
+
+    CARGO_PROFILE_RELEASE_OPT_LEVEL=$opt_level \
+        cargo zigbuild --locked --release --target "$target" --target-dir "$target_dir"
     mkdir -p "dist/bin/$target"
     cp "$target_dir/$target/release/picoguard" "dist/bin/$target/picoguard"
     echo "$target: $(stat -c %s "dist/bin/$target/picoguard") bytes"
