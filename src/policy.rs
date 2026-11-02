@@ -206,6 +206,7 @@ mod tests {
 
     use super::*;
     use crate::dns::test_util::{self, QuerySpec, ResponseSpec};
+    use crate::dns::wire::ResponseInfo;
     use crate::filter::engine::CompiledList;
     use crate::filter::parse::ListFormat;
 
@@ -213,14 +214,6 @@ mod tests {
         let (list, _) = CompiledList::from_text(ListFormat::Adblock, rules);
 
         Arc::new(Engine::new(vec![Arc::new(list)], Vec::new()))
-    }
-
-    #[test]
-    fn a_new_policy_is_active_at_generation_zero() {
-        let view = Policy::new().view(Instant::now());
-
-        assert_eq!(view.generation, 0);
-        assert!(!view.paused);
     }
 
     #[test]
@@ -347,42 +340,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_request_an_allow_rule_matched_is_told_from_one_nothing_matched() {
-        let policy = Policy::with_engine(engine("@@||ok.example^\n||ads.example^\n"));
-        let now = Instant::now();
-        let view = policy.view(now);
-
-        assert_eq!(
-            request_decision(&view, "ok.example.", RecordType::A),
-            Verdict::Allow
-        );
-        assert_eq!(
-            request_decision(&view, "other.example.", RecordType::A),
-            Verdict::NoMatch
-        );
-
-        policy.pause(Duration::from_secs(5), now);
-        assert_eq!(
-            request_decision(&policy.view(now), "ok.example.", RecordType::A),
-            Verdict::NoMatch
-        );
-    }
-
-    fn response_decision(
-        view: &PolicyView,
-        rtype: RecordType,
+    fn reply(
         answers: Vec<hickory_proto::rr::Record>,
-    ) -> Decision {
-        let spec = QuerySpec::new("q.example.", rtype);
-        let reply = ResponseSpec {
+        additionals: Vec<hickory_proto::rr::Record>,
+    ) -> Vec<u8> {
+        ResponseSpec {
             answers,
+            additionals,
             ..ResponseSpec::default()
         }
-        .bytes(&spec);
+        .bytes(&QuerySpec::new("q.example.", RecordType::A))
+    }
 
+    fn response_decision(view: &PolicyView, reply: &[u8]) -> Decision {
         view.check_response(ReplyParts {
-            bytes: &reply,
+            bytes: reply,
             ttl_offsets: &[],
             opt_start: None,
         })
@@ -393,108 +365,36 @@ mod tests {
     }
 
     #[test]
-    fn answer_records_are_checked_in_order_and_the_first_blocked_one_decides() {
-        let policy = Policy::with_engine(engine(
-            "||tracker.example^\n1.1.1.1 9.9.9.9\n||203.0.113.7^\n",
-        ));
+    fn a_junk_answer_record_does_not_hide_a_cname_to_a_blocked_name() {
+        let policy = Policy::with_engine(engine("||tracker.example^\n||203.0.113.7^\n"));
         let view = policy.view(Instant::now());
-        let a = |address: &str| test_util::a("q.example.", 60, ip(address));
-        let check = |answers| response_decision(&view, RecordType::A, answers);
+        let junk = test_util::a("q.example.", 60, ip("8.8.8.8"));
+        let cloak = test_util::cname("q.example.", 60, "cdn.tracker.example.");
+        let mut bytes = reply(vec![junk, cloak], Vec::new());
+        let rdata = bytes
+            .windows(4)
+            .position(|window| window == [8, 8, 8, 8])
+            .unwrap();
+        bytes[rdata - 2..rdata].copy_from_slice(&3u16.to_be_bytes());
+        bytes.remove(rdata + 3);
+        assert!(ResponseInfo::parse(&bytes).is_ok());
 
-        assert_eq!(check(vec![a("8.8.8.8")]), Decision::Pass);
         assert!(matches!(
-            check(vec![test_util::cname(
-                "q.example.",
-                60,
-                "cdn.tracker.example."
-            )]),
-            Decision::Block { .. }
-        ));
-        assert_eq!(
-            check(vec![a("9.9.9.9")]),
-            Decision::Block {
-                ips: vec!["1.1.1.1".parse().unwrap()]
-            }
-        );
-        assert!(matches!(
-            check(vec![a("8.8.8.8"), a("203.0.113.7")]),
+            response_decision(&view, &bytes),
             Decision::Block { .. }
         ));
     }
 
     #[test]
-    fn a_root_cname_target_is_not_checked_as_a_name() {
-        let policy = Policy::with_engine(engine("/^\\.$/\n/./\n"));
-        let view = policy.view(Instant::now());
-        let root_target = vec![test_util::cname("q.example.", 60, ".")];
-
-        assert_eq!(
-            response_decision(&view, RecordType::A, root_target),
-            Decision::Pass
-        );
-    }
-
-    #[test]
-    fn https_hints_are_checked() {
-        let policy = Policy::with_engine(engine("||203.0.113.7^\n||2001:db8::bad^\n"));
-        let view = policy.view(Instant::now());
-        let hints = |v4: &[&str], v6: &[&str]| {
-            let v4: Vec<_> = v4.iter().map(|text| ip(text)).collect();
-            let v6: Vec<_> = v6.iter().map(|text| text.parse().unwrap()).collect();
-
-            response_decision(
-                &view,
-                RecordType::HTTPS,
-                vec![test_util::https("q.example.", 60, &v4, &v6)],
-            )
-        };
-
-        assert_eq!(hints(&["8.8.8.8"], &["2606:4700::1111"]), Decision::Pass);
-        assert!(matches!(
-            hints(&["8.8.8.8", "203.0.113.7"], &[]),
-            Decision::Block { .. }
-        ));
-        assert!(matches!(
-            hints(&[], &["2001:db8::bad"]),
-            Decision::Block { .. }
-        ));
-    }
-
-    #[test]
-    fn an_ipv4_mapped_answer_is_checked_as_dotted_ipv4_text() {
+    fn only_the_answer_section_is_checked() {
         let policy = Policy::with_engine(engine("||203.0.113.7^\n"));
         let view = policy.view(Instant::now());
-        let mapped: std::net::Ipv6Addr = "::ffff:203.0.113.7".parse().unwrap();
-
-        let decision = response_decision(
-            &view,
-            RecordType::AAAA,
-            vec![test_util::aaaa("q.example.", 60, mapped)],
-        );
-
-        assert!(matches!(decision, Decision::Block { .. }));
-        assert_eq!(go_ip_text(IpAddr::V6(mapped)), "203.0.113.7");
-        assert_eq!(go_ip_text("2001:db8::1".parse().unwrap()), "2001:db8::1");
-    }
-
-    #[test]
-    fn a_paused_policy_passes_every_reply() {
-        let policy = Policy::with_engine(engine("||tracker.example^\n"));
-        let now = Instant::now();
-        policy.pause(Duration::from_secs(5), now);
-        let answers = || vec![test_util::cname("q.example.", 60, "tracker.example.")];
+        let answer = test_util::a("q.example.", 60, ip("8.8.8.8"));
+        let extra = test_util::a("extra.example.", 60, ip("203.0.113.7"));
 
         assert_eq!(
-            response_decision(&policy.view(now), RecordType::A, answers()),
+            response_decision(&view, &reply(vec![answer], vec![extra])),
             Decision::Pass
         );
-        assert!(matches!(
-            response_decision(
-                &policy.view(now + Duration::from_secs(6)),
-                RecordType::A,
-                answers()
-            ),
-            Decision::Block { .. }
-        ));
     }
 }

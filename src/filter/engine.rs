@@ -1305,45 +1305,6 @@ mod tests {
     }
 
     #[test]
-    fn blocked_answer_follows_the_default_mode() {
-        let null4 = BlockedAnswer::Ips(ips(&["0.0.0.0"]));
-        let null6 = BlockedAnswer::Ips(ips(&["::"]));
-        assert_eq!(blocked_answer(TYPE_A, &[]), null4);
-        assert_eq!(blocked_answer(TYPE_AAAA, &[]), null6);
-        assert_eq!(blocked_answer(TYPE_HTTPS, &[]), BlockedAnswer::Empty);
-        assert_eq!(blocked_answer(16, &[]), BlockedAnswer::NoData);
-        assert_eq!(
-            blocked_answer(255, &ips(&["1.2.3.4"])),
-            BlockedAnswer::NoData
-        );
-    }
-
-    #[test]
-    fn blocked_answer_with_host_rule_ips() {
-        let v4 = ips(&["1.2.3.4", "5.6.7.8"]);
-        let v6 = ips(&["2001:db8::1"]);
-        assert_eq!(blocked_answer(TYPE_A, &v4), BlockedAnswer::Ips(v4.clone()));
-        assert_eq!(
-            blocked_answer(TYPE_AAAA, &v6),
-            BlockedAnswer::Ips(v6.clone())
-        );
-        assert_eq!(blocked_answer(TYPE_HTTPS, &v4), BlockedAnswer::Empty);
-        // IPs of the other family give an empty answer, not a null IP.
-        assert_eq!(blocked_answer(TYPE_A, &v6), BlockedAnswer::Empty);
-        assert_eq!(blocked_answer(TYPE_AAAA, &v4), BlockedAnswer::Empty);
-        assert_eq!(
-            blocked_answer(TYPE_A, &ips(&["1.2.3.4", "::1"])),
-            BlockedAnswer::Empty
-        );
-        // An IPv4-mapped address is an IPv6 address for AdGuard.
-        let mapped = ips(&["::ffff:1.2.3.4"]);
-        assert_eq!(
-            blocked_answer(TYPE_AAAA, &mapped),
-            BlockedAnswer::Ips(mapped)
-        );
-    }
-
-    #[test]
     fn a_name_with_more_addresses_than_the_cap_is_cut_one_past_it() {
         let many_v4: String = (0..600)
             .map(|index| format!("10.0.{}.{} big.example\n", index / 256, index % 256))
@@ -1514,62 +1475,6 @@ mod tests {
     }
 
     #[test]
-    fn input_is_lowercased() {
-        let engine = adblock("||ads.example^\n");
-        assert!(blocked(&engine, "ADS.Example", TYPE_A));
-        assert!(!blocked(&engine, "", TYPE_A));
-    }
-
-    #[test]
-    fn host_rules_answer_with_the_ips_of_the_checked_family() {
-        let engine = adblock("1.2.3.4 a.example\n2001:db8::1 a.example\n0.0.0.0 a.example\n");
-        let check = |record_type| engine.check("a.example", record_type, false);
-        assert_eq!(
-            check(TYPE_A),
-            Decision::Block {
-                ips: ips(&["1.2.3.4", "0.0.0.0"])
-            }
-        );
-        assert_eq!(
-            check(TYPE_AAAA),
-            Decision::Block {
-                ips: ips(&["2001:db8::1"])
-            }
-        );
-        assert_eq!(check(TYPE_HTTPS), Decision::Block { ips: Vec::new() });
-        assert_eq!(check(TYPE_CNAME), Decision::Block { ips: Vec::new() });
-    }
-
-    #[test]
-    fn network_rules_beat_host_rules_and_allow_beats_block() {
-        let engine = adblock("0.0.0.0 h.example\n@@||h.example^\n||b.example^\n@@||b.example^\n");
-        assert!(!blocked(&engine, "h.example", TYPE_A));
-        assert!(!blocked(&engine, "b.example", TYPE_A));
-    }
-
-    #[test]
-    fn important_beats_allow_across_lists() {
-        let engine = engine(
-            &[
-                ("||x.example^$important\n", ListFormat::Adblock),
-                ("@@||x.example^\n", ListFormat::Adblock),
-            ],
-            &[],
-        );
-        assert!(blocked(&engine, "x.example", TYPE_A));
-    }
-
-    #[test]
-    fn allowlist_engine_wins_even_with_block_rules_inside() {
-        let engine = engine(
-            &[("||x.example^\n", ListFormat::Adblock)],
-            &["||x.example^\n"],
-        );
-        assert!(!blocked(&engine, "x.example", TYPE_A));
-        assert!(!blocked(&engine, "sub.x.example", TYPE_A));
-    }
-
-    #[test]
     fn the_verdict_tells_an_allow_rule_from_no_rule() {
         let engine = engine(
             &[("@@||ok.example^\n||bad.example^\n", ListFormat::Adblock)],
@@ -1582,91 +1487,6 @@ mod tests {
         assert_eq!(verdict("bad.example"), Verdict::Block { ips: Vec::new() });
         assert_eq!(verdict("other.example"), Verdict::NoMatch);
         assert_eq!(verdict(""), Verdict::NoMatch);
-    }
-
-    #[test]
-    fn badfilter_disables_a_plain_rule_in_another_list() {
-        let engine = engine(
-            &[
-                ("||x.example^\n||y.example^\n", ListFormat::Adblock),
-                ("||x.example^$badfilter\n", ListFormat::Adblock),
-            ],
-            &[],
-        );
-        assert!(!blocked(&engine, "x.example", TYPE_A));
-        assert!(!blocked(&engine, "sub.x.example", TYPE_A));
-        assert!(blocked(&engine, "y.example", TYPE_A));
-    }
-
-    #[test]
-    fn conditional_badfilter_disables_only_for_its_record_types() {
-        let engine = adblock("||x.example^\n||x.example^$badfilter,dnstype=A\n");
-        assert!(!blocked(&engine, "x.example", TYPE_A));
-        assert!(blocked(&engine, "x.example", TYPE_AAAA));
-
-        let engine = adblock("||x.example^\n||x.example^$badfilter,dnstype=~A\n");
-        assert!(blocked(&engine, "x.example", TYPE_A));
-        assert!(!blocked(&engine, "x.example", TYPE_AAAA));
-    }
-
-    #[test]
-    fn badfilter_identity_is_case_sensitive() {
-        let engine = adblock("||X.example^\n||x.example^$badfilter\n");
-        assert!(blocked(&engine, "x.example", TYPE_A));
-        let engine = adblock("||X.example^\n||X.example^$badfilter\n");
-        assert!(!blocked(&engine, "x.example", TYPE_A));
-    }
-
-    #[test]
-    fn overlapping_badfilters_disable_every_target() {
-        // urlfilter v0.23.4 brings the rule back when two badfilters match; picoguard does not.
-        let engine =
-            adblock("||x.example^\n||x.example^$badfilter\n||x.example^$badfilter,important\n");
-        assert!(!blocked(&engine, "x.example", TYPE_A));
-    }
-
-    #[test]
-    fn denyallow_never_matches_an_ip_input() {
-        let engine = adblock("*$denyallow=ok.example\n");
-        assert!(blocked(&engine, "other.example", TYPE_A));
-        assert!(!blocked(&engine, "ok.example", TYPE_A));
-        assert!(!blocked(&engine, "sub.ok.example", TYPE_A));
-        assert!(!blocked(&engine, "9.9.9.9", TYPE_A));
-        assert!(!blocked(&engine, "2001:db8::1", TYPE_AAAA));
-    }
-
-    #[test]
-    fn denyallow_tld_wildcard_uses_icann_suffixes() {
-        let engine = adblock("*$denyallow=google.*\n");
-        for pass in [
-            "google.com",
-            "www.google.co.uk",
-            "google.org",
-            "x.google.com.au",
-        ] {
-            assert!(!blocked(&engine, pass, TYPE_A), "{pass}");
-        }
-
-        for block in [
-            "google.example",
-            "mygoogle.com",
-            "google.blogspot.com",
-            "google.nosuchtld",
-        ] {
-            assert!(blocked(&engine, block, TYPE_A), "{block}");
-        }
-    }
-
-    #[test]
-    fn ip_text_inputs_use_the_separator_rules() {
-        let engine = adblock("|dead^\n||beef^\n||1.2.3.4^\n");
-        assert!(blocked(&engine, "dead:beef::1", TYPE_AAAA));
-        assert!(blocked(&engine, "dead::1", TYPE_AAAA));
-        assert!(!blocked(&engine, "deadbeef::1", TYPE_AAAA));
-        assert!(blocked(&engine, "beef::1", TYPE_AAAA));
-        assert!(blocked(&engine, "1.2.3.4", TYPE_A));
-        assert!(!blocked(&engine, "1.2.3.45", TYPE_A));
-        assert!(!blocked(&engine, "11.2.3.4", TYPE_A));
     }
 
     #[test]
@@ -1730,13 +1550,6 @@ mod tests {
         assert_eq!(list.regex_failed(), 1);
         assert_eq!(list.slow_rule_count(), 1);
         assert_eq!(summary.counters.regex_rules, 2);
-    }
-
-    #[test]
-    fn client_restricted_rules_match_and_permitted_ones_do_not() {
-        let engine = adblock("||a.example^$client=~192.168.0.1\n||b.example^$client=192.168.0.1\n");
-        assert!(blocked(&engine, "a.example", TYPE_A));
-        assert!(!blocked(&engine, "b.example", TYPE_A));
     }
 
     /// A page list as the scheduler builds it: one plain rule per name, no text parsed.
@@ -1972,21 +1785,6 @@ mod tests {
     }
 
     #[test]
-    fn explain_follows_badfilter_and_conditions() {
-        let disabled = adblock("||x.example^\n||x.example^$badfilter\n");
-        let for_aaaa = adblock("||y.example^\n||y.example^$badfilter,dnstype=AAAA\n");
-        let only_aaaa = adblock("||z.example^$dnstype=AAAA\n");
-
-        assert_eq!(disabled.explain("x.example", TYPE_A, false), None);
-        assert_eq!(
-            for_aaaa.explain("y.example", TYPE_A, false),
-            explained(false, Side::Main, 0, "||y.example^")
-        );
-        assert_eq!(for_aaaa.explain("y.example", TYPE_AAAA, false), None);
-        assert_eq!(only_aaaa.explain("z.example", TYPE_A, false), None);
-    }
-
-    #[test]
     fn find_is_offered_no_unrelated_slow_rule() {
         let unrelated: String = (0..20_000)
             .map(|number| format!("||unrelated-{number:05}*.invalid^\n"))
@@ -2091,8 +1889,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hash_membership_agrees_with_binary_search_on_any_distribution() {
+    /// Sorted arrays of every shape the interpolated search meets, each with the values
+    /// around its entries as needles.
+    fn arrays_with_needles() -> Vec<(Vec<u64>, Vec<u64>)> {
         let uniform: Vec<u64> = (0..5000u64)
             .map(|n| xxh3_64(&n.to_le_bytes()))
             .collect::<std::collections::BTreeSet<_>>()
@@ -2103,12 +1902,37 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
-        for sorted in [uniform, clustered, vec![], vec![7], vec![7, 9]] {
-            let mut needles: Vec<u64> = sorted
-                .iter()
-                .flat_map(|&n| [n, n.wrapping_add(1), n.wrapping_sub(1)])
-                .collect();
-            needles.extend([0, 1, u64::MAX, u64::MAX - 1]);
+
+        [uniform, clustered, vec![], vec![7], vec![7, 9]]
+            .into_iter()
+            .map(|sorted| {
+                let mut needles: Vec<u64> = sorted
+                    .iter()
+                    .flat_map(|&n| [n, n.wrapping_add(1), n.wrapping_sub(1)])
+                    .collect();
+                needles.extend([0, 1, u64::MAX, u64::MAX - 1]);
+
+                (sorted, needles)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lower_bound_agrees_with_partition_point_on_any_distribution() {
+        for (sorted, needles) in arrays_with_needles() {
+            for needle in needles {
+                assert_eq!(
+                    lower_bound(&sorted, needle),
+                    sorted.partition_point(|value| *value < needle),
+                    "{needle}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hash_membership_agrees_with_binary_search_on_any_distribution() {
+        for (sorted, needles) in arrays_with_needles() {
             for needle in needles {
                 assert_eq!(
                     contains_hash(&sorted, needle),

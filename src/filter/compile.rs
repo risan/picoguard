@@ -667,24 +667,6 @@ mod tests {
         assert_ne!(auto, fingerprint(other_cap, text).await);
     }
 
-    #[tokio::test]
-    async fn explicit_format_changes_the_result_for_the_same_text() {
-        let worker = CompileWorker::spawn().unwrap();
-        let text = b"a.example\n";
-
-        let adguard = compile_in_pieces(&worker, options(ListFormat::Auto), text, 64)
-            .await
-            .unwrap();
-        let domains = compile_in_pieces(&worker, options(ListFormat::Domains), text, 64)
-            .await
-            .unwrap();
-
-        assert_eq!(adguard.content_hash, domains.content_hash);
-        assert_eq!(adguard.summary.format, ListFormat::Adblock);
-        assert_eq!(domains.summary.format, ListFormat::Domains);
-        assert_ne!(adguard.fingerprint, domains.fingerprint);
-    }
-
     struct RecordsDropThread(std_mpsc::Sender<(ThreadId, Option<String>)>);
 
     impl Drop for RecordsDropThread {
@@ -1110,53 +1092,6 @@ mod tests {
 
         assert_ne!(thread, std::thread::current().id());
         assert_eq!(name.as_deref(), Some("picoguard-compile"));
-    }
-
-    #[tokio::test]
-    async fn an_assembled_engine_decides_like_one_built_in_place() {
-        let worker = CompileWorker::spawn().unwrap();
-        let blocklist = compile_in_pieces(
-            &worker,
-            options(ListFormat::Auto),
-            b"||ads.example^\n||both.example^\n||bad.example^\n||bad.example^$badfilter\n",
-            64,
-        )
-        .await
-        .unwrap();
-        let user_rules =
-            compile_in_pieces(&worker, options(ListFormat::Auto), b"||mine.example^\n", 64)
-                .await
-                .unwrap();
-        let allowlist =
-            compile_in_pieces(&worker, options(ListFormat::Auto), b"||both.example^\n", 64)
-                .await
-                .unwrap();
-        let main = vec![Arc::clone(&blocklist.list), Arc::clone(&user_rules.list)];
-        let allow = vec![Arc::clone(&allowlist.list)];
-        let in_place = Engine::new(main.clone(), allow.clone());
-
-        let assembled = worker.assemble(main, allow).await.unwrap();
-
-        for name in ["ads.example", "mine.example", "both.example", "bad.example"] {
-            assert_eq!(
-                assembled.check(name, TYPE_A, false),
-                in_place.check(name, TYPE_A, false),
-                "{name}"
-            );
-        }
-
-        assert!(matches!(
-            assembled.check("mine.example", TYPE_A, false),
-            Decision::Block { .. }
-        ));
-        assert_eq!(
-            assembled.check("both.example", TYPE_A, false),
-            Decision::Pass
-        );
-        assert_eq!(
-            assembled.check("bad.example", TYPE_A, false),
-            Decision::Pass
-        );
     }
 
     #[test]

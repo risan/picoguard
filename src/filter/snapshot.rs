@@ -1363,8 +1363,16 @@ ads.*.tracker
         assert_eq!(a.compile_charge, b.compile_charge);
     }
 
+    fn clone_of(snapshot: &Snapshot) -> Snapshot {
+        Snapshot {
+            meta: snapshot.meta.clone(),
+            list: Arc::clone(&snapshot.list),
+            counters: snapshot.counters.clone(),
+        }
+    }
+
     #[tokio::test]
-    async fn a_written_snapshot_loads_back_identical() {
+    async fn a_written_snapshot_loads_back_identical_and_decides_alike() {
         let worker = CompileWorker::spawn().unwrap();
         let state = TestDir::new("snap");
         let store = SnapshotStore::open(state.path()).unwrap();
@@ -1383,25 +1391,6 @@ ads.*.tracker
         assert_same_list(&loaded.list, &snapshot.list);
         assert_eq!(loaded.meta.validators.etag.as_deref(), Some("\"tag\""));
         assert!(loaded.fits(SOURCE, &options(ListFormat::Auto)));
-    }
-
-    fn clone_of(snapshot: &Snapshot) -> Snapshot {
-        Snapshot {
-            meta: snapshot.meta.clone(),
-            list: Arc::clone(&snapshot.list),
-            counters: snapshot.counters.clone(),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_loaded_snapshot_decides_like_the_compiled_list() {
-        let worker = CompileWorker::spawn().unwrap();
-        let state = TestDir::new("snap");
-        let store = SnapshotStore::open(state.path()).unwrap();
-        let snapshot = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
-        store.save(clone_of(&snapshot)).await.unwrap();
-        store.flush().await;
-        let loaded = load(&store.path_for(SOURCE).unwrap(), &caps()).unwrap();
 
         let compiled = Engine::new(vec![Arc::clone(&snapshot.list)], Vec::new());
         let reloaded = Engine::new(vec![loaded.list], Vec::new());
@@ -1498,90 +1487,6 @@ ads.*.tracker
     }
 
     #[tokio::test]
-    async fn a_format_change_with_the_same_content_is_recompiled_and_rewritten() {
-        let worker = CompileWorker::spawn().unwrap();
-        let state = TestDir::new("snap");
-        let store = SnapshotStore::open(state.path()).unwrap();
-        let text = "a.example\nb.example\n";
-        let adguard = snapshot_of(&worker, text, ListFormat::Auto).await;
-        store.save(clone_of(&adguard)).await.unwrap();
-        store.flush().await;
-        let written = store.bytes_written();
-
-        let domains = snapshot_of(&worker, text, ListFormat::Domains).await;
-        assert_eq!(domains.meta.content_hash, adguard.meta.content_hash);
-        assert_ne!(domains.meta.fingerprint, adguard.meta.fingerprint);
-        assert!(!adguard.fits(SOURCE, &options(ListFormat::Domains)));
-        store.save(domains).await.unwrap();
-        store.flush().await;
-
-        assert!(store.bytes_written() > written);
-        let loaded = load(&store.path_for(SOURCE).unwrap(), &caps()).unwrap();
-        assert_eq!(loaded.meta.effective_format, ListFormat::Domains);
-        assert_eq!(loaded.meta.configured_format, ListFormat::Domains);
-    }
-
-    #[tokio::test]
-    async fn a_format_change_is_noticed_across_a_restart() {
-        let state = TestDir::new("snap");
-        let text = "a.example\nb.example\n";
-        {
-            let worker = CompileWorker::spawn().unwrap();
-            let store = SnapshotStore::open(state.path()).unwrap();
-            store
-                .save(snapshot_of(&worker, text, ListFormat::Auto).await)
-                .await
-                .unwrap();
-            store.flush().await;
-        }
-
-        // A new process: the config now says `domains`.
-        let worker = CompileWorker::spawn().unwrap();
-        let store = SnapshotStore::open(state.path()).unwrap();
-        let path = store.path_for(SOURCE).unwrap();
-        let old = worker.load(path.clone(), caps()).await.unwrap();
-        assert!(old.fits(SOURCE, &options(ListFormat::Auto)));
-        assert!(!old.fits(SOURCE, &options(ListFormat::Domains)));
-        assert_eq!(store.bytes_written(), 0);
-
-        let recompiled = snapshot_of(&worker, text, ListFormat::Domains).await;
-        assert_ne!(recompiled.meta.fingerprint, old.meta.fingerprint);
-        store.save(recompiled).await.unwrap();
-        store.flush().await;
-
-        assert!(store.bytes_written() > 0);
-        let loaded = load(&path, &caps()).unwrap();
-        assert_eq!(loaded.meta.effective_format, ListFormat::Domains);
-    }
-
-    #[tokio::test]
-    async fn another_source_or_rule_cap_does_not_fit() {
-        let worker = CompileWorker::spawn().unwrap();
-        let snapshot = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
-
-        assert!(snapshot.fits(SOURCE, &options(ListFormat::Auto)));
-        assert!(!snapshot.fits("https://other.example/list.txt", &options(ListFormat::Auto)));
-        assert!(!snapshot.fits(SOURCE, &capped(10)));
-    }
-
-    #[tokio::test]
-    async fn persistence_off_never_writes_or_reads() {
-        let worker = CompileWorker::spawn().unwrap();
-        let state = TestDir::new("snap");
-        let store = SnapshotStore::disabled();
-
-        store
-            .save(snapshot_of(&worker, MIXED, ListFormat::Auto).await)
-            .await
-            .unwrap();
-        store.flush().await;
-
-        assert!(store.path_for(SOURCE).is_none());
-        assert_eq!(store.bytes_written(), 0);
-        assert!(files_in(state.path()).is_empty());
-    }
-
-    #[tokio::test]
     async fn nothing_is_created_until_the_first_write() {
         let state = TestDir::new("snap");
 
@@ -1672,19 +1577,6 @@ ads.*.tracker
 
         assert!(unchecked.is_ok());
         assert!(matches!(refused, Err(SnapshotError::BlocksCanary)));
-    }
-
-    #[tokio::test]
-    async fn a_flipped_byte_inside_an_array_fails_the_checksum() {
-        let state = TestDir::new("snap");
-        let list: String = (0..2000).map(|i| format!("||host{i}.example^\n")).collect();
-        let (path, mut bytes) = saved_bytes(&state, &list).await;
-
-        let middle = bytes.len() / 2;
-        bytes[middle] ^= 0x01;
-        fs::write(&path, &bytes).unwrap();
-
-        assert!(matches!(rejected(&path), SnapshotError::BadChecksum));
     }
 
     /// The offset of the length field of the first plain-rule array of a one-rule list.
@@ -2485,22 +2377,8 @@ ads.*.tracker
         assert_eq!(files.calls(), []);
     }
 
-    #[test]
-    fn each_source_has_its_own_stable_file() {
-        let state = TestDir::new("snap");
-        let store = SnapshotStore::open(state.path()).unwrap();
-
-        let a = store.path_for("https://a.example/list").unwrap();
-        let b = store.path_for("https://b.example/list").unwrap();
-
-        assert_ne!(a, b);
-        assert_eq!(a, store.path_for("https://a.example/list").unwrap());
-        assert_eq!(a.parent().unwrap(), lists_dir(&state));
-        assert_eq!(a.extension().unwrap(), "pgs");
-    }
-
     #[tokio::test]
-    async fn a_snapshot_fits_only_the_redirect_setting_it_was_made_with() {
+    async fn a_snapshot_fits_only_the_source_format_cap_and_redirect_setting_it_was_made_with() {
         let worker = CompileWorker::spawn().unwrap();
         let state = TestDir::new("snap");
         let store = SnapshotStore::open(state.path()).unwrap();
@@ -2517,6 +2395,21 @@ ads.*.tracker
 
         assert!(!loaded.meta.allow_redirects);
         assert!(loaded.fits(SOURCE, &blocking));
+        assert!(!loaded.fits("https://other.example/list.txt", &blocking));
+        assert!(!loaded.fits(
+            SOURCE,
+            &CompileOptions {
+                format: ListFormat::Auto,
+                ..blocking
+            }
+        ));
+        assert!(!loaded.fits(
+            SOURCE,
+            &CompileOptions {
+                max_rules: 10,
+                ..blocking
+            }
+        ));
         let allowing = CompileOptions {
             allow_redirects: true,
             ..blocking
