@@ -427,22 +427,39 @@ mod tests {
         TcpListener::bind(address).await.unwrap()
     }
 
+    /// Accepts TCP connections on `address` and closes each one at once.
+    async fn hang_up_listener(address: SocketAddr) {
+        let listener = TcpListener::bind(address).await.unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+    }
+
     #[tokio::test]
     async fn a_cached_address_that_accepts_tcp_but_fails_tls_is_forgotten() {
         let pki = TestPki::new();
         let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
         let old_address = SocketAddr::new("127.0.0.2".parse().unwrap(), server.address.port());
-        let _silent = silent_listener(old_address).await;
+        hang_up_listener(old_address).await;
         let dns = fake_dns(vec![Ipv4Addr::new(127, 0, 0, 2)], Vec::new()).await;
         let dialer = named_dialer(&pki, &server, &dns);
 
-        let stuck = dialer
-            .connect(Instant::now() + Duration::from_millis(300))
-            .await;
+        let failed = dialer.connect(deadline()).await;
+        let lookups_after_failure = dns.queries.load(Ordering::SeqCst);
         dns.set_v4(vec![Ipv4Addr::LOCALHOST]);
         let recovered = dialer.connect(deadline()).await;
 
-        assert!(matches!(stuck, Err(UpstreamError::Timeout)), "{stuck:?}");
+        assert!(
+            matches!(&failed, Err(UpstreamError::Io(error)) if error.kind() != io::ErrorKind::NotFound),
+            "the handshake must fail after the name was resolved: {failed:?}"
+        );
+        assert!(
+            dns.queries.load(Ordering::SeqCst) > lookups_after_failure,
+            "the failed address must be forgotten and the name looked up again"
+        );
         assert!(recovered.is_ok(), "{recovered:?}");
     }
 
