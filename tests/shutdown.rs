@@ -10,10 +10,20 @@ use std::time::{Duration, Instant};
 
 use common::harness::{a_record, fake_upstream, name, reply_to};
 use common::http::ListServer;
-use common::process::{exit_within, send_signal, start};
+use common::process::{Running, exit_within, send_signal, start};
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::RecordType;
 use tokio::net::UdpSocket;
+
+/// Kills and reaps the server when a failed assertion ends the test early.
+struct Reaped(Running);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.child.kill();
+        let _ = self.0.child.wait();
+    }
+}
 
 const LIST: &str = "||ads.example^\n";
 
@@ -222,17 +232,23 @@ async fn sigterm_exits_within_the_allowance_while_a_download_stalls_and_keeps_th
     // download never answers.
     list_server.set_delay(Duration::from_secs(120));
     let requests = list_server.requests();
-    let mut server = start("shutdown-stalled-second.toml", |port| {
+    let mut server = Reaped(start("shutdown-stalled-second.toml", |port| {
         config_with(port, "hosts")
-    });
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
     while list_server.requests() == requests {
+        assert!(
+            server.0.child.try_wait().unwrap().is_none(),
+            "the server exited before it asked for the list"
+        );
+        assert!(Instant::now() < deadline, "the list was never asked for");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    send_signal(&server.child, "TERM");
+    send_signal(&server.0.child, "TERM");
     let stopping = Instant::now();
 
-    let status = exit_within(&mut server.child, Duration::from_secs(15)).await;
+    let status = exit_within(&mut server.0.child, Duration::from_secs(15)).await;
     assert_eq!(status.and_then(|status| status.code()), Some(0));
     assert!(
         stopping.elapsed() < Duration::from_secs(13),
