@@ -791,6 +791,11 @@ mod tests {
         assert!(!verify_sums(sums, test_pair(8).sign(sums).as_ref(), &key));
         assert!(!verify_sums(sums, &signature.as_ref()[..63], &key));
 
+        let mut flipped = signature.as_ref().to_vec();
+        flipped[17] ^= 0x01;
+        assert_eq!(flipped.len(), 64);
+        assert!(!verify_sums(sums, &flipped, &key));
+
         let mut longer = signature.as_ref().to_vec();
         longer.push(0);
         assert!(!verify_sums(sums, &longer, &key));
