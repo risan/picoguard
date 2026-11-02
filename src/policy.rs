@@ -206,6 +206,7 @@ mod tests {
 
     use super::*;
     use crate::dns::test_util::{self, QuerySpec, ResponseSpec};
+    use crate::dns::wire::ResponseInfo;
     use crate::filter::engine::CompiledList;
     use crate::filter::parse::ListFormat;
 
@@ -388,6 +389,26 @@ mod tests {
         })
     }
 
+    fn reply(
+        answers: Vec<hickory_proto::rr::Record>,
+        additionals: Vec<hickory_proto::rr::Record>,
+    ) -> Vec<u8> {
+        ResponseSpec {
+            answers,
+            additionals,
+            ..ResponseSpec::default()
+        }
+        .bytes(&QuerySpec::new("q.example.", RecordType::A))
+    }
+
+    fn decision_of_reply(view: &PolicyView, reply: &[u8]) -> Decision {
+        view.check_response(ReplyParts {
+            bytes: reply,
+            ttl_offsets: &[],
+            opt_start: None,
+        })
+    }
+
     fn ip(text: &str) -> std::net::Ipv4Addr {
         text.parse().unwrap()
     }
@@ -496,5 +517,39 @@ mod tests {
             ),
             Decision::Block { .. }
         ));
+    }
+
+    #[test]
+    fn a_junk_answer_record_does_not_hide_a_cname_to_a_blocked_name() {
+        let policy = Policy::with_engine(engine("||tracker.example^\n||203.0.113.7^\n"));
+        let view = policy.view(Instant::now());
+        let junk = test_util::a("q.example.", 60, ip("8.8.8.8"));
+        let cloak = test_util::cname("q.example.", 60, "cdn.tracker.example.");
+        let mut bytes = reply(vec![junk, cloak], Vec::new());
+        let rdata = bytes
+            .windows(4)
+            .position(|window| window == [8, 8, 8, 8])
+            .unwrap();
+        bytes[rdata - 2..rdata].copy_from_slice(&3u16.to_be_bytes());
+        bytes.remove(rdata + 3);
+        assert!(ResponseInfo::parse(&bytes).is_ok());
+
+        assert!(matches!(
+            decision_of_reply(&view, &bytes),
+            Decision::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn only_the_answer_section_is_checked() {
+        let policy = Policy::with_engine(engine("||203.0.113.7^\n"));
+        let view = policy.view(Instant::now());
+        let answer = test_util::a("q.example.", 60, ip("8.8.8.8"));
+        let extra = test_util::a("extra.example.", 60, ip("203.0.113.7"));
+
+        assert_eq!(
+            decision_of_reply(&view, &reply(vec![answer], vec![extra])),
+            Decision::Pass
+        );
     }
 }

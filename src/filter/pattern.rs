@@ -1276,6 +1276,7 @@ mod tests {
         assert!(!matches("|http://url-b.example", "url-b.example"));
     }
 
+            "(?<!look)",
     #[test]
     fn patterns_with_a_path_never_match_a_bare_host() {
         assert!(!matches("||path.example/ads^", "path.example"));

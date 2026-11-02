@@ -2091,8 +2091,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hash_membership_agrees_with_binary_search_on_any_distribution() {
+    /// Sorted arrays of every shape the interpolated search meets, each with the values
+    /// around its entries as needles.
+    fn arrays_with_needles() -> Vec<(Vec<u64>, Vec<u64>)> {
         let uniform: Vec<u64> = (0..5000u64)
             .map(|n| xxh3_64(&n.to_le_bytes()))
             .collect::<std::collections::BTreeSet<_>>()
@@ -2103,12 +2104,37 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
-        for sorted in [uniform, clustered, vec![], vec![7], vec![7, 9]] {
-            let mut needles: Vec<u64> = sorted
-                .iter()
-                .flat_map(|&n| [n, n.wrapping_add(1), n.wrapping_sub(1)])
-                .collect();
-            needles.extend([0, 1, u64::MAX, u64::MAX - 1]);
+
+        [uniform, clustered, vec![], vec![7], vec![7, 9]]
+            .into_iter()
+            .map(|sorted| {
+                let mut needles: Vec<u64> = sorted
+                    .iter()
+                    .flat_map(|&n| [n, n.wrapping_add(1), n.wrapping_sub(1)])
+                    .collect();
+                needles.extend([0, 1, u64::MAX, u64::MAX - 1]);
+
+                (sorted, needles)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lower_bound_agrees_with_partition_point_on_any_distribution() {
+        for (sorted, needles) in arrays_with_needles() {
+            for needle in needles {
+                assert_eq!(
+                    lower_bound(&sorted, needle),
+                    sorted.partition_point(|value| *value < needle),
+                    "{needle}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hash_membership_agrees_with_binary_search_on_any_distribution() {
+        for (sorted, needles) in arrays_with_needles() {
             for needle in needles {
                 assert_eq!(
                     contains_hash(&sorted, needle),
