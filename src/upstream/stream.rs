@@ -805,6 +805,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_frame_shorter_than_a_dns_header_closes_the_connection() {
+        for length in [0u16, 1, 11] {
+            let client = client();
+            let (ours, mut server) = duplex(4096);
+            client.attach(ours);
+
+            tokio::spawn(async move {
+                let received = read_frame(&mut server).await;
+                let mut frame = length.to_be_bytes().to_vec();
+                frame.extend_from_slice(&received[..2]);
+                frame.resize(frame.len() + usize::from(length.saturating_sub(2)), 0);
+                server.write_all(&frame).await.unwrap();
+                server
+            });
+            let result = client.query(&mut request("a.example."), deadline()).await;
+
+            assert!(
+                matches!(result, Err(UpstreamError::Closed)),
+                "length {length}: {result:?}"
+            );
+            tokio::task::yield_now().await;
+            assert!(!client.is_connected(), "length {length}");
+        }
+    }
+
+    #[tokio::test]
     async fn attaching_a_new_connection_replaces_the_old_one() {
         let client = client();
         let (first, _first_server) = duplex(4096);

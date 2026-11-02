@@ -1093,11 +1093,13 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(30));
 
         let started = Instant::now();
-        upstreams
-            .query(&mut query_for("example.com."))
+        let answered = upstreams
+            .query_charged(&mut query_for("example.com."), &Budget::new(usize::MAX))
             .await
             .unwrap();
         let whole_query_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        assert_eq!(answered.server, 1, "the server that answered is reported");
 
         let tallies: Vec<Tally> = upstreams.tallies().map(|(_, tally)| tally).collect();
         assert_eq!(tallies[0].answered, 0);

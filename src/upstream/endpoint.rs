@@ -509,6 +509,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_bootstrap_asks_the_next_server_when_one_is_silent() {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let knows = fake_dns(vec!["192.0.2.8".parse().unwrap()], Vec::new()).await;
+        let bootstrap = Bootstrap::at(vec![silent.local_addr().unwrap(), knows.address]);
+        let started = Instant::now();
+
+        let addresses = bootstrap.resolve("dns.example", later()).await.unwrap();
+
+        assert_eq!(addresses, vec!["192.0.2.8".parse::<IpAddr>().unwrap()]);
+        // A silent server may hold the lookup for its own second only, not for the 3 s deadline.
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
     async fn a_name_nobody_knows_is_an_error() {
         let empty = fake_dns(Vec::new(), Vec::new()).await;
 
