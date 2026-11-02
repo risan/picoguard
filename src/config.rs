@@ -1083,6 +1083,16 @@ mod tests {
         assert!(limits.pending_bytes <= 1024 * 1024);
     }
 
+    /// The cache's defaults are the most the 256 MB plan allows, like the limits above.
+    #[test]
+    fn default_cache_sizes_are_the_most_the_plan_allows() {
+        let cache = CacheConfig::default();
+
+        assert!(cache.max_entries <= 10_000);
+        assert!(cache.max_bytes <= 4 * 1024 * 1024);
+        assert!(cache.max_response_size <= 4096);
+    }
+
     #[test]
     fn example_config_parses_and_equals_defaults() {
         assert_eq!(Config::parse(EXAMPLE_CONFIG).unwrap(), Config::default());
