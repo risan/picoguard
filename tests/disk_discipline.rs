@@ -9,15 +9,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::harness::{answering_upstream, name};
 use common::http::ListServer;
-use common::process::{Running, start};
+use common::process::{Running, start_with_web_port};
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::RecordType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 
 /// Whatever a write, an append, a truncate, a rename, a create or a delete leaves behind: the
 /// inode, the size and both change times of a file, and of a folder (whose times move when an
@@ -105,15 +105,6 @@ impl Drop for Stopped {
     }
 }
 
-async fn free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 async fn world(name: &str, saved_settings: Option<&str>) -> World {
     let state = common::release::scratch(name);
     if let Some(saved) = saved_settings {
@@ -124,8 +115,7 @@ async fn world(name: &str, saved_settings: Option<&str>) -> World {
     let lists = ListServer::start().await;
     lists.serve("/with-etag.txt", "||ads.example^\n", Some("\"v1\""));
     lists.serve("/without-etag.txt", "||tracker.example^\n", None);
-    let web_port = free_tcp_port().await;
-    let config = |port: u16| {
+    let config = |port: u16, web_port: u16| {
         format!(
             "[[lists]]\nurl = {:?}\nformat = \"adblock\"\n\
              [[lists]]\nurl = {:?}\nformat = \"adblock\"\n\
@@ -139,7 +129,7 @@ async fn world(name: &str, saved_settings: Option<&str>) -> World {
             upstream.address,
         )
     };
-    let daemon = start(&format!("{name}.toml"), config);
+    let (daemon, web_port) = start_with_web_port(&format!("{name}.toml"), config);
     let dns_port = daemon.port;
 
     World {
@@ -194,6 +184,36 @@ async fn ask(port: u16, text: &str) {
         .unwrap();
 }
 
+/// Seconds since each list was loaded or confirmed current, as the page shows them.
+async fn list_ages(world: &World) -> Vec<Option<u64>> {
+    let reply = page_call(world.web_port, "GET", "/api/lists", "").await;
+    let (_, body) = reply.split_once("\r\n\r\n").expect("a reply with a body");
+    let lists: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|error| {
+        panic!("{error}: {reply}");
+    });
+
+    lists["lists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|list| list["age_seconds"].as_u64())
+        .collect()
+}
+
+/// Waits until the ages of both lists satisfy `reached`.
+async fn until_both_lists(world: &World, what: &str, reached: impl Fn(u64) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let ages = list_ages(world).await;
+        if ages.len() == 2 && ages.iter().all(|age| age.is_some_and(&reached)) {
+            return;
+        }
+
+        assert!(Instant::now() < deadline, "{what}: {ages:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Waits until both lists are in force and saved.
 async fn until_the_lists_are_saved(world: &World) {
     for _ in 0..400 {
@@ -237,21 +257,16 @@ async fn unchanged_workload_leaves_the_state_folder_as_it_was(name: &str, saved:
     .await;
     assert!(login.starts_with("HTTP/1.1 200"), "{login}");
 
+    until_both_lists(&world, "the lists never aged a second", |age| age >= 1).await;
     let requests = world.lists.requests();
     let refresh = page_call(world.web_port, "POST", "/api/lists/refresh", "").await;
     assert!(refresh.starts_with("HTTP/1.1 202"), "{refresh}");
-    for _ in 0..400 {
-        if world.lists.requests() >= requests + 2 {
-            break;
-        }
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // A refresh ends, snapshot write included, when the list counts as just checked.
+    until_both_lists(&world, "the refresh never ended", |age| age == 0).await;
 
     assert_eq!(world.lists.requests(), requests + 2, "both lists refreshed");
     assert_eq!(world.lists.not_modified(), 1, "one answer was a 304");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     assert_eq!(observe(&world.state), before);
     assert_eq!(world.state.join("settings.json").exists(), settings_existed);
 }
