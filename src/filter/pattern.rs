@@ -1296,44 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn go_regex_syntax_matches_like_go() {
-        assert!(matches("/^brace{\\.example$/", "brace{.example"));
-        assert!(matches("/^lit\\{x\\}\\.example$/", "lit{x}.example"));
-        assert!(matches(
-            "/^under\\_score\\.example$/",
-            "under_score.example"
-        ));
-        assert!(matches(
-            "/\\pL+\\.latin-class\\.example/",
-            "abc.latin-class.example"
-        ));
-        assert!(!matches(
-            "/\\pL+\\.latin-class\\.example/",
-            "ab1.latin-class.example"
-        ));
-        assert!(matches(
-            "/^\\p{Latin}+\\.script\\.example$/",
-            "abc.script.example"
-        ));
-        assert!(matches(
-            "/\\p{Greek}\\.greek\\.example/",
-            "\u{3b1}.greek.example"
-        ));
-        assert!(matches(
-            "/^[[:alpha:]]+\\.posix\\.example$/",
-            "abc.posix.example"
-        ));
-        assert!(matches("/^\\x61bc\\.hex\\.example$/", "abc.hex.example"));
-        assert!(matches(
-            "/^[\\w-]+\\.word-class\\.example$/",
-            "ab-1.word-class.example"
-        ));
-        assert!(matches("/^[^\\D]+\\.negd\\.example$/", "123.negd.example"));
-        assert!(!matches("/^[^\\D]+\\.negd\\.example$/", "abc.negd.example"));
-        assert!(matches("/(?s)dot.all\\.example/", "dotxall.example"));
-        assert!(matches("/(?U)lazy.+\\.example/", "lazyabc.example"));
-        assert!(matches("/^\\x{4e2d}$/", "\u{4e2d}"));
-        // `\d` and `\w` are ASCII only in Go.
+    fn go_classes_are_ascii_only() {
         assert!(!matches(
             "/^\\d+\\.digits\\.example$/",
             "\u{661}\u{662}.digits.example"

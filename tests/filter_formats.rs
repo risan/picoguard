@@ -118,20 +118,18 @@ fn dnsmasq_and_rpz_lists_block_the_same_domains() {
 }
 
 #[test]
-fn hosts_file_is_read_as_host_rules() {
-    let counters = counters("stevenblack-hosts");
-    assert!(counters.host_names > 70_000, "{}", counters.host_names);
-    assert_eq!(counters.slow_rules, 0);
-    assert_eq!(counters.invalid, 0, "{:?}", counters.first_invalid);
-    assert_eq!(counters.unmatchable_hosts, 0);
-}
-
-#[test]
-fn explicit_hosts_format_reads_the_same_names() {
+fn a_hosts_file_is_read_as_host_rules_with_and_without_the_format_named() {
     let auto = counters("stevenblack-hosts");
     let hosts = parse_file("stevenblack-hosts", ListFormat::Hosts).counters;
+
+    for counters in [&auto, &hosts] {
+        assert!(counters.host_names > 70_000, "{}", counters.host_names);
+        assert_eq!(counters.slow_rules, 0);
+        assert_eq!(counters.invalid, 0, "{:?}", counters.first_invalid);
+        assert_eq!(counters.unmatchable_hosts, 0);
+    }
+
     assert_eq!(hosts.host_names, auto.host_names);
-    assert_eq!(hosts.invalid, 0);
 }
 
 fn engine_of_hosts(text: &str) -> Engine {

@@ -1583,7 +1583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_redirects_are_followed() {
+    async fn five_redirects_are_followed_and_a_sixth_is_refused() {
         let server = Server::start(redirecting(5)).await;
 
         let pumped = fetch_body(&local(), &server.url("/0"), &Limits::default()).await;
@@ -1591,10 +1591,7 @@ mod tests {
         assert!(pumped.result.is_ok());
         assert_eq!(pumped.text(), b"done");
         assert_eq!(server.request_count(), 6);
-    }
 
-    #[tokio::test]
-    async fn a_sixth_redirect_is_refused() {
         let server = Server::start(redirecting(6)).await;
 
         let error = fetch_error(&local(), &server.url("/0"), &Limits::default()).await;

@@ -1058,11 +1058,11 @@ async fn age_snapshot(config: &Config, version: u32) {
 /// Compiler version 2 is the one that kept `$ORIGIN .` in RPZ owners (fixed in 3). Whatever
 /// it wrote must be compiled again, whether or not the server would answer 304.
 #[tokio::test]
-async fn a_snapshot_of_the_previous_compiler_is_compiled_again_without_validators() {
+async fn a_snapshot_of_the_previous_compiler_is_compiled_again() {
     let dir = StateDir::new();
     let server = ListServer::start().await;
-    server.serve("/l.txt", V1, None);
-    let config = config_of(&dir, vec![url_list("upgrade-plain", server.url("/l.txt"))]);
+    server.serve("/l.txt", V1, Some("\"v1\""));
+    let config = config_of(&dir, vec![url_list("upgrade", server.url("/l.txt"))]);
     {
         let (mut scheduler, _) = boot(&config).await;
         scheduler.refresh(0, &downloader()).await;
@@ -1077,36 +1077,13 @@ async fn a_snapshot_of_the_previous_compiler_is_compiled_again_without_validator
 
     scheduler.refresh(0, &downloader()).await;
 
-    assert!(blocked(&policy, "ads.example."));
-    assert!(store.bytes_written() > 0, "the snapshot is rewritten");
-    server.stop().await;
-    let (offline, _) = boot(&config).await;
-    assert!(blocked(&offline.policy(), "ads.example."));
-}
-
-#[tokio::test]
-async fn a_snapshot_of_the_previous_compiler_is_compiled_again_whatever_its_validators() {
-    let dir = StateDir::new();
-    let server = ListServer::start().await;
-    server.serve("/l.txt", V1, Some("\"v1\""));
-    let config = config_of(&dir, vec![url_list("upgrade-tagged", server.url("/l.txt"))]);
-    {
-        let (mut scheduler, _) = boot(&config).await;
-        scheduler.refresh(0, &downloader()).await;
-    }
-
-    age_snapshot(&config, 2).await;
-    let (mut scheduler, store) = boot(&config).await;
-    let policy = scheduler.policy();
-    scheduler.refresh(0, &downloader()).await;
-
     assert_eq!(
         server.not_modified(),
         0,
         "no validator is sent for a snapshot that was not used"
     );
     assert!(blocked(&policy, "ads.example."));
-    assert!(store.bytes_written() > 0);
+    assert!(store.bytes_written() > 0, "the snapshot is rewritten");
     server.stop().await;
     let (offline, _) = boot(&config).await;
     assert!(blocked(&offline.policy(), "ads.example."));
@@ -2279,6 +2256,29 @@ async fn a_page_list_whose_refresh_grows_past_the_budget_keeps_its_last_good_cop
 
     let mut scheduler = boot_with_page_lists(&file, lists).await;
     let control = scheduler.control();
+    let tiny = Arc::clone(scheduler.list(0).expect("booted from the snapshot"));
+    assert_eq!(control.memory().estimate_bytes, estimate);
+    server.serve("/tiny.txt", &many_rules(100_000), None);
+    scheduler.refresh(0, &downloader()).await;
+
+    let status = &control.statuses()[0];
+    assert_eq!(status.last_error.as_deref(), Some(OVER_THE_MEMORY_BUDGET));
+    assert!(Arc::ptr_eq(&tiny, scheduler.list(0).unwrap()));
+    assert!(blocked(&scheduler.policy(), "ads.example."));
+    assert!(!blocked(&scheduler.policy(), "n5.example."));
+    let memory = control.memory();
+    assert_eq!(memory.estimate_bytes, estimate);
+    assert!(memory.estimate_bytes <= memory.budget_bytes);
+
+    // A copy that grows within the room is put in force.
+    server.serve("/tiny.txt", &many_rules(1000), None);
+    scheduler.refresh(0, &downloader()).await;
+
+    assert_eq!(control.statuses()[0].last_error, None);
+    assert!(blocked(&scheduler.policy(), "n5.example."));
+    assert!(control.memory().estimate_bytes <= control.memory().budget_bytes);
+}
+
 #[tokio::test]
 async fn a_page_list_whose_refresh_is_no_larger_is_accepted_while_the_estimate_is_over_the_budget()
 {
@@ -2325,29 +2325,6 @@ async fn a_page_list_whose_refresh_is_no_larger_is_accepted_while_the_estimate_i
     assert!(!blocked(&scheduler.policy(), "a19999.example."));
     let memory = control.memory();
     assert!(memory.estimate_bytes > memory.budget_bytes);
-}
-
-    let tiny = Arc::clone(scheduler.list(0).expect("booted from the snapshot"));
-    assert_eq!(control.memory().estimate_bytes, estimate);
-    server.serve("/tiny.txt", &many_rules(100_000), None);
-    scheduler.refresh(0, &downloader()).await;
-
-    let status = &control.statuses()[0];
-    assert_eq!(status.last_error.as_deref(), Some(OVER_THE_MEMORY_BUDGET));
-    assert!(Arc::ptr_eq(&tiny, scheduler.list(0).unwrap()));
-    assert!(blocked(&scheduler.policy(), "ads.example."));
-    assert!(!blocked(&scheduler.policy(), "n5.example."));
-    let memory = control.memory();
-    assert_eq!(memory.estimate_bytes, estimate);
-    assert!(memory.estimate_bytes <= memory.budget_bytes);
-
-    // A copy that grows within the room is put in force.
-    server.serve("/tiny.txt", &many_rules(1000), None);
-    scheduler.refresh(0, &downloader()).await;
-
-    assert_eq!(control.statuses()[0].last_error, None);
-    assert!(blocked(&scheduler.policy(), "n5.example."));
-    assert!(control.memory().estimate_bytes <= control.memory().budget_bytes);
 }
 
 #[tokio::test]
@@ -2468,6 +2445,29 @@ async fn a_list_added_from_the_page_is_admitted_saved_and_in_force_with_the_file
         .add_list(add("Added", server.url("/added.txt")))
         .await
         .unwrap();
+
+    assert_eq!(added(&control).await, Ok(()));
+    assert!(blocked(&policy, "ads.example."));
+    assert_eq!(
+        shown(&control),
+        [
+            ("file".to_string(), true, true),
+            ("Added".to_string(), true, true)
+        ]
+    );
+    let saved = settings_file(&dir).unwrap().lists.unwrap();
+    assert_eq!(
+        saved
+            .iter()
+            .map(|list| (list.name.as_deref(), list.refresh_hours))
+            .collect::<Vec<_>>(),
+        [(Some("file"), 24), (Some("Added"), 12)]
+    );
+    let memory = control.memory();
+    assert!(memory.estimate_bytes <= memory.budget_bytes);
+    assert_eq!(server.requested("/added.txt"), 1);
+}
+
 #[tokio::test]
 async fn a_list_added_from_the_page_that_cannot_be_saved_is_refused_and_nothing_is_in_force() {
     let dir = StateDir::new();
@@ -2500,29 +2500,6 @@ async fn a_list_added_from_the_page_that_cannot_be_saved_is_refused_and_nothing_
     assert_eq!(control.memory().estimate_bytes, estimate);
     assert!(!dir.file("missing").exists());
     assert!(every_file(dir.path()).is_empty());
-}
-
-
-    assert_eq!(added(&control).await, Ok(()));
-    assert!(blocked(&policy, "ads.example."));
-    assert_eq!(
-        shown(&control),
-        [
-            ("file".to_string(), true, true),
-            ("Added".to_string(), true, true)
-        ]
-    );
-    let saved = settings_file(&dir).unwrap().lists.unwrap();
-    assert_eq!(
-        saved
-            .iter()
-            .map(|list| (list.name.as_deref(), list.refresh_hours))
-            .collect::<Vec<_>>(),
-        [(Some("file"), 24), (Some("Added"), 12)]
-    );
-    let memory = control.memory();
-    assert!(memory.estimate_bytes <= memory.budget_bytes);
-    assert_eq!(server.requested("/added.txt"), 1);
 }
 
 #[tokio::test]

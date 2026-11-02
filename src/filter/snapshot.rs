@@ -1363,8 +1363,16 @@ ads.*.tracker
         assert_eq!(a.compile_charge, b.compile_charge);
     }
 
+    fn clone_of(snapshot: &Snapshot) -> Snapshot {
+        Snapshot {
+            meta: snapshot.meta.clone(),
+            list: Arc::clone(&snapshot.list),
+            counters: snapshot.counters.clone(),
+        }
+    }
+
     #[tokio::test]
-    async fn a_written_snapshot_loads_back_identical() {
+    async fn a_written_snapshot_loads_back_identical_and_decides_alike() {
         let worker = CompileWorker::spawn().unwrap();
         let state = TestDir::new("snap");
         let store = SnapshotStore::open(state.path()).unwrap();
@@ -1383,25 +1391,6 @@ ads.*.tracker
         assert_same_list(&loaded.list, &snapshot.list);
         assert_eq!(loaded.meta.validators.etag.as_deref(), Some("\"tag\""));
         assert!(loaded.fits(SOURCE, &options(ListFormat::Auto)));
-    }
-
-    fn clone_of(snapshot: &Snapshot) -> Snapshot {
-        Snapshot {
-            meta: snapshot.meta.clone(),
-            list: Arc::clone(&snapshot.list),
-            counters: snapshot.counters.clone(),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_loaded_snapshot_decides_like_the_compiled_list() {
-        let worker = CompileWorker::spawn().unwrap();
-        let state = TestDir::new("snap");
-        let store = SnapshotStore::open(state.path()).unwrap();
-        let snapshot = snapshot_of(&worker, MIXED, ListFormat::Auto).await;
-        store.save(clone_of(&snapshot)).await.unwrap();
-        store.flush().await;
-        let loaded = load(&store.path_for(SOURCE).unwrap(), &caps()).unwrap();
 
         let compiled = Engine::new(vec![Arc::clone(&snapshot.list)], Vec::new());
         let reloaded = Engine::new(vec![loaded.list], Vec::new());
@@ -2389,7 +2378,7 @@ ads.*.tracker
     }
 
     #[tokio::test]
-    async fn a_snapshot_fits_only_the_redirect_setting_it_was_made_with() {
+    async fn a_snapshot_fits_only_the_source_format_cap_and_redirect_setting_it_was_made_with() {
         let worker = CompileWorker::spawn().unwrap();
         let state = TestDir::new("snap");
         let store = SnapshotStore::open(state.path()).unwrap();
@@ -2406,6 +2395,21 @@ ads.*.tracker
 
         assert!(!loaded.meta.allow_redirects);
         assert!(loaded.fits(SOURCE, &blocking));
+        assert!(!loaded.fits("https://other.example/list.txt", &blocking));
+        assert!(!loaded.fits(
+            SOURCE,
+            &CompileOptions {
+                format: ListFormat::Auto,
+                ..blocking
+            }
+        ));
+        assert!(!loaded.fits(
+            SOURCE,
+            &CompileOptions {
+                max_rules: 10,
+                ..blocking
+            }
+        ));
         let allowing = CompileOptions {
             allow_redirects: true,
             ..blocking
