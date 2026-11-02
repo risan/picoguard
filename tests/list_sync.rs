@@ -1059,34 +1059,42 @@ async fn age_snapshot(config: &Config, version: u32) {
 /// it wrote must be compiled again, whether or not the server would answer 304.
 #[tokio::test]
 async fn a_snapshot_of_the_previous_compiler_is_compiled_again() {
-    let dir = StateDir::new();
-    let server = ListServer::start().await;
-    server.serve("/l.txt", V1, Some("\"v1\""));
-    let config = config_of(&dir, vec![url_list("upgrade", server.url("/l.txt"))]);
-    {
-        let (mut scheduler, _) = boot(&config).await;
+    for etag in [None, Some("\"v1\"")] {
+        let dir = StateDir::new();
+        let server = ListServer::start().await;
+        server.serve("/l.txt", V1, etag);
+        let config = config_of(&dir, vec![url_list("upgrade", server.url("/l.txt"))]);
+        {
+            let (mut scheduler, _) = boot(&config).await;
+            scheduler.refresh(0, &downloader()).await;
+        }
+
+        age_snapshot(&config, 2).await;
+        let (mut scheduler, store) = boot(&config).await;
+        let policy = scheduler.policy();
+
+        assert!(
+            scheduler.list(0).is_none(),
+            "the old snapshot is not used (etag {etag:?})"
+        );
+        assert!(!blocked(&policy, "ads.example."));
+
         scheduler.refresh(0, &downloader()).await;
+
+        assert_eq!(
+            server.not_modified(),
+            0,
+            "no validator is sent for a snapshot that was not used (etag {etag:?})"
+        );
+        assert!(blocked(&policy, "ads.example."));
+        assert!(
+            store.bytes_written() > 0,
+            "the snapshot is rewritten (etag {etag:?})"
+        );
+        server.stop().await;
+        let (offline, _) = boot(&config).await;
+        assert!(blocked(&offline.policy(), "ads.example."));
     }
-
-    age_snapshot(&config, 2).await;
-    let (mut scheduler, store) = boot(&config).await;
-    let policy = scheduler.policy();
-
-    assert!(scheduler.list(0).is_none(), "the old snapshot is not used");
-    assert!(!blocked(&policy, "ads.example."));
-
-    scheduler.refresh(0, &downloader()).await;
-
-    assert_eq!(
-        server.not_modified(),
-        0,
-        "no validator is sent for a snapshot that was not used"
-    );
-    assert!(blocked(&policy, "ads.example."));
-    assert!(store.bytes_written() > 0, "the snapshot is rewritten");
-    server.stop().await;
-    let (offline, _) = boot(&config).await;
-    assert!(blocked(&offline.policy(), "ads.example."));
 }
 
 /// A login or error page served with status 200 compiles to junk rules; it must never
