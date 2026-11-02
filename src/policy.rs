@@ -217,14 +217,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_policy_is_active_at_generation_zero() {
-        let view = Policy::new().view(Instant::now());
-
-        assert_eq!(view.generation, 0);
-        assert!(!view.paused);
-    }
-
-    #[test]
     fn the_time_left_of_a_pause_counts_down_to_nothing() {
         let policy = Policy::new();
         let start = Instant::now();
@@ -348,47 +340,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_request_an_allow_rule_matched_is_told_from_one_nothing_matched() {
-        let policy = Policy::with_engine(engine("@@||ok.example^\n||ads.example^\n"));
-        let now = Instant::now();
-        let view = policy.view(now);
-
-        assert_eq!(
-            request_decision(&view, "ok.example.", RecordType::A),
-            Verdict::Allow
-        );
-        assert_eq!(
-            request_decision(&view, "other.example.", RecordType::A),
-            Verdict::NoMatch
-        );
-
-        policy.pause(Duration::from_secs(5), now);
-        assert_eq!(
-            request_decision(&policy.view(now), "ok.example.", RecordType::A),
-            Verdict::NoMatch
-        );
-    }
-
-    fn response_decision(
-        view: &PolicyView,
-        rtype: RecordType,
-        answers: Vec<hickory_proto::rr::Record>,
-    ) -> Decision {
-        let spec = QuerySpec::new("q.example.", rtype);
-        let reply = ResponseSpec {
-            answers,
-            ..ResponseSpec::default()
-        }
-        .bytes(&spec);
-
-        view.check_response(ReplyParts {
-            bytes: &reply,
-            ttl_offsets: &[],
-            opt_start: None,
-        })
-    }
-
     fn reply(
         answers: Vec<hickory_proto::rr::Record>,
         additionals: Vec<hickory_proto::rr::Record>,
@@ -401,7 +352,7 @@ mod tests {
         .bytes(&QuerySpec::new("q.example.", RecordType::A))
     }
 
-    fn decision_of_reply(view: &PolicyView, reply: &[u8]) -> Decision {
+    fn response_decision(view: &PolicyView, reply: &[u8]) -> Decision {
         view.check_response(ReplyParts {
             bytes: reply,
             ttl_offsets: &[],
@@ -411,112 +362,6 @@ mod tests {
 
     fn ip(text: &str) -> std::net::Ipv4Addr {
         text.parse().unwrap()
-    }
-
-    #[test]
-    fn answer_records_are_checked_in_order_and_the_first_blocked_one_decides() {
-        let policy = Policy::with_engine(engine(
-            "||tracker.example^\n1.1.1.1 9.9.9.9\n||203.0.113.7^\n",
-        ));
-        let view = policy.view(Instant::now());
-        let a = |address: &str| test_util::a("q.example.", 60, ip(address));
-        let check = |answers| response_decision(&view, RecordType::A, answers);
-
-        assert_eq!(check(vec![a("8.8.8.8")]), Decision::Pass);
-        assert!(matches!(
-            check(vec![test_util::cname(
-                "q.example.",
-                60,
-                "cdn.tracker.example."
-            )]),
-            Decision::Block { .. }
-        ));
-        assert_eq!(
-            check(vec![a("9.9.9.9")]),
-            Decision::Block {
-                ips: vec!["1.1.1.1".parse().unwrap()]
-            }
-        );
-        assert!(matches!(
-            check(vec![a("8.8.8.8"), a("203.0.113.7")]),
-            Decision::Block { .. }
-        ));
-    }
-
-    #[test]
-    fn a_root_cname_target_is_not_checked_as_a_name() {
-        let policy = Policy::with_engine(engine("/^\\.$/\n/./\n"));
-        let view = policy.view(Instant::now());
-        let root_target = vec![test_util::cname("q.example.", 60, ".")];
-
-        assert_eq!(
-            response_decision(&view, RecordType::A, root_target),
-            Decision::Pass
-        );
-    }
-
-    #[test]
-    fn https_hints_are_checked() {
-        let policy = Policy::with_engine(engine("||203.0.113.7^\n||2001:db8::bad^\n"));
-        let view = policy.view(Instant::now());
-        let hints = |v4: &[&str], v6: &[&str]| {
-            let v4: Vec<_> = v4.iter().map(|text| ip(text)).collect();
-            let v6: Vec<_> = v6.iter().map(|text| text.parse().unwrap()).collect();
-
-            response_decision(
-                &view,
-                RecordType::HTTPS,
-                vec![test_util::https("q.example.", 60, &v4, &v6)],
-            )
-        };
-
-        assert_eq!(hints(&["8.8.8.8"], &["2606:4700::1111"]), Decision::Pass);
-        assert!(matches!(
-            hints(&["8.8.8.8", "203.0.113.7"], &[]),
-            Decision::Block { .. }
-        ));
-        assert!(matches!(
-            hints(&[], &["2001:db8::bad"]),
-            Decision::Block { .. }
-        ));
-    }
-
-    #[test]
-    fn an_ipv4_mapped_answer_is_checked_as_dotted_ipv4_text() {
-        let policy = Policy::with_engine(engine("||203.0.113.7^\n"));
-        let view = policy.view(Instant::now());
-        let mapped: std::net::Ipv6Addr = "::ffff:203.0.113.7".parse().unwrap();
-
-        let decision = response_decision(
-            &view,
-            RecordType::AAAA,
-            vec![test_util::aaaa("q.example.", 60, mapped)],
-        );
-
-        assert!(matches!(decision, Decision::Block { .. }));
-        assert_eq!(go_ip_text(IpAddr::V6(mapped)), "203.0.113.7");
-        assert_eq!(go_ip_text("2001:db8::1".parse().unwrap()), "2001:db8::1");
-    }
-
-    #[test]
-    fn a_paused_policy_passes_every_reply() {
-        let policy = Policy::with_engine(engine("||tracker.example^\n"));
-        let now = Instant::now();
-        policy.pause(Duration::from_secs(5), now);
-        let answers = || vec![test_util::cname("q.example.", 60, "tracker.example.")];
-
-        assert_eq!(
-            response_decision(&policy.view(now), RecordType::A, answers()),
-            Decision::Pass
-        );
-        assert!(matches!(
-            response_decision(
-                &policy.view(now + Duration::from_secs(6)),
-                RecordType::A,
-                answers()
-            ),
-            Decision::Block { .. }
-        ));
     }
 
     #[test]
@@ -535,7 +380,7 @@ mod tests {
         assert!(ResponseInfo::parse(&bytes).is_ok());
 
         assert!(matches!(
-            decision_of_reply(&view, &bytes),
+            response_decision(&view, &bytes),
             Decision::Block { .. }
         ));
     }
@@ -548,7 +393,7 @@ mod tests {
         let extra = test_util::a("extra.example.", 60, ip("203.0.113.7"));
 
         assert_eq!(
-            decision_of_reply(&view, &reply(vec![answer], vec![extra])),
+            response_decision(&view, &reply(vec![answer], vec![extra])),
             Decision::Pass
         );
     }

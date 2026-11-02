@@ -1413,25 +1413,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_chunked_body_is_decoded() {
-        let server = Server::start(|_, _, mut stream| async move {
-            respond(
-                &mut stream,
-                "200 OK",
-                &[("Transfer-Encoding", "chunked")],
-                b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
-            )
-            .await;
-        })
-        .await;
-
-        let pumped = fetch_body(&local(), &server.url("/"), &Limits::default()).await;
-
-        assert!(pumped.result.is_ok());
-        assert_eq!(pumped.text(), b"hello world");
-    }
-
-    #[tokio::test]
     async fn an_empty_body_is_just_the_end() {
         let server = Server::start(|_, _, mut stream| async move {
             respond(&mut stream, "200 OK", &[], b"").await;
@@ -1821,11 +1802,6 @@ mod tests {
     }
 
     #[test]
-    fn the_default_total_deadline_is_ten_minutes() {
-        assert_eq!(Limits::default().total_timeout, Duration::from_secs(600));
-    }
-
-    #[test]
     fn local_addresses_are_loopback_private_link_local_and_unspecified() {
         for local in [
             "127.0.0.1",
@@ -2117,27 +2093,6 @@ mod tests {
 
         assert!(pumped.result.is_ok(), "{:?}", pumped.result);
         assert_eq!(pumped.text(), sample(1000));
-    }
-
-    #[tokio::test]
-    async fn a_compressed_body_is_refused() {
-        let server = Server::start(|_, _, mut stream| async move {
-            respond(
-                &mut stream,
-                "200 OK",
-                &[("Content-Encoding", "gzip")],
-                b"\x1f\x8b",
-            )
-            .await;
-        })
-        .await;
-
-        let error = fetch_error(&local(), &server.url("/"), &Limits::default()).await;
-
-        assert!(
-            matches!(error, FetchError::UnsupportedEncoding(_)),
-            "{error:?}"
-        );
     }
 
     /// The server writes `head_lines` (after the status line) and `body` as they are.

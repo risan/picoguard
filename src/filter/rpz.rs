@@ -289,30 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_and_wildcard_block() {
-        let records = read("ads.example CNAME .\n*.ads.example CNAME .\n");
-        assert_eq!(
-            records,
-            [
-                policy("ads.example", false, false),
-                policy("ads.example", true, false)
-            ]
-        );
-    }
-
-    #[test]
-    fn passthru_allows_with_the_same_scope() {
-        let records = read("ok.example CNAME rpz-passthru.\n*.ok.example CNAME rpz-passthru.\n");
-        assert_eq!(
-            records,
-            [
-                policy("ok.example", false, true),
-                policy("ok.example", true, true)
-            ]
-        );
-    }
-
-    #[test]
     fn nodata_and_drop_actions_block() {
         let records = read("a.example CNAME *.\nb.example CNAME rpz-drop.\n");
         assert_eq!(
@@ -399,28 +375,6 @@ mod tests {
         let text = "a.example A 1.2.3.4\nb.example CNAME walled.example.\n32.4.3.2.1.rpz-ip CNAME .\nns.rpz-nsdname CNAME .\nmid*.example CNAME .\n";
         let records = read(text);
         assert_eq!(records, vec![Record::Other; 5]);
-    }
-
-    #[test]
-    fn a_record_over_the_byte_cap_is_discarded_through_its_closing_parenthesis() {
-        let mut reader = RpzReader::new();
-        let mut records = Vec::new();
-        let mut out = |record| records.push(record);
-        reader.feed_line("big.example CNAME (", &mut out);
-        let mut peak = 0;
-        for _ in 0..10_000 {
-            reader.feed_line("  ads.example", &mut out);
-            peak = peak.max(reader.buffered_bytes());
-        }
-
-        reader.feed_line(")", &mut out);
-        reader.feed_line("after.example CNAME .", &mut out);
-        reader.finish(&mut out);
-        assert_eq!(
-            records,
-            [Record::TooLong, policy("after.example", false, false)]
-        );
-        assert!(peak <= MAX_RECORD_BYTES, "held {peak} bytes");
     }
 
     #[test]

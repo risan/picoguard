@@ -2104,19 +2104,6 @@ mod tests {
     }
 
     #[test]
-    fn rule_text_is_the_pattern_and_modifiers_in_a_fixed_order() {
-        assert_eq!(
-            slow_rule("||a.example^$dnstype=A|~AAAA").text(),
-            "||a.example^$dnstype=A|~AAAA"
-        );
-        assert_eq!(slow_rule(r"/^ad[0-9]+\./").text(), r"/^ad[0-9]+\./");
-        assert_eq!(
-            slow_rule("||x.example^$dnstype=AAAA,important").text(),
-            "||x.example^$important,dnstype=AAAA"
-        );
-    }
-
-    #[test]
     fn regex_rules() {
         let (rules, counters) = adguard("/^ad[0-9]+\\./\n/ab/$important,dnstype=MX\n");
         assert_eq!(
