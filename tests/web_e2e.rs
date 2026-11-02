@@ -3225,6 +3225,53 @@ async fn oversized_request_heads_are_refused() {
     assert_eq!(after.status, 200, "the server still answers");
 }
 
+/// How many connections the page serves at once, and how long one may take to send its head:
+/// `MAX_CONNECTIONS` and `HEAD_TIMEOUT` in `src/web.rs`.
+const PAGE_CONNECTIONS: usize = 16;
+
+#[tokio::test]
+async fn connections_that_send_no_head_cannot_hold_the_page_down() {
+    let (site, _upstream) = plain_site().await;
+    let mut idle = Vec::new();
+    for index in 0..PAGE_CONNECTIONS {
+        let mut stream = TcpStream::connect(site.web).await.unwrap();
+        if index % 2 == 1 {
+            stream
+                .write_all(b"GET /api/status HTTP/1.1\r\nHost: x\r\n")
+                .await
+                .unwrap();
+        }
+
+        idle.push(stream);
+    }
+
+    assert!(
+        site.is_ignored(get("/api/status")).await,
+        "a connection past the limit was served"
+    );
+    assert_eq!(
+        ask(&site.dns, "ok.example.", RecordType::A)
+            .await
+            .response_code,
+        ResponseCode::NoError
+    );
+
+    for (index, mut stream) in idle.into_iter().enumerate() {
+        let mut chunk = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
+            .await
+            .unwrap_or_else(|_| panic!("connection {index} was still open after 15 s"));
+
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "connection {index} got {closed:?}"
+        );
+    }
+
+    let after = site.send(get("/api/status")).await;
+    assert_eq!(after.status, 200, "the page answers again");
+}
+
 #[tokio::test]
 async fn a_peer_outside_allow_from_gets_nothing_from_reads_or_changes() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
@@ -4843,6 +4890,135 @@ async fn a_list_change_from_the_page_never_sets_a_path_redirects_or_anything_unk
     assert_eq!(lists["lists"][0]["editable"], false);
     assert_eq!(lists["lists"][0]["from"], "file");
     assert_eq!(server.requests(), 0);
+}
+
+#[tokio::test]
+async fn a_list_name_from_the_page_is_at_most_100_characters_without_control_characters() {
+    const REFUSED: &str = "a list name has at most 100 characters and no control characters";
+    let (site, server, _upstream) = list_site(|_| {}).await;
+    server.serve("/a.txt", "||a.example^\n", None);
+    server.serve("/b.txt", "||b.example^\n", None);
+    server.serve("/c.txt", "||c.example^\n", None);
+    let (a, b, c) = (
+        server.url("/a.txt"),
+        server.url("/b.txt"),
+        server.url("/c.txt"),
+    );
+    let at_the_limit = "\u{e9}".repeat(100);
+    let bad_names = [
+        "x".repeat(101),
+        "\u{e9}".repeat(101),
+        "in\nside".to_string(),
+        "in\u{0}side".to_string(),
+        "in\u{7f}side".to_string(),
+        "tab\tinside".to_string(),
+    ];
+
+    for name in &bad_names {
+        let reply = site.send(post("/api/lists/add", &add_body(name, &a))).await;
+
+        assert_eq!(reply.status, 400, "{name:?}: {}", reply.body);
+        assert!(reply.body.contains(REFUSED), "{}", reply.body);
+    }
+
+    assert_eq!(server.requests(), 0, "a refused add downloaded the list");
+    assert!(saved_settings(&site).is_none());
+    assert!(site.control.pending_list().is_none());
+
+    site.send(post("/api/lists/add", &add_body(&at_the_limit, &a)))
+        .await;
+    let lists = after_the_add(&site).await;
+    assert_eq!(lists["pending"]["state"], "added");
+    assert_eq!(lists["lists"][0]["name"], at_the_limit.as_str());
+
+    let edit = |source: &str, name: &str| {
+        post(
+            "/api/lists/edit",
+            &serde_json::json!({"role": "block", "source": source, "name": name}).to_string(),
+        )
+    };
+    for name in &bad_names {
+        let reply = site.send(edit(&a, name)).await;
+
+        assert_eq!(reply.status, 400, "{name:?}: {}", reply.body);
+        assert!(reply.body.contains(REFUSED), "{}", reply.body);
+    }
+
+    let lists = site.send(get("/api/lists")).await.json();
+    assert_eq!(lists["lists"][0]["name"], at_the_limit.as_str());
+    assert_eq!(
+        saved_settings(&site).unwrap()["lists"][0]["name"],
+        at_the_limit.as_str()
+    );
+
+    let renamed = site.send(edit(&a, "  Renamed  ")).await;
+    assert_eq!(renamed.status, 200, "{}", renamed.body);
+    assert_eq!(renamed.json()["lists"][0]["name"], "Renamed");
+    assert_eq!(
+        saved_settings(&site).unwrap()["lists"][0]["name"],
+        "Renamed"
+    );
+
+    let cleared = site.send(edit(&a, " \t ")).await;
+    assert_eq!(cleared.status, 200, "{}", cleared.body);
+    assert_eq!(cleared.json()["lists"][0]["name"], a.as_str());
+
+    site.send(post("/api/lists/add", &add_body("   ", &b)))
+        .await;
+    assert_eq!(after_the_add(&site).await["pending"]["state"], "added");
+    site.send(post("/api/lists/add", &add_body("  Padded  ", &c)))
+        .await;
+    let lists = after_the_add(&site).await;
+    assert_eq!(lists["pending"]["state"], "added");
+    let names: Vec<&str> = lists["lists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|list| list["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [a.as_str(), b.as_str(), "Padded"]);
+}
+
+#[tokio::test]
+async fn a_list_url_from_the_page_has_no_user_name_or_password_but_may_hold_an_at_sign_later() {
+    let (site, server, _upstream) = list_site(|_| {}).await;
+    server.serve("/p@th/list.txt", "||path.example^\n", None);
+    server.serve("/query.txt?token=a@b", "||query.example^\n", None);
+    let host = server.url("/").trim_end_matches('/').to_string();
+    let with = |userinfo: &str| host.replacen("://", &format!("://{userinfo}@"), 1) + "/list.txt";
+
+    for url in [with("user:secret"), with("user"), with(":")] {
+        let reply = site
+            .send(post("/api/lists/add", &add_body("Private", &url)))
+            .await;
+
+        assert_eq!(reply.status, 400, "{url}: {}", reply.body);
+        assert!(
+            reply
+                .body
+                .contains("the list URL must not contain a user name or password"),
+            "{}",
+            reply.body
+        );
+        assert!(!reply.body.contains("secret"), "{}", reply.body);
+    }
+
+    assert_eq!(server.requests(), 0);
+    assert!(saved_settings(&site).is_none());
+    assert!(site.control.pending_list().is_none());
+
+    for path in ["/p@th/list.txt", "/query.txt?token=a@b"] {
+        let reply = site
+            .send(post("/api/lists/add", &add_body("At", &server.url(path))))
+            .await;
+
+        assert_eq!(reply.status, 202, "{path}: {}", reply.body);
+        assert_eq!(
+            after_the_add(&site).await["pending"]["state"],
+            "added",
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]
