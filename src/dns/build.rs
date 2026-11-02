@@ -983,16 +983,30 @@ mod tests {
     #[test]
     fn a_client_size_below_512_is_treated_as_512() {
         let mut client = QuerySpec::new("example.com.", RecordType::A);
-        client.edns = Some((100, false));
-        let upstream = ResponseSpec {
-            answers: vec![a("example.com.", 120, [192, 0, 2, 1].into())],
-            ..ResponseSpec::default()
-        }
-        .bytes(&QuerySpec::new("example.com.", RecordType::A));
+        client.edns = Some((512, false));
+        let upstream = reply_of_len(&client, 300, false);
+        // The test encoder raises any size to 512, so the client's size is written by hand.
+        let mut bytes = client.bytes();
+        let size_at = bytes.len() - OPT_RECORD_LEN + 3;
+        bytes[size_at..size_at + 2].copy_from_slice(&100u16.to_be_bytes());
+        let query = Query::parse(&bytes).unwrap();
+        assert_eq!(query.edns.unwrap().udp_size, 100);
+        let (ttl_offsets, opt_start) = parts_of(&upstream);
+        let parts = ReplyParts {
+            bytes: &upstream,
+            ttl_offsets: &ttl_offsets,
+            opt_start,
+        };
+        let mut out = Vec::new();
 
-        let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
+        Reply::new(&query, SERVER_UDP_SIZE, Protocol::Udp).from_upstream(
+            parts,
+            no_aging(),
+            &mut out,
+        );
 
         assert!(!parse(&out).metadata.truncation);
+        assert!(out.len() > 100);
     }
 
     /// An upstream reply of exactly `total` bytes: one TXT answer, and the OPT

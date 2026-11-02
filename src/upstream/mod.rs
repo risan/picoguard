@@ -681,7 +681,7 @@ fn parse_server(spec: &str, context: &Context) -> Result<Transport, String> {
     }
 
     Err(format!(
-        "upstream {spec}: encrypted upstreams are not supported yet, use udp:// or tcp://"
+        "upstream {spec}: use udp://, tcp://, tls:// or https://"
     ))
 }
 
