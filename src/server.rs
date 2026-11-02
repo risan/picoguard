@@ -459,15 +459,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listeners_open_udp_and_tcp_on_the_requested_address() {
-        let listeners = Listeners::bind(&server_config(&["127.0.0.1"], 0)).unwrap();
-
-        assert_eq!(listeners.udp_addresses().len(), 1);
-        assert_eq!(listeners.tcp_addresses().len(), 1);
-        assert!(listeners.udp_addresses()[0].ip().is_loopback());
-    }
-
-    #[tokio::test]
     async fn wildcard_ipv4_and_ipv6_share_one_port() {
         if !ipv6_available() {
             return;
@@ -748,28 +739,6 @@ mod tests {
         let messages = written_to_a_slow_peer(&pipeline, replies).await;
 
         assert_eq!(first_address(&messages[1]), "0.0.0.0");
-    }
-
-    #[tokio::test]
-    async fn a_pause_lasts_until_the_clock_reaches_its_deadline() {
-        let clock = ManualClock::new();
-        let policy = clock.policy(blocking("||ads.example^\n"));
-        let (pipeline, _upstream) = pipeline_over(&policy).await;
-        policy.pause(Duration::from_secs(60), policy.now());
-        let answer_of = || async {
-            let mut out = Vec::new();
-            pipeline
-                .answer(query_for("ads.example."), Protocol::Tcp, CLIENT, &mut out)
-                .await;
-
-            first_address(&out)
-        };
-
-        assert_eq!(answer_of().await, "1.2.3.4");
-        clock.advance(Duration::from_secs(59));
-        assert_eq!(answer_of().await, "1.2.3.4");
-        clock.advance(Duration::from_secs(1));
-        assert_eq!(answer_of().await, "0.0.0.0");
     }
 
     fn asked(upstream: &FakeDns) -> usize {

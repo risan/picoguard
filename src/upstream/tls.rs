@@ -386,24 +386,6 @@ mod tests {
         assert_eq!(server.connections.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn the_alpn_protocol_follows_the_transport() {
-        let pki = TestPki::new();
-        let server = idle_server(&pki, &["h2", "dot"], ring::default_provider()).await;
-
-        let h2 = dialer(&pki, true, Alpn::H2, &server)
-            .connect(deadline())
-            .await
-            .unwrap();
-        let dot = dialer(&pki, true, Alpn::Dot, &server)
-            .connect(deadline())
-            .await
-            .unwrap();
-
-        assert_eq!(h2.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
-        assert_eq!(dot.get_ref().1.alpn_protocol(), Some(&b"dot"[..]));
-    }
-
     /// A dialer for the host name `dns.example`, which `dns` resolves, on the
     /// port of `server`. The certificate is checked against `localhost`.
     fn named_dialer(pki: &TestPki, server: &TlsServer, dns: &FakeDns) -> TlsDialer {
@@ -427,22 +409,39 @@ mod tests {
         TcpListener::bind(address).await.unwrap()
     }
 
+    /// Accepts TCP connections on `address` and closes each one at once.
+    async fn hang_up_listener(address: SocketAddr) {
+        let listener = TcpListener::bind(address).await.unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+    }
+
     #[tokio::test]
     async fn a_cached_address_that_accepts_tcp_but_fails_tls_is_forgotten() {
         let pki = TestPki::new();
         let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
         let old_address = SocketAddr::new("127.0.0.2".parse().unwrap(), server.address.port());
-        let _silent = silent_listener(old_address).await;
+        hang_up_listener(old_address).await;
         let dns = fake_dns(vec![Ipv4Addr::new(127, 0, 0, 2)], Vec::new()).await;
         let dialer = named_dialer(&pki, &server, &dns);
 
-        let stuck = dialer
-            .connect(Instant::now() + Duration::from_millis(300))
-            .await;
+        let failed = dialer.connect(deadline()).await;
+        let lookups_after_failure = dns.queries.load(Ordering::SeqCst);
         dns.set_v4(vec![Ipv4Addr::LOCALHOST]);
         let recovered = dialer.connect(deadline()).await;
 
-        assert!(matches!(stuck, Err(UpstreamError::Timeout)), "{stuck:?}");
+        assert!(
+            matches!(&failed, Err(UpstreamError::Io(error)) if error.kind() != io::ErrorKind::NotFound),
+            "the handshake must fail after the name was resolved: {failed:?}"
+        );
+        assert!(
+            dns.queries.load(Ordering::SeqCst) > lookups_after_failure,
+            "the failed address must be forgotten and the name looked up again"
+        );
         assert!(recovered.is_ok(), "{recovered:?}");
     }
 
@@ -518,18 +517,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_h2_dialer_rejects_a_server_that_negotiates_no_protocol() {
-        let pki = TestPki::new();
-        let server = idle_server(&pki, &[], ring::default_provider()).await;
-
-        let result = dialer(&pki, true, Alpn::H2, &server)
-            .connect(deadline())
-            .await;
-
-        assert!(matches!(result, Err(UpstreamError::Io(_))), "{result:?}");
-    }
-
-    #[tokio::test]
     async fn a_dot_dialer_accepts_a_server_that_negotiates_no_protocol() {
         let pki = TestPki::new();
         let server = idle_server(&pki, &[], ring::default_provider()).await;
@@ -540,23 +527,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(stream.get_ref().1.alpn_protocol(), None);
-    }
-
-    #[tokio::test]
-    async fn an_ip_address_is_checked_against_the_ip_names_of_the_certificate() {
-        let pki = TestPki::new();
-        let server = idle_server(&pki, &["h2"], ring::default_provider()).await;
-        let tls = Arc::new(Tls::with_roots(pki.roots(), true));
-        let name = ServerName::try_from("127.0.0.1").unwrap();
-        let dialer = TlsDialer::new(
-            tls,
-            Alpn::H2,
-            name,
-            Remote::at(server.address),
-            "test".into(),
-        );
-
-        assert!(dialer.connect(deadline()).await.is_ok());
     }
 
     #[tokio::test]

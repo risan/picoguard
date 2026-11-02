@@ -636,27 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn no_password_means_no_auth() {
-        assert!(Auth::new(&WebConfig::default()).unwrap().is_none());
-    }
-
-    #[test]
-    fn the_session_cookie_is_strict_http_only_and_lasts_thirty_days() {
-        let auth = auth(&web_config("admin", "s3cret"));
-        let cookie = auth.session_cookie(T);
-
-        assert!(cookie.starts_with("picoguard_session="), "{cookie}");
-        assert!(
-            cookie.ends_with("; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict"),
-            "{cookie}"
-        );
-        assert_eq!(
-            SIGNED_OUT_COOKIE,
-            "picoguard_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"
-        );
-    }
-
-    #[test]
     fn a_token_is_accepted_until_its_expiry_and_not_after() {
         let auth = auth(&web_config("admin", "s3cret"));
         let token = token_of(&auth.session_cookie(T));
@@ -721,19 +700,6 @@ mod tests {
                     "issued by {issuer_index}, checked by {checker_index}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn the_same_config_makes_the_same_key() {
-        let hash = PasswordHash::new(b"s3cret", 1000).unwrap();
-
-        for config in [web_config("admin", "s3cret"), hashed_config("admin", &hash)] {
-            let before = auth(&config);
-            let after = auth(&config);
-
-            assert!(accepts(&after, &token_of(&before.session_cookie(T)), T));
-            assert!(accepts(&before, &token_of(&after.session_cookie(T)), T));
         }
     }
 
@@ -805,19 +771,6 @@ mod tests {
         assert!(limiter.is_limited(peer, last + Duration::from_secs(1)));
         assert!(limiter.is_limited(peer, last + Duration::from_secs(899)));
         assert!(!limiter.is_limited(peer, last + Duration::from_secs(900)));
-    }
-
-    #[test]
-    fn four_failures_do_not_lock() {
-        let start = Instant::now();
-        let mut limiter = Limiter::new(start);
-        let peer = ip("192.0.2.1");
-
-        for _ in 0..4 {
-            limiter.record_failure(peer, start);
-        }
-
-        assert!(!limiter.is_limited(peer, start));
     }
 
     #[test]

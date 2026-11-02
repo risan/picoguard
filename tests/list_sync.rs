@@ -695,6 +695,71 @@ async fn a_changed_format_in_the_config_recompiles_and_rewrites_the_snapshot() {
 }
 
 #[tokio::test]
+async fn auto_to_domains_on_unchanged_content_is_recompiled_and_survives_an_offline_restart() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/l.txt", "a.example\nb.example\n", Some("\"v1\""));
+    let auto = ListConfig {
+        format: ListFormat::Auto,
+        ..url_list("auto-to-domains", server.url("/l.txt"))
+    };
+    let domains = ListConfig {
+        format: ListFormat::Domains,
+        ..auto.clone()
+    };
+    let snapshot_of = |list: &ListConfig| {
+        let options = CompileOptions::new(list.format, list.max_rules);
+        let path = SnapshotStore::open(dir.path())
+            .unwrap()
+            .path_for(list.url.as_ref().unwrap())
+            .unwrap();
+
+        async move {
+            CompileWorker::spawn()
+                .unwrap()
+                .load(path, options)
+                .await
+                .unwrap()
+        }
+    };
+    {
+        let (mut scheduler, _) = boot(&config_of(&dir, vec![auto.clone()])).await;
+        scheduler.refresh(0, &downloader()).await;
+    }
+
+    let before = snapshot_of(&auto).await;
+    assert_eq!(before.meta.configured_format, ListFormat::Auto);
+    assert_eq!(before.meta.effective_format, ListFormat::Adblock);
+
+    {
+        let (mut scheduler, store) = boot(&config_of(&dir, vec![domains.clone()])).await;
+        assert!(scheduler.list(0).is_none(), "the old snapshot does not fit");
+
+        scheduler.refresh(0, &downloader()).await;
+
+        assert!(blocked(&scheduler.policy(), "a.example."));
+        assert_eq!(server.not_modified(), 0, "no validators are sent for it");
+        assert!(store.bytes_written() > 0, "the snapshot is written again");
+    }
+
+    let after = snapshot_of(&domains).await;
+    assert_eq!(after.meta.content_hash, before.meta.content_hash);
+    assert_ne!(after.meta.fingerprint, before.meta.fingerprint);
+    assert_eq!(after.meta.configured_format, ListFormat::Domains);
+    assert_eq!(after.meta.effective_format, ListFormat::Domains);
+
+    drop(server);
+    let (scheduler, store) = boot(&config_of(&dir, vec![domains])).await;
+
+    assert!(
+        scheduler.list(0).is_some(),
+        "the new snapshot fits and loads"
+    );
+    assert!(blocked(&scheduler.policy(), "b.example."));
+    assert_eq!(store.bytes_written(), 0);
+}
+
+#[tokio::test]
 async fn without_persistence_nothing_is_read_or_written() {
     let dir = StateDir::new();
     let server = ListServer::start().await;
@@ -993,58 +1058,43 @@ async fn age_snapshot(config: &Config, version: u32) {
 /// Compiler version 2 is the one that kept `$ORIGIN .` in RPZ owners (fixed in 3). Whatever
 /// it wrote must be compiled again, whether or not the server would answer 304.
 #[tokio::test]
-async fn a_snapshot_of_the_previous_compiler_is_compiled_again_without_validators() {
-    let dir = StateDir::new();
-    let server = ListServer::start().await;
-    server.serve("/l.txt", V1, None);
-    let config = config_of(&dir, vec![url_list("upgrade-plain", server.url("/l.txt"))]);
-    {
-        let (mut scheduler, _) = boot(&config).await;
+async fn a_snapshot_of_the_previous_compiler_is_compiled_again() {
+    for etag in [None, Some("\"v1\"")] {
+        let dir = StateDir::new();
+        let server = ListServer::start().await;
+        server.serve("/l.txt", V1, etag);
+        let config = config_of(&dir, vec![url_list("upgrade", server.url("/l.txt"))]);
+        {
+            let (mut scheduler, _) = boot(&config).await;
+            scheduler.refresh(0, &downloader()).await;
+        }
+
+        age_snapshot(&config, 2).await;
+        let (mut scheduler, store) = boot(&config).await;
+        let policy = scheduler.policy();
+
+        assert!(
+            scheduler.list(0).is_none(),
+            "the old snapshot is not used (etag {etag:?})"
+        );
+        assert!(!blocked(&policy, "ads.example."));
+
         scheduler.refresh(0, &downloader()).await;
+
+        assert_eq!(
+            server.not_modified(),
+            0,
+            "no validator is sent for a snapshot that was not used (etag {etag:?})"
+        );
+        assert!(blocked(&policy, "ads.example."));
+        assert!(
+            store.bytes_written() > 0,
+            "the snapshot is rewritten (etag {etag:?})"
+        );
+        server.stop().await;
+        let (offline, _) = boot(&config).await;
+        assert!(blocked(&offline.policy(), "ads.example."));
     }
-
-    age_snapshot(&config, 2).await;
-    let (mut scheduler, store) = boot(&config).await;
-    let policy = scheduler.policy();
-
-    assert!(scheduler.list(0).is_none(), "the old snapshot is not used");
-    assert!(!blocked(&policy, "ads.example."));
-
-    scheduler.refresh(0, &downloader()).await;
-
-    assert!(blocked(&policy, "ads.example."));
-    assert!(store.bytes_written() > 0, "the snapshot is rewritten");
-    server.stop().await;
-    let (offline, _) = boot(&config).await;
-    assert!(blocked(&offline.policy(), "ads.example."));
-}
-
-#[tokio::test]
-async fn a_snapshot_of_the_previous_compiler_is_compiled_again_whatever_its_validators() {
-    let dir = StateDir::new();
-    let server = ListServer::start().await;
-    server.serve("/l.txt", V1, Some("\"v1\""));
-    let config = config_of(&dir, vec![url_list("upgrade-tagged", server.url("/l.txt"))]);
-    {
-        let (mut scheduler, _) = boot(&config).await;
-        scheduler.refresh(0, &downloader()).await;
-    }
-
-    age_snapshot(&config, 2).await;
-    let (mut scheduler, store) = boot(&config).await;
-    let policy = scheduler.policy();
-    scheduler.refresh(0, &downloader()).await;
-
-    assert_eq!(
-        server.not_modified(),
-        0,
-        "no validator is sent for a snapshot that was not used"
-    );
-    assert!(blocked(&policy, "ads.example."));
-    assert!(store.bytes_written() > 0);
-    server.stop().await;
-    let (offline, _) = boot(&config).await;
-    assert!(blocked(&offline.policy(), "ads.example."));
 }
 
 /// A login or error page served with status 200 compiles to junk rules; it must never
@@ -2238,6 +2288,54 @@ async fn a_page_list_whose_refresh_grows_past_the_budget_keeps_its_last_good_cop
 }
 
 #[tokio::test]
+async fn a_page_list_whose_refresh_is_no_larger_is_accepted_while_the_estimate_is_over_the_budget()
+{
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    let small = |count: usize| -> String {
+        (0..count)
+            .map(|index| format!("||a{index}.example^\n"))
+            .collect()
+    };
+    server.serve("/small.txt", &small(20_000), None);
+    server.serve("/big.txt", &many_rules(200_000), None);
+    let mut file = config_of(&dir, Vec::new());
+    let lists = vec![
+        page_list(server.url("/small.txt")),
+        page_list(server.url("/big.txt")),
+    ];
+    let (steady, small_charge) = {
+        let mut scheduler = boot_with_page_lists(&file, lists.clone()).await;
+        scheduler.refresh(0, &downloader()).await;
+        scheduler.refresh(1, &downloader()).await;
+        let big_charge = scheduler.list(1).unwrap().compile_charge();
+        let small_charge = scheduler.list(0).unwrap().compile_charge();
+
+        (
+            scheduler.control().memory().estimate_bytes - big_charge,
+            small_charge,
+        )
+    };
+    // Room to compile the small list again, but not the big one: the estimate is over.
+    file.limits.memory_mb = (steady + small_charge).div_ceil(MIB);
+
+    let mut scheduler = boot_with_page_lists(&file, lists).await;
+    let control = scheduler.control();
+    let memory = control.memory();
+    assert!(memory.estimate_bytes > memory.budget_bytes);
+    assert!(blocked(&scheduler.policy(), "a19999.example."));
+
+    server.serve("/small.txt", &small(15_000), None);
+    scheduler.refresh(0, &downloader()).await;
+
+    assert_eq!(control.statuses()[0].last_error, None);
+    assert!(blocked(&scheduler.policy(), "a14999.example."));
+    assert!(!blocked(&scheduler.policy(), "a19999.example."));
+    let memory = control.memory();
+    assert!(memory.estimate_bytes > memory.budget_bytes);
+}
+
+#[tokio::test]
 async fn a_reset_counts_only_the_lists_that_stay_against_the_budget() {
     let dir = StateDir::new();
     let server = ListServer::start().await;
@@ -2376,6 +2474,40 @@ async fn a_list_added_from_the_page_is_admitted_saved_and_in_force_with_the_file
     let memory = control.memory();
     assert!(memory.estimate_bytes <= memory.budget_bytes);
     assert_eq!(server.requested("/added.txt"), 1);
+}
+
+#[tokio::test]
+async fn a_list_added_from_the_page_that_cannot_be_saved_is_refused_and_nothing_is_in_force() {
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.serve("/added.txt", V1, None);
+    let mut config = config_of(&dir, Vec::new());
+    config.state.dir = dir.file("missing");
+    let (control, policy) = running(&config).await;
+    let estimate = control.memory().estimate_bytes;
+    let generation_before = generation(&policy);
+
+    control
+        .add_list(add("Added", server.url("/added.txt")))
+        .await
+        .unwrap();
+    let refused = added(&control).await;
+
+    assert!(
+        matches!(&refused, Err(ListError::NotSaved(SaveError::Failed(_)))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        server.requested("/added.txt"),
+        1,
+        "the list was admitted first"
+    );
+    assert!(!blocked(&policy, "ads.example."));
+    assert_eq!(generation(&policy), generation_before);
+    assert!(control.statuses().is_empty());
+    assert_eq!(control.memory().estimate_bytes, estimate);
+    assert!(!dir.file("missing").exists());
+    assert!(every_file(dir.path()).is_empty());
 }
 
 #[tokio::test]

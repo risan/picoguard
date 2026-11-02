@@ -356,10 +356,12 @@ pub fn open_regular(path: &Path, cap: u64) -> io::Result<File> {
 /// The whole of a file `open_regular` accepts. It reads at most one byte past `cap`, so a file
 /// that grew after the check is refused too.
 pub fn read_regular(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    read_capped(open_regular(path, cap)?, cap)
+}
+
+fn read_capped(reader: impl Read, cap: u64) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    open_regular(path, cap)?
-        .take(cap + 1)
-        .read_to_end(&mut bytes)?;
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
 
     if bytes.len() as u64 > cap {
         return Err(io::Error::other("larger than allowed"));
@@ -542,14 +544,21 @@ fn copy_binary(from: &Path, to: &Path) -> Result<digest::Digest, String> {
     let fail = |error: io::Error| format!("picoguard: {error}");
 
     let source = open_regular(from, MAX_BINARY_BYTES).map_err(fail)?;
-    let mut source = source.take(MAX_BINARY_BYTES + 1);
     let mut target = create_private(to, 0o700).map_err(fail)?;
+
+    copy_capped(source, &mut target, MAX_BINARY_BYTES).map_err(fail)
+}
+
+/// Reads at most one byte past `cap`, so a source that grew after the size check is refused
+/// without the rest of it being read. Nothing past `cap` is written.
+fn copy_capped(source: impl Read, target: &mut impl Write, cap: u64) -> io::Result<digest::Digest> {
+    let mut source = source.take(cap + 1);
     let mut hash = digest::Context::new(&digest::SHA256);
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     let mut total = 0u64;
 
     loop {
-        let read = source.read(&mut buffer).map_err(fail)?;
+        let read = source.read(&mut buffer)?;
 
         if read == 0 {
             break;
@@ -557,15 +566,15 @@ fn copy_binary(from: &Path, to: &Path) -> Result<digest::Digest, String> {
 
         total += read as u64;
 
-        if total > MAX_BINARY_BYTES {
-            return Err("picoguard: larger than allowed".to_string());
+        if total > cap {
+            return Err(io::Error::other("larger than allowed"));
         }
 
         hash.update(&buffer[..read]);
-        target.write_all(&buffer[..read]).map_err(fail)?;
+        target.write_all(&buffer[..read])?;
     }
 
-    target.flush().map_err(fail)?;
+    target.flush()?;
 
     Ok(hash.finish())
 }
@@ -690,6 +699,78 @@ mod tests {
         format!("{byte:02x}").repeat(32)
     }
 
+    /// A file that never ends. A read that would go past `allowed` bytes fails the test at
+    /// once, so a missing bound cannot hang it or fill the memory.
+    struct EndlessFile {
+        given: u64,
+        allowed: u64,
+    }
+
+    impl Read for EndlessFile {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let end = self.given + buffer.len() as u64;
+            assert!(
+                end <= self.allowed,
+                "read on to byte {end} of {}",
+                self.allowed
+            );
+
+            buffer.fill(b'x');
+            self.given = end;
+
+            Ok(buffer.len())
+        }
+    }
+
+    const CAP: u64 = 100_000;
+
+    #[test]
+    fn a_file_that_grew_past_the_cap_is_read_one_byte_past_it_and_refused() {
+        let mut file = EndlessFile {
+            given: 0,
+            allowed: CAP + 1,
+        };
+
+        let error = read_capped(&mut file, CAP).unwrap_err();
+
+        assert_eq!(error.to_string(), "larger than allowed");
+        assert_eq!(file.given, CAP + 1);
+        assert_eq!(read_capped(&b"abc"[..], 3).unwrap(), b"abc");
+        assert!(read_capped(&b"abcd"[..], 3).is_err());
+    }
+
+    #[test]
+    fn a_regular_file_that_reads_longer_than_it_measures_is_refused() {
+        // procfs files measure 0 bytes and read longer.
+        let error = read_regular(Path::new("/proc/self/status"), 16).unwrap_err();
+
+        assert_eq!(error.to_string(), "larger than allowed");
+    }
+
+    #[test]
+    fn a_binary_that_grew_past_the_cap_is_copied_up_to_it_and_refused() {
+        let mut file = EndlessFile {
+            given: 0,
+            allowed: CAP + 1,
+        };
+        let mut copy = Vec::new();
+
+        let error = copy_capped(&mut file, &mut copy, CAP).unwrap_err();
+
+        assert_eq!(error.to_string(), "larger than allowed");
+        assert_eq!(file.given, CAP + 1);
+        assert!(copy.len() as u64 <= CAP);
+
+        let mut exact = Vec::new();
+        let hash = copy_capped(&vec![7u8; 10][..], &mut exact, 10).unwrap();
+
+        assert_eq!(exact, vec![7u8; 10]);
+        assert_eq!(
+            hash.as_ref(),
+            digest::digest(&digest::SHA256, &exact).as_ref()
+        );
+    }
+
     #[test]
     fn the_built_in_key_is_the_key_file() {
         let key_file = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/dist/release-key.der"));
@@ -709,6 +790,11 @@ mod tests {
         assert!(!verify_sums(b"abd  picoguard\n", signature.as_ref(), &key));
         assert!(!verify_sums(sums, test_pair(8).sign(sums).as_ref(), &key));
         assert!(!verify_sums(sums, &signature.as_ref()[..63], &key));
+
+        let mut flipped = signature.as_ref().to_vec();
+        flipped[17] ^= 0x01;
+        assert_eq!(flipped.len(), 64);
+        assert!(!verify_sums(sums, &flipped, &key));
 
         let mut longer = signature.as_ref().to_vec();
         longer.push(0);

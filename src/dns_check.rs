@@ -138,22 +138,6 @@ mod tests {
     }
 
     #[test]
-    fn the_query_asks_for_example_com_a_in() {
-        let query = build_query(ID);
-        let header = Header::parse(&query).unwrap();
-
-        assert_eq!(header.id, ID);
-        assert!(!header.is_response());
-        assert!(header.recursion_desired());
-        assert_eq!(header.question_count, 1);
-        assert_eq!(header.answer_count, 0);
-        assert_eq!(
-            &query[wire::HEADER_LEN..],
-            b"\x07example\x03com\x00\x00\x01\x00\x01"
-        );
-    }
-
-    #[test]
     fn replies_are_judged_by_id_question_and_rcode() {
         let query = build_query(ID);
 

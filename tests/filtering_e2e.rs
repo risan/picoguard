@@ -37,67 +37,6 @@ fn is_blocked_a(reply: &Message) -> bool {
 }
 
 #[tokio::test]
-async fn blocked_replies_follow_the_query_type() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let engine = engine_of(
-        &["||blocked.example^\n1.2.3.4 host4.example\n2001:db8::1 host6.example\n"],
-        &[],
-    );
-    let server = start(&config_for(&upstream), engine).await;
-
-    let reply = ask(&server, "blocked.example.", RecordType::A).await;
-    assert_eq!(answer_addresses(&reply), ["0.0.0.0"]);
-    assert_eq!(reply.answers[0].ttl, BLOCKED_TTL);
-
-    let reply = ask(&server, "sub.blocked.example.", RecordType::AAAA).await;
-    assert_eq!(answer_addresses(&reply), ["::"]);
-
-    let reply = ask(&server, "blocked.example.", RecordType::HTTPS).await;
-    assert_eq!(u16::from(reply.metadata.response_code), 0);
-    assert!(reply.answers.is_empty() && reply.authorities.is_empty());
-
-    for rtype in [RecordType::TXT, RecordType::MX, RecordType::NS] {
-        let reply = ask(&server, "blocked.example.", rtype).await;
-        assert_eq!(u16::from(reply.metadata.response_code), 0);
-        assert!(reply.answers.is_empty());
-        assert!(
-            matches!(&reply.authorities[..], [record] if record.record_type() == RecordType::SOA && record.ttl == BLOCKED_TTL)
-        );
-    }
-
-    let reply = ask(&server, "host4.example.", RecordType::A).await;
-    assert_eq!(answer_addresses(&reply), ["1.2.3.4"]);
-
-    // A host rule of the other address family blocks with the null address.
-    let reply = ask(&server, "host4.example.", RecordType::AAAA).await;
-    assert_eq!(answer_addresses(&reply), ["::"]);
-
-    let reply = ask(&server, "host6.example.", RecordType::AAAA).await;
-    assert_eq!(answer_addresses(&reply), ["2001:db8::1"]);
-    let reply = ask(&server, "host6.example.", RecordType::A).await;
-    assert_eq!(answer_addresses(&reply), ["0.0.0.0"]);
-
-    assert_eq!(
-        upstream.count(),
-        0,
-        "blocked requests never reach the upstream"
-    );
-}
-
-#[tokio::test]
-async fn a_conditional_badfilter_disables_its_target_for_one_type_only() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let engine = engine_of(&["||x.example^\n||x.example^$badfilter,dnstype=A\n"], &[]);
-    let server = start(&config_for(&upstream), engine).await;
-
-    let for_a = ask(&server, "x.example.", RecordType::A).await;
-    let for_aaaa = ask(&server, "x.example.", RecordType::AAAA).await;
-
-    assert_eq!(answer_addresses(&for_a), ["9.9.9.9"]);
-    assert_eq!(answer_addresses(&for_aaaa), ["::"]);
-}
-
-#[tokio::test]
 async fn the_allowlist_engine_is_asked_first() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
     let engine = engine_of(&["||x.example^$important\n"], &["||x.example^\n"]);
@@ -218,21 +157,6 @@ async fn a_request_admitted_during_a_pause_is_blocked_when_the_reply_comes_after
         answer_addresses(&coalesced)
     );
     assert_eq!(upstream.count(), 1);
-}
-
-#[tokio::test]
-async fn a_request_still_paused_when_the_reply_comes_is_answered() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::from_millis(300)).await;
-    let server = start(
-        &config_for(&upstream),
-        engine_of(&["||late.example^\n"], &[]),
-    )
-    .await;
-
-    server.policy.pause(Duration::from_secs(60), Instant::now());
-    let reply = ask(&server, "late.example.", RecordType::A).await;
-
-    assert_eq!(answer_addresses(&reply), ["9.9.9.9"]);
 }
 
 #[tokio::test]

@@ -380,23 +380,6 @@ async fn site(config: Config) -> Site {
     .await
 }
 
-/// A release build with an installer and a newer version known: the button is offered
-/// whenever a password is set.
-async fn full_site(config: Config) -> Site {
-    let site = site_with(
-        config,
-        SiteKind {
-            build: Build::Release,
-            installer: true,
-            release_target: true,
-        },
-    )
-    .await;
-    site.updates.show(Some(offered()));
-
-    site
-}
-
 async fn site_with(config: Config, kind: SiteKind) -> Site {
     site_saving(config, kind, None).await
 }
@@ -567,6 +550,16 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/rules",
         "/api/rules/remove",
         "/api/explain?name=",
+        "/api/settings",
+        "/api/services",
+        "api(\"/api/lists\")",
+        "/api/lists/add",
+        "/api/lists/reset",
+        "\"/api/lists/\" + change",
+        "editList(node, \"edit\"",
+        "editList(node, \"remove\"",
+        // Without it every 401 would open the browser's own sign-in prompt.
+        "\"X-Requested-With\": \"picoguard\"",
         "setInterval(update, 5000)",
         "id=\"version\"",
         "id=\"update\"",
@@ -1107,50 +1100,6 @@ fn upstream_entries(status: &Value) -> &Vec<Value> {
 }
 
 #[tokio::test]
-async fn a_failed_over_query_counts_a_failure_on_the_first_server_and_an_answer_on_the_second() {
-    let dead = fake_upstream(|_| Vec::new()).await;
-    let slow = answering_upstream([9, 9, 9, 9], Duration::from_millis(80)).await;
-    let mut config = local_config(&slow);
-    config.upstream.servers = vec![
-        format!("udp://{}", dead.address),
-        format!("udp://{}", slow.address),
-    ];
-    config.upstream.timeout_ms = 1000;
-    let site = site(config).await;
-
-    // Which server goes first is a weighted draw; the dead one is the first try often enough.
-    let mut asked = 0;
-    let started = Instant::now();
-    while dead.count() == 0 {
-        assert!(asked < 40, "the dead server was never tried");
-
-        ask(&site.dns, &format!("n{asked}.example."), RecordType::A).await;
-        asked += 1;
-    }
-    let asking_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-    let status = site.send(get("/api/status")).await.json();
-    let servers = upstream_entries(&status);
-
-    assert_eq!(servers[0]["label"], format!("udp://{}", dead.address));
-    assert_eq!(servers[0]["answered"], 0);
-    assert_eq!(servers[0]["failed"], 1);
-    assert!(servers[0]["avg_ms"].is_null());
-    assert_eq!(servers[1]["answered"], asked);
-    assert_eq!(servers[1]["failed"], 0);
-    let average = servers[1]["avg_ms"].as_f64().unwrap();
-    // Each try at the dead server takes at least 500 ms (half the 1000 ms timeout) of the wall
-    // time that the answered exchanges share it with, however loaded the machine is. A time that
-    // counted those tries too would not leave that much out.
-    let answered_ms = average * asked as f64;
-    assert!(average >= 80.0, "{average}");
-    assert!(
-        answered_ms < asking_ms - 400.0,
-        "{answered_ms} answered of {asking_ms}"
-    );
-}
-
-#[tokio::test]
 async fn a_query_for_a_local_name_counts_on_the_local_resolver_only() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
     let router = answering_upstream([192, 168, 1, 9], Duration::from_millis(20)).await;
@@ -1268,43 +1217,6 @@ async fn clearing_the_cache_empties_it_and_the_next_query_goes_upstream() {
     assert_eq!(upstream.count(), 3);
     let status = site.send(get("/api/status")).await.json();
     assert_eq!(status["counters"]["upstream"], upstream_before + 1);
-}
-
-#[tokio::test]
-async fn the_cache_size_is_shown_only_when_signed_in() {
-    let (with_password, _upstream) = plain_site().await;
-    let (without_password, _other) = open_site().await;
-
-    let signed_in = with_password.send(get("/api/status")).await.json();
-    let read_only = without_password.send(get("/api/status")).await.json();
-
-    let mut keys: Vec<&str> = signed_in["cache"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(keys, ["bytes", "entries"]);
-    assert!(read_only.get("cache").is_none());
-}
-
-#[tokio::test]
-async fn the_upstreams_show_with_a_password_and_are_left_out_without_one() {
-    let (with_password, upstream) = plain_site().await;
-    let (without_password, _other) = open_site().await;
-
-    let signed_in = with_password.send(get("/api/status")).await.json();
-    let read_only = without_password.send(get("/api/status")).await;
-
-    assert!(signed_in.get("limited").is_none());
-    assert_eq!(
-        upstream_entries(&signed_in)[0]["label"],
-        format!("udp://{}", upstream.address)
-    );
-    assert_eq!(read_only.json()["limited"], SET_A_PASSWORD);
-    assert!(read_only.json().get("upstreams").is_none());
-    assert!(!read_only.body.contains("udp://"));
 }
 
 #[tokio::test]
@@ -1527,67 +1439,6 @@ async fn without_a_local_resolver_names_are_null_and_nothing_is_looked_up() {
     }
 
     assert_eq!(upstream.count(), 0);
-}
-
-#[tokio::test]
-async fn loopback_and_public_clients_are_never_looked_up() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let router = fake_upstream(|query| {
-        let owner = query.queries[0].name().clone();
-        let data = RData::PTR(PTR(name("any.lan.")));
-
-        vec![(
-            Duration::ZERO,
-            reply_to(query, vec![Record::from_rdata(owner, 600, data)]),
-        )]
-    })
-    .await;
-    let mut config = local_config(&upstream);
-    config.local.resolver = Some(router.address);
-    let site = site(config).await;
-    for client in ["8.8.8.8", "2001:db8::1", "::ffff:8.8.8.8", "::1"] {
-        record_client(&site, client, "a.example.");
-    }
-
-    ask(&site.dns, "ok.example.", RecordType::A).await;
-
-    for _ in 0..3 {
-        let (status, log) = status_and_log(&site).await;
-
-        assert_eq!(
-            status["top_clients"]["entries"].as_array().unwrap().len(),
-            5
-        );
-        assert_every_name_is_null(&status, &log);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    assert_eq!(router.count(), 0);
-}
-
-#[tokio::test]
-async fn ten_polls_of_one_client_send_one_lookup() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let router = router(&[]).await;
-    let mut config = local_config(&upstream);
-    config.local.resolver = Some(router.address);
-    let site = site(config).await;
-    record_client(&site, "192.168.110.50", "a.example.");
-
-    for _ in 0..10 {
-        let (status, log) = status_and_log(&site).await;
-
-        assert_every_name_is_null(&status, &log);
-    }
-
-    let started = Instant::now();
-    while router.count() == 0 {
-        assert!(started.elapsed() < Duration::from_secs(3), "no lookup");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(router.count(), 1);
 }
 
 #[tokio::test]
@@ -2016,376 +1867,279 @@ async fn wait_for_requests(server: &ListServer, count: usize) {
 
 const UPDATE_BODY: &str = "{\"version\": \"9.9.9\"}";
 
-fn rejected_mutations() -> Vec<(&'static str, Request, u16)> {
-    let big = format!("{{\"minutes\": 5, \"padding\": \"{}\"}}", "x".repeat(1100));
-    let chunked_big = format!("{:x}\r\n{}\r\n0\r\n\r\n", big.len(), big);
+/// A site whose saved settings hold a list the page can edit and remove, served by a server of
+/// its own, and a rule the page can remove.
+struct SeededSite {
+    site: Site,
+    list: String,
+    _server: ListServer,
+}
+
+impl std::ops::Deref for SeededSite {
+    type Target = Site;
+
+    fn deref(&self) -> &Site {
+        &self.site
+    }
+}
+
+async fn seeded_site(config: Config, full: bool) -> SeededSite {
+    let server = ListServer::start().await;
+    server.serve("/seeded.txt", "||seeded.example^\n", None);
+    let list = server.url("/seeded.txt");
+    let saved = serde_json::json!({
+        "version": 1,
+        "page_rules": [{"name": "x.example", "action": "block"}],
+        "lists": [{"role": "block", "name": "Seeded", "url": list, "refresh_hours": 12, "enabled": true}],
+    })
+    .to_string();
+    let kind = SiteKind {
+        build: if full {
+            Build::Release
+        } else {
+            Build::current()
+        },
+        installer: true,
+        release_target: true,
+    };
+    let site = site_saving(config, kind, Some(&saved)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while site.control.statuses().first().map(|status| status.rules) != Some(1) {
+        assert!(Instant::now() < deadline, "the seeded list never loaded");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(!no_page_rules(&site).await, "the rule is seeded");
+    if full {
+        site.updates.show(Some(offered()));
+    }
+
+    SeededSite {
+        site,
+        list,
+        _server: server,
+    }
+}
+
+/// Everything a change could alter, as the page and the saved file would show it.
+#[derive(Debug, PartialEq)]
+struct Changeable {
+    paused: bool,
+    settings_in_force: String,
+    page_rules_in_force: String,
+    settings_file: Option<Value>,
+    lists: String,
+    lists_on_page: bool,
+    pending_list: String,
+}
+
+async fn changeable(site: &Site) -> Changeable {
+    Changeable {
+        paused: site.is_paused(),
+        settings_in_force: format!("{:?}", *site.control.saved().lock().await),
+        page_rules_in_force: site
+            .control
+            .with_button_rules(|rules| format!("{rules:?}"))
+            .await,
+        settings_file: saved_settings(site),
+        lists: format!("{:?}", site.control.statuses()),
+        lists_on_page: site.control.lists_on_page(),
+        pending_list: format!("{:?}", site.control.pending_list()),
+    }
+}
+
+/// A route that changes something, with a request body it accepts.
+struct ChangeRoute {
+    name: &'static str,
+    path: &'static str,
+    valid_body: String,
+    size_limit: usize,
+    /// A get of the same path reads instead of being refused.
+    reads_by_get: bool,
+    /// Signing in and out are open to a client that is not signed in.
+    needs_sign_in: bool,
+}
+
+fn change_routes(seeded_list: &str) -> Vec<ChangeRoute> {
+    let route = |name, path, valid_body: &str| ChangeRoute {
+        name,
+        path,
+        valid_body: valid_body.to_string(),
+        size_limit: 1024,
+        reads_by_get: false,
+        needs_sign_in: true,
+    };
+    let evil = "http://127.0.0.1:9/evil.txt";
+    let seeded = serde_json::json!({"role": "block", "source": seeded_list});
+    let edit = serde_json::json!({"role": "block", "source": seeded_list, "enabled": false});
 
     vec![
-        (
-            "another origin",
-            post("/api/pause", "{\"minutes\": 5}").header("Origin", "http://evil.example"),
-            403,
-        ),
-        (
-            "same host, other port",
-            post("/api/pause", "{\"minutes\": 5}").header("Origin", "http://127.0.0.1:1"),
-            403,
-        ),
-        (
-            "https origin",
-            post("/api/resume", "").header("Origin", "https://127.0.0.1"),
-            403,
-        ),
-        (
-            "null origin",
-            post("/api/lists/refresh", "").header("Origin", "null"),
-            403,
-        ),
-        (
-            "a name that is not configured",
-            post("/api/pause", "{\"minutes\": 5}").header("Host", "evil.example"),
-            403,
-        ),
-        (
-            "a rebound name with the right port",
-            post("/api/pause", "{\"minutes\": 5}").header("Host", "localhost:8080"),
-            403,
-        ),
-        (
-            "plain text",
-            post("/api/pause", "{\"minutes\": 5}").header("Content-Type", "text/plain"),
-            415,
-        ),
-        (
-            "a form",
-            post("/api/pause", "minutes=5")
-                .header("Content-Type", "application/x-www-form-urlencoded"),
-            415,
-        ),
-        (
-            "no content type",
-            Request {
-                headers: Vec::new(),
-                ..post("/api/pause", "{\"minutes\": 5}")
-            },
-            415,
-        ),
-        ("a body over 1 KiB", post("/api/pause", &big), 413),
-        (
-            "a body over 1 KiB without a length",
-            Request {
-                headers: vec![
-                    ("Content-Type".to_string(), "application/json".to_string()),
-                    ("Transfer-Encoding".to_string(), "chunked".to_string()),
-                ],
-                body: chunked_big.into_bytes(),
-                ..post("/api/pause", "")
-            },
-            413,
-        ),
-        ("a get of pause", get("/api/pause"), 405),
-        ("a get of resume", get("/api/resume"), 405),
-        ("a get of refresh", get("/api/lists/refresh"), 405),
-        (
-            "a get of pause with a body",
-            Request {
-                body: b"{\"minutes\": 5}".to_vec(),
-                ..get("/api/pause")
-            },
-            405,
-        ),
-        (
-            "a put",
-            Request {
-                method: "PUT",
-                ..post("/api/pause", "{\"minutes\": 5}")
-            },
-            405,
-        ),
-        (
-            "an update from another origin",
-            post("/api/update", UPDATE_BODY).header("Origin", "http://evil.example"),
-            403,
-        ),
-        (
-            "an update from a null origin",
-            post("/api/update", UPDATE_BODY).header("Origin", "null"),
-            403,
-        ),
-        (
-            "an update for a name that is not configured",
-            post("/api/update", UPDATE_BODY).header("Host", "evil.example"),
-            403,
-        ),
-        (
-            "an update as plain text",
-            post("/api/update", UPDATE_BODY).header("Content-Type", "text/plain"),
-            415,
-        ),
-        (
-            "an update without a content type",
-            Request {
-                headers: Vec::new(),
-                ..post("/api/update", UPDATE_BODY)
-            },
-            415,
-        ),
-        (
-            "an update body over 1 KiB",
-            post(
-                "/api/update",
-                &format!(
-                    "{{\"version\": \"9.9.9\", \"padding\": \"{}\"}}",
-                    "x".repeat(1100)
-                ),
-            ),
-            413,
-        ),
-        ("a get of update", get("/api/update"), 405),
-        (
-            "a put of update",
-            Request {
-                method: "PUT",
-                ..post("/api/update", UPDATE_BODY)
-            },
-            405,
-        ),
-        ("a post of a read", post("/api/status", "{}"), 405),
-        ("a post of the page", post("/", "{}"), 405),
-        (
-            "a login from another origin",
-            login("admin", "s3cret").header("Origin", "http://evil.example"),
-            403,
-        ),
-        (
-            "a login from a null origin",
-            login("admin", "s3cret").header("Origin", "null"),
-            403,
-        ),
-        (
-            "a login for a name that is not configured",
-            login("admin", "s3cret").header("Host", "evil.example"),
-            403,
-        ),
-        (
-            "a login as plain text",
-            login("admin", "s3cret").header("Content-Type", "text/plain"),
-            415,
-        ),
-        (
-            "a login without a content type",
-            Request {
-                headers: Vec::new(),
-                ..login("admin", "s3cret")
-            },
-            415,
-        ),
-        (
-            "a login body over 1 KiB",
-            post(
+        route("pause", "/api/pause", "{\"minutes\": 5}"),
+        route("resume", "/api/resume", ""),
+        route("refresh", "/api/lists/refresh", ""),
+        route("update", "/api/update", UPDATE_BODY),
+        route("cache clear", "/api/cache/clear", "{}"),
+        ChangeRoute {
+            reads_by_get: true,
+            ..route("rule add", "/api/rules", NEW_RULE_BODY)
+        },
+        route("rule removal", "/api/rules/remove", REMOVE_BODY),
+        ChangeRoute {
+            size_limit: 64 * 1024,
+            reads_by_get: true,
+            ..route(
+                "settings",
+                "/api/settings",
+                &rewrite_body(&[("evil.lan", "10.6.6.6")]),
+            )
+        },
+        route("list add", "/api/lists/add", &add_body("Evil", evil)),
+        route("list edit", "/api/lists/edit", &edit.to_string()),
+        route("list removal", "/api/lists/remove", &seeded.to_string()),
+        route("lists reset", "/api/lists/reset", "{}"),
+        ChangeRoute {
+            needs_sign_in: false,
+            ..route(
+                "login",
                 "/api/login",
-                &format!(
-                    "{{\"user\": \"admin\", \"password\": \"s3cret\", \"padding\": \"{}\"}}",
-                    "x".repeat(1100)
-                ),
-            ),
-            413,
-        ),
-        (
-            "a get of login",
-            Request {
-                method: "GET",
-                ..login("admin", "s3cret")
-            },
-            405,
-        ),
-        (
-            "a put of login",
-            Request {
-                method: "PUT",
-                ..login("admin", "s3cret")
-            },
-            405,
-        ),
-        (
-            "a logout from another origin",
-            post("/api/logout", "{}").header("Origin", "http://evil.example"),
-            403,
-        ),
-        (
-            "a logout from a null origin",
-            post("/api/logout", "{}").header("Origin", "null"),
-            403,
-        ),
-        (
-            "a logout for a name that is not configured",
-            post("/api/logout", "{}").header("Host", "evil.example"),
-            403,
-        ),
-        (
-            "a logout as plain text",
-            post("/api/logout", "{}").header("Content-Type", "text/plain"),
-            415,
-        ),
-        (
-            "a logout without a content type",
-            Request {
-                headers: Vec::new(),
-                ..post("/api/logout", "{}")
-            },
-            415,
-        ),
-        ("a logout body over 1 KiB", post("/api/logout", &big), 413),
-        ("a get of logout", get("/api/logout"), 405),
-        (
-            "a put of logout",
-            Request {
-                method: "PUT",
-                ..post("/api/logout", "{}")
-            },
-            405,
-        ),
-        (
-            "a cache clear from another origin",
-            post("/api/cache/clear", "{}").header("Origin", "http://evil.example"),
-            403,
-        ),
-        (
-            "a cache clear from a null origin",
-            post("/api/cache/clear", "{}").header("Origin", "null"),
-            403,
-        ),
-        (
-            "a cache clear to a name that is not configured",
-            post("/api/cache/clear", "{}").header("Host", "evil.example"),
-            403,
-        ),
-        (
-            "a cache clear as plain text",
-            post("/api/cache/clear", "{}").header("Content-Type", "text/plain"),
-            415,
-        ),
-        (
-            "a cache clear without a content type",
-            Request {
-                headers: Vec::new(),
-                ..post("/api/cache/clear", "{}")
-            },
-            415,
-        ),
-        (
-            "a cache clear body over 1 KiB",
-            post("/api/cache/clear", &big),
-            413,
-        ),
-        ("a get of cache clear", get("/api/cache/clear"), 405),
-        (
-            "a put of cache clear",
-            Request {
-                method: "PUT",
-                ..post("/api/cache/clear", "{}")
-            },
-            405,
-        ),
-        (
-            "a rule from another origin",
-            post("/api/rules", RULE_BODY).header("Origin", "http://evil.example"),
-            403,
-        ),
-        (
-            "a rule from a null origin",
-            post("/api/rules", RULE_BODY).header("Origin", "null"),
-            403,
-        ),
-        (
-            "a rule for a name that is not configured",
-            post("/api/rules", RULE_BODY).header("Host", "evil.example"),
-            403,
-        ),
-        (
-            "a rule as plain text",
-            post("/api/rules", RULE_BODY).header("Content-Type", "text/plain"),
-            415,
-        ),
-        (
-            "a rule without a content type",
-            Request {
-                headers: Vec::new(),
-                ..post("/api/rules", RULE_BODY)
-            },
-            415,
-        ),
-        (
-            "a rule body over 1 KiB",
-            post(
-                "/api/rules",
-                &format!(
-                    "{{\"name\": \"x.example\", \"action\": \"block\", \"padding\": \"{}\"}}",
-                    "x".repeat(1100)
-                ),
-            ),
-            413,
-        ),
-        (
-            "a put of rules",
-            Request {
-                method: "PUT",
-                ..post("/api/rules", RULE_BODY)
-            },
-            405,
-        ),
-        (
-            "a removal from another origin",
-            post("/api/rules/remove", REMOVE_BODY).header("Origin", "http://evil.example"),
-            403,
-        ),
-        (
-            "a removal from a null origin",
-            post("/api/rules/remove", REMOVE_BODY).header("Origin", "null"),
-            403,
-        ),
-        (
-            "a removal for a name that is not configured",
-            post("/api/rules/remove", REMOVE_BODY).header("Host", "evil.example"),
-            403,
-        ),
-        (
-            "a removal as plain text",
-            post("/api/rules/remove", REMOVE_BODY).header("Content-Type", "text/plain"),
-            415,
-        ),
-        (
-            "a removal without a content type",
-            Request {
-                headers: Vec::new(),
-                ..post("/api/rules/remove", REMOVE_BODY)
-            },
-            415,
-        ),
-        (
-            "a removal body over 1 KiB",
-            post(
-                "/api/rules/remove",
-                &format!(
-                    "{{\"name\": \"x.example\", \"padding\": \"{}\"}}",
-                    "x".repeat(1100)
-                ),
-            ),
-            413,
-        ),
-        ("a get of removal", get("/api/rules/remove"), 405),
-        (
-            "a put of removal",
-            Request {
-                method: "PUT",
-                ..post("/api/rules/remove", REMOVE_BODY)
-            },
-            405,
-        ),
+                &serde_json::json!({"user": "admin", "password": "s3cret"}).to_string(),
+            )
+        },
+        ChangeRoute {
+            needs_sign_in: false,
+            ..route("logout", "/api/logout", "{}")
+        },
     ]
 }
 
+impl ChangeRoute {
+    fn valid(&self) -> Request {
+        post(self.path, &self.valid_body)
+    }
+
+    /// The valid body with a member that takes it past the size limit of the route.
+    fn oversized_body(&self) -> String {
+        let padding = "x".repeat(self.size_limit);
+        let body = self.valid_body.trim_end();
+
+        match body.strip_suffix('}') {
+            Some(object) => format!("{object},\"padding\":\"{padding}\"}}"),
+            None => format!("{{\"padding\":\"{padding}\"}}"),
+        }
+    }
+
+    /// Every way to be refused that applies to the route, each as the valid request with one
+    /// thing wrong, and the status that refuses it.
+    fn refused(&self) -> Vec<(String, Request, u16)> {
+        let path = self.path;
+        let body = self.valid_body.as_str();
+        let oversized = self.oversized_body();
+        let chunked = Request {
+            headers: vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ],
+            body: format!("{:x}\r\n{}\r\n0\r\n\r\n", oversized.len(), oversized).into_bytes(),
+            ..post(path, "")
+        };
+        let mut rows = vec![
+            (
+                "from another origin",
+                self.valid().header("Origin", "http://evil.example"),
+                403,
+            ),
+            (
+                "from the same host and another port",
+                self.valid().header("Origin", "http://127.0.0.1:1"),
+                403,
+            ),
+            (
+                "from an https origin",
+                self.valid().header("Origin", "https://127.0.0.1"),
+                403,
+            ),
+            (
+                "from a null origin",
+                self.valid().header("Origin", "null"),
+                403,
+            ),
+            (
+                "for a name that is not configured",
+                self.valid().header("Host", "evil.example"),
+                403,
+            ),
+            (
+                "for a rebound name with the right port",
+                self.valid().header("Host", "localhost:8080"),
+                403,
+            ),
+            (
+                "as plain text",
+                self.valid().header("Content-Type", "text/plain"),
+                415,
+            ),
+            (
+                "as a form",
+                self.valid()
+                    .header("Content-Type", "application/x-www-form-urlencoded"),
+                415,
+            ),
+            (
+                "without a content type",
+                Request {
+                    headers: Vec::new(),
+                    ..self.valid()
+                },
+                415,
+            ),
+            ("over its size limit", post(path, &oversized), 413),
+            ("over its size limit without a length", chunked, 413),
+            (
+                "as a put",
+                Request {
+                    method: "PUT",
+                    ..self.valid()
+                },
+                405,
+            ),
+        ];
+        if !self.reads_by_get {
+            rows.push(("as a get", get(path), 405));
+            rows.push((
+                "as a get with its body",
+                Request {
+                    body: body.as_bytes().to_vec(),
+                    ..get(path)
+                },
+                405,
+            ));
+        }
+
+        rows.into_iter()
+            .map(|(what, request, status)| (format!("{} {what}", self.name), request, status))
+            .collect()
+    }
+}
+
+/// Every refused request of every change route, and a change posted to a read.
+fn rejected_mutations(seeded_list: &str) -> Vec<(String, Request, u16)> {
+    let mut rejected: Vec<(String, Request, u16)> = change_routes(seeded_list)
+        .iter()
+        .flat_map(ChangeRoute::refused)
+        .collect();
+    rejected.push((
+        "a post of a read".to_string(),
+        post("/api/status", "{}"),
+        405,
+    ));
+    rejected.push(("a post of the page".to_string(), post("/", "{}"), 405));
+
+    rejected
+}
+
 const RULE_BODY: &str = "{\"name\":\"x.example\",\"action\":\"block\"}";
+/// A rule the seeded sites do not hold, so a refused add would show as a change.
+const NEW_RULE_BODY: &str = "{\"name\":\"new.example\",\"action\":\"block\"}";
 const REMOVE_BODY: &str = "{\"name\":\"x.example\"}";
 
 /// True when no rule was added from the page.
@@ -2393,18 +2147,18 @@ async fn no_page_rules(site: &Site) -> bool {
     site.control.with_button_rules(<[_]>::is_empty).await
 }
 
-async fn assert_mutations_are_rejected(site: &Site, sign_in: impl Fn(Request) -> Request) {
+async fn assert_mutations_are_rejected(site: &SeededSite, sign_in: impl Fn(Request) -> Request) {
     let cached = cache_one_answer(site).await;
+    let before = changeable(site).await;
 
-    for (what, request, status) in rejected_mutations() {
+    for (what, request, status) in rejected_mutations(&site.list) {
         let reply = site.send_as_is(sign_in(request)).await;
 
         assert_eq!(reply.status, status, "{what}");
         assert_eq!(reply.header("set-cookie"), None, "{what} set a cookie");
-        assert!(!site.is_paused(), "{what} paused blocking");
-        assert_nothing_was_started(site, what);
-        assert_cache_kept(site, cached, what);
-        assert!(no_page_rules(site).await, "{what} added a rule");
+        assert_nothing_was_started(site, &what);
+        assert_cache_kept(site, cached, &what);
+        assert_eq!(changeable(site).await, before, "{what} changed something");
     }
 }
 
@@ -2440,7 +2194,7 @@ async fn open_site() -> (Site, common::harness::FakeUpstream) {
 }
 
 #[tokio::test]
-async fn status_shows_the_version_with_and_without_a_password() {
+async fn the_status_shows_the_version_and_a_newer_one_with_or_without_a_password() {
     let (with_password, _upstream) = plain_site().await;
     let (without_password, _other) = open_site().await;
 
@@ -2452,15 +2206,7 @@ async fn status_shows_the_version_with_and_without_a_password() {
         for absent in ["latest", "notes", "how"] {
             assert!(status["update"].get(absent).is_none(), "{absent}");
         }
-    }
-}
 
-#[tokio::test]
-async fn status_shows_a_newer_version_with_notes_and_command() {
-    let (with_password, _upstream) = plain_site().await;
-    let (without_password, _other) = open_site().await;
-
-    for site in [&with_password, &without_password] {
         site.updates.show(Some(Latest {
             version: "9.9.9".to_string(),
             notes: "Faster lists".to_string(),
@@ -2518,33 +2264,65 @@ async fn a_hanging_check_holds_up_neither_dns_nor_the_page() {
 const SET_A_PASSWORD: &str = "set web.user and web.password_hash (or web.password) to use this";
 
 #[tokio::test]
-async fn without_a_password_the_page_shows_totals_and_lists_and_nothing_else() {
-    let (site, _upstream) = open_site().await;
-    ask(&site.dns, "ads.example.", RecordType::A).await;
-    ask(&site.dns, "ok.example.", RecordType::A).await;
+async fn private_status_fields_are_left_out_without_a_password_and_shown_with_one() {
+    let (with_password, upstream) = plain_site().await;
+    let (without_password, _other) = open_site().await;
+    for site in [&with_password, &without_password] {
+        ask(&site.dns, "ads.example.", RecordType::A).await;
+        ask(&site.dns, "ok.example.", RecordType::A).await;
+    }
 
-    assert_eq!(site.send(get("/")).await.status, 200);
-    assert_eq!(site.send(get("/api/lists")).await.status, 200);
+    let signed_in = with_password.send(get("/api/status")).await.json();
 
-    let reply = site.send(get("/api/status")).await;
-    let status = reply.json();
+    assert!(signed_in.get("limited").is_none());
+    for private in ["top_queried", "top_blocked", "top_clients"] {
+        assert!(signed_in.get(private).is_some(), "{private}");
+    }
+    assert_eq!(
+        upstream_entries(&signed_in)[0]["label"],
+        format!("udp://{}", upstream.address)
+    );
+    let mut keys: Vec<&str> = signed_in["cache"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["bytes", "entries"]);
+
+    assert_eq!(without_password.send(get("/")).await.status, 200);
+    assert_eq!(without_password.send(get("/api/lists")).await.status, 200);
+    let reply = without_password.send(get("/api/status")).await;
+    let read_only = reply.json();
 
     assert_eq!(reply.status, 200);
-    assert_eq!(status["counters"]["total"], 2);
-    assert_eq!(status["blocked_percent"], 50.0);
-    assert!(status["lists"].is_array());
-    assert_eq!(status["limited"], SET_A_PASSWORD);
-    for private in ["top_queried", "top_blocked", "top_clients"] {
-        assert!(status.get(private).is_none(), "{private}");
+    assert_eq!(read_only["counters"]["total"], 2);
+    assert_eq!(read_only["blocked_percent"], 50.0);
+    assert!(read_only["lists"].is_array());
+    assert_eq!(read_only["limited"], SET_A_PASSWORD);
+    for private in [
+        "top_queried",
+        "top_blocked",
+        "top_clients",
+        "upstreams",
+        "cache",
+    ] {
+        assert!(read_only.get(private).is_none(), "{private}");
     }
     assert!(!reply.body.contains("ads.example"));
+    assert!(!reply.body.contains("udp://"));
 }
 
 #[tokio::test]
 async fn without_a_password_the_log_and_every_change_are_forbidden() {
-    let (site, _upstream) = open_site().await;
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    without_credentials(&mut config);
+    let site = seeded_site(config, false).await;
     ask(&site.dns, "ads.example.", RecordType::A).await;
     let cached = cache_one_answer(&site).await;
+    let before = changeable(&site).await;
 
     let log = site.send(get("/api/querylog")).await;
     assert_eq!(log.status, 403);
@@ -2557,48 +2335,27 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
     );
     assert!(!log.body.contains("ads.example"));
 
+    let changes = change_routes(&site.list)
+        .into_iter()
+        .map(|route| (route.name, route.valid()));
     for (what, request) in [
-        ("pause", post("/api/pause", "{\"minutes\": 5}")),
-        ("resume", post("/api/resume", "")),
-        ("refresh", post("/api/lists/refresh", "")),
-        ("update", post("/api/update", UPDATE_BODY)),
         ("a get of pause", get("/api/pause")),
-        ("login", login("admin", "s3cret")),
-        ("logout", post("/api/logout", "{}")),
-        ("clear cache", post("/api/cache/clear", "{}")),
-        ("add a rule", post("/api/rules", RULE_BODY)),
-        ("remove a rule", post("/api/rules/remove", REMOVE_BODY)),
         ("the rules", get("/api/rules")),
         ("explain", get("/api/explain?name=ads.example")),
         ("the settings", get("/api/settings")),
-        ("a settings change", post("/api/settings", "{}")),
-        ("add a list", post("/api/lists/add", "{}")),
-        ("edit a list", post("/api/lists/edit", "{}")),
-        ("remove a list", post("/api/lists/remove", "{}")),
-        ("reset the lists", post("/api/lists/reset", "{}")),
-    ] {
+        ("the services", get("/api/services")),
+    ]
+    .into_iter()
+    .chain(changes)
+    {
         let reply = site.send(request).await;
 
         assert_eq!(reply.status, 403, "{what}");
         assert_eq!(reply.json()["error"], SET_A_PASSWORD, "{what}");
     }
 
-    assert!(!site.is_paused());
     assert_cache_kept(&site, cached, "a forbidden change");
-    assert!(no_page_rules(&site).await);
-}
-
-#[tokio::test]
-async fn with_a_password_the_status_keeps_its_top_lists_and_is_not_limited() {
-    let (site, _upstream) = plain_site().await;
-    ask(&site.dns, "ads.example.", RecordType::A).await;
-
-    let status = site.send(get("/api/status")).await.json();
-
-    assert!(status.get("limited").is_none());
-    for private in ["top_queried", "top_blocked", "top_clients"] {
-        assert!(status.get(private).is_some(), "{private}");
-    }
+    assert_eq!(changeable(&site).await, before);
 }
 
 #[tokio::test]
@@ -2616,10 +2373,11 @@ async fn unsafe_mutations_are_rejected_without_a_password() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
     let mut config = local_config(&upstream);
     without_credentials(&mut config);
-    let site = full_site(config).await;
+    let site = seeded_site(config, true).await;
     let cached = cache_one_answer(&site).await;
+    let before = changeable(&site).await;
 
-    for (what, request, _) in rejected_mutations() {
+    for (what, request, _) in rejected_mutations(&site.list) {
         let target = request.path.clone();
         let reply = site.send(request).await;
 
@@ -2630,19 +2388,16 @@ async fn unsafe_mutations_are_rejected_without_a_password() {
             403
         };
         assert_eq!(reply.status, expected, "{what}");
-        assert!(!site.is_paused(), "{what} paused blocking");
-        assert_nothing_was_started(&site, what);
-        assert_cache_kept(&site, cached, what);
-        assert!(no_page_rules(&site).await, "{what} added a rule");
+        assert_nothing_was_started(&site, &what);
+        assert_cache_kept(&site, cached, &what);
+        assert_eq!(changeable(&site).await, before, "{what} changed something");
     }
 }
 
 #[tokio::test]
 async fn unsafe_mutations_are_rejected_with_a_password_and_valid_credentials() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let mut config = local_config(&upstream);
-    with_credentials(&mut config);
-    let site = full_site(config).await;
+    let site = seeded_site(local_config(&upstream), true).await;
 
     assert_mutations_are_rejected(&site, |request| request.signed_in(ADMIN)).await;
 }
@@ -2650,7 +2405,7 @@ async fn unsafe_mutations_are_rejected_with_a_password_and_valid_credentials() {
 #[tokio::test]
 async fn unsafe_mutations_are_rejected_with_a_session_cookie() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let site = full_site(local_config(&upstream)).await;
+    let site = seeded_site(local_config(&upstream), true).await;
     let token = site
         .send_as_is(login("admin", "s3cret"))
         .await
@@ -2658,6 +2413,27 @@ async fn unsafe_mutations_are_rejected_with_a_session_cookie() {
         .unwrap();
 
     assert_mutations_are_rejected(&site, |request| request.with_session(&token)).await;
+}
+
+/// The refusals of the tables only mean something if the same request, with nothing wrong,
+/// is accepted.
+#[tokio::test]
+async fn every_change_route_accepts_the_request_the_tables_refuse() {
+    for index in 0..change_routes("").len() {
+        let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+        let site = seeded_site(local_config(&upstream), true).await;
+        let route = change_routes(&site.list).swap_remove(index);
+
+        let reply = site.send(route.valid()).await;
+
+        assert!(
+            reply.status == 200 || reply.status == 202,
+            "{}: {} {}",
+            route.name,
+            reply.status,
+            reply.body
+        );
+    }
 }
 
 #[tokio::test]
@@ -2690,28 +2466,27 @@ async fn a_get_of_a_mutation_names_the_method_that_works() {
 
 #[tokio::test]
 async fn with_a_password_the_page_opens_without_a_prompt_and_the_api_needs_a_sign_in() {
-    let (site, _upstream) = plain_site().await;
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let site = seeded_site(local_config(&upstream), false).await;
+    let before = changeable(&site).await;
     let reads = [
         "/api/status",
         "/api/querylog",
         "/api/lists",
         "/api/rules",
         "/api/explain?name=ads.example",
+        "/api/settings",
+        "/api/services",
     ];
-    let changes = [
-        ("/api/pause", "{\"minutes\": 5}"),
-        ("/api/resume", ""),
-        ("/api/lists/refresh", ""),
-        ("/api/update", UPDATE_BODY),
-        ("/api/cache/clear", "{}"),
-        ("/api/rules", RULE_BODY),
-        ("/api/rules/remove", REMOVE_BODY),
-    ];
+    let changes: Vec<ChangeRoute> = change_routes(&site.list)
+        .into_iter()
+        .filter(|route| route.needs_sign_in)
+        .collect();
     let requests = || {
         reads
             .iter()
             .map(|path| get(path))
-            .chain(changes.iter().map(|(path, body)| post(path, body)))
+            .chain(changes.iter().map(ChangeRoute::valid))
     };
 
     let page = site.send_as_is(get("/")).await;
@@ -2763,8 +2538,7 @@ async fn with_a_password_the_page_opens_without_a_prompt_and_the_api_needs_a_sig
         }
     }
 
-    assert!(!site.is_paused());
-    assert!(no_page_rules(&site).await);
+    assert_eq!(changeable(&site).await, before);
 
     for path in reads {
         let reply = site.send_as_is(get(path).signed_in(ADMIN)).await;
@@ -3231,6 +3005,53 @@ async fn oversized_request_heads_are_refused() {
 
     let after = site.send(get("/api/status")).await;
     assert_eq!(after.status, 200, "the server still answers");
+}
+
+/// How many connections the page serves at once, and how long one may take to send its head:
+/// `MAX_CONNECTIONS` and `HEAD_TIMEOUT` in `src/web.rs`.
+const PAGE_CONNECTIONS: usize = 16;
+
+#[tokio::test]
+async fn connections_that_send_no_head_cannot_hold_the_page_down() {
+    let (site, _upstream) = plain_site().await;
+    let mut idle = Vec::new();
+    for index in 0..PAGE_CONNECTIONS {
+        let mut stream = TcpStream::connect(site.web).await.unwrap();
+        if index % 2 == 1 {
+            stream
+                .write_all(b"GET /api/status HTTP/1.1\r\nHost: x\r\n")
+                .await
+                .unwrap();
+        }
+
+        idle.push(stream);
+    }
+
+    assert!(
+        site.is_ignored(get("/api/status")).await,
+        "a connection past the limit was served"
+    );
+    assert_eq!(
+        ask(&site.dns, "ok.example.", RecordType::A)
+            .await
+            .response_code,
+        ResponseCode::NoError
+    );
+
+    for (index, mut stream) in idle.into_iter().enumerate() {
+        let mut chunk = [0u8; 64];
+        let closed = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
+            .await
+            .unwrap_or_else(|_| panic!("connection {index} was still open after 15 s"));
+
+        assert!(
+            matches!(closed, Ok(0) | Err(_)),
+            "connection {index} got {closed:?}"
+        );
+    }
+
+    let after = site.send(get("/api/status")).await;
+    assert_eq!(after.status, 200, "the page answers again");
 }
 
 #[tokio::test]
@@ -4133,17 +3954,6 @@ async fn a_settings_change_that_is_not_valid_is_refused_and_nothing_is_written()
 }
 
 #[tokio::test]
-async fn a_settings_change_of_nothing_writes_nothing_and_answers_the_settings() {
-    let (site, _upstream) = plain_site().await;
-
-    let changed = site.send(post("/api/settings", "{}")).await;
-
-    assert_eq!(changed.status, 200);
-    assert_eq!(changed.json(), site.send(get("/api/settings")).await.json());
-    assert!(saved_settings(&site).is_none());
-}
-
-#[tokio::test]
 async fn only_the_settings_route_takes_a_body_of_64_kib() {
     let (site, _upstream) = plain_site().await;
     let padded = |length: usize| format!("{{}}{}", " ".repeat(length - 2));
@@ -4271,26 +4081,6 @@ async fn rewrites_and_safe_search_apply_at_once_and_a_reset_goes_back_to_the_con
     assert_eq!(addresses(&answer), ["9.9.9.9"]);
     let explained = site.send(get("/api/explain?name=google.de")).await.json();
     assert_eq!(explained["decision"], "none");
-}
-
-#[tokio::test]
-async fn the_same_rewrites_again_write_nothing() {
-    let (site, _upstream) = plain_site().await;
-    let file = site.state.join(settings::FILE_NAME);
-    let body = rewrite_body(&[("nas.lan", "192.168.1.10")]);
-    assert_eq!(site.send(post("/api/settings", &body)).await.status, 200);
-    std::fs::remove_file(&file).unwrap();
-
-    for body in [
-        body,
-        rewrite_body(&[("NAS.lan.", " 192.168.1.10")]),
-        "{\"safe_search\": null}".to_string(),
-    ] {
-        let reply = site.send(post("/api/settings", &body)).await;
-
-        assert_eq!(reply.status, 200, "{body}: {}", reply.body);
-        assert!(!file.exists(), "{body} wrote the file");
-    }
 }
 
 #[tokio::test]
@@ -4509,23 +4299,41 @@ async fn a_larger_cache_that_would_pass_the_memory_budget_is_refused_and_a_small
 #[tokio::test]
 async fn the_file_is_written_only_when_a_setting_in_force_changes() {
     let (site, first) = plain_site().await;
-    let body = upstream_body(&[udp(&first)]);
+    let upstreams = upstream_body(&[udp(&first)]);
+    let rewrites = rewrite_body(&[("nas.lan", "192.168.1.10")]);
+    let normalized_rewrites = rewrite_body(&[("NAS.lan.", " 192.168.1.10")]);
     let file = site.state.join(settings::FILE_NAME);
 
-    assert_eq!(site.send(post("/api/settings", &body)).await.status, 200);
-    assert!(file.exists());
-    std::fs::remove_file(&file).unwrap();
-
-    for body in [
-        body.as_str(),
-        "{}",
-        "{\"cache\": null}",
-        "{\"rewrites\": null, \"safe_search\": null, \"services\": null}",
+    // Nothing is in force twice: the second round sets rewrites, so a reset of them would write.
+    for (set, unchanged) in [
+        (
+            &upstreams,
+            vec![
+                upstreams.as_str(),
+                "{}",
+                "{\"cache\": null}",
+                "{\"rewrites\": null, \"safe_search\": null, \"services\": null}",
+            ],
+        ),
+        (
+            &rewrites,
+            vec![
+                rewrites.as_str(),
+                normalized_rewrites.as_str(),
+                "{\"safe_search\": null}",
+            ],
+        ),
     ] {
-        let reply = site.send(post("/api/settings", body)).await;
+        assert_eq!(site.send(post("/api/settings", set)).await.status, 200);
+        assert!(file.exists());
+        std::fs::remove_file(&file).unwrap();
 
-        assert_eq!(reply.status, 200, "{body}: {}", reply.body);
-        assert!(!file.exists(), "{body} wrote the file");
+        for body in unchanged {
+            let reply = site.send(post("/api/settings", body)).await;
+
+            assert_eq!(reply.status, 200, "{body}: {}", reply.body);
+            assert!(!file.exists(), "{body} wrote the file");
+        }
     }
 }
 
@@ -4867,6 +4675,135 @@ async fn a_list_change_from_the_page_never_sets_a_path_redirects_or_anything_unk
 }
 
 #[tokio::test]
+async fn a_list_name_from_the_page_is_at_most_100_characters_without_control_characters() {
+    const REFUSED: &str = "a list name has at most 100 characters and no control characters";
+    let (site, server, _upstream) = list_site(|_| {}).await;
+    server.serve("/a.txt", "||a.example^\n", None);
+    server.serve("/b.txt", "||b.example^\n", None);
+    server.serve("/c.txt", "||c.example^\n", None);
+    let (a, b, c) = (
+        server.url("/a.txt"),
+        server.url("/b.txt"),
+        server.url("/c.txt"),
+    );
+    let at_the_limit = "\u{e9}".repeat(100);
+    let bad_names = [
+        "x".repeat(101),
+        "\u{e9}".repeat(101),
+        "in\nside".to_string(),
+        "in\u{0}side".to_string(),
+        "in\u{7f}side".to_string(),
+        "tab\tinside".to_string(),
+    ];
+
+    for name in &bad_names {
+        let reply = site.send(post("/api/lists/add", &add_body(name, &a))).await;
+
+        assert_eq!(reply.status, 400, "{name:?}: {}", reply.body);
+        assert!(reply.body.contains(REFUSED), "{}", reply.body);
+    }
+
+    assert_eq!(server.requests(), 0, "a refused add downloaded the list");
+    assert!(saved_settings(&site).is_none());
+    assert!(site.control.pending_list().is_none());
+
+    site.send(post("/api/lists/add", &add_body(&at_the_limit, &a)))
+        .await;
+    let lists = after_the_add(&site).await;
+    assert_eq!(lists["pending"]["state"], "added");
+    assert_eq!(lists["lists"][0]["name"], at_the_limit.as_str());
+
+    let edit = |source: &str, name: &str| {
+        post(
+            "/api/lists/edit",
+            &serde_json::json!({"role": "block", "source": source, "name": name}).to_string(),
+        )
+    };
+    for name in &bad_names {
+        let reply = site.send(edit(&a, name)).await;
+
+        assert_eq!(reply.status, 400, "{name:?}: {}", reply.body);
+        assert!(reply.body.contains(REFUSED), "{}", reply.body);
+    }
+
+    let lists = site.send(get("/api/lists")).await.json();
+    assert_eq!(lists["lists"][0]["name"], at_the_limit.as_str());
+    assert_eq!(
+        saved_settings(&site).unwrap()["lists"][0]["name"],
+        at_the_limit.as_str()
+    );
+
+    let renamed = site.send(edit(&a, "  Renamed  ")).await;
+    assert_eq!(renamed.status, 200, "{}", renamed.body);
+    assert_eq!(renamed.json()["lists"][0]["name"], "Renamed");
+    assert_eq!(
+        saved_settings(&site).unwrap()["lists"][0]["name"],
+        "Renamed"
+    );
+
+    let cleared = site.send(edit(&a, " \t ")).await;
+    assert_eq!(cleared.status, 200, "{}", cleared.body);
+    assert_eq!(cleared.json()["lists"][0]["name"], a.as_str());
+
+    site.send(post("/api/lists/add", &add_body("   ", &b)))
+        .await;
+    assert_eq!(after_the_add(&site).await["pending"]["state"], "added");
+    site.send(post("/api/lists/add", &add_body("  Padded  ", &c)))
+        .await;
+    let lists = after_the_add(&site).await;
+    assert_eq!(lists["pending"]["state"], "added");
+    let names: Vec<&str> = lists["lists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|list| list["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [a.as_str(), b.as_str(), "Padded"]);
+}
+
+#[tokio::test]
+async fn a_list_url_from_the_page_has_no_user_name_or_password_but_may_hold_an_at_sign_later() {
+    let (site, server, _upstream) = list_site(|_| {}).await;
+    server.serve("/p@th/list.txt", "||path.example^\n", None);
+    server.serve("/query.txt?token=a@b", "||query.example^\n", None);
+    let host = server.url("/").trim_end_matches('/').to_string();
+    let with = |userinfo: &str| host.replacen("://", &format!("://{userinfo}@"), 1) + "/list.txt";
+
+    for url in [with("user:secret"), with("user"), with(":")] {
+        let reply = site
+            .send(post("/api/lists/add", &add_body("Private", &url)))
+            .await;
+
+        assert_eq!(reply.status, 400, "{url}: {}", reply.body);
+        assert!(
+            reply
+                .body
+                .contains("the list URL must not contain a user name or password"),
+            "{}",
+            reply.body
+        );
+        assert!(!reply.body.contains("secret"), "{}", reply.body);
+    }
+
+    assert_eq!(server.requests(), 0);
+    assert!(saved_settings(&site).is_none());
+    assert!(site.control.pending_list().is_none());
+
+    for path in ["/p@th/list.txt", "/query.txt?token=a@b"] {
+        let reply = site
+            .send(post("/api/lists/add", &add_body("At", &server.url(path))))
+            .await;
+
+        assert_eq!(reply.status, 202, "{path}: {}", reply.body);
+        assert_eq!(
+            after_the_add(&site).await["pending"]["state"],
+            "added",
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn page_lists_are_edited_removed_and_reset_through_the_api() {
     let (site, server, _upstream) = list_site(|_| {}).await;
     server.serve("/list.txt", "||edited.example^\n", None);
@@ -4923,26 +4860,6 @@ async fn page_lists_are_edited_removed_and_reset_through_the_api() {
         saved_settings(&site).unwrap(),
         serde_json::json!({"version": 1})
     );
-}
-
-#[tokio::test]
-async fn without_a_password_the_lists_show_no_source_and_no_pending_add() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let mut config = local_config(&upstream);
-    without_credentials(&mut config);
-    config.lists = vec![ListConfig {
-        name: Some("Private".to_string()),
-        url: Some("https://lists.example/list.txt?token=secret".to_string()),
-        ..ListConfig::default()
-    }];
-    let site = site(config).await;
-
-    let lists = site.send(get("/api/lists")).await;
-
-    assert_eq!(lists.status, 200);
-    assert!(!lists.body.contains("secret"), "{}", lists.body);
-    assert!(lists.json().get("pending").is_none());
-    assert!(lists.json()["memory"]["budget_bytes"].as_u64().is_some());
 }
 
 #[tokio::test]

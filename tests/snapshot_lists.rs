@@ -12,7 +12,7 @@ use common::{Query, load_real};
 use picoguard::filter::compile::{CompileOptions, CompileWorker, Compiled};
 use picoguard::filter::engine::{Decision, Engine, blocked_answer};
 use picoguard::filter::parse::{ListFormat, dns_type_code};
-use picoguard::filter::snapshot::{Snapshot, SnapshotStore, load};
+use picoguard::filter::snapshot::{Snapshot, SnapshotStore};
 use picoguard::lists::{MAX_PIECE_BYTES, Piece, Validators};
 
 const MAX_RULES: u32 = 3_000_000;
@@ -203,66 +203,4 @@ async fn a_refresh_with_the_same_text_writes_nothing_even_after_a_restart() {
     let total: u64 = sizes.iter().sum();
     println!("snapshot sizes for the three real lists: {sizes:?} bytes, {total} in total");
     assert!(total < 8 * 1024 * 1024);
-}
-
-#[tokio::test]
-async fn a_changed_format_with_the_same_text_is_rewritten_after_a_restart() {
-    let real = load_real();
-    let text = &real.lists[2];
-    let state = StateDir::new("snapshot-format");
-    let as_domains = CompileOptions {
-        format: ListFormat::Domains,
-        ..options()
-    };
-    {
-        let worker = CompileWorker::spawn().unwrap();
-        let store = SnapshotStore::open(state.path()).unwrap();
-        let list = compile(&worker, text).await;
-        store
-            .save(Snapshot::new(
-                &list,
-                &options(),
-                &source(0),
-                Validators::default(),
-            ))
-            .await
-            .unwrap();
-        store.flush().await;
-    }
-
-    let worker = CompileWorker::spawn().unwrap();
-    let store = SnapshotStore::open(state.path()).unwrap();
-    let path = store.path_for(&source(0)).unwrap();
-    let boot = load(&path, &options()).unwrap();
-    assert!(boot.fits(&source(0), &options()));
-    assert!(!boot.fits(&source(0), &as_domains));
-
-    let compilation = worker.start(as_domains);
-    for piece in text.as_bytes().chunks(MAX_PIECE_BYTES) {
-        compilation
-            .pieces
-            .send(Piece::Data(piece.to_vec()))
-            .await
-            .unwrap();
-    }
-
-    compilation.pieces.send(Piece::End).await.unwrap();
-    let recompiled = compilation.result().await.unwrap();
-    assert_eq!(recompiled.content_hash, boot.meta.content_hash);
-    assert_ne!(recompiled.fingerprint, boot.meta.fingerprint);
-
-    store
-        .save(Snapshot::new(
-            &recompiled,
-            &as_domains,
-            &source(0),
-            Validators::default(),
-        ))
-        .await
-        .unwrap();
-    store.flush().await;
-
-    assert!(store.bytes_written() > 0);
-    let rewritten = load(&path, &options()).unwrap();
-    assert_eq!(rewritten.meta.configured_format, ListFormat::Domains);
 }

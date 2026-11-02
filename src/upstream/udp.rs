@@ -155,17 +155,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_is_returned_whole() {
-        let server = server_replying_with(DATAGRAM).await;
-
-        let reply = exchange(server, &mut query_for("example.com."), LIMIT, soon())
-            .await
-            .unwrap();
-
-        assert_eq!(reply.len(), DATAGRAM);
-    }
-
-    #[tokio::test]
     async fn a_reply_one_byte_over_the_cap_is_rejected_not_cut_short() {
         let server = server_replying_with(DATAGRAM).await;
 

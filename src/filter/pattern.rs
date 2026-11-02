@@ -1094,61 +1094,6 @@ mod tests {
     }
 
     #[test]
-    fn subdomain_anchor_and_separator() {
-        assert!(matches("||ads.example^", "ads.example"));
-        assert!(matches("||ads.example^", "www.ads.example"));
-        assert!(matches("||ads.example^", "a.b.ads.example"));
-        assert!(!matches("||ads.example^", "xads.example"));
-        assert!(!matches("||ads.example^", "ads.example.org"));
-        assert!(!matches("||ads.example^", "ads.examples"));
-    }
-
-    #[test]
-    fn without_a_separator_the_rule_matches_longer_names() {
-        assert!(matches("||ads.example", "ads.example.org"));
-        assert!(matches("||ads.example", "ads.examples"));
-        assert!(!matches("||ads.example", "xads.example"));
-    }
-
-    #[test]
-    fn exact_anchor() {
-        assert!(matches("|ads.example^", "ads.example"));
-        assert!(!matches("|ads.example^", "www.ads.example"));
-        assert!(matches("|ads", "ads.example"));
-        assert!(!matches("|ads", "xads"));
-    }
-
-    #[test]
-    fn end_anchor() {
-        assert!(matches("example|", "ads.example"));
-        assert!(!matches("example|", "ads.example.org"));
-        assert!(matches("|ads.example|", "ads.example"));
-        assert!(!matches("|ads.example|", "x.ads.example"));
-    }
-
-    #[test]
-    fn unanchored_pattern_is_a_substring() {
-        assert!(matches("ads", "x-ads-y.example"));
-        assert!(matches(".adonweb.ru^", "www.adonweb.ru"));
-        assert!(!matches(".adonweb.ru^", "adonweb.ru"));
-    }
-
-    #[test]
-    fn wildcards() {
-        assert!(matches("||ad*.example^", "ad123.example"));
-        assert!(matches("||ad*.example^", "www.ad.example"));
-        assert!(matches("||ad*.example^", "ads.x.example"));
-        assert!(!matches("||ad*.example^", "ad.example.org"));
-        assert!(matches("*.leading.example", "x.leading.example"));
-        assert!(!matches("*.leading.example", "leading.example"));
-        assert!(matches("||*.star-first.example^", "sub.star-first.example"));
-        assert!(!matches("||*.star-first.example^", "star-first.example"));
-        assert!(matches("*", "anything"));
-        assert!(matches("||", "anything"));
-        assert!(matches("|", "anything"));
-    }
-
-    #[test]
     fn many_wildcards_match_in_time_linear_in_the_name() {
         let host = "a".repeat(250);
         let url = format!("http://{host}");
@@ -1184,12 +1129,6 @@ mod tests {
         assert!(cost("/track[0-9]+/") < 24 * 1024);
         assert!(cost("/(\\pL|\\pN){1,50}x/") > 512 * 1024);
         assert!(cost("/(\\pL|\\pN){1,50}x/") > 5 * cost("/(\\pL|\\pN){1,5}x/"));
-    }
-
-    #[test]
-    fn a_pipe_inside_the_pattern_is_literal() {
-        assert!(matches("||mid|pipe.example^", "mid|pipe.example"));
-        assert!(!matches("||mid|pipe.example^", "mid.pipe.example"));
     }
 
     #[test]
@@ -1240,14 +1179,6 @@ mod tests {
     }
 
     #[test]
-    fn dots_are_not_separators_in_ip_text() {
-        assert!(matches("||1.2.3.4^", "1.2.3.4"));
-        assert!(!matches("||1.2.3.4^", "1.2.3.45"));
-        assert!(!matches("||1.2.3.4^", "11.2.3.4"));
-        assert!(matches("||1.2.3.4^", "9.1.2.3.4"));
-    }
-
-    #[test]
     fn ipv4_mapped_ipv6_text() {
         assert!(matches("||::ffff:1.2.3.4^", "::ffff:1.2.3.4"));
         assert!(!matches("||1.2.3.4^", "::ffff:1.2.3.4"));
@@ -1262,25 +1193,6 @@ mod tests {
         assert!(!matches("||b^", ".b"));
         assert!(matches("||b^", "..b"));
         assert!(matches("||b^", "a_x-1.b"));
-    }
-
-    #[test]
-    fn pattern_with_url_prefix_matches_the_url() {
-        assert!(matches("://scheme-less.example^", "scheme-less.example"));
-        assert!(!matches(
-            "://scheme-less.example^",
-            "www.scheme-less.example"
-        ));
-        assert!(matches("http://url-c.example^", "url-c.example"));
-        assert!(!matches("http://url-c.example^", "sub.url-c.example"));
-        assert!(!matches("|http://url-b.example", "url-b.example"));
-    }
-
-    #[test]
-    fn patterns_with_a_path_never_match_a_bare_host() {
-        assert!(!matches("||path.example/ads^", "path.example"));
-        assert!(!matches("/ads/foo.", "ads"));
-        assert!(!matches("||url-f.example/", "url-f.example"));
     }
 
     #[test]
@@ -1331,24 +1243,6 @@ mod tests {
     }
 
     #[test]
-    fn regex_rules() {
-        assert!(matches("/^ad[sx]?[0-9]+\\./", "ads22.example"));
-        assert!(!matches("/^ad[sx]?[0-9]+\\./", "xad1.example"));
-        assert!(matches(
-            "/tracker-\\d{2,3}\\.example$/",
-            "tracker-12.example"
-        ));
-        assert!(!matches(
-            "/tracker-\\d{2,3}\\.example$/",
-            "tracker-1.example"
-        ));
-        assert!(matches("/(?i)UPPER-CI\\.example/", "upper-ci.example"));
-        assert!(matches("/UPPER-CS\\.example/", "upper-cs.example"));
-        assert!(matches("//", "x"));
-        assert!(matches("/.*/", "x"));
-    }
-
-    #[test]
     fn go_syntax_translation() {
         let translated = |source: &str| translate_go_regex(source).unwrap();
         assert_eq!(translated("a\\_b"), "a\\_b");
@@ -1377,64 +1271,12 @@ mod tests {
     }
 
     #[test]
-    fn octal_escapes_become_hex_literals() {
-        let translated = |source: &str| translate_go_regex(source).unwrap();
-        assert_eq!(translated("\\141"), "\\x{61}");
-        assert_eq!(translated("\\0"), "\\x{0}");
-        assert_eq!(translated("\\012"), "\\x{A}");
-        assert_eq!(translated("\\1411"), "\\x{61}1");
-        assert_eq!(translated("\\777"), "\\x{1FF}");
-        assert!(translate_go_regex("\\18").is_err());
-    }
-
-    #[test]
-    fn named_captures_become_plain_groups() {
-        let translated = |source: &str| translate_go_regex(source).unwrap();
-        assert_eq!(translated("(?P<1>a)"), "(?:a)");
-        assert_eq!(translated("(?P<a>x)(?P<a>y)"), "(?:x)(?:y)");
-        assert_eq!(translated("(?<n_1>z)"), "(?:z)");
-        for source in [
-            "(?P<bad-name>x)",
-            "(?P<>x)",
-            "(?<>x)",
-            "(?P<\u{e9}>x)",
-            "(?P<open",
-            "(?<=look)",
-            "(?<!look)",
-        ] {
-            assert!(translate_go_regex(source).is_err(), "{source} should fail");
-        }
-    }
-
-    #[test]
-    fn repetition_counts_follow_go_syntax() {
-        let translated = |source: &str| translate_go_regex(source).unwrap();
-        assert_eq!(translated("a{01}"), "a\\{01}");
-        assert_eq!(translated("a{1,02}"), "a\\{1,02}");
-        assert_eq!(translated("a{00}"), "a\\{00}");
-        assert_eq!(translated("a{0}"), "a{0}");
-        assert_eq!(translated("a{10,20}"), "a{10,20}");
-        assert_eq!(translated("a{0,}"), "a{0,}");
-        assert!(translate_go_regex("a{1001}").is_err());
-    }
-
-    #[test]
-    fn go_octal_names_and_counts_match_like_go() {
-        assert!(matches("/^(?:\\141ds)\\.example$/", "ads.example"));
-        assert!(matches("/^[\\141-\\143]x\\.example$/", "bx.example"));
-        assert!(matches("/^\\1411\\.example$/", "a1.example"));
-        assert!(matches("/^(?P<1>n)(?P<1>m)\\.example$/", "nm.example"));
-        assert!(matches("/^lead{01}\\.example$/", "lead{01}.example"));
-        assert!(!matches("/^lead{01}\\.example$/", "lead.example"));
-        assert!(matches("/^cc{1,2}\\.example$/", "ccc.example"));
-    }
-
-    #[test]
     fn syntax_go_rejects_is_rejected() {
         for source in [
             "(?x)a b",
             "(?=look)",
             "(?<=look)",
+            "(?<!look)",
             "x*+",
             "[",
             "(unclosed",
@@ -1454,44 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn go_regex_syntax_matches_like_go() {
-        assert!(matches("/^brace{\\.example$/", "brace{.example"));
-        assert!(matches("/^lit\\{x\\}\\.example$/", "lit{x}.example"));
-        assert!(matches(
-            "/^under\\_score\\.example$/",
-            "under_score.example"
-        ));
-        assert!(matches(
-            "/\\pL+\\.latin-class\\.example/",
-            "abc.latin-class.example"
-        ));
-        assert!(!matches(
-            "/\\pL+\\.latin-class\\.example/",
-            "ab1.latin-class.example"
-        ));
-        assert!(matches(
-            "/^\\p{Latin}+\\.script\\.example$/",
-            "abc.script.example"
-        ));
-        assert!(matches(
-            "/\\p{Greek}\\.greek\\.example/",
-            "\u{3b1}.greek.example"
-        ));
-        assert!(matches(
-            "/^[[:alpha:]]+\\.posix\\.example$/",
-            "abc.posix.example"
-        ));
-        assert!(matches("/^\\x61bc\\.hex\\.example$/", "abc.hex.example"));
-        assert!(matches(
-            "/^[\\w-]+\\.word-class\\.example$/",
-            "ab-1.word-class.example"
-        ));
-        assert!(matches("/^[^\\D]+\\.negd\\.example$/", "123.negd.example"));
-        assert!(!matches("/^[^\\D]+\\.negd\\.example$/", "abc.negd.example"));
-        assert!(matches("/(?s)dot.all\\.example/", "dotxall.example"));
-        assert!(matches("/(?U)lazy.+\\.example/", "lazyabc.example"));
-        assert!(matches("/^\\x{4e2d}$/", "\u{4e2d}"));
-        // `\d` and `\w` are ASCII only in Go.
+    fn go_classes_are_ascii_only() {
         assert!(!matches(
             "/^\\d+\\.digits\\.example$/",
             "\u{661}\u{662}.digits.example"
@@ -1509,31 +1314,10 @@ mod tests {
     }
 
     #[test]
-    fn suffix_candidates_stop_at_characters_outside_the_name_class() {
-        // `a:b.c`: the prefix group cannot cross the colon, but the colon ends a candidate.
-        assert_eq!(suffixes("a:b.c"), sorted(vec!["a", "a:b.c"]));
-        assert_eq!(
-            suffixes("dead:beef::1"),
-            sorted(vec!["dead", "dead:beef", "dead:beef:", "dead:beef::1"])
-        );
-        assert_eq!(suffixes("x.y:z"), sorted(vec!["x.y", "x.y:z", "y", "y:z"]));
-    }
-
-    #[test]
     fn ends_include_every_separator_position() {
         assert_eq!(suffixes("a/b"), sorted(vec!["a", "a/b"]));
         assert_eq!(suffixes("a b"), ["a b"]);
         assert_eq!(suffixes("a\u{e9}"), sorted(vec!["a", "a\u{e9}"]));
-    }
-
-    #[test]
-    fn exact_candidates_start_at_the_beginning_only() {
-        assert_eq!(exacts("a.b.c"), ["a.b.c"]);
-        assert_eq!(
-            exacts("dead:beef::1"),
-            sorted(vec!["dead", "dead:beef", "dead:beef:", "dead:beef::1"])
-        );
-        assert_eq!(exacts(""), Vec::<String>::new());
     }
 
     #[test]

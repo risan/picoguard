@@ -2,7 +2,11 @@
 
 mod common;
 
+use std::net::IpAddr;
+use std::sync::Arc;
+
 use common::{fixtures_dir, read_text};
+use picoguard::filter::engine::{CompiledList, Decision, Engine, TYPE_A, TYPE_AAAA};
 use picoguard::filter::parse::{Counters, ListFormat, ParseSummary, Parser, Rule};
 
 fn parse_file(name: &str, format: ListFormat) -> ParseSummary {
@@ -114,18 +118,121 @@ fn dnsmasq_and_rpz_lists_block_the_same_domains() {
 }
 
 #[test]
-fn hosts_file_is_read_as_host_rules() {
-    let counters = counters("stevenblack-hosts");
-    assert!(counters.host_names > 70_000, "{}", counters.host_names);
-    assert_eq!(counters.slow_rules, 0);
-    assert_eq!(counters.invalid, 0, "{:?}", counters.first_invalid);
-    assert_eq!(counters.unmatchable_hosts, 0);
+fn a_hosts_file_is_read_as_host_rules_with_and_without_the_format_named() {
+    let auto = counters("stevenblack-hosts");
+    let hosts = parse_file("stevenblack-hosts", ListFormat::Hosts).counters;
+
+    for counters in [&auto, &hosts] {
+        assert!(counters.host_names > 70_000, "{}", counters.host_names);
+        assert_eq!(counters.slow_rules, 0);
+        assert_eq!(counters.invalid, 0, "{:?}", counters.first_invalid);
+        assert_eq!(counters.unmatchable_hosts, 0);
+    }
+
+    assert_eq!(hosts.host_names, auto.host_names);
+}
+
+fn engine_of_hosts(text: &str) -> Engine {
+    let (list, _) = CompiledList::from_text(ListFormat::Hosts, text);
+
+    Engine::new(vec![Arc::new(list)], Vec::new())
+}
+
+fn answer_of(engine: &Engine, name: &str, record_type: u16) -> Option<Vec<IpAddr>> {
+    match engine.check(name, record_type, false) {
+        Decision::Block { ips } => Some(ips),
+        Decision::Pass => None,
+    }
 }
 
 #[test]
-fn explicit_hosts_format_reads_the_same_names() {
-    let auto = counters("stevenblack-hosts");
-    let hosts = parse_file("stevenblack-hosts", ListFormat::Hosts).counters;
-    assert_eq!(hosts.host_names, auto.host_names);
-    assert_eq!(hosts.invalid, 0);
+fn every_name_of_the_real_hosts_list_is_redirected_and_a_near_miss_is_not() {
+    let text = read_text(&fixtures_dir().join("lists/stevenblack-hosts.txt.gz"));
+    let engine = engine_of_hosts(&text);
+    let null: IpAddr = "0.0.0.0".parse().unwrap();
+    let names: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("0.0.0.0 "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter(|name| *name != "0.0.0.0")
+        .collect();
+    assert!(names.len() > 70_000, "{}", names.len());
+
+    for name in &names {
+        assert_eq!(answer_of(&engine, name, TYPE_A), Some(vec![null]), "{name}");
+    }
+
+    for name in names.iter().step_by(97) {
+        let mut changed = name.to_string();
+        changed.insert(0, 'x');
+
+        assert_eq!(answer_of(&engine, &changed, TYPE_A), None, "{changed}");
+        assert_eq!(answer_of(&engine, &format!("sub.{name}"), TYPE_A), None);
+    }
+}
+
+/// 100,000 names over 50 answer IPs, a third of them with an IPv6 address, every seventh
+/// with both families.
+#[test]
+fn a_large_hosts_list_answers_every_name_with_its_own_addresses() {
+    let address_of = |n: usize, ipv6: bool| -> IpAddr {
+        if ipv6 {
+            format!("2001:db8::{:x}", n % 50 + 1).parse().unwrap()
+        } else {
+            format!("10.0.{}.1", n % 50).parse().unwrap()
+        }
+    };
+    let families_of = |n: usize| match (n.is_multiple_of(7), n.is_multiple_of(3)) {
+        (true, _) => (true, true),
+        (false, ipv6) => (!ipv6, ipv6),
+    };
+    let mut text = String::new();
+    for n in 0..100_000 {
+        let (v4, v6) = families_of(n);
+        if v4 {
+            text.push_str(&format!("{} host{n}.example\n", address_of(n, false)));
+        }
+
+        if v6 {
+            text.push_str(&format!("{} host{n}.example\n", address_of(n, true)));
+        }
+    }
+
+    let engine = engine_of_hosts(&text);
+
+    for n in 0..100_000 {
+        let name = format!("host{n}.example");
+        let (v4, v6) = families_of(n);
+        let expected = |wanted: bool, ipv6: bool| {
+            Some(if wanted {
+                vec![address_of(n, ipv6)]
+            } else {
+                Vec::new()
+            })
+        };
+
+        assert_eq!(
+            answer_of(&engine, &name, TYPE_A),
+            expected(v4, false),
+            "{name}"
+        );
+        assert_eq!(
+            answer_of(&engine, &name, TYPE_AAAA),
+            expected(v6, true),
+            "{name}"
+        );
+    }
+
+    for n in (0..100_000).step_by(11) {
+        for missing in [
+            format!("hosu{n}.example"),
+            format!("host{n}.exampl"),
+            format!("sub.host{n}.example"),
+            format!("host{}.example", n + 100_000),
+        ] {
+            assert_eq!(answer_of(&engine, &missing, TYPE_A), None, "{missing}");
+        }
+    }
+
+    assert_eq!(answer_of(&engine, "example", TYPE_A), None);
 }

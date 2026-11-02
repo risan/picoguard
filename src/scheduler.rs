@@ -2586,7 +2586,17 @@ mod tests {
     }
 
     #[test]
-    fn names_outside_rule_5_are_refused() {
+    fn names_outside_rule_5_are_refused_and_the_longest_is_accepted() {
+        let longest = long_name(253);
+        assert_eq!(longest.len(), 253);
+        assert!(longest.split('.').take(3).all(|label| label.len() == 63));
+
+        assert_eq!(normalized_name(&longest).as_ref(), Some(&longest));
+        assert_eq!(
+            normalized_name(&format!("{longest}.")).as_ref(),
+            Some(&longest)
+        );
+
         let too_long = long_name(254);
         let long_label = format!("{}.example", "a".repeat(64));
         assert_eq!(too_long.len(), 254);
@@ -2609,18 +2619,5 @@ mod tests {
         ] {
             assert_eq!(normalized_name(bad), None, "{bad:?}");
         }
-    }
-
-    #[test]
-    fn the_longest_name_is_accepted() {
-        let longest = long_name(253);
-        assert_eq!(longest.len(), 253);
-        assert!(longest.split('.').take(3).all(|label| label.len() == 63));
-
-        assert_eq!(normalized_name(&longest).as_ref(), Some(&longest));
-        assert_eq!(
-            normalized_name(&format!("{longest}.")).as_ref(),
-            Some(&longest)
-        );
     }
 }

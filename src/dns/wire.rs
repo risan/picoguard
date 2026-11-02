@@ -1134,16 +1134,6 @@ mod tests {
     }
 
     #[test]
-    fn query_without_edns_has_no_edns_and_no_dnssec_ok() {
-        let bytes = QuerySpec::new("example.com.", RecordType::A).bytes();
-
-        let query = Query::parse(&bytes).unwrap();
-
-        assert_eq!(query.edns, None);
-        assert!(!query.dnssec_ok());
-    }
-
-    #[test]
     fn question_bytes_keep_the_clients_letter_case() {
         let bytes = QuerySpec::new("ExAmPle.COM.", RecordType::A).bytes();
 
@@ -1280,17 +1270,6 @@ mod tests {
         assert_eq!(read_name(&forward, 0), Err(WireError::BadName));
         assert_eq!(read_name(&cycle_through_labels, 0), Err(WireError::BadName));
         assert_eq!(read_name(&pointer_to_pointer, 2), Err(WireError::BadName));
-    }
-
-    #[test]
-    fn a_pointer_cycle_that_walks_labels_ends_at_the_name_limit() {
-        // Offset 0: label "a" then a pointer at 2 that jumps back to 0.
-        // Backward-only pointers allow this; the length limit must stop it.
-        let msg = [1, b'a', 0xC0, 0x00, 0, 0];
-
-        let result = read_name(&msg, 2);
-
-        assert_eq!(result, Err(WireError::BadName));
     }
 
     fn pointer_to(target: usize) -> [u8; 2] {

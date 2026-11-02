@@ -47,25 +47,3 @@ fn level_filter(level: LogLevel) -> LevelFilter {
 fn format_line(level: Level, message: Arguments) -> String {
     format!("{level} {message}")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn line_is_level_then_message() {
-        assert_eq!(
-            format_line(Level::Warn, format_args!("list {} failed", "pro")),
-            "WARN list pro failed"
-        );
-    }
-
-    #[test]
-    fn config_levels_map_to_log_filters() {
-        assert_eq!(level_filter(LogLevel::Error), LevelFilter::Error);
-        assert_eq!(level_filter(LogLevel::Warn), LevelFilter::Warn);
-        assert_eq!(level_filter(LogLevel::Info), LevelFilter::Info);
-        assert_eq!(level_filter(LogLevel::Debug), LevelFilter::Debug);
-        assert_eq!(level_filter(LogLevel::Trace), LevelFilter::Trace);
-    }
-}

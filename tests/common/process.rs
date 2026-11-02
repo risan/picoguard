@@ -1,6 +1,6 @@
 //! Runs the built `picoguard` binary on a free UDP/TCP port of 127.0.0.1.
 
-use std::net::UdpSocket;
+use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
@@ -28,6 +28,13 @@ pub fn write_config(name: &str, content: &str) -> PathBuf {
 /// `port`. The port is picked free; if another process takes it first the server exits
 /// and the start is tried again with another port.
 pub fn start(name: &str, config_for: impl Fn(u16) -> String) -> Running {
+    start_with_web_port(name, |port, _web_port| config_for(port)).0
+}
+
+/// As `start`, for a config that also binds a TCP port for the web page: the two ports are
+/// picked together, so a start that fails because another process took either of them is
+/// tried again with both picked anew. Returns the web port too.
+pub fn start_with_web_port(name: &str, config_for: impl Fn(u16, u16) -> String) -> (Running, u16) {
     let _starting = STARTING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -38,7 +45,12 @@ pub fn start(name: &str, config_for: impl Fn(u16) -> String) -> Running {
             .local_addr()
             .unwrap()
             .port();
-        let path = write_config(name, &config_for(port));
+        let web_port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let path = write_config(name, &config_for(port, web_port));
         let mut child = Command::new(env!("CARGO_BIN_EXE_picoguard"))
             .args(["-c", path.to_str().unwrap()])
             .stderr(Stdio::piped())
@@ -46,14 +58,14 @@ pub fn start(name: &str, config_for: impl Fn(u16) -> String) -> Running {
             .expect("picoguard binary should start");
 
         if wait_for_refused_version_bind(port, &mut child) {
-            return Running { child, port };
+            return (Running { child, port }, web_port);
         }
 
         let _ = child.kill();
         let _ = child.wait();
     }
 
-    panic!("picoguard never answered on a free port");
+    panic!("picoguard never answered on free ports");
 }
 
 /// `version.bind` is refused without any upstream, which makes it a probe. False when the

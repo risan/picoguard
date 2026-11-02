@@ -6,14 +6,24 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::harness::{a_record, fake_upstream, name, reply_to};
 use common::http::ListServer;
-use common::process::{exit_within, send_signal, start};
+use common::process::{Running, exit_within, send_signal, start};
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::RecordType;
 use tokio::net::UdpSocket;
+
+/// Kills and reaps the server when a failed assertion ends the test early.
+struct Reaped(Running);
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.child.kill();
+        let _ = self.0.child.wait();
+    }
+}
 
 const LIST: &str = "||ads.example^\n";
 
@@ -31,6 +41,27 @@ impl StateDir {
 
     fn snapshots(&self) -> usize {
         fs::read_dir(self.0.join("lists")).map_or(0, |entries| entries.count())
+    }
+
+    /// Every file under `lists/`, by name, with its bytes.
+    fn snapshot_files(&self) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<_> = fs::read_dir(self.0.join("lists"))
+            .map(|entries| {
+                entries
+                    .map(|entry| {
+                        let entry = entry.unwrap();
+
+                        (
+                            entry.file_name().to_string_lossy().to_string(),
+                            fs::read(entry.path()).unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+
+        files
     }
 }
 
@@ -161,4 +192,68 @@ async fn sigterm_stops_at_once_while_a_refresh_waits_on_a_silent_upstream() {
 
     let status = exit_within(&mut server.child, Duration::from_secs(5)).await;
     assert_eq!(status.and_then(|status| status.code()), Some(0));
+}
+
+/// The shutdown allowance in `main.rs` (`SHUTDOWN_WAIT`) is 10 seconds.
+#[tokio::test]
+async fn sigterm_exits_within_the_allowance_while_a_download_stalls_and_keeps_the_last_snapshot() {
+    let state = StateDir::new("stalled-download");
+    let list_server = ListServer::start().await;
+    list_server.serve("/l.txt", LIST, Some("\"v1\""));
+    let url = list_server.url("/l.txt");
+    let config_with = |port: u16, format: &str| {
+        format!(
+            "[[lists]]\nurl = {url:?}\nformat = {format:?}\n\
+             [server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+             [upstream]\nservers = [\"udp://127.0.0.1:9\"]\n\
+             [web]\nenabled = false\n[state]\ndir = {:?}\n",
+            state.0
+        )
+    };
+    {
+        let mut server = start("shutdown-stalled-first.toml", |port| {
+            config_with(port, "adblock")
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.snapshots() == 0 {
+            assert!(Instant::now() < deadline, "the first snapshot never came");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        send_signal(&server.child, "TERM");
+
+        let status = exit_within(&mut server.child, Duration::from_secs(15)).await;
+        assert_eq!(status.and_then(|status| status.code()), Some(0));
+    }
+
+    let last_good = state.snapshot_files();
+    assert_eq!(last_good.len(), 1);
+    // The snapshot no longer fits the config, so the list is downloaded at once, and the
+    // download never answers.
+    list_server.set_delay(Duration::from_secs(120));
+    let requests = list_server.requests();
+    let mut server = Reaped(start("shutdown-stalled-second.toml", |port| {
+        config_with(port, "hosts")
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while list_server.requests() == requests {
+        assert!(
+            server.0.child.try_wait().unwrap().is_none(),
+            "the server exited before it asked for the list"
+        );
+        assert!(Instant::now() < deadline, "the list was never asked for");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    send_signal(&server.0.child, "TERM");
+    let stopping = Instant::now();
+
+    let status = exit_within(&mut server.0.child, Duration::from_secs(15)).await;
+    assert_eq!(status.and_then(|status| status.code()), Some(0));
+    assert!(
+        stopping.elapsed() < Duration::from_secs(13),
+        "{:?}",
+        stopping.elapsed()
+    );
+    assert_eq!(state.snapshot_files(), last_good);
 }

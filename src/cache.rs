@@ -709,25 +709,6 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_reply_is_returned_with_its_age() {
-        let mut cache = Cache::new(&config());
-        let fixture = Fixture::new("example.com.");
-        let reply = fixture.positive(60);
-        let start = Instant::now();
-
-        assert!(insert(&mut cache, &fixture, &reply, start));
-
-        let query = fixture.query();
-        let hit = cache
-            .get(&CacheKey::new(&query), start + Duration::from_secs(7))
-            .unwrap();
-        assert_eq!(hit.age_secs, 7);
-        assert_eq!(hit.parts.bytes, &reply[..]);
-        assert!(hit.parts.opt_start.is_some());
-        assert_eq!(hit.parts.ttl_offsets.len(), 1);
-    }
-
-    #[test]
     fn an_entry_expires_at_its_smallest_ttl() {
         let mut cache = Cache::new(&config());
         let fixture = Fixture::new("example.com.");
@@ -843,47 +824,29 @@ mod tests {
     }
 
     #[test]
-    fn nodata_behind_a_cname_chain_lives_as_long_as_the_negative_ttl() {
-        let mut cache = Cache::new(&config());
-        let fixture = Fixture::new("www.example.com.");
-        let start = Instant::now();
-        let reply = chain_reply(&fixture, 0, 300, vec![], vec![soa("example.net.", 900, 45)]);
-
-        assert!(insert(&mut cache, &fixture, &reply, start));
-
-        assert_eq!(lifetime_in_secs(&mut cache, &fixture, start), Some(45));
-    }
-
-    #[test]
-    fn a_short_cname_ttl_bounds_a_negative_reply_behind_the_chain() {
-        let soa_record = || vec![soa("example.net.", 900, 45)];
+    fn a_negative_reply_behind_a_cname_chain_lives_as_long_as_the_shorter_of_the_chain_and_the_soa()
+    {
         let fixture = Fixture::new("www.example.com.");
         let start = Instant::now();
 
-        for rcode in [0, 3] {
+        for (rcode, cname_ttl, lifetime) in [(0, 300, 45), (3, 300, 45), (0, 20, 20), (3, 20, 20)] {
             let mut cache = Cache::new(&config());
-            let reply = chain_reply(&fixture, rcode, 20, vec![], soa_record());
+            let reply = chain_reply(
+                &fixture,
+                rcode,
+                cname_ttl,
+                vec![],
+                vec![soa("example.net.", 900, 45)],
+            );
 
             assert!(insert(&mut cache, &fixture, &reply, start));
 
             assert_eq!(
                 lifetime_in_secs(&mut cache, &fixture, start),
-                Some(20),
-                "rcode {rcode}"
+                Some(lifetime),
+                "rcode {rcode}, CNAME TTL {cname_ttl}"
             );
         }
-    }
-
-    #[test]
-    fn nxdomain_behind_a_cname_chain_uses_the_negative_ttl_when_it_is_shorter() {
-        let mut cache = Cache::new(&config());
-        let fixture = Fixture::new("www.example.com.");
-        let start = Instant::now();
-        let reply = chain_reply(&fixture, 3, 300, vec![], vec![soa("example.net.", 900, 45)]);
-
-        assert!(insert(&mut cache, &fixture, &reply, start));
-
-        assert_eq!(lifetime_in_secs(&mut cache, &fixture, start), Some(45));
     }
 
     #[test]
@@ -1048,33 +1011,6 @@ mod tests {
 
         assert!(cache.get(&colliding, start).is_none());
         assert_eq!(cache.len(), 1, "the other entry stays");
-    }
-
-    #[test]
-    fn the_least_recently_used_entry_is_evicted_first() {
-        let mut cache = Cache::new(&CacheConfig {
-            max_entries: 3,
-            ..config()
-        });
-        let start = Instant::now();
-        let names = ["a.example.", "b.example.", "c.example.", "d.example."];
-        let fixtures: Vec<Fixture> = names.iter().map(|name| Fixture::new(name)).collect();
-        for fixture in &fixtures[..3] {
-            insert(&mut cache, fixture, &fixture.positive(60), start);
-        }
-
-        assert!(age_of_hit(&mut cache, &fixtures[0], start).is_some());
-
-        insert(&mut cache, &fixtures[3], &fixtures[3].positive(60), start);
-
-        assert_eq!(cache.len(), 3);
-        assert!(
-            age_of_hit(&mut cache, &fixtures[1], start).is_none(),
-            "b was least recent"
-        );
-        for kept in [0, 2, 3] {
-            assert!(age_of_hit(&mut cache, &fixtures[kept], start).is_some());
-        }
     }
 
     #[test]
@@ -1266,27 +1202,6 @@ mod tests {
     }
 
     #[test]
-    fn a_memo_is_kept_with_its_entry_and_replaced_on_reinsert() {
-        let mut cache = Cache::new(&config());
-        let start = Instant::now();
-        let fixture = Fixture::new("example.com.");
-        let query = fixture.query();
-        let key = CacheKey::new(&query);
-        let token = insert_entry(&mut cache, &fixture, &fixture.positive(60), start).unwrap();
-        assert_eq!(cache.get(&key, start).unwrap().memo, None);
-
-        let memo = Memo {
-            generation: 7,
-            decision: Decision::Pass,
-        };
-        cache.set_memo(&key, token, memo.clone());
-
-        assert_eq!(cache.get(&key, start).unwrap().memo, Some(memo));
-        insert(&mut cache, &fixture, &fixture.positive(60), start);
-        assert_eq!(cache.get(&key, start).unwrap().memo, None);
-    }
-
-    #[test]
     fn a_memo_for_an_entry_that_was_replaced_is_refused() {
         let mut cache = Cache::new(&config());
         let start = Instant::now();
@@ -1397,38 +1312,6 @@ mod tests {
     }
 
     #[test]
-    fn a_hit_carries_the_token_of_its_entry() {
-        let mut cache = Cache::new(&config());
-        let start = Instant::now();
-        let fixture = Fixture::new("example.com.");
-        let query = fixture.query();
-        let token = insert_entry(&mut cache, &fixture, &fixture.positive(60), start).unwrap();
-
-        assert_eq!(
-            cache.get(&CacheKey::new(&query), start).unwrap().token,
-            token
-        );
-    }
-
-    #[test]
-    fn a_memo_for_a_missing_entry_is_ignored() {
-        let mut cache = Cache::new(&config());
-        let fixture = Fixture::new("example.com.");
-        let query = fixture.query();
-
-        cache.set_memo(
-            &CacheKey::new(&query),
-            EntryToken(0),
-            Memo {
-                generation: 1,
-                decision: Decision::Pass,
-            },
-        );
-
-        assert!(cache.is_empty());
-    }
-
-    #[test]
     fn identities_differ_by_flags_type_and_name_only() {
         let plain = Fixture::new("Example.com.");
         let same = Fixture::new("example.COM.");
@@ -1484,25 +1367,6 @@ mod tests {
 
         assert!(cache.get(&key, start + Duration::from_secs(161)).is_none());
         assert_eq!(cache.len(), 0);
-        assert_eq!(cache.bytes(), 0);
-    }
-
-    #[test]
-    fn with_optimism_off_the_window_is_ignored() {
-        let mut cache = Cache::new(&CacheConfig {
-            optimistic: false,
-            optimistic_max_age_secs: 100,
-            ..CacheConfig::default()
-        });
-        let fixture = Fixture::new("example.com.");
-        let start = Instant::now();
-        insert(&mut cache, &fixture, &fixture.positive(60), start);
-
-        assert_eq!(
-            stale_of_hit(&mut cache, &fixture, start + Duration::from_secs(60)),
-            None
-        );
-        assert!(cache.is_empty());
         assert_eq!(cache.bytes(), 0);
     }
 

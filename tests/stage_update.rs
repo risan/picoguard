@@ -231,6 +231,33 @@ async fn a_good_update_is_staged_and_waits() {
     }
 }
 
+/// The files sit in a folder the installer, which runs as root, reads: no other user may open
+/// or change them, whether the folder is new or was left behind open.
+#[tokio::test]
+async fn the_staged_files_and_their_folder_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode_of = |path: PathBuf| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let files = release_files();
+
+    for (name, left_behind) in [("private-new", false), ("private-reused", true)] {
+        let rig = make_rig(name, &files).await;
+        if left_behind {
+            fs::create_dir(rig.staged()).unwrap();
+            fs::set_permissions(rig.staged(), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let view = start_and_end(&rig).await;
+
+        assert_eq!(view.state, "waiting", "{name}");
+        assert_eq!(mode_of(rig.staged()), 0o700, "{name}: the folder");
+        assert_eq!(mode_of(rig.staged().join("picoguard")), 0o700, "{name}");
+        for small in ["SHA256SUMS", "SHA256SUMS.sig", "request"] {
+            assert_eq!(mode_of(rig.staged().join(small)), 0o600, "{name}: {small}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_bad_signature_stops_before_the_binary() {
     let mut other_key = release_files();

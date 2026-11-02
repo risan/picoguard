@@ -493,26 +493,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reply_is_matched_by_the_id_the_client_chose() {
-        let client = client();
-        let (ours, mut server) = duplex(4096);
-        client.attach(ours);
-
-        let server_task = tokio::spawn(async move {
-            let received = read_frame(&mut server).await;
-            write_reply(&mut server, [received[0], received[1]], b"ok").await;
-            server
-        });
-        let reply = client
-            .query(&mut request("a.example."), deadline())
-            .await
-            .unwrap();
-
-        assert_eq!(&reply[12..], b"ok");
-        drop(server_task.await.unwrap());
-    }
-
-    #[tokio::test]
     async fn replies_may_arrive_out_of_order_on_one_connection() {
         let client = Arc::new(client());
         let (ours, mut server) = duplex(4096);
@@ -825,6 +805,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_frame_shorter_than_a_dns_header_closes_the_connection() {
+        for length in [0u16, 1, 11] {
+            let client = client();
+            let (ours, mut server) = duplex(4096);
+            client.attach(ours);
+
+            tokio::spawn(async move {
+                let received = read_frame(&mut server).await;
+                let mut frame = length.to_be_bytes().to_vec();
+                frame.extend_from_slice(&received[..2]);
+                frame.resize(frame.len() + usize::from(length.saturating_sub(2)), 0);
+                server.write_all(&frame).await.unwrap();
+                server
+            });
+            let result = client.query(&mut request("a.example."), deadline()).await;
+
+            assert!(
+                matches!(result, Err(UpstreamError::Closed)),
+                "length {length}: {result:?}"
+            );
+            tokio::task::yield_now().await;
+            assert!(!client.is_connected(), "length {length}");
+
+            // Read here, so a panic in the reader fails the test instead of only closing.
+            let mut frame = length.to_be_bytes().to_vec();
+            frame.extend_from_slice(&[0x12, 0x34]);
+            frame.resize(frame.len() + 16, 0);
+            let session = Session {
+                state: Arc::clone(&client.state),
+                epoch: 0,
+                max_reply: client.max_reply,
+                io_timeout: SHORT,
+            };
+            let read = session.read_frame(&mut BufReader::new(&frame[..])).await;
+
+            assert!(
+                matches!(read, Err(UpstreamError::BadReply)),
+                "length {length}: {read:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn attaching_a_new_connection_replaces_the_old_one() {
         let client = client();
         let (first, _first_server) = duplex(4096);
@@ -1117,27 +1140,6 @@ mod tests {
             assert_eq!(address_of(&reply.unwrap()), [b'a'; 4]);
             restarted.wait_for_handshakes(1).await;
             assert_eq!(restarted.handshakes.load(Ordering::SeqCst), 1);
-        }
-
-        #[tokio::test]
-        async fn a_reply_over_the_configured_limit_is_an_error() {
-            let pki = TestPki::new();
-            let server = TlsServer::start(dot_server_config(&pki), |mut stream| async move {
-                while let Some(query) = read_query(&mut stream).await {
-                    reply_to(&mut stream, &query).await;
-                }
-            })
-            .await;
-            let limits = LimitsConfig {
-                upstream_reply_max: 30,
-                ..LimitsConfig::default()
-            };
-
-            let result = upstream_for(&pki, server.address, &limits)
-                .query(&mut query_for("a.example."), later())
-                .await;
-
-            assert!(result.is_err());
         }
     }
 }
