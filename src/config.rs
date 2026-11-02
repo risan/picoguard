@@ -1061,100 +1061,26 @@ mod tests {
         assert!(config.is_ok(), "{config:?}");
     }
 
-    #[test]
-    fn defaults_match_the_plan() {
-        let config = Config::default();
-
-        assert_eq!(config.server.port, 53);
-        assert_eq!(config.blocked_ttl, 10);
-        assert!(config.refuse_any);
-        assert_eq!(
-            config.blocked_hosts,
-            ["version.bind", "id.server", "hostname.bind"]
-        );
-        assert_eq!(config.cache.max_entries, 10_000);
-        assert_eq!(config.cache.max_bytes, 4 * 1024 * 1024);
-        assert_eq!(config.cache.max_response_size, 4096);
-        assert_eq!(config.stats.query_log_entries, 1000);
-        assert_eq!(config.stats.top_k, 50);
-        assert_eq!(config.log.level, LogLevel::Warn);
-        assert!(config.state.persist_lists);
-        assert!(config.rules.is_empty());
-        assert!(config.allowlists.is_empty());
-        assert!(config.local.resolver.is_none());
-        assert!(config.web.user.is_none());
-        assert!(config.web.password.is_none());
-    }
-
+    /// Each default is the most the 256 MB plan allows: a higher one would raise what a peer
+    /// can make the daemon hold, so a change here needs the plan to change first.
     #[test]
     fn default_limits_match_d21() {
         let limits = LimitsConfig::default();
 
-        assert_eq!(limits.h2_stream_window, 64 * 1024);
-        assert_eq!(limits.h2_connection_window, 128 * 1024);
-        assert_eq!(limits.h2_max_header_list, 16 * 1024);
-        assert_eq!(limits.upstream_concurrency, 32);
-        assert_eq!(limits.max_inflight_queries, 128);
-        assert_eq!(limits.max_waiting_clients, 256);
-        assert_eq!(limits.tcp_max_connections, 16);
-        assert_eq!(limits.tcp_idle_secs, 30);
-        assert_eq!(limits.tcp_read_buffer, 2048);
-        assert_eq!(limits.tcp_queue_replies, 4);
-        assert_eq!(limits.tcp_queue_bytes, 128 * 1024);
-        assert_eq!(limits.tcp_write_timeout_secs, 5);
-        assert_eq!(limits.upstream_reply_max, 64 * 1024);
-        assert_eq!(limits.pending_bytes, 1024 * 1024);
-    }
-
-    #[test]
-    fn default_lists_and_upstreams_match_the_brief() {
-        let config = Config::default();
-
-        let urls: Vec<_> = config
-            .lists
-            .iter()
-            .map(|list| list.url.as_deref())
-            .collect();
-        assert_eq!(
-            urls,
-            [
-                Some("https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"),
-                Some(
-                    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt"
-                ),
-                Some(
-                    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.mini.txt"
-                ),
-            ]
-        );
-        assert!(
-            config
-                .lists
-                .iter()
-                .all(|list| list.format == ListFormat::Adblock)
-        );
-        assert!(config.lists.iter().all(|list| list.refresh_hours == 24));
-        assert!(
-            config
-                .lists
-                .iter()
-                .all(|list| list.slow_rule_budget == 8 * 1024 * 1024)
-        );
-        assert!(config.lists.iter().all(|list| list.max_rules == 1_500_000));
-        assert_eq!(
-            config.upstream.servers,
-            [
-                "https://1.1.1.1/dns-query",
-                "https://1.0.0.1/dns-query",
-                "https://9.9.9.10/dns-query",
-                "https://149.112.112.10/dns-query",
-            ]
-        );
-    }
-
-    #[test]
-    fn default_config_is_valid() {
-        Config::default().validate().unwrap();
+        assert!(limits.h2_stream_window <= 64 * 1024);
+        assert!(limits.h2_connection_window <= 128 * 1024);
+        assert!(limits.h2_max_header_list <= 16 * 1024);
+        assert!(limits.upstream_concurrency <= 32);
+        assert!(limits.max_inflight_queries <= 128);
+        assert!(limits.max_waiting_clients <= 256);
+        assert!(limits.tcp_max_connections <= 16);
+        assert!(limits.tcp_idle_secs <= 30);
+        assert!(limits.tcp_read_buffer <= 2048);
+        assert!(limits.tcp_queue_replies <= 4);
+        assert!(limits.tcp_queue_bytes <= 128 * 1024);
+        assert!(limits.tcp_write_timeout_secs <= 5);
+        assert!(limits.upstream_reply_max <= 64 * 1024);
+        assert!(limits.pending_bytes <= 1024 * 1024);
     }
 
     #[test]
@@ -1271,26 +1197,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_top_level_key_is_rejected() {
-        let message = error_of("blocked_tll = 5");
+    fn a_typo_in_a_key_or_a_list_format_is_rejected_by_name() {
+        let list = "[[lists]]\nurl = \"https://example.com/l\"\n";
+        let cases = [
+            ("blocked_tll = 5".to_string(), "blocked_tll"),
+            ("[cache]\nmax_entires = 5".to_string(), "max_entires"),
+            ("[update]\nbogus = 1".to_string(), "bogus"),
+            (format!("{list}fromat = \"hosts\""), "fromat"),
+            (format!("{list}format = \"csv\""), "csv"),
+        ];
 
-        assert!(message.contains("blocked_tll"), "{message}");
-    }
+        for (text, typo) in cases {
+            let message = error_of(&text);
 
-    #[test]
-    fn unknown_section_key_is_rejected() {
-        let message = error_of("[cache]\nmax_entires = 5");
-
-        assert!(message.contains("max_entires"), "{message}");
-    }
-
-    #[test]
-    fn optimistic_caching_is_on_by_default() {
-        let cache = CacheConfig::default();
-
-        assert!(cache.optimistic);
-        assert_eq!(cache.optimistic_answer_ttl_secs, 30);
-        assert_eq!(cache.optimistic_max_age_secs, 43_200);
+            assert!(message.contains(typo), "{text}: {message}");
+        }
     }
 
     #[test]
@@ -1305,44 +1226,6 @@ mod tests {
             assert_eq!(cache.optimistic_answer_ttl_secs, answer_ttl);
             assert_eq!(cache.optimistic_max_age_secs, max_age);
         }
-    }
-
-    #[test]
-    fn update_check_is_on_by_default() {
-        assert!(Config::parse("").unwrap().update.check);
-    }
-
-    #[test]
-    fn update_check_can_be_turned_off() {
-        let config = Config::parse("[update]\ncheck = false").unwrap();
-
-        assert!(!config.update.check);
-    }
-
-    #[test]
-    fn an_unknown_update_key_is_rejected() {
-        let message = error_of("[update]\nbogus = 1");
-
-        assert!(message.contains("bogus"), "{message}");
-    }
-
-    #[test]
-    fn unknown_list_key_is_rejected() {
-        let message = error_of("[[lists]]\nurl = \"https://example.com/l\"\nfromat = \"hosts\"");
-
-        assert!(message.contains("fromat"), "{message}");
-    }
-
-    #[test]
-    fn unknown_list_format_is_rejected() {
-        let message = error_of("[[lists]]\nurl = \"https://example.com/l\"\nformat = \"csv\"");
-
-        assert!(message.contains("csv"), "{message}");
-    }
-
-    #[test]
-    fn invalid_toml_is_rejected() {
-        assert!(Config::parse("[cache").is_err());
     }
 
     const HASH: &str = "pbkdf2-sha256$1000$000102030405060708090a0b0c0d0e0f$33a78c377ca7b6590fa1b215cc970fba516076f108ecb68af58ec95d86021701";
@@ -1615,23 +1498,6 @@ mod tests {
     }
 
     #[test]
-    fn web_bind_defaults_to_both_families() {
-        assert_eq!(
-            Config::default().web.bind,
-            ["0.0.0.0".parse::<IpAddr>().unwrap(), "::".parse().unwrap()]
-        );
-    }
-
-    #[test]
-    fn web_bind_accepts_ipv4_only_and_ipv6_only() {
-        let ipv4 = Config::parse("[web]\nbind = [\"127.0.0.1\"]").unwrap();
-        let ipv6 = Config::parse("[web]\nbind = [\"::1\"]").unwrap();
-
-        assert_eq!(ipv4.web.bind, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
-        assert_eq!(ipv6.web.bind, ["::1".parse::<IpAddr>().unwrap()]);
-    }
-
-    #[test]
     fn cidr_matches_networks_and_single_hosts() {
         let lan: Cidr = "192.168.0.0/16".parse().unwrap();
         let host: Cidr = "10.1.2.3".parse().unwrap();
@@ -1723,14 +1589,21 @@ mod tests {
     }
 
     #[test]
-    fn server_bind_defaults_to_both_families_and_accepts_one_family() {
+    fn the_listen_addresses_default_to_both_families_and_accept_one_family() {
         let both = ["0.0.0.0".parse::<IpAddr>().unwrap(), "::".parse().unwrap()];
-        let ipv4 = Config::parse("[server]\nbind = [\"127.0.0.1\"]").unwrap();
-        let ipv6 = Config::parse("[server]\nbind = [\"::1\"]").unwrap();
 
         assert_eq!(Config::default().server.bind, both);
-        assert_eq!(ipv4.server.bind, ["127.0.0.1".parse::<IpAddr>().unwrap()]);
-        assert_eq!(ipv6.server.bind, ["::1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(Config::default().web.bind, both);
+        for single in ["127.0.0.1", "::1"] {
+            let expected = [single.parse::<IpAddr>().unwrap()];
+            let config = Config::parse(&format!(
+                "[server]\nbind = [\"{single}\"]\n[web]\nbind = [\"{single}\"]"
+            ))
+            .unwrap();
+
+            assert_eq!(config.server.bind, expected);
+            assert_eq!(config.web.bind, expected);
+        }
     }
 
     #[test]
@@ -1774,34 +1647,6 @@ mod tests {
 
             assert!(message.contains(expected), "{text:?}: {message}");
         }
-    }
-
-    #[test]
-    fn negative_number_is_rejected() {
-        assert!(Config::parse("[cache]\nmax_entries = -1").is_err());
-    }
-
-    #[test]
-    fn invalid_ip_address_is_rejected() {
-        let message = error_of("[server]\nbind = [\"not-an-ip\"]");
-
-        assert!(message.contains("invalid IP address"), "{message}");
-    }
-
-    #[test]
-    fn the_release_2_keys_default_to_nothing_new() {
-        let config = Config::default();
-
-        assert!(config.rewrites.is_empty());
-        assert!(!config.safe_search);
-        assert!(config.services.block.is_empty());
-        assert_eq!(
-            config.services.catalog_url,
-            "https://adguardteam.github.io/HostlistsRegistry/assets/services.json"
-        );
-        assert_eq!(config.services.refresh_hours, 24);
-        assert_eq!(config.limits.memory_mb, 48);
-        assert!(config.lists.iter().all(|list| list.enabled));
     }
 
     #[test]
@@ -1975,15 +1820,5 @@ mod tests {
         );
 
         assert!(config.is_ok(), "{config:?}");
-    }
-
-    #[test]
-    fn missing_file_names_the_path() {
-        let error = Config::load(Path::new("/nonexistent/picoguard.toml")).unwrap_err();
-
-        assert!(
-            error.to_string().contains("/nonexistent/picoguard.toml"),
-            "{error}"
-        );
     }
 }

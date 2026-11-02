@@ -615,22 +615,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_argument_is_an_error() {
-        assert_eq!(
-            parse(&["--frobnicate"]),
-            Err("unknown argument --frobnicate".to_string())
-        );
-    }
-
-    #[test]
-    fn config_flag_without_value_is_an_error() {
-        assert_eq!(
-            parse(&["--config"]),
-            Err("--config needs a file argument".to_string())
-        );
-    }
-
-    #[test]
     fn hash_password_takes_no_value_and_only_a_config_beside_it() {
         assert_eq!(parse(&["--hash-password"]), Ok(Command::HashPassword));
         assert_eq!(

@@ -798,6 +798,13 @@ impl Web {
                         "send {\"role\": \"block\" or \"allow\", \"name\": \"...\", \"url\": \"...\", \"refresh_hours\": 1 to 168}",
                     )
                 })?;
+                if url_has_userinfo(&request.url) {
+                    return Err(Rejection::new(
+                        StatusCode::BAD_REQUEST,
+                        "the list URL must not contain a user name or password",
+                    ));
+                }
+
                 let edit = ListEdit::Add {
                     role: request.role,
                     name: list_name(request.name)?,
@@ -1244,6 +1251,17 @@ fn object_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
     }
 
     serde_json::from_slice(body).ok()
+}
+
+/// The download refuses a `user:pass@` before the host, so such a list could only fail.
+/// An `@` after the authority belongs to the path or the query and is fine.
+fn url_has_userinfo(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 /// A list name from the page, trimmed; `None` when it is empty.
