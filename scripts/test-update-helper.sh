@@ -131,7 +131,9 @@ prepare_fixtures() {
     cp scripts/install.sh "$fixtures/install.sh"
     cp -r dist "$fixtures/dist"
     cp "$cases_dir/cases.sh" "$fixtures/cases.sh"
-    git show main:scripts/install.sh >"$fixtures/old-install.sh"
+    # v0.2.0 is the last release whose installer has no update installer: the rollback case
+    # upgrades from it.
+    git show v0.2.0:scripts/install.sh >"$fixtures/old-install.sh"
     make_releases
     chmod -R a+rX "$fixtures"
 }
