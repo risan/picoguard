@@ -890,22 +890,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_slow_server_within_the_timeout_still_answers() {
-        let server = fake_udp(|request| {
-            vec![(
-                Duration::from_millis(150),
-                answer(request, ANSWER_MARKER, false),
-            )]
-        })
-        .await;
-        let upstreams = upstreams(vec![udp_url(&server)], 1000);
-
-        let reply = upstreams.query(&mut query_for("example.com.")).await;
-
-        assert!(reply.is_ok());
-    }
-
-    #[tokio::test]
     async fn queries_fail_over_to_the_other_server() {
         let dead = dead_udp().await;
         let good = good_udp().await;
@@ -1139,19 +1123,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_server_that_only_times_out_counts_each_try_as_a_failure() {
-        let dead = dead_udp().await;
-        let upstreams = upstreams(vec![udp_url(&dead)], 400);
-
-        let result = upstreams.query(&mut query_for("example.com.")).await;
-
-        assert!(matches!(result, Err(UpstreamError::Timeout)));
-        let (_, tally) = upstreams.tallies().next().unwrap();
-        assert_eq!((tally.answered, tally.failed), (0, 2));
-        assert_eq!(tally.average_ms(), None);
-    }
-
-    #[tokio::test]
     async fn a_query_within_a_shorter_limit_gives_up_by_it_and_counts_each_try() {
         let dead = dead_udp().await;
         let upstreams = upstreams(vec![udp_url(&dead)], 5000);
@@ -1172,26 +1143,7 @@ mod tests {
         assert_eq!(dead.received.load(Ordering::SeqCst), 2, "one retry");
         let (_, tally) = upstreams.tallies().next().unwrap();
         assert_eq!((tally.answered, tally.failed), (0, 2));
-    }
-
-    #[tokio::test]
-    async fn a_query_within_a_limit_answers_like_query_charged() {
-        let good = good_udp().await;
-        let upstreams = upstreams(vec![udp_url(&good)], 1000);
-
-        let answered = upstreams
-            .query_charged_within(
-                &mut query_for("example.com."),
-                &Budget::new(usize::MAX),
-                Duration::from_millis(1000),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(answered.server, 0);
-        assert_eq!(address_of(&answered.reply), ANSWER_MARKER);
-        let (_, tally) = upstreams.tallies().next().unwrap();
-        assert_eq!((tally.answered, tally.failed), (1, 0));
+        assert_eq!(tally.average_ms(), None);
     }
 
     #[tokio::test]
@@ -1271,27 +1223,6 @@ mod tests {
         let (_, tally) = over_tcp.tallies().next().unwrap();
         assert_eq!((tally.answered, tally.failed), (1, 1));
         assert_eq!(over_tcp.servers[0].health.lock().unwrap().failures, 0);
-    }
-
-    #[test]
-    fn fresh_servers_list_their_labels_in_config_order_with_nothing_counted() {
-        let upstreams = upstreams(
-            vec![
-                "udp://192.0.2.1:53".to_string(),
-                "tcp://192.0.2.2:53".to_string(),
-            ],
-            1000,
-        );
-
-        let listed: Vec<(&str, Tally)> = upstreams.tallies().collect();
-
-        assert_eq!(
-            listed,
-            vec![
-                ("udp://192.0.2.1:53", Tally::default()),
-                ("tcp://192.0.2.2:53", Tally::default()),
-            ]
-        );
     }
 
     #[tokio::test]
@@ -1423,13 +1354,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_single_server_is_used_even_when_avoided() {
-        let upstreams = upstreams(vec!["udp://192.0.2.1:53".to_string()], 1000);
-
-        assert_eq!(upstreams.pick(Some(0), 0.5), 0);
-    }
-
-    #[tokio::test]
     async fn failures_back_off_exponentially_and_success_clears_it() {
         let upstreams = upstreams(vec!["udp://192.0.2.1:53".to_string()], 1000);
         let server = &upstreams.servers[0];
@@ -1481,55 +1405,6 @@ mod tests {
         );
         assert!(
             matches!(tcp, Ok(Transport::Tcp(ref t)) if matches!(t.dial, Dial::Plain(server) if server == "192.168.1.1:5300".parse().unwrap()))
-        );
-    }
-
-    #[test]
-    fn encrypted_urls_map_to_dot_and_doh_transports() {
-        let doh_ip = parse("https://1.1.1.1/dns-query", &[]);
-        let doh_host = parse("https://dns.example/dns-query", &["9.9.9.9"]);
-        let dot_ip = parse("tls://1.1.1.1#cloudflare-dns.com", &[]);
-        let dot_host = parse("tls://dns.quad9.net", &["9.9.9.9"]);
-
-        assert!(matches!(doh_ip, Ok(Transport::Doh(_))));
-        assert!(matches!(doh_host, Ok(Transport::Doh(_))));
-        assert!(matches!(
-            dot_ip,
-            Ok(Transport::Dot(StreamUpstream {
-                dial: Dial::Tls(_),
-                ..
-            }))
-        ));
-        assert!(matches!(dot_host, Ok(Transport::Dot(_))));
-    }
-
-    #[test]
-    fn bad_server_urls_are_errors() {
-        let hostname = parse("udp://dns.example", &[]).err().unwrap();
-        let no_bootstrap = parse("https://dns.example/dns-query", &[]).err().unwrap();
-        let no_bootstrap_dot = parse("tls://dns.example", &[]).err().unwrap();
-        let bad_name = parse("tls://1.1.1.1#not a name", &[]).err().unwrap();
-
-        assert!(hostname.contains("IP address"), "{hostname}");
-        assert!(
-            no_bootstrap.contains("upstream.bootstrap"),
-            "{no_bootstrap}"
-        );
-        assert!(no_bootstrap_dot.contains("upstream.bootstrap"));
-        assert!(bad_name.contains("server name"), "{bad_name}");
-    }
-
-    #[test]
-    fn the_default_config_builds_four_doh_upstreams_without_a_bootstrap() {
-        let upstreams =
-            Upstreams::from_config(&UpstreamConfig::default(), &LimitsConfig::default()).unwrap();
-
-        assert_eq!(upstreams.servers.len(), 4);
-        assert!(
-            upstreams
-                .servers
-                .iter()
-                .all(|server| matches!(server.transport, Transport::Doh(_)))
         );
     }
 

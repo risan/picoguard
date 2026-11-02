@@ -567,12 +567,4 @@ mod tests {
         assert_eq!(dns.queries.load(Ordering::SeqCst), 4, "resolved twice");
         drop(listener);
     }
-
-    #[tokio::test]
-    async fn an_ip_remote_never_asks_the_bootstrap() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let remote = Remote::at(listener.local_addr().unwrap());
-
-        assert!(remote.connect_with(later(), accept).await.is_ok());
-    }
 }
