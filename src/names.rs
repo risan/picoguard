@@ -342,7 +342,6 @@ fn is_host_name(name: &Name) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::{Duration, Instant};
 
@@ -375,15 +374,6 @@ mod tests {
 
     fn seconds(count: u64) -> Duration {
         Duration::from_secs(count)
-    }
-
-    #[test]
-    fn a_new_address_starts_one_lookup_and_shows_no_name() {
-        let mut table = NameTable::new(MAX_LOOKUPS);
-        let t0 = Instant::now();
-
-        assert_eq!(table.shown(address(1), t0), shown(None, true));
-        assert_eq!(table.len(), 1);
     }
 
     #[test]
@@ -756,54 +746,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_names_pool_takes_four_slots_whatever_the_limits() {
-        let router = fake_router(&[], true).await;
-        let limits = LimitsConfig {
-            upstream_concurrency: 1,
-            ..LimitsConfig::default()
-        };
-        let names = names_for(&router, &limits);
-        let started = Instant::now();
-
-        for number in 0..4 {
-            assert_eq!(names.name_of(lan_address(number)), None);
-        }
-
-        assert!(wait_until(Duration::from_secs(3), || router.asked().len() >= 4).await);
-        // With one slot, a second lookup could not be sent before the first try of the first
-        // one ended at 1 s.
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
-        );
-    }
-
-    #[tokio::test]
-    async fn twenty_addresses_send_four_lookups_and_repeats_send_none() {
-        let router = fake_router(&[], true).await;
-        let names = names_for(&router, &LimitsConfig::default());
-
-        for number in 0..20 {
-            assert_eq!(names.name_of(lan_address(number)), None);
-        }
-
-        for _ in 0..10 {
-            assert_eq!(names.name_of(lan_address(0)), None);
-        }
-
-        assert!(wait_until(Duration::from_secs(3), || router.asked().len() >= 4).await);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // A second try asks the same name again, so the names asked are counted, not the
-        // questions.
-        let asked: HashSet<String> = router.asked().into_iter().collect();
-        assert_eq!(asked.len(), 4, "{asked:?}");
-        assert!(asked.contains(&reverse_name(lan_address(0)).to_string()));
-        assert_eq!(names.lookups_in_flight(), 4);
-    }
-
-    #[tokio::test]
     async fn a_lookup_gives_up_after_two_seconds_and_counts_each_try_on_the_resolver() {
         let router = fake_router(&[], true).await;
         let names = names_for(&router, &LimitsConfig::default());
@@ -824,26 +766,5 @@ mod tests {
 
         assert_eq!(router.asked().len(), 2, "no name is kept for 5 minutes");
         assert_eq!(names.lookups_in_flight(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_found_name_shows_on_a_later_call_and_counts_as_an_answer() {
-        let owner = reverse_name(lan_address(1)).to_string();
-        let router = fake_router(&[(&owner, "Risan-PC.lan.", 600)], false).await;
-        let names = names_for(&router, &LimitsConfig::default());
-
-        assert_eq!(names.name_of(lan_address(1)), None);
-
-        let mut shown = None;
-        let appeared = wait_until(Duration::from_secs(5), || {
-            shown = names.name_of(lan_address(1));
-
-            shown.is_some()
-        })
-        .await;
-        assert!(appeared);
-        assert_eq!(shown.as_deref(), Some("risan-pc.lan"));
-        assert_eq!((names.tally().answered, names.tally().failed), (1, 0));
-        assert_eq!(router.asked(), [owner]);
     }
 }

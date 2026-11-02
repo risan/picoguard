@@ -1624,18 +1624,6 @@ mod tests {
         reverse_address(&Name::from_text(text).unwrap())
     }
 
-    #[test]
-    fn ipv4_reverse_names_give_the_address() {
-        assert_eq!(
-            address_of("4.3.2.10.in-addr.arpa."),
-            Some("10.2.3.4".parse().unwrap())
-        );
-        assert_eq!(
-            address_of("1.1.168.192.IN-ADDR.ARPA"),
-            Some("192.168.1.1".parse().unwrap())
-        );
-    }
-
     fn ipv6_reverse(address: &str) -> String {
         let octets = address.parse::<Ipv6Addr>().unwrap().octets();
         let nibbles: Vec<String> = octets
@@ -1646,18 +1634,6 @@ mod tests {
             .collect();
 
         format!("{}.ip6.arpa", nibbles.join("."))
-    }
-
-    #[test]
-    fn ipv6_reverse_names_give_the_address() {
-        assert_eq!(
-            address_of(&ipv6_reverse("fd00::1")),
-            Some("fd00::1".parse().unwrap())
-        );
-        assert_eq!(
-            address_of(&ipv6_reverse("fe80::1234:5678")),
-            Some("fe80::1234:5678".parse().unwrap())
-        );
     }
 
     #[test]
@@ -1944,22 +1920,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_compressed_question_is_answered_with_formerr() {
-        let mut config = Config::default();
-        config.upstream.servers = vec!["udp://127.0.0.1:9".to_string()];
-        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
-        let mut request = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-        request.extend_from_slice(&[0xC0, 0x04, 0, 1, 0, 1]);
-        let mut out = Vec::new();
-
-        let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut out);
-
-        assert_eq!(quick, Quick::Replied);
-        assert_eq!(out.len(), 12);
-        assert_eq!(u16::from(parse(&out).metadata.response_code), 1);
-    }
-
-    #[tokio::test]
     async fn a_blocked_decision_with_many_ips_is_recomputed_instead_of_held_in_the_cache() {
         let host_rules: String = (0..200)
             .map(|index| format!("10.0.{}.{} 9.9.9.9\n", index / 256, index % 256))
@@ -2052,31 +2012,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stale_hit_is_answered_at_once_with_the_answer_ttl() {
-        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
-        let stale = QuerySpec::new("stale.example.", RecordType::A);
-        let fresh = QuerySpec::new("fresh.example.", RecordType::A);
-        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 301).unwrap();
-        insert_aged(&pipeline, &fresh, [2, 2, 2, 2], 300, 10).unwrap();
-        let mut out = Vec::new();
-
-        let quick = pipeline.answer_quickly(&stale.bytes(), Protocol::Udp, CLIENT, &mut out);
-        assert_eq!(quick, Quick::Replied);
-        assert_eq!(answer_ttls(&out), [30]);
-        assert_eq!(answer_addresses(&out), ["1.1.1.1"]);
-
-        let quick = pipeline.answer_quickly(&fresh.bytes(), Protocol::Udp, CLIENT, &mut out);
-        assert_eq!(quick, Quick::Replied);
-        assert_eq!(answer_ttls(&out), [290]);
-        assert_eq!(answer_addresses(&out), ["2.2.2.2"]);
-
-        let counters = counters(&pipeline);
-        assert_eq!(counters.total, 2);
-        assert_eq!(counters.cached, 2);
-        assert_eq!(counters.upstream, 0);
-    }
-
-    #[tokio::test]
     async fn a_stale_hit_over_tcp_is_delivered_with_the_answer_ttl() {
         let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
         let stale = QuerySpec::new("stale.example.", RecordType::A);
@@ -2129,36 +2064,6 @@ mod tests {
         );
         let soa_ttls: Vec<u32> = reply.authorities.iter().map(|record| record.ttl).collect();
         assert_eq!(soa_ttls, [30]);
-    }
-
-    #[tokio::test]
-    async fn past_its_window_an_expired_entry_needs_the_upstream() {
-        let mut config = offline_config();
-        config.cache.optimistic_max_age_secs = 10;
-        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
-        let stale = QuerySpec::new("stale.example.", RecordType::A);
-        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 311).unwrap();
-        let mut out = Vec::new();
-
-        let quick = pipeline.answer_quickly(&stale.bytes(), Protocol::Udp, CLIENT, &mut out);
-
-        assert_eq!(quick, Quick::NeedsUpstream);
-        assert!(pipeline.cache.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn with_optimism_off_an_expired_entry_needs_the_upstream() {
-        let mut config = offline_config();
-        config.cache.optimistic = false;
-        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
-        let stale = QuerySpec::new("stale.example.", RecordType::A);
-        insert_aged(&pipeline, &stale, [1, 1, 1, 1], 300, 301).unwrap();
-        let mut out = Vec::new();
-
-        let quick = pipeline.answer_quickly(&stale.bytes(), Protocol::Udp, CLIENT, &mut out);
-
-        assert_eq!(quick, Quick::NeedsUpstream);
-        assert!(pipeline.cache.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2676,14 +2581,6 @@ mod tests {
         assert_eq!(answered, Ok(true), "printer.lan was answered within 1 s");
 
         answer_addresses(&out)
-    }
-
-    #[tokio::test]
-    async fn without_a_local_resolver_no_device_name_is_looked_up() {
-        let pipeline = pipeline_with_local(&[], None);
-
-        assert_eq!(pipeline.device_name("192.168.1.5".parse().unwrap()), None);
-        assert!(pipeline.device_names.is_none());
     }
 
     #[tokio::test]

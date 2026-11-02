@@ -874,3 +874,107 @@ async fn a_query_that_got_no_answer_is_answered_by_a_rewrite_added_since() {
     assert_eq!(values(&reply), ["10.0.0.9"]);
     assert_eq!(result, QueryResult::Rewritten);
 }
+
+fn request_for(text: &str) -> Vec<u8> {
+    let mut query = Message::query();
+    query.metadata.id = 0x5555;
+    query.metadata.recursion_desired = true;
+    query.add_query(DnsQuery::query(name(text), RecordType::A));
+
+    query.to_vec().unwrap()
+}
+
+/// A server whose only upstream query slot is held by a lookup of `slow-0.example`.
+async fn server_with_the_only_slot_held(
+    upstream: &FakeUpstream,
+    entries: &[(&str, &str)],
+    engine: Arc<Engine>,
+) -> (Running, tokio::task::JoinHandle<Message>) {
+    let server = start_with(upstream, entries, false, engine, |config| {
+        config.limits.max_inflight_queries = 1;
+    })
+    .await;
+    let holder = {
+        let server = server.clone();
+        tokio::spawn(async move { ask_tcp(&server, "slow-0.example.", RecordType::A).await })
+    };
+    tokio::time::sleep(SLOW / 6).await;
+
+    (server, holder)
+}
+
+#[tokio::test]
+async fn a_rewrite_target_without_a_free_slot_drops_udp_and_fails_tcp() {
+    let upstream = scripted_upstream().await;
+    let (server, holder) = server_with_the_only_slot_held(
+        &upstream,
+        &[("alias.lan", "slow-1.example")],
+        engine_of(&[], &[]),
+    )
+    .await;
+    let client = "127.0.0.1".parse().unwrap();
+    let mut out = Vec::new();
+
+    let udp_answered = server
+        .pipeline
+        .answer(request_for("alias.lan."), Protocol::Udp, client, &mut out)
+        .await;
+
+    assert!(!udp_answered, "UDP is dropped");
+    assert_eq!(server.pipeline.stats().snapshot().counters.dropped, 1);
+
+    let tcp_answered = server
+        .pipeline
+        .answer(request_for("alias.lan."), Protocol::Tcp, client, &mut out)
+        .await;
+
+    assert!(tcp_answered);
+    assert_eq!(
+        Message::from_vec(&out).unwrap().metadata.response_code,
+        ResponseCode::ServFail
+    );
+    assert_eq!(server.pipeline.stats().snapshot().counters.dropped, 1);
+    let held = holder.await.unwrap();
+    assert_eq!(held.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(asked_names(&upstream), ["slow-0.example."]);
+}
+
+#[tokio::test]
+async fn a_rewrite_added_after_prepare_is_shed_when_its_target_has_no_slot() {
+    let upstream = scripted_upstream().await;
+    let (server, holder) =
+        server_with_the_only_slot_held(&upstream, &[], engine_of(&["||blocked.example^\n"], &[]))
+            .await;
+    let client: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+    let udp = server
+        .pipeline
+        .prepare(request_for("blocked.example."), Protocol::Udp, client)
+        .await
+        .expect("a prepared query");
+    let tcp = server
+        .pipeline
+        .prepare(request_for("blocked.example."), Protocol::Tcp, client)
+        .await
+        .expect("a prepared query");
+    drop(
+        server
+            .pipeline
+            .replace_rewrites(table(&[("blocked.example", "slow-1.example")])),
+    );
+    let mut out = Vec::new();
+
+    let udp_finished = server.pipeline.finish(&udp, &mut out).await;
+
+    assert!(udp_finished.is_none(), "UDP is dropped");
+    assert_eq!(server.pipeline.stats().snapshot().counters.dropped, 1);
+
+    let tcp_finished = server.pipeline.finish(&tcp, &mut out).await;
+
+    assert!(tcp_finished.is_some());
+    assert_eq!(
+        Message::from_vec(&out).unwrap().metadata.response_code,
+        ResponseCode::ServFail
+    );
+    holder.await.unwrap();
+    assert_eq!(asked_names(&upstream), ["slow-0.example."]);
+}

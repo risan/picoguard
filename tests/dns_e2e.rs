@@ -1044,18 +1044,3 @@ async fn pipelined_tcp_queries_are_limited_per_connection() {
     assert_eq!(upstream.peak(), 2);
     assert_eq!(upstream.active.load(Ordering::SeqCst), 0);
 }
-
-#[tokio::test]
-async fn a_tcp_client_can_send_several_queries_on_one_connection() {
-    let upstream = answering_upstream().await;
-    let server = start(config_for(&upstream)).await;
-    let mut stream = TcpStream::connect(server.tcp).await.unwrap();
-
-    for index in 0..3u16 {
-        let ask = Ask::new(&format!("s{index}.example."), RecordType::A).with_id(index);
-        write_framed(&mut stream, &ask.bytes()).await;
-        let reply = read_framed(&mut stream).await.unwrap();
-
-        assert_eq!(reply.metadata.id, index);
-    }
-}

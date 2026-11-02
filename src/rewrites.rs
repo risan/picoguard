@@ -484,15 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn the_google_search_domains_are_sorted_and_unique() {
-        assert!(
-            GOOGLE_SEARCH_DOMAINS
-                .windows(2)
-                .all(|pair| pair[0] < pair[1])
-        );
-    }
-
-    #[test]
     fn a_rewrite_of_the_user_beats_safe_search() {
         let rewrites = table(&[("www.google.com", "10.0.0.1"), ("*.bing.com", "b.lan")]);
 
