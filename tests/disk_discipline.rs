@@ -214,6 +214,32 @@ async fn until_both_lists(world: &World, what: &str, reached: impl Fn(u64) -> bo
     }
 }
 
+/// Waits until each list has been checked again since the lists aged a second. A refresh
+/// ends, snapshot write included, when its list counts as just checked; the lists refresh one
+/// after the other, so each is remembered once seen at age 0.
+async fn until_each_list_refreshed(world: &World) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut refreshed = [false; 2];
+    loop {
+        let ages = list_ages(world).await;
+        for (done, age) in refreshed.iter_mut().zip(&ages) {
+            if *age == Some(0) {
+                *done = true;
+            }
+        }
+
+        if ages.len() == 2 && refreshed.iter().all(|done| *done) {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "the refresh never ended: {ages:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Waits until both lists are in force and saved.
 async fn until_the_lists_are_saved(world: &World) {
     for _ in 0..400 {
@@ -262,8 +288,7 @@ async fn unchanged_workload_leaves_the_state_folder_as_it_was(name: &str, saved:
     let refresh = page_call(world.web_port, "POST", "/api/lists/refresh", "").await;
     assert!(refresh.starts_with("HTTP/1.1 202"), "{refresh}");
 
-    // A refresh ends, snapshot write included, when the list counts as just checked.
-    until_both_lists(&world, "the refresh never ended", |age| age == 0).await;
+    until_each_list_refreshed(&world).await;
 
     assert_eq!(world.lists.requests(), requests + 2, "both lists refreshed");
     assert_eq!(world.lists.not_modified(), 1, "one answer was a 304");

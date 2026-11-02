@@ -1981,7 +1981,7 @@ fn change_routes(seeded_list: &str) -> Vec<ChangeRoute> {
         route("cache clear", "/api/cache/clear", "{}"),
         ChangeRoute {
             reads_by_get: true,
-            ..route("rule add", "/api/rules", RULE_BODY)
+            ..route("rule add", "/api/rules", NEW_RULE_BODY)
         },
         route("rule removal", "/api/rules/remove", REMOVE_BODY),
         ChangeRoute {
@@ -2138,6 +2138,8 @@ fn rejected_mutations(seeded_list: &str) -> Vec<(String, Request, u16)> {
 }
 
 const RULE_BODY: &str = "{\"name\":\"x.example\",\"action\":\"block\"}";
+/// A rule the seeded sites do not hold, so a refused add would show as a change.
+const NEW_RULE_BODY: &str = "{\"name\":\"new.example\",\"action\":\"block\"}";
 const REMOVE_BODY: &str = "{\"name\":\"x.example\"}";
 
 /// True when no rule was added from the page.
