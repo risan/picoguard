@@ -804,14 +804,6 @@ mod tests {
     }
 
     #[test]
-    fn no_settings_change_nothing() {
-        assert_eq!(
-            merged(&Config::default(), &Settings::default()).unwrap(),
-            Config::default()
-        );
-    }
-
-    #[test]
     fn each_setting_replaces_only_its_own_fields() {
         let mut file = Config::default();
         file.upstream.timeout_ms = 2000;

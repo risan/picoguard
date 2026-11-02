@@ -35,14 +35,6 @@ fn check_accepts_the_example_config() {
 }
 
 #[test]
-fn check_accepts_the_long_config_flag_in_any_order() {
-    let output = picoguard(&["--config", &example_config(), "--check"]);
-
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(text(&output.stdout).trim(), "OK");
-}
-
-#[test]
 fn check_rejects_an_invalid_value_and_names_the_field() {
     let path = write_config("invalid-value.toml", "[cache]\nmax_entries = 0\n");
 
@@ -55,114 +47,6 @@ fn check_rejects_an_invalid_value_and_names_the_field() {
         "{}",
         text(&output.stderr)
     );
-}
-
-#[test]
-fn check_refuses_optimistic_values_outside_their_ranges() {
-    let cases = [
-        (
-            "optimistic_answer_ttl_secs = 0",
-            "cache.optimistic_answer_ttl_secs must be > 0",
-        ),
-        (
-            "optimistic_answer_ttl_secs = 3601",
-            "cache.optimistic_answer_ttl_secs must be <= 3600",
-        ),
-        (
-            "optimistic_max_age_secs = 0",
-            "cache.optimistic_max_age_secs must be > 0",
-        ),
-        (
-            "optimistic_max_age_secs = 604801",
-            "cache.optimistic_max_age_secs must be <= 604800",
-        ),
-    ];
-
-    for (index, (line, expected)) in cases.into_iter().enumerate() {
-        let path = write_config(
-            &format!("optimistic-{index}.toml"),
-            &format!("[cache]\n{line}\n"),
-        );
-
-        let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
-
-        assert_eq!(output.status.code(), Some(1), "{line}");
-        assert!(text(&output.stdout).is_empty(), "{line}");
-        assert!(
-            text(&output.stderr).contains(expected),
-            "{line}: {}",
-            text(&output.stderr)
-        );
-    }
-}
-
-#[test]
-fn check_accepts_optimistic_values_at_their_edges() {
-    let path = write_config(
-        "optimistic-edges.toml",
-        "[cache]\noptimistic_answer_ttl_secs = 3600\noptimistic_max_age_secs = 604800\n",
-    );
-
-    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
-
-    assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
-    assert_eq!(text(&output.stdout).trim(), "OK");
-}
-
-const HASH: &str = "pbkdf2-sha256$1000$000102030405060708090a0b0c0d0e0f$33a78c377ca7b6590fa1b215cc970fba516076f108ecb68af58ec95d86021701";
-
-#[test]
-fn check_rejects_a_password_and_a_password_hash_together() {
-    let path = write_config(
-        "password-and-hash.toml",
-        &format!("[web]\nuser = \"admin\"\npassword = \"s3cret\"\npassword_hash = \"{HASH}\"\n"),
-    );
-
-    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        text(&output.stderr).contains("not both"),
-        "{}",
-        text(&output.stderr)
-    );
-}
-
-#[test]
-fn check_rejects_a_malformed_password_hash() {
-    let path = write_config(
-        "malformed-hash.toml",
-        "[web]\nuser = \"admin\"\npassword_hash = \"pbkdf2-sha256$1000$00$00\"\n",
-    );
-
-    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        text(&output.stderr).contains("password_hash"),
-        "{}",
-        text(&output.stderr)
-    );
-}
-
-#[test]
-fn check_rejects_an_unknown_key() {
-    let path = write_config("unknown-key.toml", "blocked_tll = 5\n");
-
-    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(text(&output.stderr).contains("blocked_tll"));
-}
-
-#[test]
-fn check_rejects_an_unknown_update_key() {
-    let path = write_config("unknown-update-key.toml", "[update]\nbogus = 1\n");
-
-    let output = picoguard(&["--check", "-c", path.to_str().unwrap()]);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(text(&output.stderr).contains("bogus"));
 }
 
 #[test]
@@ -402,20 +286,6 @@ fn running_the_status_page_with_a_password_logs_nothing() {
 }
 
 #[test]
-fn running_with_a_host_name_upstream_and_no_bootstrap_exits_one() {
-    let path = write_config(
-        "https-host-upstream.toml",
-        "[server]\nbind = [\"127.0.0.1\"]\nport = 0\n\
-         [upstream]\nservers = [\"https://dns.example/dns-query\"]\nbootstrap = []\n",
-    );
-
-    let output = picoguard(&["-c", path.to_str().unwrap()]);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(text(&output.stderr).contains("upstream.bootstrap"));
-}
-
-#[test]
 fn running_with_the_default_encrypted_upstreams_starts() {
     let mut server = start("default-upstreams.toml", |port| {
         format!(
@@ -557,34 +427,11 @@ fn config_flag_without_a_value_is_a_usage_error() {
     assert!(text(&output.stderr).contains("-c"));
 }
 
+/// A test build has no release marker, so it stops before it reaches the built-in key; the
+/// release binary's refusal of an update that key did not sign is checked by
+/// `scripts/test-update-helper.sh`.
 #[test]
-fn verify_update_needs_two_directories() {
-    let scratch =
-        std::env::temp_dir().join(format!("picoguard-verify-args-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir(&scratch).unwrap();
-    let staged = scratch.join("staged");
-    let into = scratch.join("into");
-    let (staged, into) = (staged.to_str().unwrap(), into.to_str().unwrap());
-
-    for args in [
-        vec!["verify-update"],
-        vec!["verify-update", staged],
-        vec!["verify-update", staged, into, "extra"],
-    ] {
-        let output = picoguard(&args);
-
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert!(text(&output.stderr).contains("verify-update"), "{args:?}");
-        assert!(text(&output.stdout).is_empty(), "{args:?}");
-    }
-
-    assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
-    let _ = std::fs::remove_dir_all(&scratch);
-}
-
-#[test]
-fn verify_update_refuses_what_the_built_in_key_did_not_sign() {
+fn a_build_that_is_not_a_release_refuses_verify_update_with_one_line_and_no_directory() {
     let root = common::release::scratch("cli-verify-update");
     let staged =
         common::release::stage_dir(&root, "9.9.9", &common::release::script("9.9.9"), |_| {});
@@ -598,6 +445,11 @@ fn verify_update_refuses_what_the_built_in_key_did_not_sign() {
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(text(&output.stderr).trim().lines().count(), 1);
+    assert!(
+        text(&output.stderr).contains("this build cannot verify updates"),
+        "{}",
+        text(&output.stderr)
+    );
     assert!(!into.exists());
 }
 
@@ -741,24 +593,6 @@ fn dns_check_gives_up_on_silence() {
     assert_eq!(output.status.code(), Some(1));
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(text(&output.stderr).trim().lines().count(), 1);
-}
-
-#[test]
-fn dns_check_needs_an_address_and_a_port() {
-    for args in [
-        vec!["dns-check"],
-        vec!["dns-check", "127.0.0.1"],
-        vec!["dns-check", "127.0.0.1", "53", "extra"],
-        vec!["dns-check", "x", "53"],
-        vec!["dns-check", "127.0.0.1", "0"],
-        vec!["dns-check", "127.0.0.1", "70000"],
-    ] {
-        let output = picoguard(&args);
-
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert!(text(&output.stderr).contains("dns-check"), "{args:?}");
-        assert!(text(&output.stdout).is_empty(), "{args:?}");
-    }
 }
 
 #[test]

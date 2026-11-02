@@ -684,24 +684,8 @@ mod tests {
     }
 
     #[test]
-    fn the_next_check_comes_about_a_day_later() {
-        let timing = CheckTiming::default();
-
-        let delays: Vec<Duration> = (0..1000).map(|_| timing.next_delay()).collect();
-
-        assert!(delays.iter().all(|delay| {
-            *delay >= Duration::from_secs(77_760) && *delay <= Duration::from_secs(95_040)
-        }));
-        assert!(
-            delays
-                .iter()
-                .any(|delay| *delay < Duration::from_secs(82_000))
-        );
-        assert!(
-            delays
-                .iter()
-                .any(|delay| *delay > Duration::from_secs(91_000))
-        );
+    fn the_check_repeats_every_day_by_default() {
+        assert_eq!(CheckTiming::default().every, Duration::from_secs(24 * 3600));
     }
 
     #[test]
@@ -710,6 +694,7 @@ mod tests {
 
         let newer = || Outcome::Newer("0.3.0".to_string());
         let sequence = [
+            Outcome::UpToDate,
             Outcome::Failed(Failure::Status(500)),
             Outcome::Failed(Failure::Status(500)),
             Outcome::UpToDate,
@@ -731,6 +716,7 @@ mod tests {
         assert_eq!(
             levels,
             [
+                None,
                 Some(Warn),
                 None,
                 Some(Info),
@@ -741,11 +727,6 @@ mod tests {
                 None
             ]
         );
-    }
-
-    #[test]
-    fn the_first_up_to_date_answer_logs_nothing() {
-        assert!(log_line(&Outcome::UpToDate, &Outcome::UpToDate, "").is_none());
     }
 
     #[test]

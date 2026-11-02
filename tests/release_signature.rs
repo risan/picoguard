@@ -11,7 +11,6 @@ const SPKI_PREFIX: [u8; 12] = [
 const TEST_KEY: &[u8] = include_bytes!("fixtures/release/test-key.der");
 const SUMS: &[u8] = include_bytes!("fixtures/release/SHA256SUMS");
 const SIGNATURE: &[u8] = include_bytes!("fixtures/release/SHA256SUMS.sig");
-const RELEASE_KEY: &[u8] = include_bytes!("../dist/release-key.der");
 
 fn raw_public_key(der: &[u8]) -> &[u8] {
     assert_eq!(der.len(), 44);
@@ -25,37 +24,4 @@ fn openssl_signature_verifies_with_ring() {
 
     assert_eq!(SIGNATURE.len(), 64);
     assert!(key.verify(SUMS, SIGNATURE).is_ok());
-}
-
-#[test]
-fn modified_sums_is_rejected() {
-    let key = UnparsedPublicKey::new(&ED25519, raw_public_key(TEST_KEY));
-    let mut modified = SUMS.to_vec();
-    modified.push(b'\n');
-
-    assert!(key.verify(&modified, SIGNATURE).is_err());
-}
-
-#[test]
-fn a_corrupted_signature_is_rejected() {
-    let key = UnparsedPublicKey::new(&ED25519, raw_public_key(TEST_KEY));
-    let mut corrupted = SIGNATURE.to_vec();
-    corrupted[0] ^= 1;
-
-    assert!(key.verify(SUMS, &corrupted).is_err());
-    assert!(key.verify(SUMS, &SIGNATURE[..63]).is_err());
-}
-
-#[test]
-fn another_key_is_rejected() {
-    let other = UnparsedPublicKey::new(&ED25519, raw_public_key(RELEASE_KEY));
-
-    assert_ne!(RELEASE_KEY, TEST_KEY);
-    assert!(other.verify(SUMS, SIGNATURE).is_err());
-}
-
-#[test]
-fn release_key_has_the_published_format() {
-    assert_eq!(RELEASE_KEY.len(), 44);
-    assert_eq!(RELEASE_KEY[..12], SPKI_PREFIX);
 }

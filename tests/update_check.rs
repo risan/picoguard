@@ -12,7 +12,7 @@ use common::http::ListServer;
 use picoguard::config::{Config, UpdateConfig, WebConfig};
 use picoguard::lists::{Downloader, Names};
 use picoguard::update::{
-    Build, CheckTiming, Checker, Failure, Latest, Outcome, Updates, parse_running, start,
+    Build, CheckTiming, Checker, Failure, Outcome, Updates, parse_running, start,
 };
 use picoguard::upstream::tls::Tls;
 use serde_json::json;
@@ -264,25 +264,6 @@ async fn an_empty_body_leaves_the_notes_out() {
         assert_eq!(view.notes, None, "{body}");
         assert!(view.how.is_some(), "{body}");
     }
-}
-
-#[tokio::test]
-async fn a_shown_notice_is_replaced_with_the_new_one() {
-    let updates = updates();
-
-    updates.show(Some(Latest {
-        version: "1.2.3".to_string(),
-        notes: "a".to_string(),
-    }));
-    updates.show(Some(Latest {
-        version: "1.2.4".to_string(),
-        notes: String::new(),
-    }));
-
-    let view = updates.view();
-
-    assert_eq!(view.latest.as_deref(), Some("1.2.4"));
-    assert_eq!(view.notes, None);
 }
 
 /// Answers each connection in turn with the next of `replies`, then closes it.

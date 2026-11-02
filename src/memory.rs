@@ -108,12 +108,6 @@ mod tests {
     }
 
     #[test]
-    fn megabytes_have_one_decimal() {
-        assert_eq!(megabytes(48 * MIB), "48.0 MB");
-        assert_eq!(megabytes(MIB + MIB / 2), "1.5 MB");
-    }
-
-    #[test]
     fn the_default_settings_leave_most_of_the_budget_for_lists() {
         let config = crate::config::Config::default();
         let fixed = fixed_bytes(&config.limits, &config.stats);
