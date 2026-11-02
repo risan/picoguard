@@ -827,6 +827,23 @@ mod tests {
             );
             tokio::task::yield_now().await;
             assert!(!client.is_connected(), "length {length}");
+
+            // Read here, so a panic in the reader fails the test instead of only closing.
+            let mut frame = length.to_be_bytes().to_vec();
+            frame.extend_from_slice(&[0x12, 0x34]);
+            frame.resize(frame.len() + 16, 0);
+            let session = Session {
+                state: Arc::clone(&client.state),
+                epoch: 0,
+                max_reply: client.max_reply,
+                io_timeout: SHORT,
+            };
+            let read = session.read_frame(&mut BufReader::new(&frame[..])).await;
+
+            assert!(
+                matches!(read, Err(UpstreamError::BadReply)),
+                "length {length}: {read:?}"
+            );
         }
     }
 
