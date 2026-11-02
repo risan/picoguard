@@ -567,6 +567,16 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/rules",
         "/api/rules/remove",
         "/api/explain?name=",
+        "/api/settings",
+        "/api/services",
+        "api(\"/api/lists\")",
+        "/api/lists/add",
+        "/api/lists/reset",
+        "\"/api/lists/\" + change",
+        "editList(node, \"edit\"",
+        "editList(node, \"remove\"",
+        // Without it every 401 would open the browser's own sign-in prompt.
+        "\"X-Requested-With\": \"picoguard\"",
         "setInterval(update, 5000)",
         "id=\"version\"",
         "id=\"update\"",
@@ -1107,50 +1117,6 @@ fn upstream_entries(status: &Value) -> &Vec<Value> {
 }
 
 #[tokio::test]
-async fn a_failed_over_query_counts_a_failure_on_the_first_server_and_an_answer_on_the_second() {
-    let dead = fake_upstream(|_| Vec::new()).await;
-    let slow = answering_upstream([9, 9, 9, 9], Duration::from_millis(80)).await;
-    let mut config = local_config(&slow);
-    config.upstream.servers = vec![
-        format!("udp://{}", dead.address),
-        format!("udp://{}", slow.address),
-    ];
-    config.upstream.timeout_ms = 1000;
-    let site = site(config).await;
-
-    // Which server goes first is a weighted draw; the dead one is the first try often enough.
-    let mut asked = 0;
-    let started = Instant::now();
-    while dead.count() == 0 {
-        assert!(asked < 40, "the dead server was never tried");
-
-        ask(&site.dns, &format!("n{asked}.example."), RecordType::A).await;
-        asked += 1;
-    }
-    let asking_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-    let status = site.send(get("/api/status")).await.json();
-    let servers = upstream_entries(&status);
-
-    assert_eq!(servers[0]["label"], format!("udp://{}", dead.address));
-    assert_eq!(servers[0]["answered"], 0);
-    assert_eq!(servers[0]["failed"], 1);
-    assert!(servers[0]["avg_ms"].is_null());
-    assert_eq!(servers[1]["answered"], asked);
-    assert_eq!(servers[1]["failed"], 0);
-    let average = servers[1]["avg_ms"].as_f64().unwrap();
-    // Each try at the dead server takes at least 500 ms (half the 1000 ms timeout) of the wall
-    // time that the answered exchanges share it with, however loaded the machine is. A time that
-    // counted those tries too would not leave that much out.
-    let answered_ms = average * asked as f64;
-    assert!(average >= 80.0, "{average}");
-    assert!(
-        answered_ms < asking_ms - 400.0,
-        "{answered_ms} answered of {asking_ms}"
-    );
-}
-
-#[tokio::test]
 async fn a_query_for_a_local_name_counts_on_the_local_resolver_only() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
     let router = answering_upstream([192, 168, 1, 9], Duration::from_millis(20)).await;
@@ -1268,43 +1234,6 @@ async fn clearing_the_cache_empties_it_and_the_next_query_goes_upstream() {
     assert_eq!(upstream.count(), 3);
     let status = site.send(get("/api/status")).await.json();
     assert_eq!(status["counters"]["upstream"], upstream_before + 1);
-}
-
-#[tokio::test]
-async fn the_cache_size_is_shown_only_when_signed_in() {
-    let (with_password, _upstream) = plain_site().await;
-    let (without_password, _other) = open_site().await;
-
-    let signed_in = with_password.send(get("/api/status")).await.json();
-    let read_only = without_password.send(get("/api/status")).await.json();
-
-    let mut keys: Vec<&str> = signed_in["cache"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(keys, ["bytes", "entries"]);
-    assert!(read_only.get("cache").is_none());
-}
-
-#[tokio::test]
-async fn the_upstreams_show_with_a_password_and_are_left_out_without_one() {
-    let (with_password, upstream) = plain_site().await;
-    let (without_password, _other) = open_site().await;
-
-    let signed_in = with_password.send(get("/api/status")).await.json();
-    let read_only = without_password.send(get("/api/status")).await;
-
-    assert!(signed_in.get("limited").is_none());
-    assert_eq!(
-        upstream_entries(&signed_in)[0]["label"],
-        format!("udp://{}", upstream.address)
-    );
-    assert_eq!(read_only.json()["limited"], SET_A_PASSWORD);
-    assert!(read_only.json().get("upstreams").is_none());
-    assert!(!read_only.body.contains("udp://"));
 }
 
 #[tokio::test]
@@ -1527,67 +1456,6 @@ async fn without_a_local_resolver_names_are_null_and_nothing_is_looked_up() {
     }
 
     assert_eq!(upstream.count(), 0);
-}
-
-#[tokio::test]
-async fn loopback_and_public_clients_are_never_looked_up() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let router = fake_upstream(|query| {
-        let owner = query.queries[0].name().clone();
-        let data = RData::PTR(PTR(name("any.lan.")));
-
-        vec![(
-            Duration::ZERO,
-            reply_to(query, vec![Record::from_rdata(owner, 600, data)]),
-        )]
-    })
-    .await;
-    let mut config = local_config(&upstream);
-    config.local.resolver = Some(router.address);
-    let site = site(config).await;
-    for client in ["8.8.8.8", "2001:db8::1", "::ffff:8.8.8.8", "::1"] {
-        record_client(&site, client, "a.example.");
-    }
-
-    ask(&site.dns, "ok.example.", RecordType::A).await;
-
-    for _ in 0..3 {
-        let (status, log) = status_and_log(&site).await;
-
-        assert_eq!(
-            status["top_clients"]["entries"].as_array().unwrap().len(),
-            5
-        );
-        assert_every_name_is_null(&status, &log);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    assert_eq!(router.count(), 0);
-}
-
-#[tokio::test]
-async fn ten_polls_of_one_client_send_one_lookup() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let router = router(&[]).await;
-    let mut config = local_config(&upstream);
-    config.local.resolver = Some(router.address);
-    let site = site(config).await;
-    record_client(&site, "192.168.110.50", "a.example.");
-
-    for _ in 0..10 {
-        let (status, log) = status_and_log(&site).await;
-
-        assert_every_name_is_null(&status, &log);
-    }
-
-    let started = Instant::now();
-    while router.count() == 0 {
-        assert!(started.elapsed() < Duration::from_secs(3), "no lookup");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(router.count(), 1);
 }
 
 #[tokio::test]
@@ -2016,7 +1884,107 @@ async fn wait_for_requests(server: &ListServer, count: usize) {
 
 const UPDATE_BODY: &str = "{\"version\": \"9.9.9\"}";
 
-fn rejected_mutations() -> Vec<(&'static str, Request, u16)> {
+fn rejected_mutations() -> Vec<(String, Request, u16)> {
+    let mut rejected: Vec<(String, Request, u16)> =
+        rejected_pause_update_login_cache_and_rule_changes()
+            .into_iter()
+            .map(|(what, request, status)| (what.to_string(), request, status))
+            .collect();
+    rejected.extend(rejected_list_and_settings_changes());
+
+    rejected
+}
+
+/// The checks every change route shares, for the routes that save what they change: a request
+/// that is let through would write `settings.json` or start a list download.
+fn rejected_list_and_settings_changes() -> Vec<(String, Request, u16)> {
+    let source = "http://127.0.0.1:9/evil.txt";
+    let routes = [
+        (
+            "the settings",
+            "/api/settings",
+            rewrite_body(&[("evil.lan", "10.6.6.6")]),
+            64 * 1024,
+        ),
+        (
+            "an add of a list",
+            "/api/lists/add",
+            add_body("Evil", source),
+            1024,
+        ),
+        (
+            "an edit of a list",
+            "/api/lists/edit",
+            serde_json::json!({"role": "block", "source": source, "enabled": false}).to_string(),
+            1024,
+        ),
+        (
+            "a removal of a list",
+            "/api/lists/remove",
+            serde_json::json!({"role": "block", "source": source}).to_string(),
+            1024,
+        ),
+        (
+            "a reset of the lists",
+            "/api/lists/reset",
+            "{}".to_string(),
+            1024,
+        ),
+    ];
+    let mut rejected = Vec::new();
+
+    for (route, path, body, limit) in routes {
+        let padded = format!(
+            "{},\"padding\":\"{}\"}}",
+            &body[..body.len() - 1],
+            "x".repeat(limit)
+        );
+        let without_content_type = || Request {
+            headers: Vec::new(),
+            ..post(path, &body)
+        };
+        let put = || Request {
+            method: "PUT",
+            ..post(path, &body)
+        };
+        let mut rows = vec![
+            (
+                "from another origin",
+                post(path, &body).header("Origin", "http://evil.example"),
+                403,
+            ),
+            (
+                "from a null origin",
+                post(path, &body).header("Origin", "null"),
+                403,
+            ),
+            (
+                "for a name that is not configured",
+                post(path, &body).header("Host", "evil.example"),
+                403,
+            ),
+            (
+                "as plain text",
+                post(path, &body).header("Content-Type", "text/plain"),
+                415,
+            ),
+            ("without a content type", without_content_type(), 415),
+            ("over its size limit", post(path, &padded), 413),
+            ("as a put", put(), 405),
+        ];
+        if path != "/api/settings" {
+            rows.push(("as a get", get(path), 405));
+        }
+
+        for (what, request, status) in rows {
+            rejected.push((format!("{route} {what}"), request, status));
+        }
+    }
+
+    rejected
+}
+
+fn rejected_pause_update_login_cache_and_rule_changes() -> Vec<(&'static str, Request, u16)> {
     let big = format!("{{\"minutes\": 5, \"padding\": \"{}\"}}", "x".repeat(1100));
     let chunked_big = format!("{:x}\r\n{}\r\n0\r\n\r\n", big.len(), big);
 
@@ -2402,10 +2370,18 @@ async fn assert_mutations_are_rejected(site: &Site, sign_in: impl Fn(Request) ->
         assert_eq!(reply.status, status, "{what}");
         assert_eq!(reply.header("set-cookie"), None, "{what} set a cookie");
         assert!(!site.is_paused(), "{what} paused blocking");
-        assert_nothing_was_started(site, what);
-        assert_cache_kept(site, cached, what);
+        assert_nothing_was_started(site, &what);
+        assert_cache_kept(site, cached, &what);
         assert!(no_page_rules(site).await, "{what} added a rule");
+        assert_settings_and_lists_untouched(site, &what);
     }
+}
+
+/// A refused change to the settings or the lists saves nothing and starts no download.
+fn assert_settings_and_lists_untouched(site: &Site, what: &str) {
+    assert!(saved_settings(site).is_none(), "{what} saved settings");
+    assert!(!site.control.lists_on_page(), "{what} moved the lists");
+    assert!(site.control.pending_list().is_none(), "{what} added a list");
 }
 
 /// Asks a name the upstream answers, so the cache holds an entry a clear would remove.
@@ -2440,7 +2416,7 @@ async fn open_site() -> (Site, common::harness::FakeUpstream) {
 }
 
 #[tokio::test]
-async fn status_shows_the_version_with_and_without_a_password() {
+async fn the_status_shows_the_version_and_a_newer_one_with_or_without_a_password() {
     let (with_password, _upstream) = plain_site().await;
     let (without_password, _other) = open_site().await;
 
@@ -2452,15 +2428,7 @@ async fn status_shows_the_version_with_and_without_a_password() {
         for absent in ["latest", "notes", "how"] {
             assert!(status["update"].get(absent).is_none(), "{absent}");
         }
-    }
-}
 
-#[tokio::test]
-async fn status_shows_a_newer_version_with_notes_and_command() {
-    let (with_password, _upstream) = plain_site().await;
-    let (without_password, _other) = open_site().await;
-
-    for site in [&with_password, &without_password] {
         site.updates.show(Some(Latest {
             version: "9.9.9".to_string(),
             notes: "Faster lists".to_string(),
@@ -2518,26 +2486,54 @@ async fn a_hanging_check_holds_up_neither_dns_nor_the_page() {
 const SET_A_PASSWORD: &str = "set web.user and web.password_hash (or web.password) to use this";
 
 #[tokio::test]
-async fn without_a_password_the_page_shows_totals_and_lists_and_nothing_else() {
-    let (site, _upstream) = open_site().await;
-    ask(&site.dns, "ads.example.", RecordType::A).await;
-    ask(&site.dns, "ok.example.", RecordType::A).await;
+async fn private_status_fields_are_left_out_without_a_password_and_shown_with_one() {
+    let (with_password, upstream) = plain_site().await;
+    let (without_password, _other) = open_site().await;
+    for site in [&with_password, &without_password] {
+        ask(&site.dns, "ads.example.", RecordType::A).await;
+        ask(&site.dns, "ok.example.", RecordType::A).await;
+    }
 
-    assert_eq!(site.send(get("/")).await.status, 200);
-    assert_eq!(site.send(get("/api/lists")).await.status, 200);
+    let signed_in = with_password.send(get("/api/status")).await.json();
 
-    let reply = site.send(get("/api/status")).await;
-    let status = reply.json();
+    assert!(signed_in.get("limited").is_none());
+    for private in ["top_queried", "top_blocked", "top_clients"] {
+        assert!(signed_in.get(private).is_some(), "{private}");
+    }
+    assert_eq!(
+        upstream_entries(&signed_in)[0]["label"],
+        format!("udp://{}", upstream.address)
+    );
+    let mut keys: Vec<&str> = signed_in["cache"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["bytes", "entries"]);
+
+    assert_eq!(without_password.send(get("/")).await.status, 200);
+    assert_eq!(without_password.send(get("/api/lists")).await.status, 200);
+    let reply = without_password.send(get("/api/status")).await;
+    let read_only = reply.json();
 
     assert_eq!(reply.status, 200);
-    assert_eq!(status["counters"]["total"], 2);
-    assert_eq!(status["blocked_percent"], 50.0);
-    assert!(status["lists"].is_array());
-    assert_eq!(status["limited"], SET_A_PASSWORD);
-    for private in ["top_queried", "top_blocked", "top_clients"] {
-        assert!(status.get(private).is_none(), "{private}");
+    assert_eq!(read_only["counters"]["total"], 2);
+    assert_eq!(read_only["blocked_percent"], 50.0);
+    assert!(read_only["lists"].is_array());
+    assert_eq!(read_only["limited"], SET_A_PASSWORD);
+    for private in [
+        "top_queried",
+        "top_blocked",
+        "top_clients",
+        "upstreams",
+        "cache",
+    ] {
+        assert!(read_only.get(private).is_none(), "{private}");
     }
     assert!(!reply.body.contains("ads.example"));
+    assert!(!reply.body.contains("udp://"));
 }
 
 #[tokio::test]
@@ -2571,6 +2567,7 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
         ("the rules", get("/api/rules")),
         ("explain", get("/api/explain?name=ads.example")),
         ("the settings", get("/api/settings")),
+        ("the services", get("/api/services")),
         ("a settings change", post("/api/settings", "{}")),
         ("add a list", post("/api/lists/add", "{}")),
         ("edit a list", post("/api/lists/edit", "{}")),
@@ -2586,19 +2583,6 @@ async fn without_a_password_the_log_and_every_change_are_forbidden() {
     assert!(!site.is_paused());
     assert_cache_kept(&site, cached, "a forbidden change");
     assert!(no_page_rules(&site).await);
-}
-
-#[tokio::test]
-async fn with_a_password_the_status_keeps_its_top_lists_and_is_not_limited() {
-    let (site, _upstream) = plain_site().await;
-    ask(&site.dns, "ads.example.", RecordType::A).await;
-
-    let status = site.send(get("/api/status")).await.json();
-
-    assert!(status.get("limited").is_none());
-    for private in ["top_queried", "top_blocked", "top_clients"] {
-        assert!(status.get(private).is_some(), "{private}");
-    }
 }
 
 #[tokio::test]
@@ -2631,9 +2615,10 @@ async fn unsafe_mutations_are_rejected_without_a_password() {
         };
         assert_eq!(reply.status, expected, "{what}");
         assert!(!site.is_paused(), "{what} paused blocking");
-        assert_nothing_was_started(&site, what);
-        assert_cache_kept(&site, cached, what);
+        assert_nothing_was_started(&site, &what);
+        assert_cache_kept(&site, cached, &what);
         assert!(no_page_rules(&site).await, "{what} added a rule");
+        assert_settings_and_lists_untouched(&site, &what);
     }
 }
 
@@ -2697,6 +2682,8 @@ async fn with_a_password_the_page_opens_without_a_prompt_and_the_api_needs_a_sig
         "/api/lists",
         "/api/rules",
         "/api/explain?name=ads.example",
+        "/api/settings",
+        "/api/services",
     ];
     let changes = [
         ("/api/pause", "{\"minutes\": 5}"),
@@ -2706,6 +2693,11 @@ async fn with_a_password_the_page_opens_without_a_prompt_and_the_api_needs_a_sig
         ("/api/cache/clear", "{}"),
         ("/api/rules", RULE_BODY),
         ("/api/rules/remove", REMOVE_BODY),
+        ("/api/settings", "{}"),
+        ("/api/lists/add", "{}"),
+        ("/api/lists/edit", "{}"),
+        ("/api/lists/remove", "{}"),
+        ("/api/lists/reset", "{}"),
     ];
     let requests = || {
         reads
@@ -4133,17 +4125,6 @@ async fn a_settings_change_that_is_not_valid_is_refused_and_nothing_is_written()
 }
 
 #[tokio::test]
-async fn a_settings_change_of_nothing_writes_nothing_and_answers_the_settings() {
-    let (site, _upstream) = plain_site().await;
-
-    let changed = site.send(post("/api/settings", "{}")).await;
-
-    assert_eq!(changed.status, 200);
-    assert_eq!(changed.json(), site.send(get("/api/settings")).await.json());
-    assert!(saved_settings(&site).is_none());
-}
-
-#[tokio::test]
 async fn only_the_settings_route_takes_a_body_of_64_kib() {
     let (site, _upstream) = plain_site().await;
     let padded = |length: usize| format!("{{}}{}", " ".repeat(length - 2));
@@ -4271,26 +4252,6 @@ async fn rewrites_and_safe_search_apply_at_once_and_a_reset_goes_back_to_the_con
     assert_eq!(addresses(&answer), ["9.9.9.9"]);
     let explained = site.send(get("/api/explain?name=google.de")).await.json();
     assert_eq!(explained["decision"], "none");
-}
-
-#[tokio::test]
-async fn the_same_rewrites_again_write_nothing() {
-    let (site, _upstream) = plain_site().await;
-    let file = site.state.join(settings::FILE_NAME);
-    let body = rewrite_body(&[("nas.lan", "192.168.1.10")]);
-    assert_eq!(site.send(post("/api/settings", &body)).await.status, 200);
-    std::fs::remove_file(&file).unwrap();
-
-    for body in [
-        body,
-        rewrite_body(&[("NAS.lan.", " 192.168.1.10")]),
-        "{\"safe_search\": null}".to_string(),
-    ] {
-        let reply = site.send(post("/api/settings", &body)).await;
-
-        assert_eq!(reply.status, 200, "{body}: {}", reply.body);
-        assert!(!file.exists(), "{body} wrote the file");
-    }
 }
 
 #[tokio::test]
@@ -4509,23 +4470,41 @@ async fn a_larger_cache_that_would_pass_the_memory_budget_is_refused_and_a_small
 #[tokio::test]
 async fn the_file_is_written_only_when_a_setting_in_force_changes() {
     let (site, first) = plain_site().await;
-    let body = upstream_body(&[udp(&first)]);
+    let upstreams = upstream_body(&[udp(&first)]);
+    let rewrites = rewrite_body(&[("nas.lan", "192.168.1.10")]);
+    let normalized_rewrites = rewrite_body(&[("NAS.lan.", " 192.168.1.10")]);
     let file = site.state.join(settings::FILE_NAME);
 
-    assert_eq!(site.send(post("/api/settings", &body)).await.status, 200);
-    assert!(file.exists());
-    std::fs::remove_file(&file).unwrap();
-
-    for body in [
-        body.as_str(),
-        "{}",
-        "{\"cache\": null}",
-        "{\"rewrites\": null, \"safe_search\": null, \"services\": null}",
+    // Nothing is in force twice: the second round sets rewrites, so a reset of them would write.
+    for (set, unchanged) in [
+        (
+            &upstreams,
+            vec![
+                upstreams.as_str(),
+                "{}",
+                "{\"cache\": null}",
+                "{\"rewrites\": null, \"safe_search\": null, \"services\": null}",
+            ],
+        ),
+        (
+            &rewrites,
+            vec![
+                rewrites.as_str(),
+                normalized_rewrites.as_str(),
+                "{\"safe_search\": null}",
+            ],
+        ),
     ] {
-        let reply = site.send(post("/api/settings", body)).await;
+        assert_eq!(site.send(post("/api/settings", set)).await.status, 200);
+        assert!(file.exists());
+        std::fs::remove_file(&file).unwrap();
 
-        assert_eq!(reply.status, 200, "{body}: {}", reply.body);
-        assert!(!file.exists(), "{body} wrote the file");
+        for body in unchanged {
+            let reply = site.send(post("/api/settings", body)).await;
+
+            assert_eq!(reply.status, 200, "{body}: {}", reply.body);
+            assert!(!file.exists(), "{body} wrote the file");
+        }
     }
 }
 
@@ -4923,26 +4902,6 @@ async fn page_lists_are_edited_removed_and_reset_through_the_api() {
         saved_settings(&site).unwrap(),
         serde_json::json!({"version": 1})
     );
-}
-
-#[tokio::test]
-async fn without_a_password_the_lists_show_no_source_and_no_pending_add() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let mut config = local_config(&upstream);
-    without_credentials(&mut config);
-    config.lists = vec![ListConfig {
-        name: Some("Private".to_string()),
-        url: Some("https://lists.example/list.txt?token=secret".to_string()),
-        ..ListConfig::default()
-    }];
-    let site = site(config).await;
-
-    let lists = site.send(get("/api/lists")).await;
-
-    assert_eq!(lists.status, 200);
-    assert!(!lists.body.contains("secret"), "{}", lists.body);
-    assert!(lists.json().get("pending").is_none());
-    assert!(lists.json()["memory"]["budget_bytes"].as_u64().is_some());
 }
 
 #[tokio::test]

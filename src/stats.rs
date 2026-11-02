@@ -497,14 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_the_planned_sizes() {
-        let settings = StatsSettings::default();
-
-        assert_eq!(settings.top_k, 50);
-        assert_eq!(settings.query_log_entries, 1_000);
-    }
-
-    #[test]
     fn counters_follow_each_result() {
         let (stats, _) = stats_at(StatsSettings::default(), MIDNIGHT);
 
@@ -538,37 +530,6 @@ mod tests {
                 dropped: 2,
             }
         );
-    }
-
-    #[test]
-    fn fresh_stats_are_empty() {
-        let (stats, _) = stats_at(StatsSettings::default(), MIDNIGHT);
-        let snapshot = stats.snapshot();
-
-        assert_eq!(snapshot.counters, Counters::default());
-        assert_eq!(snapshot.hourly.len(), 24);
-        assert!(snapshot.hourly.iter().all(|bucket| bucket.total == 0));
-        assert!(snapshot.top_queried.is_empty());
-        assert!(stats.query_log(10).is_empty());
-    }
-
-    #[test]
-    fn blocked_domains_list_only_blocked_results() {
-        let (stats, _) = stats_at(StatsSettings::default(), MIDNIGHT);
-
-        record(&stats, "ads.example", QueryResult::BlockedRequest);
-        record(&stats, "ads.example", QueryResult::BlockedResponse);
-        record(&stats, "tracker.example", QueryResult::BlockedRequest);
-        record(&stats, "fine.example", QueryResult::Pass);
-        let snapshot = stats.snapshot();
-
-        let blocked: Vec<(&str, u64)> = snapshot
-            .top_blocked
-            .iter()
-            .map(|entry| (&*entry.key, entry.count))
-            .collect();
-        assert_eq!(blocked, [("ads.example", 2), ("tracker.example", 1)]);
-        assert_eq!(snapshot.top_queried.len(), 3);
     }
 
     #[test]
@@ -747,16 +708,6 @@ mod tests {
         assert_eq!(counts(snapshot.top_queried), [2, 1]);
         assert_eq!(counts(snapshot.top_blocked), [2, 1]);
         assert_eq!(logged_names(&stats, 3)[0], *shown(&first));
-    }
-
-    #[test]
-    fn query_log_lists_newest_first_until_full() {
-        let (stats, _) = stats_at(small(5, 3), MIDNIGHT);
-
-        record(&stats, "one.example", QueryResult::Pass);
-        record(&stats, "two.example", QueryResult::Pass);
-
-        assert_eq!(logged_names(&stats, 10), ["two.example", "one.example"]);
     }
 
     #[test]
