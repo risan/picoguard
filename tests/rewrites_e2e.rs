@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::harness::{
-    FakeUpstream, Running, a_record, ask, config_for, engine_of, fake_upstream, name, reply_to,
-    start,
+    FakeUpstream, Running, a_record, ask, config_for, engine_of, fake_upstream,
+    fake_upstream_with_gate, name, reply_to, start,
 };
 use hickory_proto::op::{Edns, Message, Query as DnsQuery, ResponseCode};
 use hickory_proto::rr::rdata::{AAAA, CNAME};
@@ -21,6 +21,7 @@ use picoguard::filter::engine::Engine;
 use picoguard::pipeline::Prepared;
 use picoguard::rewrites::Rewrites;
 use picoguard::stats::QueryResult;
+use tokio::sync::watch;
 
 const SAFE_GOOGLE: [u8; 4] = [216, 239, 38, 120];
 const ANY_OTHER: [u8; 4] = [9, 9, 9, 9];
@@ -83,70 +84,71 @@ fn asked_names(upstream: &FakeUpstream) -> Vec<String> {
 /// Answers by question name, as a scripted upstream; any other A question gets `ANY_OTHER`.
 /// A name that starts with "slow" is answered after `SLOW`, and `silent.example` never.
 async fn scripted_upstream() -> FakeUpstream {
-    fake_upstream(|query| {
-        let question = &query.queries[0];
-        let owner = question.name().to_string();
-        let is_aaaa = question.query_type() == RecordType::AAAA;
-        let answers = match owner.as_str() {
-            "forcesafesearch.google.com." => vec![a_record(&owner, 300, SAFE_GOOGLE)],
-            "strict.bing.com." => vec![a_record(&owner, 300, [204, 79, 197, 220])],
-            "web.example." if is_aaaa => vec![
-                cname_record(&owner, 200, "a.cdn.example."),
-                cname_record("a.cdn.example.", 100, "b.cdn.example."),
-                aaaa_record("b.cdn.example.", 250, "2001:db8::1"),
-            ],
-            "web.example." => vec![
-                cname_record(&owner, 200, "a.cdn.example."),
-                cname_record("a.cdn.example.", 100, "b.cdn.example."),
-                a_record("b.cdn.example.", 250, [1, 2, 3, 4]),
-                a_record("other.example.", 10, [6, 6, 6, 6]),
-                a_record("b.cdn.example.", 250, [1, 2, 3, 5]),
-            ],
-            "long.example." => vec![a_record(&owner, 3600, [7, 7, 7, 7])],
-            "short.example." => vec![a_record(&owner, 1, [8, 8, 8, 8])],
-            "empty.example." => Vec::new(),
-            "loop.example." => vec![
-                cname_record(&owner, 60, "loop2.example."),
-                cname_record("loop2.example.", 60, "loop.example."),
-            ],
-            _ if is_aaaa => Vec::new(),
-            _ => vec![a_record(&owner, 300, ANY_OTHER)],
-        };
-        let mut reply = reply_to(query, answers);
-        match owner.as_str() {
-            "gone.example." => {
-                reply.metadata.response_code = ResponseCode::NXDomain;
-            }
+    fake_upstream(scripted_answer).await
+}
 
-            "broken.example." => {
-                reply.metadata.response_code = ResponseCode::ServFail;
-            }
-
-            "cut.example." => {
-                reply.metadata.truncation = true;
-            }
-
-            "badvers.example." => {
-                reply.metadata.response_code = ResponseCode::BADVERS;
-                reply.set_edns(Edns::new());
-            }
-
-            _ => {}
+fn scripted_answer(query: &Message) -> Vec<(Duration, Message)> {
+    let question = &query.queries[0];
+    let owner = question.name().to_string();
+    let is_aaaa = question.query_type() == RecordType::AAAA;
+    let answers = match owner.as_str() {
+        "forcesafesearch.google.com." => vec![a_record(&owner, 300, SAFE_GOOGLE)],
+        "strict.bing.com." => vec![a_record(&owner, 300, [204, 79, 197, 220])],
+        "web.example." if is_aaaa => vec![
+            cname_record(&owner, 200, "a.cdn.example."),
+            cname_record("a.cdn.example.", 100, "b.cdn.example."),
+            aaaa_record("b.cdn.example.", 250, "2001:db8::1"),
+        ],
+        "web.example." => vec![
+            cname_record(&owner, 200, "a.cdn.example."),
+            cname_record("a.cdn.example.", 100, "b.cdn.example."),
+            a_record("b.cdn.example.", 250, [1, 2, 3, 4]),
+            a_record("other.example.", 10, [6, 6, 6, 6]),
+            a_record("b.cdn.example.", 250, [1, 2, 3, 5]),
+        ],
+        "long.example." => vec![a_record(&owner, 3600, [7, 7, 7, 7])],
+        "short.example." => vec![a_record(&owner, 1, [8, 8, 8, 8])],
+        "empty.example." => Vec::new(),
+        "loop.example." => vec![
+            cname_record(&owner, 60, "loop2.example."),
+            cname_record("loop2.example.", 60, "loop.example."),
+        ],
+        _ if is_aaaa => Vec::new(),
+        _ => vec![a_record(&owner, 300, ANY_OTHER)],
+    };
+    let mut reply = reply_to(query, answers);
+    match owner.as_str() {
+        "gone.example." => {
+            reply.metadata.response_code = ResponseCode::NXDomain;
         }
 
-        if owner == "silent.example." {
-            return Vec::new();
+        "broken.example." => {
+            reply.metadata.response_code = ResponseCode::ServFail;
         }
 
-        let delay = if owner.starts_with("slow") {
-            SLOW
-        } else {
-            Duration::ZERO
-        };
+        "cut.example." => {
+            reply.metadata.truncation = true;
+        }
 
-        vec![(delay, reply)]
-    })
-    .await
+        "badvers.example." => {
+            reply.metadata.response_code = ResponseCode::BADVERS;
+            reply.set_edns(Edns::new());
+        }
+
+        _ => {}
+    }
+
+    if owner == "silent.example." {
+        return Vec::new();
+    }
+
+    let delay = if owner.starts_with("slow") {
+        SLOW
+    } else {
+        Duration::ZERO
+    };
+
+    vec![(delay, reply)]
 }
 
 async fn start_with(
@@ -884,34 +886,47 @@ fn request_for(text: &str) -> Vec<u8> {
     query.to_vec().unwrap()
 }
 
-/// A server whose only upstream query slot is held by a lookup of `slow-0.example`.
+/// A server whose only upstream query slot is held by a lookup of `slow-0.example`: the upstream
+/// has received it, and answers it only when the returned gate is opened.
 async fn server_with_the_only_slot_held(
-    upstream: &FakeUpstream,
     entries: &[(&str, &str)],
     engine: Arc<Engine>,
-) -> (Running, tokio::task::JoinHandle<Message>) {
-    let server = start_with(upstream, entries, false, engine, |config| {
+) -> (
+    Running,
+    FakeUpstream,
+    tokio::task::JoinHandle<Message>,
+    watch::Sender<bool>,
+) {
+    let (upstream, gate) = fake_upstream_with_gate(scripted_answer, |query| {
+        query.queries[0].name().to_string().starts_with("slow")
+    })
+    .await;
+    let server = start_with(&upstream, entries, false, engine, |config| {
         config.limits.max_inflight_queries = 1;
+        config.upstream.timeout_ms = 30_000;
     })
     .await;
     let holder = {
         let server = server.clone();
         tokio::spawn(async move { ask_tcp(&server, "slow-0.example.", RecordType::A).await })
     };
-    tokio::time::sleep(SLOW / 6).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while upstream.count() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the holder never reached the upstream"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
-    (server, holder)
+    (server, upstream, holder, gate)
 }
 
 #[tokio::test]
 async fn a_rewrite_target_without_a_free_slot_drops_udp_and_fails_tcp() {
-    let upstream = scripted_upstream().await;
-    let (server, holder) = server_with_the_only_slot_held(
-        &upstream,
-        &[("alias.lan", "slow-1.example")],
-        engine_of(&[], &[]),
-    )
-    .await;
+    let (server, upstream, holder, gate) =
+        server_with_the_only_slot_held(&[("alias.lan", "slow-1.example")], engine_of(&[], &[]))
+            .await;
     let client = "127.0.0.1".parse().unwrap();
     let mut out = Vec::new();
 
@@ -934,6 +949,7 @@ async fn a_rewrite_target_without_a_free_slot_drops_udp_and_fails_tcp() {
         ResponseCode::ServFail
     );
     assert_eq!(server.pipeline.stats().snapshot().counters.dropped, 1);
+    gate.send(true).unwrap();
     let held = holder.await.unwrap();
     assert_eq!(held.metadata.response_code, ResponseCode::NoError);
     assert_eq!(asked_names(&upstream), ["slow-0.example."]);
@@ -941,10 +957,8 @@ async fn a_rewrite_target_without_a_free_slot_drops_udp_and_fails_tcp() {
 
 #[tokio::test]
 async fn a_rewrite_added_after_prepare_is_shed_when_its_target_has_no_slot() {
-    let upstream = scripted_upstream().await;
-    let (server, holder) =
-        server_with_the_only_slot_held(&upstream, &[], engine_of(&["||blocked.example^\n"], &[]))
-            .await;
+    let (server, upstream, holder, gate) =
+        server_with_the_only_slot_held(&[], engine_of(&["||blocked.example^\n"], &[])).await;
     let client: std::net::IpAddr = "127.0.0.1".parse().unwrap();
     let udp = server
         .pipeline
@@ -975,6 +989,7 @@ async fn a_rewrite_added_after_prepare_is_shed_when_its_target_has_no_slot() {
         Message::from_vec(&out).unwrap().metadata.response_code,
         ResponseCode::ServFail
     );
+    gate.send(true).unwrap();
     holder.await.unwrap();
     assert_eq!(asked_names(&upstream), ["slow-0.example."]);
 }

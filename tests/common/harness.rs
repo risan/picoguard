@@ -15,6 +15,7 @@ use picoguard::pipeline::Pipeline;
 use picoguard::policy::Policy;
 use picoguard::server::{self, Listeners};
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 
 pub const PATIENT: Duration = Duration::from_secs(3);
 
@@ -41,6 +42,30 @@ impl FakeUpstream {
 pub async fn fake_upstream(
     handler: impl Fn(&Message) -> Vec<(Duration, Message)> + Send + Sync + 'static,
 ) -> FakeUpstream {
+    serve(handler, None).await
+}
+
+/// As `fake_upstream`, but the replies to a query `holds` names are sent only once the gate
+/// opens: a test then knows the query is still waiting however long it takes.
+pub async fn fake_upstream_with_gate(
+    handler: impl Fn(&Message) -> Vec<(Duration, Message)> + Send + Sync + 'static,
+    holds: impl Fn(&Message) -> bool + Send + Sync + 'static,
+) -> (FakeUpstream, watch::Sender<bool>) {
+    let (open, gate) = watch::channel(false);
+    let upstream = serve(handler, Some((Box::new(holds), gate))).await;
+
+    (upstream, open)
+}
+
+type Holds = (
+    Box<dyn Fn(&Message) -> bool + Send + Sync>,
+    watch::Receiver<bool>,
+);
+
+async fn serve(
+    handler: impl Fn(&Message) -> Vec<(Duration, Message)> + Send + Sync + 'static,
+    hold: Option<Holds>,
+) -> FakeUpstream {
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let address = socket.local_addr().unwrap();
     let received = Arc::new(Mutex::new(Vec::new()));
@@ -57,7 +82,15 @@ pub async fn fake_upstream(
             seen.lock().unwrap().push(query.clone());
             let replies = handler(&query);
             let socket = Arc::clone(&socket);
+            let mut gate = hold
+                .as_ref()
+                .filter(|(holds, _)| holds(&query))
+                .map(|(_, gate)| gate.clone());
             tokio::spawn(async move {
+                if let Some(gate) = gate.as_mut() {
+                    let _ = gate.wait_for(|open| *open).await;
+                }
+
                 for (delay, reply) in replies {
                     tokio::time::sleep(delay).await;
                     let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
