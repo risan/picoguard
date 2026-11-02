@@ -1552,6 +1552,19 @@ ads.*.tracker
     }
 
     #[tokio::test]
+    async fn a_flipped_byte_inside_an_array_fails_the_checksum() {
+        let state = TestDir::new("snap");
+        let list: String = (0..2000).map(|i| format!("||host{i}.example^\n")).collect();
+        let (path, mut bytes) = saved_bytes(&state, &list).await;
+
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x01;
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(rejected(&path), SnapshotError::BadChecksum));
+    }
+
+    #[tokio::test]
     async fn an_older_compiler_version_is_refused() {
         let state = TestDir::new("snap");
         let (path, mut bytes) = saved_bytes(&state, MIXED).await;
