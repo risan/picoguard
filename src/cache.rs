@@ -824,47 +824,29 @@ mod tests {
     }
 
     #[test]
-    fn nodata_behind_a_cname_chain_lives_as_long_as_the_negative_ttl() {
-        let mut cache = Cache::new(&config());
-        let fixture = Fixture::new("www.example.com.");
-        let start = Instant::now();
-        let reply = chain_reply(&fixture, 0, 300, vec![], vec![soa("example.net.", 900, 45)]);
-
-        assert!(insert(&mut cache, &fixture, &reply, start));
-
-        assert_eq!(lifetime_in_secs(&mut cache, &fixture, start), Some(45));
-    }
-
-    #[test]
-    fn a_short_cname_ttl_bounds_a_negative_reply_behind_the_chain() {
-        let soa_record = || vec![soa("example.net.", 900, 45)];
+    fn a_negative_reply_behind_a_cname_chain_lives_as_long_as_the_shorter_of_the_chain_and_the_soa()
+    {
         let fixture = Fixture::new("www.example.com.");
         let start = Instant::now();
 
-        for rcode in [0, 3] {
+        for (rcode, cname_ttl, lifetime) in [(0, 300, 45), (3, 300, 45), (0, 20, 20), (3, 20, 20)] {
             let mut cache = Cache::new(&config());
-            let reply = chain_reply(&fixture, rcode, 20, vec![], soa_record());
+            let reply = chain_reply(
+                &fixture,
+                rcode,
+                cname_ttl,
+                vec![],
+                vec![soa("example.net.", 900, 45)],
+            );
 
             assert!(insert(&mut cache, &fixture, &reply, start));
 
             assert_eq!(
                 lifetime_in_secs(&mut cache, &fixture, start),
-                Some(20),
-                "rcode {rcode}"
+                Some(lifetime),
+                "rcode {rcode}, CNAME TTL {cname_ttl}"
             );
         }
-    }
-
-    #[test]
-    fn nxdomain_behind_a_cname_chain_uses_the_negative_ttl_when_it_is_shorter() {
-        let mut cache = Cache::new(&config());
-        let fixture = Fixture::new("www.example.com.");
-        let start = Instant::now();
-        let reply = chain_reply(&fixture, 3, 300, vec![], vec![soa("example.net.", 900, 45)]);
-
-        assert!(insert(&mut cache, &fixture, &reply, start));
-
-        assert_eq!(lifetime_in_secs(&mut cache, &fixture, start), Some(45));
     }
 
     #[test]

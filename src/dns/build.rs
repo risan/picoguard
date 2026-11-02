@@ -922,48 +922,26 @@ mod tests {
     }
 
     #[test]
-    fn a_1500_byte_answer_is_truncated_over_udp_without_edns() {
-        let client = QuerySpec::new("big.example.com.", RecordType::TXT);
-        let upstream = large_answer(&client);
-        assert!(upstream.len() > 1500);
+    fn a_1500_byte_answer_is_truncated_over_udp_to_the_smaller_of_the_client_and_server_size() {
+        for (edns, bound) in [
+            (None, 512),
+            (Some((1232, false)), 1232),
+            (Some((4096, false)), usize::from(SERVER_UDP_SIZE)),
+        ] {
+            let mut client = QuerySpec::new("big.example.com.", RecordType::TXT);
+            client.edns = edns;
+            let upstream = large_answer(&client);
+            assert!(upstream.len() > 1500);
 
-        let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
+            let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
 
-        let message = parse(&out);
-        assert!(message.metadata.truncation);
-        assert!(message.answers.is_empty());
-        assert_eq!(message.queries.len(), 1);
-        assert!(out.len() <= 512);
-    }
-
-    #[test]
-    fn a_1500_byte_answer_is_truncated_over_udp_with_edns_1232() {
-        let mut client = QuerySpec::new("big.example.com.", RecordType::TXT);
-        client.edns = Some((1232, false));
-        let upstream = large_answer(&client);
-
-        let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
-
-        let message = parse(&out);
-        assert!(message.metadata.truncation);
-        assert!(message.answers.is_empty());
-        assert!(message.edns.is_some(), "OPT survives truncation");
-        assert!(out.len() <= 1232);
-    }
-
-    #[test]
-    fn the_server_size_caps_a_larger_client_size() {
-        let mut client = QuerySpec::new("big.example.com.", RecordType::TXT);
-        client.edns = Some((4096, false));
-        let upstream = large_answer(&client);
-
-        let out = from_upstream(&client, &upstream, Protocol::Udp, no_aging());
-
-        let message = parse(&out);
-        assert!(message.metadata.truncation);
-        assert!(message.answers.is_empty());
-        assert!(message.edns.is_some());
-        assert!(out.len() <= usize::from(SERVER_UDP_SIZE));
+            let message = parse(&out);
+            assert!(message.metadata.truncation, "{edns:?}");
+            assert!(message.answers.is_empty(), "{edns:?}");
+            assert_eq!(message.queries.len(), 1, "{edns:?}");
+            assert_eq!(message.edns.is_some(), edns.is_some(), "{edns:?}");
+            assert!(out.len() <= bound, "{edns:?}: {} bytes", out.len());
+        }
     }
 
     #[test]
