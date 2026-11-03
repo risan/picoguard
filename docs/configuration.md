@@ -428,7 +428,7 @@ and once among the `[[allowlists]]`.
 
 Downloads use `If-None-Match` and `If-Modified-Since`, and send `Accept-Encoding: identity`:
 picoguard does not decompress, so a reply that is compressed anyway fails. A failed download keeps the last good list.
-A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private,
+A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private, shared (`100.64.0.0/10`, Tailscale),
 link-local or unspecified address fails too, unless the list URL itself points into those ranges.
 A list in `[[lists]]` that blocks any of three made-up check names (for example because of a rule
 like `||*^` or `/./`) is refused the same way: the last good copy stays and the status page shows the
