@@ -14,6 +14,7 @@ use std::fmt;
 use regex_automata::meta::{self, Regex};
 use regex_automata::nfa::thompson::WhichCaptures;
 use regex_syntax::ast::{self, Ast, ClassPerlKind, ClassSetItem};
+use regex_syntax::hir::Hir;
 use regex_syntax::hir::translate::TranslatorBuilder;
 
 /// Compiled regexes may not grow beyond this many bytes. The slow-rule budget charges what
@@ -235,10 +236,8 @@ fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize, usize), Pat
         return Err(PatternError::TooBig);
     }
 
-    let hir = TranslatorBuilder::new()
-        .case_insensitive(true)
-        .build()
-        .translate(&translated, &ast)
+    let hir = translate_hir(&translated, &ast, Alphabet::Ascii)
+        .or_else(|_| translate_hir(&translated, &ast, Alphabet::Unicode))
         .map_err(|error| PatternError::Regex(error.to_string(), REGEX_BUILD_BYTES + parse_bytes))?;
     drop(ast);
     let size_limit = if room == usize::MAX {
@@ -273,6 +272,31 @@ fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize, usize), Pat
     let cost = regex.memory_usage() + regex.create_cache().memory_usage();
 
     Ok((regex, cost, parse_bytes))
+}
+
+/// What a regex is matched against.
+#[derive(Clone, Copy)]
+enum Alphabet {
+    /// Every input of the DNS path is ASCII (`Name` escapes the rest), so classes, `.` and case
+    /// folding can be byte-sized, which builds a much smaller automaton.
+    Ascii,
+    /// Needed by a pattern that is not ASCII-only (`\pL`, a non-ASCII literal).
+    Unicode,
+}
+
+fn translate_hir(
+    translated: &str,
+    ast: &Ast,
+    alphabet: Alphabet,
+) -> Result<Hir, regex_syntax::hir::Error> {
+    let unicode = matches!(alphabet, Alphabet::Unicode);
+
+    TranslatorBuilder::new()
+        .case_insensitive(true)
+        .unicode(unicode)
+        .utf8(unicode)
+        .build()
+        .translate(translated, ast)
 }
 
 /// What parsing a regex of `length` bytes with this syntax tree holds at most: the tree, and
@@ -1067,6 +1091,8 @@ fn for_each_end(input: &str, start: usize, f: &mut dyn FnMut(&str)) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
 
     fn matches(pattern: &str, host: &str) -> bool {
@@ -1560,6 +1586,94 @@ mod tests {
                         matches(&exact_rule, input),
                         exact.iter().any(|c| c == part),
                         "{exact_rule} vs {input}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_regex_is_built_for_ascii_input() {
+        let cost = Matcher::compile(r"/(https?:\/\/)1\.2\.3\..{100,}/")
+            .unwrap()
+            .cost_bytes();
+
+        assert!(cost < 16 * 1024, "{cost} bytes");
+    }
+
+    #[test]
+    fn a_regex_that_needs_unicode_falls_back_to_it() {
+        let (class, _, _) = compile_regex(r"^\pL+x$", usize::MAX).unwrap();
+        let (literal, _, _) = compile_regex("^caf\u{e9}$", usize::MAX).unwrap();
+
+        assert!(class.is_match("abx"));
+        assert!(!class.is_match("a1x"));
+        assert!(literal.is_match("caf\u{e9}"));
+    }
+
+    fn fixture_regexes() -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lists/adguard-dns.txt.gz");
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+
+        text.lines()
+            .filter(|line| line.len() > 2 && line.starts_with('/') && line.ends_with('/'))
+            .map(|line| line[1..line.len() - 1].to_string())
+            .collect()
+    }
+
+    fn build_in(source: &str, alphabet: Alphabet) -> Regex {
+        let translated = translate_go_regex(source).unwrap();
+        let ast = ast::parse::Parser::new().parse(&translated).unwrap();
+        let hir = translate_hir(&translated, &ast, alphabet).unwrap();
+
+        meta::Builder::new()
+            .configure(meta::Config::new().which_captures(WhichCaptures::None))
+            .build_from_hir(&hir)
+            .unwrap()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn the_ascii_and_the_unicode_build_agree_on_ascii_hosts(
+            random in "[ -~]{0,60}",
+            address in "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}(:[0-9]{1,3})?",
+            prefix in proptest::sample::select(vec!["", "http://", "https://"]),
+            label in "(mon|tue|wed|a|c|anon1)[0-9a-f]{0,60}(\\.com)?",
+        ) {
+            static BUILDS: std::sync::OnceLock<Vec<(String, Regex, Regex)>> =
+                std::sync::OnceLock::new();
+            let builds = BUILDS.get_or_init(|| {
+                let regexes = fixture_regexes();
+                assert!(regexes.len() >= 20);
+
+                regexes
+                    .into_iter()
+                    .map(|source| {
+                        let ascii = build_in(&source, Alphabet::Ascii);
+                        let unicode = build_in(&source, Alphabet::Unicode);
+
+                        (source, ascii, unicode)
+                    })
+                    .collect()
+            });
+
+            let hosts = [
+                random,
+                format!("{prefix}{address}"),
+                format!("{prefix}139.45.197.2{}", address.len()),
+                format!("{prefix}{label}"),
+                format!("{prefix}{label}.png#/ads/"),
+            ];
+            for (source, ascii, unicode) in builds {
+                for host in &hosts {
+                    proptest::prop_assert_eq!(
+                        ascii.is_match(host),
+                        unicode.is_match(host),
+                        "{} on {:?}", source, host
                     );
                 }
             }
