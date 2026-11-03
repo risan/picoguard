@@ -657,14 +657,15 @@ impl Pipeline {
         let asker = Asker::new(client);
         let mut out = Vec::new();
         let settled = self.settle(&request, protocol, None, &mut out);
-        if settled == Err(Quick::Dropped) {
-            return None;
+        match settled {
+            Err(Quick::Dropped) => return None,
+            // A malformed query or an unsupported EDNS version: the reply does not depend on
+            // any policy.
+            Err(Quick::Replied) => return Some(Prepared(Inner::Final(out))),
+            _ => {}
         }
 
-        let Ok(parsed) = Query::parse(&request) else {
-            // A malformed query: the header-only reply does not depend on any policy.
-            return Some(Prepared(Inner::Final(out)));
-        };
+        let parsed = Query::parse(&request).ok()?;
         let compact = build::compact_query(&parsed);
         drop(request);
         match settled {
@@ -993,6 +994,12 @@ impl Pipeline {
             Quick::Dropped
         })?;
         let reply = Reply::new(&query, self.udp_size, protocol);
+        if query.edns.is_some_and(|edns| edns.version > 0) {
+            reply.bad_version(out);
+
+            return Err(Quick::Replied);
+        }
+
         let name = &query.question.name;
         let record = |result| {
             if let Some(asker) = asker {
@@ -3126,5 +3133,67 @@ mod tests {
 
         assert_eq!(parse(&reply).metadata.response_code, ResponseCode::ServFail);
         assert_eq!(cached_bytes(&pipeline, &spec), None);
+    }
+
+    fn version_one_query(name: &str) -> Vec<u8> {
+        let mut request = edns_query(name).bytes();
+        let version_at = request.len() - OPT_RECORD_LEN + 6;
+        request[version_at] = 1;
+
+        request
+    }
+
+    fn assert_bad_version(reply: &[u8]) {
+        let opt = &reply[reply.len() - OPT_RECORD_LEN..];
+
+        assert_eq!(reply[3] & 0x0F, rcode::NOERROR, "the header RCODE");
+        assert_eq!(&reply[6..8], &[0, 0], "no answers");
+        assert_eq!(opt[5], 1, "the extended RCODE: BADVERS");
+        assert_eq!(opt[6], 0, "our OPT says version 0");
+        assert_eq!(&reply[0..2], &edns_query("v1.example.").bytes()[0..2]);
+    }
+
+    #[tokio::test]
+    async fn an_edns_version_above_zero_is_answered_with_badvers_without_asking_the_upstream() {
+        let fake = fake_dns(vec![Ipv4Addr::new(2, 2, 2, 2)], vec![]).await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(fake.address), Arc::new(Policy::new())).unwrap();
+        let request = version_one_query("v1.example.");
+
+        let mut over_udp = Vec::new();
+        let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut over_udp);
+        assert_eq!(quick, Quick::Replied);
+        assert_bad_version(&over_udp);
+
+        let mut over_tcp = Vec::new();
+        let prepared = pipeline
+            .prepare(request.clone(), Protocol::Tcp, CLIENT)
+            .await
+            .unwrap();
+        assert!(pipeline.finish(&prepared, &mut over_tcp).await.is_some());
+        assert_bad_version(&over_tcp);
+
+        let mut whole = Vec::new();
+        assert!(
+            pipeline
+                .answer(request, Protocol::Tcp, CLIENT, &mut whole)
+                .await
+        );
+        assert_bad_version(&whole);
+
+        assert_eq!(fake.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(counters(&pipeline).total, 0);
+    }
+
+    #[tokio::test]
+    async fn an_edns_version_zero_query_is_still_resolved() {
+        let fake = fake_dns(vec![Ipv4Addr::new(2, 2, 2, 2)], vec![]).await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(fake.address), Arc::new(Policy::new())).unwrap();
+
+        let reply = answer_over_udp(&pipeline, &edns_query("v0.example.")).await;
+
+        assert_eq!(answer_addresses(&reply), ["2.2.2.2"]);
+        assert_eq!(fake.queries.load(Ordering::SeqCst), 1);
     }
 }

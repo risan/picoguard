@@ -78,6 +78,13 @@ impl<'q, 'a> Reply<'q, 'a> {
         self.end(out, 0);
     }
 
+    /// RFC 6891 section 6.1.3: BADVERS (16) is RCODE 0 in the header and extended RCODE 1 in
+    /// our OPT record, which says version 0, the only one we speak.
+    pub fn bad_version(&self, out: &mut Vec<u8>) {
+        self.begin(rcode::NOERROR, out);
+        self.end(out, 1);
+    }
+
     /// AdGuard "default" blocking: A is 0.0.0.0, AAAA is ::, HTTPS is empty,
     /// every other type is NODATA with a SOA.
     pub fn blocked(&self, ttl: u32, out: &mut Vec<u8>) {
@@ -1175,7 +1182,8 @@ mod tests {
             again.edns,
             Some(crate::dns::wire::Edns {
                 udp_size: 1400,
-                dnssec_ok: true
+                dnssec_ok: true,
+                version: 0
             })
         );
         let without_edns = QuerySpec::new("example.com.", RecordType::A).bytes();

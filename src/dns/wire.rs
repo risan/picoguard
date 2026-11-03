@@ -425,6 +425,7 @@ fn read_question(msg: &[u8], start: usize) -> Result<(Question, usize), WireErro
 pub struct Edns {
     pub udp_size: u16,
     pub dnssec_ok: bool,
+    pub version: u8,
 }
 
 /// Why a datagram or frame is not a query that can be processed.
@@ -519,6 +520,7 @@ fn read_query_edns(msg: &[u8], start: usize, count: u16) -> Result<Option<Edns>,
             edns = Some(Edns {
                 udp_size: class,
                 dnssec_ok: ttl & EDNS_DO != 0,
+                version: (ttl >> 16) as u8,
             });
         }
 
@@ -1146,9 +1148,23 @@ mod tests {
             query.edns,
             Some(Edns {
                 udp_size: 1400,
-                dnssec_ok: true
+                dnssec_ok: true,
+                version: 0
             })
         );
+    }
+
+    #[test]
+    fn the_edns_version_of_a_query_is_read() {
+        let mut bytes = QuerySpec::new("www.example.com.", RecordType::A);
+        bytes.edns = Some((1232, false));
+        let mut bytes = bytes.bytes();
+        assert_eq!(Query::parse(&bytes).unwrap().edns.unwrap().version, 0);
+
+        let version_at = bytes.len() - 11 + 6;
+        bytes[version_at] = 3;
+
+        assert_eq!(Query::parse(&bytes).unwrap().edns.unwrap().version, 3);
     }
 
     #[test]
