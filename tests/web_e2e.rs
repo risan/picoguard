@@ -1907,20 +1907,22 @@ async fn unsafe_mutations_are_rejected_with_a_session_cookie() {
 /// is accepted.
 #[tokio::test]
 async fn every_change_route_accepts_the_request_the_tables_refuse() {
+    let mut routes = tokio::task::JoinSet::new();
     for index in 0..change_routes("").len() {
-        let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-        let site = seeded_site(local_config(&upstream), true).await;
-        let route = change_routes(&site.list).swap_remove(index);
+        routes.spawn(async move {
+            let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+            let site = seeded_site(local_config(&upstream), true).await;
+            let route = change_routes(&site.list).swap_remove(index);
+            let reply = site.send(route.valid()).await;
 
-        let reply = site.send(route.valid()).await;
+            (route.name, reply.status, reply.body)
+        });
+    }
 
-        assert!(
-            reply.status == 200 || reply.status == 202,
-            "{}: {} {}",
-            route.name,
-            reply.status,
-            reply.body
-        );
+    while let Some(done) = routes.join_next().await {
+        let (name, status, body) = done.unwrap();
+
+        assert!(status == 200 || status == 202, "{name}: {status} {body}");
     }
 }
 
