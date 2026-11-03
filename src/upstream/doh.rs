@@ -4,6 +4,7 @@
 
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{ACCEPT, CONTENT_TYPE};
@@ -11,7 +12,7 @@ use http::{Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Incoming};
 use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::time::{Instant, timeout_at};
 
 use super::tls::TlsDialer;
@@ -20,6 +21,13 @@ use crate::budget::Budget;
 use crate::config::LimitsConfig;
 
 pub(super) const DNS_MESSAGE: &str = "application/dns-message";
+
+/// A connection that was silent for this long while a request waits gets a PING, and one that
+/// does not answer it within `DEAD_CONNECTION_PING_TIMEOUT` is dropped. Together they must stay
+/// well below the per-try deadline (half of `timeout_ms`, 2.5 s by default), so the request is
+/// resent on a new connection within the same try. An idle connection sends no PINGs.
+const DEAD_CONNECTION_PING_AFTER: Duration = Duration::from_millis(500);
+const DEAD_CONNECTION_PING_TIMEOUT: Duration = Duration::from_millis(500);
 
 type Sender = http2::SendRequest<Full<Bytes>>;
 
@@ -250,6 +258,9 @@ impl DohUpstream {
 
         let mut builder = http2::Builder::new(TokioExecutor::new());
         builder
+            .timer(TokioTimer::new())
+            .keep_alive_interval(Some(DEAD_CONNECTION_PING_AFTER))
+            .keep_alive_timeout(DEAD_CONNECTION_PING_TIMEOUT)
             .initial_stream_window_size(self.stream_window)
             .initial_connection_window_size(self.connection_window)
             .max_header_list_size(self.max_header_list);
@@ -283,13 +294,13 @@ fn from_hyper(error: hyper::Error) -> UpstreamError {
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use http::request::Parts;
     use rustls::pki_types::ServerName;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
     use crate::upstream::endpoint::Remote;
@@ -322,6 +333,77 @@ mod tests {
         query[0..2].copy_from_slice(&id.to_be_bytes());
 
         query
+    }
+
+    /// Copies bytes both ways until `dead` is set; after that every byte is dropped and the
+    /// sockets stay open: a path that died without a FIN or RST.
+    async fn forward(client: TcpStream, server: TcpStream, dead: Arc<AtomicBool>) {
+        let (client_read, client_write) = client.into_split();
+        let (server_read, server_write) = server.into_split();
+
+        tokio::join!(
+            relay(client_read, server_write, Arc::clone(&dead)),
+            relay(server_read, client_write, dead),
+        );
+    }
+
+    async fn relay(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, dead: Arc<AtomicBool>) {
+        let mut buffer = [0u8; 16384];
+        while let Ok(read) = from.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+
+            if dead.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            if to.write_all(&buffer[..read]).await.is_err() {
+                break;
+            }
+        }
+
+        // Keeps `to` open, so the other side sees silence instead of a close.
+        std::future::pending::<()>().await;
+    }
+
+    #[tokio::test]
+    async fn a_silently_dead_connection_is_noticed_and_the_query_retried() {
+        let pki = TestPki::new();
+        let server = doh_server(&pki, |_, body| respond_with_answer(body)).await;
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_address = front.local_addr().unwrap();
+        let backend = server.address;
+        let first_connection_dead = Arc::new(AtomicBool::new(false));
+        let first_connection_flag = Arc::clone(&first_connection_dead);
+        tokio::spawn(async move {
+            let mut accepted = 0;
+            while let Ok((client, _)) = front.accept().await {
+                let dead = if accepted == 0 {
+                    Arc::clone(&first_connection_flag)
+                } else {
+                    Arc::new(AtomicBool::new(false))
+                };
+                accepted += 1;
+                let upstream = TcpStream::connect(backend).await.unwrap();
+                tokio::spawn(forward(client, upstream, dead));
+            }
+        });
+        let upstream = upstream_for(&pki, front_address, &LimitsConfig::default());
+        upstream
+            .query(&query_for("example.com."), deadline())
+            .await
+            .unwrap();
+
+        first_connection_dead.store(true, Ordering::SeqCst);
+        let one_try = Duration::from_secs(5);
+        let started = Instant::now();
+        let result = upstream
+            .query(&query_for("example.com."), Instant::now() + one_try)
+            .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(started.elapsed() < one_try / 2, "{:?}", started.elapsed());
     }
 
     #[tokio::test]
@@ -436,7 +518,7 @@ mod tests {
     #[tokio::test]
     async fn a_slow_server_times_out_and_the_next_query_gets_a_new_connection() {
         let pki = TestPki::new();
-        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let first = Arc::new(AtomicBool::new(true));
         let server = doh_server(&pki, move |_, body| {
             let mut reaction = respond_with_answer(body);
             if first.swap(false, Ordering::SeqCst) {
