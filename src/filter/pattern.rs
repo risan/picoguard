@@ -666,12 +666,13 @@ pub fn regex_shortcut(pattern: &str) -> String {
 /// Go: `([^\\])\<open>.*[^\\]\<close>` replaced by `$1...`, leftmost and greedy.
 fn replace_brackets(chars: &[char], open: char, close: char) -> Vec<char> {
     let mut out = Vec::with_capacity(chars.len());
+    let last_close = (1..chars.len())
+        .rev()
+        .find(|&j| chars[j] == close && chars[j - 1] != '\\');
     let mut at = 0;
     while at < chars.len() {
         if chars[at] != '\\' && chars.get(at + 1) == Some(&open) {
-            let end = (at + 3..chars.len())
-                .rev()
-                .find(|&j| chars[j] == close && chars[j - 1] != '\\');
+            let end = last_close.filter(|&j| j >= at + 3);
             if let Some(end) = end {
                 out.push(chars[at]);
                 out.extend("...".chars());
@@ -934,52 +935,63 @@ fn translate_group(chars: &[char], at: usize, out: &mut String) -> Result<usize,
         return Ok(at + 1);
     }
 
-    let rest: String = chars[at + 2..].iter().collect();
-    let name_start = rest.strip_prefix("P<").or_else(|| rest.strip_prefix('<'));
-    if let Some(name_start) = name_start {
+    let rest = &chars[at + 2..];
+    let name_prefix = if rest.starts_with(&['P', '<']) {
+        2
+    } else if rest.starts_with(&['<']) {
+        1
+    } else {
+        0
+    };
+    if name_prefix > 0 {
+        let name_start = &rest[name_prefix..];
         let name_end = name_start
-            .find('>')
+            .iter()
+            .position(|&c| c == '>')
             .ok_or_else(|| syntax_error("unclosed group name"))?;
         let name = &name_start[..name_end];
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        if name.is_empty() || !name.iter().all(|&c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(syntax_error("invalid named capture"));
         }
 
         // Go accepts numeric and repeated names, which the regex crate rejects; nothing
         // can refer to a capture here, so a plain group is equivalent.
         out.push_str("(?:");
-        let header = &rest[..rest.len() - name_start.len() + name_end + 1];
 
-        return Ok(at + 2 + header.chars().count());
+        return Ok(at + 2 + name_prefix + name_end + 1);
     }
 
     let flags_end = rest
-        .find([')', ':'])
+        .iter()
+        .position(|&c| c == ')' || c == ':')
         .ok_or_else(|| syntax_error("unclosed group flags"))?;
     let flags = &rest[..flags_end];
-    if !flags.chars().all(|c| "imsU-".contains(c)) {
+    if !flags.iter().all(|&c| "imsU-".contains(c)) {
         return Err(syntax_error("unsupported group syntax"));
     }
 
     out.push_str("(?");
-    out.push_str(flags);
+    out.extend(flags);
 
-    Ok(at + 2 + flags.chars().count())
+    Ok(at + 2 + flags_end)
 }
 
 /// A `{` starts a repetition only as `{n}`, `{n,}` or `{n,m}`; otherwise it is literal.
 fn translate_brace(chars: &[char], at: usize, out: &mut String) -> Result<usize, PatternError> {
-    let rest: String = chars[at + 1..].iter().collect();
-    let Some(close) = rest.find('}') else {
+    let body_end = chars[at + 1..]
+        .iter()
+        .position(|&c| !(c.is_ascii_digit() || c == ','))
+        .map_or(chars.len(), |offset| at + 1 + offset);
+    if chars.get(body_end) != Some(&'}') {
         out.push_str("\\{");
 
         return Ok(at + 1);
-    };
+    }
 
-    let body = &rest[..close];
+    let body: String = chars[at + 1..body_end].iter().collect();
     let (low, high) = match body.split_once(',') {
         Some((low, high)) => (low, Some(high)),
-        None => (body, None),
+        None => (body.as_str(), None),
     };
     // Go's parseInt: digits without a leading zero.
     let digits = |text: &str| {
@@ -1005,10 +1017,10 @@ fn translate_brace(chars: &[char], at: usize, out: &mut String) -> Result<usize,
     }
 
     out.push('{');
-    out.push_str(body);
+    out.push_str(&body);
     out.push('}');
 
-    Ok(at + 2 + body.chars().count())
+    Ok(body_end + 1)
 }
 
 // ---- Fast-path candidates ----
@@ -1210,6 +1222,26 @@ mod tests {
         assert_eq!(glob_shortcut("*"), "");
         assert_eq!(glob_shortcut("abc*de"), "abc");
         assert_eq!(glob_shortcut("ab*cd*efg"), "efg");
+    }
+
+    #[test]
+    fn a_4_kib_line_of_unclosed_openers_is_processed_in_linear_time() {
+        let started = std::time::Instant::now();
+        for unit in ["a{", "a(", "a[", "(?:", "(?P<", "a{1,"] {
+            let body = unit.repeat(4000 / unit.len());
+            for _ in 0..10 {
+                let _ = regex_shortcut(&format!("/{body}/"));
+                let _ = translate_go_regex(&body);
+            }
+        }
+
+        // Quadratic code needs over two seconds for this in a debug build, linear code 40
+        // milliseconds; the bound leaves room for a loaded machine.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
