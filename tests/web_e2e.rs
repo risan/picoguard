@@ -3102,16 +3102,37 @@ async fn oversized_request_heads_are_refused() {
     assert_eq!(after.status, 200, "the server still answers");
 }
 
-/// How many connections the page serves at once, and how long one may take to send its head:
-/// `MAX_CONNECTIONS` and `HEAD_TIMEOUT` in `src/web.rs`.
+/// How many connections the page serves at once, how many of them one client may hold, and how
+/// long one may take to send its head and its body: `MAX_CONNECTIONS`,
+/// `MAX_CONNECTIONS_PER_CLIENT`, `HEAD_TIMEOUT` and `BODY_TIMEOUT` in `src/web.rs`.
 const PAGE_CONNECTIONS: usize = 16;
+const PAGE_CONNECTIONS_PER_CLIENT: usize = 4;
+
+async fn connect_from(web: SocketAddr, from: &str) -> TcpStream {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddr::new(from.parse().unwrap(), 0))
+        .unwrap();
+
+    socket.connect(web).await.unwrap()
+}
+
+async fn closes_within(stream: &mut TcpStream, wait: Duration) -> bool {
+    let mut chunk = [0u8; 64];
+
+    matches!(
+        tokio::time::timeout(wait, stream.read(&mut chunk)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
 
 #[tokio::test]
 async fn connections_that_send_no_head_cannot_hold_the_page_down() {
     let (site, _upstream) = plain_site().await;
     let mut idle = Vec::new();
     for index in 0..PAGE_CONNECTIONS {
-        let mut stream = TcpStream::connect(site.web).await.unwrap();
+        let from = format!("127.0.0.{}", 1 + index / PAGE_CONNECTIONS_PER_CLIENT);
+        let mut stream = connect_from(site.web, &from).await;
         if index % 2 == 1 {
             stream
                 .write_all(b"GET /api/status HTTP/1.1\r\nHost: x\r\n")
@@ -3134,19 +3155,61 @@ async fn connections_that_send_no_head_cannot_hold_the_page_down() {
     );
 
     for (index, mut stream) in idle.into_iter().enumerate() {
-        let mut chunk = [0u8; 64];
-        let closed = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
-            .await
-            .unwrap_or_else(|_| panic!("connection {index} was still open after 15 s"));
-
         assert!(
-            matches!(closed, Ok(0) | Err(_)),
-            "connection {index} got {closed:?}"
+            closes_within(&mut stream, Duration::from_secs(15)).await,
+            "connection {index} was still open after 15 s"
         );
     }
 
     let after = site.send(get("/api/status")).await;
     assert_eq!(after.status, 200, "the page answers again");
+}
+
+#[tokio::test]
+async fn one_client_cannot_hold_more_than_its_share_of_the_page_connections() {
+    let (site, _upstream) = plain_site().await;
+    let stalled_login = "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                         Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{";
+    let mut stalled = Vec::new();
+    for _ in 0..PAGE_CONNECTIONS_PER_CLIENT {
+        let mut stream = connect_from(site.web, "127.0.0.1").await;
+        stream.write_all(stalled_login.as_bytes()).await.unwrap();
+        stalled.push(stream);
+    }
+
+    let mut fifth = connect_from(site.web, "127.0.0.1").await;
+
+    assert!(
+        closes_within(&mut fifth, Duration::from_secs(1)).await,
+        "a fifth connection from one client was kept"
+    );
+    let other = exchange_from(
+        site.web,
+        "127.0.0.2".parse().unwrap(),
+        &get("/api/status").bytes(site.web),
+    )
+    .await;
+    assert!(
+        parse_reply(&other).is_some_and(|reply| reply.status == 200 || reply.status == 401),
+        "another client was not answered: {other:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_sent_in_time_is_answered_with_408() {
+    let (site, _upstream) = plain_site().await;
+    let request = "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                   Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{";
+
+    let mut stream = TcpStream::connect(site.web).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut reply))
+        .await
+        .expect("the server kept the connection open")
+        .unwrap();
+
+    assert_eq!(parse_reply(&reply).unwrap().status, 408);
 }
 
 #[tokio::test]
