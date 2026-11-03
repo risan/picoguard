@@ -106,8 +106,8 @@ Move your settings from `AdGuardHome.yaml` to `/etc/picoguard/picoguard.toml`:
 | `local_ptr_upstreams`, private domains | `[local] resolver` |
 
 Not included: DHCP (your router does it), serving DoH/DoT to your devices, per-client settings,
-parental control, query log on disk, DNSSEC validation, editing the other settings from the web
-page (edit the TOML file). Blocked services use AdGuard's catalog from its HostlistsRegistry,
+parental control, query log on disk (the statistics are saved, the log is not), DNSSEC validation,
+editing the other settings from the web page (edit the TOML file). Blocked services use AdGuard's catalog from its HostlistsRegistry,
 downloaded at run time and never shipped with picoguard.
 
 For redundancy, run two picoguard instances (for example two containers, or a board and a
@@ -139,9 +139,14 @@ container) and give both addresses to your router as primary and secondary DNS.
   it with one click: the release is checked against a built-in signature key, a small root
   installer swaps the binary, and the old version comes back if the new one does not answer DNS.
   Turn the check and the button off with `[update] check = false`.
-- Almost no disk writes: the query log and statistics live in memory. The only routine write is
-  the last good copy of a list, only when it changed, and it can be turned off. Changes made on
-  the status page are written only when you make them.
+- Statistics that last: the chart shows 24 hours, 7, 30 or 90 days, counted in your time zone. The
+  counters, history, top lists and upstream tallies are saved to `stats.json`, so a restart or an
+  update keeps them, and "Clear statistics" and "Clear query log" start again. The query log is in
+  memory only.
+- Almost no disk writes: the routine writes are the last good copy of a list, only when it
+  changed, and `stats.json`, at most once an hour and only when the statistics changed (plus once
+  when picoguard stops). Both can be turned off. Changes made on the status page are written only
+  when you make them.
 - Hardened service: its own system user, port 53 as the only privilege, and a systemd sandbox.
 - Static binaries for ARMv7, ARM64 and x86_64 Linux. One TOML file for all settings.
 
