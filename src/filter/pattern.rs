@@ -236,9 +236,13 @@ fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize, usize), Pat
         return Err(PatternError::TooBig);
     }
 
-    let hir = translate_hir(&translated, &ast, Alphabet::Ascii)
-        .or_else(|_| translate_hir(&translated, &ast, Alphabet::Unicode))
-        .map_err(|error| PatternError::Regex(error.to_string(), REGEX_BUILD_BYTES + parse_bytes))?;
+    let hir = if may_name_a_non_ascii_character(source) {
+        translate_hir(&translated, &ast, Alphabet::Unicode)
+    } else {
+        translate_hir(&translated, &ast, Alphabet::Ascii)
+            .or_else(|_| translate_hir(&translated, &ast, Alphabet::Unicode))
+    }
+    .map_err(|error| PatternError::Regex(error.to_string(), REGEX_BUILD_BYTES + parse_bytes))?;
     drop(ast);
     let size_limit = if room == usize::MAX {
         REGEX_SIZE_LIMIT
@@ -272,6 +276,16 @@ fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize, usize), Pat
     let cost = regex.memory_usage() + regex.create_cache().memory_usage();
 
     Ok((regex, cost, parse_bytes))
+}
+
+/// True when `source` may spell a character beyond ASCII, by itself or through an escape.
+/// Case folding in the ASCII alphabet loses what such a character folds to: U+212A (the Kelvin
+/// sign) is a `k`, U+017F a `s`. A false positive only costs a larger automaton.
+fn may_name_a_non_ascii_character(source: &str) -> bool {
+    !source.is_ascii()
+        || ["\\x{", "\\u", "\\p", "\\P"]
+            .iter()
+            .any(|escape| source.contains(escape))
 }
 
 /// What a regex is matched against.
@@ -1609,6 +1623,38 @@ mod tests {
         assert!(class.is_match("abx"));
         assert!(!class.is_match("a1x"));
         assert!(literal.is_match("caf\u{e9}"));
+    }
+
+    #[test]
+    fn a_character_that_folds_to_ascii_keeps_its_folding() {
+        let cases = [
+            (r"^(?:\x{212a})ey\.example$", "key.example"),
+            (r"^\x{212A}ey\.example$", "KEY.example"),
+            (r"^\x{017f}ite\.example$", "site.example"),
+            ("^\u{212a}ey\\.example$", "key.example"),
+            ("^\u{17f}ite\\.example$", "SITE.example"),
+            (r"^[\x{212a}]ey\.example$", "key.example"),
+        ];
+        for (source, host) in cases {
+            let (regex, _, _) = compile_regex(source, usize::MAX).unwrap();
+
+            assert!(regex.is_match(host), "{source} on {host}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_regex_is_built_for_ascii() {
+        for source in [
+            r"^ads[0-9]+\.example$",
+            r"^(?:a|b)\w*\.(com|net)$",
+            r"\0\.x",
+        ] {
+            assert!(!may_name_a_non_ascii_character(source), "{source}");
+        }
+
+        for source in [r"\x{212a}", r"\pL", r"\P{Greek}", "caf\u{e9}", r"K"] {
+            assert!(may_name_a_non_ascii_character(source), "{source}");
+        }
     }
 
     fn fixture_regexes() -> Vec<String> {
