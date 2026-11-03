@@ -486,6 +486,9 @@ async fn plain_site() -> (Site, common::harness::FakeUpstream) {
     (site, upstream)
 }
 
+const PAGE_CSP: &str =
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'";
+
 #[tokio::test]
 async fn the_page_is_served_with_protective_headers() {
     let (site, _upstream) = plain_site().await;
@@ -501,13 +504,7 @@ async fn the_page_is_served_with_protective_headers() {
     assert_eq!(reply.header("cache-control"), Some("no-store"));
     assert_eq!(reply.header("x-content-type-options"), Some("nosniff"));
     assert_eq!(reply.header("x-frame-options"), Some("DENY"));
-    assert_eq!(
-        reply.header("content-security-policy"),
-        Some(
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
-             connect-src 'self'"
-        )
-    );
+    assert_eq!(reply.header("content-security-policy"), Some(PAGE_CSP));
     // No answer ever grants a cross-origin read.
     assert!(reply.header("access-control-allow-origin").is_none());
 }
@@ -2083,6 +2080,115 @@ async fn wrong_basic_auth_counts_toward_the_limit_and_anonymous_requests_do_not(
 }
 
 #[tokio::test]
+async fn an_anonymous_request_is_asked_to_sign_in_before_a_path_is_found_missing() {
+    let (site, _upstream) = plain_site().await;
+
+    let anonymous = site.send_as_is(get("/nope")).await;
+    let signed_in = site.send_as_is(get("/nope").signed_in(ADMIN)).await;
+
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(signed_in.status, 404);
+}
+
+#[tokio::test]
+async fn a_bearer_token_is_not_a_login_and_does_not_count_toward_the_limit() {
+    let (site, _upstream) = plain_site().await;
+
+    for _ in 0..10 {
+        let reply = site
+            .send_from(
+                "127.0.0.2",
+                get("/api/status").header("Authorization", "Bearer x"),
+            )
+            .await;
+        assert_eq!(reply.status, 401);
+    }
+
+    let reply = site
+        .send_from("127.0.0.2", get("/api/status").signed_in(ADMIN))
+        .await;
+    assert_eq!(reply.status, 200);
+}
+
+#[tokio::test]
+async fn every_refusal_carries_the_protective_headers_and_grants_no_cross_origin_read() {
+    let (site, _upstream) = plain_site().await;
+    let padded = format!("{{}}{}", " ".repeat(64 * 1024));
+    for _ in 0..5 {
+        site.send_from("127.0.0.2", get("/api/status").signed_in(WRONG_PASSWORD))
+            .await;
+    }
+
+    let refusals = [
+        (401, site.send_as_is(get("/api/status")).await),
+        (
+            403,
+            site.send_as_is(
+                get("/api/lists")
+                    .header("Host", "evil.example")
+                    .signed_in(ADMIN),
+            )
+            .await,
+        ),
+        (404, site.send_as_is(get("/nope").signed_in(ADMIN)).await),
+        (
+            405,
+            site.send_as_is(get("/api/pause").signed_in(ADMIN)).await,
+        ),
+        (
+            413,
+            site.send_as_is(post("/api/settings", &padded).signed_in(ADMIN))
+                .await,
+        ),
+        (
+            429,
+            site.send_from("127.0.0.2", get("/api/status").signed_in(ADMIN))
+                .await,
+        ),
+    ];
+
+    for (status, reply) in refusals {
+        assert_eq!(reply.status, status, "{}", reply.body);
+        assert_eq!(reply.header("cache-control"), Some("no-store"), "{status}");
+        assert_eq!(
+            reply.header("x-content-type-options"),
+            Some("nosniff"),
+            "{status}"
+        );
+        assert_eq!(reply.header("x-frame-options"), Some("DENY"), "{status}");
+        assert_eq!(
+            reply.header("content-security-policy"),
+            Some(PAGE_CSP),
+            "{status}"
+        );
+        assert_no_cross_origin_grant(&reply, &status.to_string());
+    }
+}
+
+#[tokio::test]
+async fn a_preflight_is_not_answered_with_a_cross_origin_grant() {
+    let (site, _upstream) = plain_site().await;
+    let preflight = Request {
+        method: "OPTIONS",
+        ..get("/api/pause")
+            .header("Origin", "http://evil.example")
+            .header("Access-Control-Request-Method", "POST")
+            .signed_in(ADMIN)
+    };
+
+    let reply = site.send_as_is(preflight).await;
+
+    assert_no_cross_origin_grant(&reply, "OPTIONS");
+    assert!(!site.is_paused());
+}
+
+fn assert_no_cross_origin_grant(reply: &Reply, what: &str) {
+    for (name, _) in &reply.headers {
+        assert!(!name.starts_with("access-control-allow-"), "{what}: {name}");
+    }
+}
+
+#[tokio::test]
 async fn a_password_hash_opens_the_api_with_basic_auth() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
     let site = site(hashed_config(&upstream, "s3cret", 1000)).await;
@@ -2467,8 +2573,7 @@ async fn a_request_without_a_host_is_refused() {
 
     let bytes = exchange(site.web, b"GET /api/status HTTP/1.0\r\n\r\n").await;
 
-    let reply = parse_reply(&bytes);
-    assert!(reply.is_none_or(|reply| reply.status == 403 || reply.status == 400));
+    assert_eq!(parse_reply(&bytes).map(|reply| reply.status), Some(403));
 }
 
 #[tokio::test]
@@ -2479,19 +2584,17 @@ async fn oversized_request_heads_are_refused() {
         .map(|index| (format!("X-Header-{index}"), "v".to_string()))
         .collect();
 
-    let mut with_long = get("/api/status");
+    let mut with_long = get("/api/status").signed_in(ADMIN);
     with_long = with_long.header("X-Long", &long_value);
-    let mut with_many = get("/api/status");
+    let mut with_many = get("/api/status").signed_in(ADMIN);
     with_many.headers.extend(many_headers);
 
     for (what, request) in [("a long header", with_long), ("many headers", with_many)] {
         let bytes = exchange(site.web, &request.bytes(site.web)).await;
         let status = parse_reply(&bytes).map(|reply| reply.status);
 
-        assert!(
-            status.is_none_or(|status| status >= 400),
-            "{what}: {status:?}"
-        );
+        // Signed in, so only the head limit can refuse it: the status route would answer 200.
+        assert!(status == Some(431), "{what}: {status:?}");
     }
 
     let after = site.send(get("/api/status")).await;
