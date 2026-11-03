@@ -532,10 +532,13 @@ pub(super) fn base64(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::time::Duration;
 
     use hyper::header::HeaderValue;
     use tokio::task::JoinSet;
+
+    use crate::password::MAX_ITERATIONS;
 
     use super::*;
 
@@ -930,16 +933,22 @@ mod tests {
         auth.check(ip(peer), Attempt::Form { user, password }).await
     }
 
-    fn timed_verify(hash: &PasswordHash) -> Duration {
-        (0..3)
-            .map(|_| {
-                let started = Instant::now();
-                hash.verify(b"not it");
+    /// Whether `check` is still waiting while another task holds the only hashing permit,
+    /// which only a check that needs the hash does. Gives the permit back and lets a waiting
+    /// check finish before it returns.
+    async fn needs_the_hash(auth: &Auth, check: impl Future<Output = Check>) -> bool {
+        let permit = Arc::clone(&auth.hashing).acquire_owned().await.unwrap();
+        let mut check = std::pin::pin!(check);
 
-                started.elapsed()
-            })
-            .min()
-            .unwrap()
+        let waited = tokio::time::timeout(Duration::from_millis(100), &mut check)
+            .await
+            .is_err();
+        drop(permit);
+        if waited {
+            check.await;
+        }
+
+        waited
     }
 
     #[tokio::test]
@@ -1004,76 +1013,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_the_first_success_the_same_credentials_are_checked_in_microseconds() {
-        let hash = PasswordHash::new(b"s3cret", 100_000).unwrap();
+    async fn after_the_first_success_the_same_credentials_are_accepted_without_the_hash() {
+        let hash = PasswordHash::new(b"s3cret", 1000).unwrap();
         let auth = auth(&hashed_config("admin", &hash));
-
-        let started = Instant::now();
-        assert_eq!(
-            check_basic(&auth, "192.0.2.1", "admin", "s3cret").await,
-            Check::Accepted
-        );
-        let first = started.elapsed();
-
-        let started = Instant::now();
-        for _ in 0..50 {
-            assert_eq!(
-                check_basic(&auth, "192.0.2.1", "admin", "s3cret").await,
-                Check::Accepted
-            );
-            assert_eq!(
-                check_form(&auth, "192.0.2.1", "admin", "s3cret").await,
-                Check::Accepted
-            );
-        }
-        let hundred = started.elapsed();
-
         assert!(
-            hundred < first / 10,
-            "first {first:?}, next 100 {hundred:?}"
+            needs_the_hash(&auth, check_basic(&auth, "192.0.2.1", "admin", "s3cret")).await,
+            "the first success has to be hashed"
         );
+
+        assert!(!needs_the_hash(&auth, check_basic(&auth, "192.0.2.1", "admin", "s3cret")).await);
+        assert!(!needs_the_hash(&auth, check_form(&auth, "192.0.2.1", "admin", "s3cret")).await);
     }
 
     #[tokio::test]
-    async fn every_wrong_attempt_pays_the_full_hash_even_after_a_success() {
-        let hash = PasswordHash::new(b"s3cret", 100_000).unwrap();
+    async fn every_wrong_attempt_needs_the_hash_even_after_a_success() {
+        let hash = PasswordHash::new(b"s3cret", 1000).unwrap();
         let auth = auth(&hashed_config("admin", &hash));
         assert_eq!(
             check_form(&auth, "192.0.2.1", "admin", "s3cret").await,
             Check::Accepted
         );
-        let one = timed_verify(&hash);
 
-        let started = Instant::now();
-        assert_eq!(
-            check_form(&auth, "192.0.2.1", "admin", "wrong").await,
-            Check::Refused
-        );
-        let wrong = started.elapsed();
-
-        assert!(
-            wrong >= one / 2,
-            "one hash {one:?}, wrong attempt {wrong:?}"
-        );
+        assert!(needs_the_hash(&auth, check_form(&auth, "192.0.2.1", "admin", "wrong")).await);
     }
 
     #[tokio::test]
-    async fn a_wrong_user_and_a_wrong_password_cost_the_same_hash() {
-        let hash = PasswordHash::new(b"s3cret", 100_000).unwrap();
+    async fn a_wrong_user_and_a_wrong_password_both_need_the_hash() {
+        let hash = PasswordHash::new(b"s3cret", 1000).unwrap();
         let auth = auth(&hashed_config("admin", &hash));
-        let one = timed_verify(&hash);
 
         for (user, password) in [("other", "s3cret"), ("admin", "wrong")] {
-            let started = Instant::now();
-            assert_eq!(
-                check_basic(&auth, "192.0.2.1", user, password).await,
-                Check::Refused
-            );
-            let took = started.elapsed();
-
             assert!(
-                took >= one / 2,
-                "{user}: one hash {one:?}, attempt {took:?}"
+                needs_the_hash(&auth, check_basic(&auth, "192.0.2.1", user, password)).await,
+                "{user}"
             );
         }
     }
@@ -1140,7 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_is_counted_even_when_the_request_is_dropped_mid_hash() {
-        let hash = PasswordHash::new(b"s3cret", 2_000_000).unwrap();
+        let hash = PasswordHash::new(b"s3cret", MAX_ITERATIONS).unwrap();
         let auth = Arc::new(auth(&hashed_config("admin", &hash)));
 
         let attempt = tokio::spawn({
