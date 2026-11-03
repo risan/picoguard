@@ -3,6 +3,7 @@
 
 pub mod compile;
 pub mod engine;
+mod hash_set;
 pub mod parse;
 pub mod pattern;
 pub mod rpz;
