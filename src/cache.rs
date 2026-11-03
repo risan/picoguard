@@ -117,7 +117,8 @@ struct Entry {
     data: Box<[u16]>,
     reply_len: u32,
     request_flags: u8,
-    inserted: Instant,
+    /// Whole seconds after `Cache::epoch`.
+    inserted_secs: u32,
     lifetime_secs: u32,
     memo: Option<Memo>,
 }
@@ -127,7 +128,7 @@ struct NewEntry<'a> {
     key: &'a CacheKey<'a>,
     reply: &'a [u8],
     ttl_offsets: &'a [u16],
-    inserted: Instant,
+    inserted_secs: u32,
     lifetime_secs: u32,
 }
 
@@ -139,7 +140,7 @@ impl Entry {
             key,
             reply,
             ttl_offsets,
-            inserted,
+            inserted_secs,
             lifetime_secs,
         } = new;
 
@@ -158,7 +159,7 @@ impl Entry {
             data,
             reply_len: u32::try_from(reply.len()).expect("a reply is at most 64 KiB"),
             request_flags: key.request_flags,
-            inserted,
+            inserted_secs,
             lifetime_secs,
             memo: None,
         }
@@ -186,10 +187,8 @@ impl Entry {
         cost_of(self.reply_len(), self.ttl_count()) + self.memo.as_ref().map_or(0, memo_cost)
     }
 
-    fn age_secs(&self, now: Instant) -> u32 {
-        let age = now.saturating_duration_since(self.inserted).as_secs();
-
-        u32::try_from(age).unwrap_or(u32::MAX)
+    fn age_secs(&self, now_secs: u32) -> u32 {
+        now_secs.saturating_sub(self.inserted_secs)
     }
 
     fn matches(&self, key: &CacheKey<'_>) -> bool {
@@ -261,6 +260,9 @@ struct Slot {
 /// Entries live in a slab and are linked by index, most recently used first, so a cached reply
 /// costs its one allocation and a slot in a contiguous `Vec`, with no list node of its own.
 pub struct Cache {
+    /// The instant of the first insert. Entries keep their age as whole seconds from it, which
+    /// takes 4 bytes where an `Instant` takes 16.
+    epoch: Option<Instant>,
     slots: Vec<Slot>,
     index: HashMap<u64, u32, BuildHasherDefault<HashIsKey>>,
     newest: u32,
@@ -310,6 +312,7 @@ impl Ttls {
 impl Cache {
     pub fn new(config: &CacheConfig) -> Cache {
         Cache {
+            epoch: None,
             slots: Vec::new(),
             index: HashMap::default(),
             newest: NONE,
@@ -334,6 +337,14 @@ impl Cache {
             next_token: self.next_token,
             ..Cache::new(config)
         }
+    }
+
+    fn secs_since_epoch(&self, now: Instant) -> u32 {
+        let elapsed = self
+            .epoch
+            .map_or(0, |epoch| now.saturating_duration_since(epoch).as_secs());
+
+        u32::try_from(elapsed).unwrap_or(u32::MAX)
     }
 
     pub fn ttls(&self) -> Ttls {
@@ -367,7 +378,7 @@ impl Cache {
             return None;
         }
 
-        let age_secs = entry.age_secs(now);
+        let age_secs = entry.age_secs(self.secs_since_epoch(now));
         let stale = age_secs >= entry.lifetime_secs;
         if stale
             && self
@@ -443,13 +454,15 @@ impl Cache {
             return None;
         }
 
+        self.epoch.get_or_insert(now);
+
         let token = EntryToken(self.next_token);
         let entry = Entry::new(NewEntry {
             token,
             key,
             reply,
             ttl_offsets: &info.ttl_offsets,
-            inserted: now,
+            inserted_secs: self.secs_since_epoch(now),
             lifetime_secs,
         });
         if !key.question_matches(entry.bytes()) {
@@ -701,6 +714,34 @@ mod tests {
         cache
             .get(&CacheKey::new(&query), now)
             .map(|hit| hit.age_secs)
+    }
+
+    /// A slot per entry is held for as long as the slab lives, so a field added to it costs
+    /// every entry of a full cache.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_slot_stays_within_88_bytes() {
+        assert!(size_of::<Slot>() <= 88, "{} bytes", size_of::<Slot>());
+    }
+
+    #[test]
+    fn an_entry_inserted_after_the_first_is_aged_from_its_own_insertion() {
+        let mut cache = Cache::new(&config());
+        let start = Instant::now();
+        let first = Fixture::new("first.example.");
+        let later = Fixture::new("later.example.");
+        assert!(insert(&mut cache, &first, &first.positive(300), start));
+        assert!(insert(
+            &mut cache,
+            &later,
+            &later.positive(300),
+            start + Duration::from_secs(100)
+        ));
+
+        let looked_up = start + Duration::from_secs(130);
+
+        assert_eq!(age_of_hit(&mut cache, &first, looked_up), Some(130));
+        assert_eq!(age_of_hit(&mut cache, &later, looked_up), Some(30));
     }
 
     #[test]
