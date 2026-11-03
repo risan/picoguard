@@ -794,6 +794,97 @@ mod tests {
         format!("udp://{}", fake.address)
     }
 
+    #[tokio::test]
+    async fn a_stream_connection_that_stops_answering_is_replaced() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut connection, _)) = listener.accept().await {
+                let number = counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if number == 0 {
+                        let mut sink = vec![0u8; 4096];
+                        while let Ok(read) = connection.read(&mut sink).await {
+                            if read == 0 {
+                                break;
+                            }
+                        }
+
+                        return;
+                    }
+
+                    answer_frames(connection).await;
+                });
+            }
+        });
+        let Ok(Transport::Tcp(tcp)) = parse(&format!("tcp://{address}"), &[]) else {
+            unreachable!();
+        };
+
+        let patient = || Instant::now() + Duration::from_millis(500);
+
+        let stalled = tcp.query(&mut query_for("example.com."), patient()).await;
+        let replaced = tcp.query(&mut query_for("example.com."), patient()).await;
+
+        assert!(
+            matches!(stalled, Err(UpstreamError::Timeout)),
+            "{stalled:?}"
+        );
+        assert!(replaced.is_ok(), "{replaced:?}");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    /// The server answers one query, then reads the next one and closes, as a server closing
+    /// an idle connection does when a query crosses its close.
+    #[tokio::test]
+    async fn a_query_crossing_the_servers_close_is_retried_on_a_new_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut connection, _)) = listener.accept().await {
+                let number = counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if number > 0 {
+                        answer_frames(connection).await;
+
+                        return;
+                    }
+
+                    for served in 0..2 {
+                        let mut length = [0u8; 2];
+                        connection.read_exact(&mut length).await.unwrap();
+                        let mut query = vec![0; usize::from(u16::from_be_bytes(length))];
+                        connection.read_exact(&mut query).await.unwrap();
+                        if served == 1 {
+                            return;
+                        }
+
+                        let reply = answer(&query, ANSWER_MARKER, false);
+                        let mut frame = (reply.len() as u16).to_be_bytes().to_vec();
+                        frame.extend_from_slice(&reply);
+                        connection.write_all(&frame).await.unwrap();
+                    }
+                });
+            }
+        });
+        let upstreams = upstreams(vec![format!("tcp://{address}")], 2000);
+
+        let first = upstreams.query(&mut query_for("example.com.")).await;
+        let second = upstreams.query(&mut query_for("example.com.")).await;
+
+        let (_, tally) = upstreams.tallies().next().unwrap();
+        assert!(first.is_ok() && second.is_ok());
+        assert_eq!(
+            tally.failed, 0,
+            "a closed idle connection is not a server failure"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn the_average_is_over_answers_only_in_milliseconds_with_one_decimal() {
         let mut tally = Tally::default();
