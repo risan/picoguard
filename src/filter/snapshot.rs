@@ -792,6 +792,10 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
     let stored_fingerprint = decoder.u128()?;
     let content_hash = decoder.u128()?;
     let compiler_version = decoder.u32()?;
+    if compiler_version != COMPILER_VERSION {
+        return Err(SnapshotError::OldCompiler(compiler_version));
+    }
+
     let configured_format = format_from_code(decoder.u8()?)?;
     let effective_format = format_from_code(decoder.u8()?)?;
     let meta_max_rules = decoder.u32()?;
@@ -853,10 +857,6 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
 
     if decoder.remaining != 0 {
         return Err(SnapshotError::Corrupt("data after the last rule"));
-    }
-
-    if compiler_version != COMPILER_VERSION {
-        return Err(SnapshotError::OldCompiler(compiler_version));
     }
 
     let expected = fingerprint(
@@ -1570,6 +1570,20 @@ ads.*.tracker
         let (path, mut bytes) = saved_bytes(&state, MIXED).await;
         let at = PREAMBLE_BYTES as usize + 32;
         bytes[at..at + 4].copy_from_slice(&(COMPILER_VERSION + 1).to_le_bytes());
+        fix_checksum(&mut bytes);
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(rejected(&path), SnapshotError::OldCompiler(_)));
+    }
+
+    #[tokio::test]
+    async fn an_older_compiler_is_named_even_when_the_rest_of_the_body_cannot_be_decoded() {
+        let state = TestDir::new("snap");
+        let (path, mut bytes) = saved_bytes(&state, MIXED).await;
+        let at = PREAMBLE_BYTES as usize + 32;
+        bytes[at..at + 4].copy_from_slice(&(COMPILER_VERSION + 1).to_le_bytes());
+        let body_end = bytes.len() - CHECKSUM_BYTES as usize;
+        bytes[at + 4..body_end].fill(0xff);
         fix_checksum(&mut bytes);
         fs::write(&path, &bytes).unwrap();
 
