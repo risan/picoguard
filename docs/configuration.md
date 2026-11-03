@@ -426,7 +426,8 @@ and once among the `[[allowlists]]`.
 | `enabled` | `true` | A list that is off is not downloaded and holds no memory. The page can turn lists on and off. |
 | `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A regex is charged the memory it really holds (about 8 KB for `/track[0-9]+/`, close to 1 MB for `/(\pL\|\pN){1,50}x/`), a wildcard rule 64 bytes for each of its parts, and every distinct rule at least 32 bytes more, even a regex that does not compile. A list over it is not used. |
 
-Downloads use `If-None-Match` and `If-Modified-Since`. A failed download keeps the last good list.
+Downloads use `If-None-Match` and `If-Modified-Since`, and send `Accept-Encoding: identity`:
+picoguard does not decompress, so a reply that is compressed anyway fails. A failed download keeps the last good list.
 A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private,
 link-local or unspecified address fails too, unless the list URL itself points into those ranges.
 A list in `[[lists]]` that blocks any of three made-up check names (for example because of a rule

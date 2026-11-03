@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{
-    ACCEPT, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, HeaderMap,
-    HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
-    TRANSFER_ENCODING, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
+    HOST, HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
+    LOCATION, TRANSFER_ENCODING, USER_AGENT,
 };
 use http::{Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty};
@@ -762,6 +762,7 @@ fn build_request(
         .header(HOST, target.host_header())
         .header(USER_AGENT, concat!("picoguard/", env!("CARGO_PKG_VERSION")))
         .header(ACCEPT, "*/*")
+        .header(ACCEPT_ENCODING, "identity")
         .header(CONNECTION, "close");
 
     let validators = [
@@ -1465,6 +1466,19 @@ mod tests {
         assert!(!request.headers.contains_key("if-none-match"));
         assert!(!request.headers.contains_key("if-modified-since"));
         assert!(request.headers["user-agent"].starts_with("picoguard/"));
+    }
+
+    #[tokio::test]
+    async fn a_download_asks_for_the_body_uncompressed() {
+        let server = Server::start(|_, _, mut stream| async move {
+            respond(&mut stream, "200 OK", &[], b"||ads.example^\n").await;
+        })
+        .await;
+
+        fetch_body(&local(), &server.url("/"), &Limits::default()).await;
+
+        let request = server.requests.lock().unwrap()[0].clone();
+        assert_eq!(request.headers["accept-encoding"], "identity");
     }
 
     #[tokio::test]
