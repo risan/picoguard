@@ -1367,7 +1367,9 @@ function showCache(cache) {
 }
 
 function showPause(pause) {
-  pausedUntil = pause.paused ? pause.until : null;
+  // The board's own clock can be years off before the network sets it, so only the seconds
+  // left count.
+  pausedUntil = pause.paused ? Math.floor(Date.now() / 1000) + (pause.seconds_left || 0) : null;
   document.body.classList.toggle("paused", pause.paused);
   tick();
 }

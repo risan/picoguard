@@ -671,6 +671,18 @@ async fn the_page_polls_one_update_at_a_time_and_fetches_only_the_open_tabs_data
     );
 }
 
+/// No browser here: the pause countdown is checked as source. It counts the seconds the board
+/// says are left, not the board's clock against the browser's.
+#[tokio::test]
+async fn the_pause_countdown_uses_the_seconds_left_not_the_boards_clock() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    assert!(page.contains("Date.now() / 1000) + (pause.seconds_left || 0)"));
+    assert!(!page.contains("pause.until"));
+}
+
 /// No browser here: the Upstreams card is checked as source. The read-only view leaves the
 /// field out, so the card is hidden there with the top lists.
 #[tokio::test]
