@@ -31,6 +31,7 @@ use crate::names::DeviceNames;
 use crate::policy::{Policy, PolicyView};
 use crate::rewrites::{ADDRESS_TTL, By, Found, MAX_TARGET_TTL, Rewrites};
 use crate::stats::{Event, QueryResult, Stats, StatsSettings};
+use crate::stats_store::{SavedStats, SavedUpstream};
 use crate::upstream::{Answered, SharedUpstreams, Tally, UpstreamError, Upstreams};
 
 /// Reverse lookups of these ranges go to the local resolver.
@@ -427,6 +428,7 @@ impl Pipeline {
             stats: Arc::new(Stats::new(StatsSettings {
                 top_k: config.stats.top_k,
                 query_log_entries: config.stats.query_log_entries,
+                retention_days: config.stats.retention_days,
             })),
         }))
     }
@@ -450,24 +452,86 @@ impl Pipeline {
             kind: ServerKind::Upstream,
             tally,
         });
-        let lookups = self
-            .device_names
-            .as_ref()
-            .map(|names| names.tally())
-            .unwrap_or_default();
+        let lookups = self.device_name_lookups();
         let local = self.local_resolver.iter().flat_map(|(address, resolver)| {
             resolver.tallies().map(move |(_, tally)| ServerTally {
                 label: address.to_string(),
                 kind: ServerKind::Local,
-                tally: Tally {
-                    answered: tally.answered + lookups.answered,
-                    failed: tally.failed + lookups.failed,
-                    answer_micros: tally.answer_micros.saturating_add(lookups.answer_micros),
-                },
+                tally: tally.plus(lookups),
             })
         });
 
         servers.chain(local).collect()
+    }
+
+    /// The statistics for the saved file: `Stats` and the tally of every server, the local
+    /// resolver's under the label of its own pool with the device lookups added.
+    pub fn saved_stats(&self) -> SavedStats {
+        let mut saved = self.stats.saved();
+        let lookups = self.device_name_lookups();
+        let local = self.local_resolver.iter().flat_map(|(_, resolver)| {
+            resolver
+                .tallies()
+                .map(move |(label, tally)| (label, tally.plus(lookups)))
+        });
+        saved.upstreams = self
+            .upstreams
+            .current()
+            .tallies()
+            .chain(local)
+            .map(|(label, tally)| SavedUpstream {
+                label: label.to_string(),
+                answered: tally.answered,
+                failed: tally.failed,
+                answer_micros: tally.answer_micros,
+            })
+            .collect();
+
+        saved
+    }
+
+    /// Puts saved statistics in place. A saved tally with no server of that label is dropped.
+    pub fn restore_stats(&self, saved: &SavedStats) {
+        self.stats.restore(saved);
+        let servers = self.upstreams.current();
+
+        for row in &saved.upstreams {
+            let tally = Tally {
+                answered: row.answered,
+                failed: row.failed,
+                answer_micros: row.answer_micros,
+            };
+            let restored = servers.restore_tally(&row.label, tally)
+                || self
+                    .local_resolver
+                    .iter()
+                    .any(|(_, resolver)| resolver.restore_tally(&row.label, tally));
+            if !restored {
+                log::debug!("no server {} for its saved tally", row.label);
+            }
+        }
+    }
+
+    /// Starts every statistic again from zero: the counters, history and top lists, and what
+    /// each server has answered. The query log is kept.
+    pub fn clear_stats(&self) {
+        self.stats.clear();
+        self.upstreams.current().clear_tallies();
+
+        if let Some((_, resolver)) = &self.local_resolver {
+            resolver.clear_tallies();
+        }
+
+        if let Some(names) = &self.device_names {
+            names.clear_tally();
+        }
+    }
+
+    fn device_name_lookups(&self) -> Tally {
+        self.device_names
+            .as_ref()
+            .map(|names| names.tally())
+            .unwrap_or_default()
     }
 
     /// The device name of a private client address, from a PTR lookup through the `[local]`
@@ -2806,5 +2870,104 @@ mod tests {
         assert!(pipeline.stats().query_log(10).is_empty());
         assert!(pipeline.stats().snapshot().top_clients.is_empty());
         assert_eq!(local_tally(&pipeline).answered, 1);
+    }
+
+    fn tallied(answered: u64) -> Tally {
+        Tally {
+            answered,
+            failed: 1,
+            answer_micros: answered * 1000,
+        }
+    }
+
+    fn two_servers_and_a_router() -> Config {
+        let mut config = Config::default();
+        config.upstream.servers = vec![
+            "udp://192.0.2.1:53".to_string(),
+            "tcp://192.0.2.2:53".to_string(),
+        ];
+        config.local.resolver = Some("192.0.2.53:53".parse().unwrap());
+
+        config
+    }
+
+    #[tokio::test]
+    async fn saved_tallies_go_back_to_the_servers_with_the_same_label() {
+        let before = Pipeline::new(&two_servers_and_a_router(), Arc::new(Policy::new())).unwrap();
+        let servers = before.upstreams().current();
+        assert!(servers.restore_tally("udp://192.0.2.1:53", tallied(3)));
+        assert!(servers.restore_tally("tcp://192.0.2.2:53", tallied(5)));
+        let (_, router) = before.local_resolver.as_ref().unwrap();
+        assert!(router.restore_tally("udp://192.0.2.53:53", tallied(7)));
+        let saved = before.saved_stats();
+        let mut config = two_servers_and_a_router();
+        config.upstream.servers = vec![
+            "tcp://192.0.2.2:53".to_string(),
+            "udp://192.0.2.9:53".to_string(),
+        ];
+
+        let after = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        after.restore_stats(&saved);
+
+        let labels: Vec<&str> = saved
+            .upstreams
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "udp://192.0.2.1:53",
+                "tcp://192.0.2.2:53",
+                "udp://192.0.2.53:53"
+            ]
+        );
+        let tallies: Vec<(String, u64)> = after
+            .upstream_tallies()
+            .into_iter()
+            .map(|server| (server.label, server.tally.answered))
+            .collect();
+        assert_eq!(
+            tallies,
+            [
+                ("tcp://192.0.2.2:53".to_string(), 5),
+                ("udp://192.0.2.9:53".to_string(), 0),
+                ("192.0.2.53:53".to_string(), 7),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_statistics_zeroes_every_tally_and_the_device_lookups() {
+        let owner = reverse_name(lan_address(1)).to_string();
+        let router = fake_router(&[(&owner, "pc.lan.", 600)], false).await;
+        let pipeline = pipeline_with_router(router.address, |_| {});
+        pipeline.device_name(lan_address(1));
+        assert!(
+            wait_until(Duration::from_secs(5), || local_tally(&pipeline).answered
+                == 1)
+            .await
+        );
+        assert!(
+            pipeline
+                .upstreams()
+                .current()
+                .restore_tally("udp://127.0.0.1:9", tallied(2))
+        );
+        pipeline.stats().record_dropped();
+        let saved = pipeline.saved_stats();
+        assert_eq!(saved.upstreams.last().unwrap().answered, 1);
+
+        pipeline.clear_stats();
+
+        assert_eq!(counters(&pipeline).dropped, 0);
+        assert!(
+            pipeline
+                .upstream_tallies()
+                .iter()
+                .all(|server| server.tally == Tally::default()),
+            "{:?}",
+            pipeline.upstream_tallies()
+        );
     }
 }

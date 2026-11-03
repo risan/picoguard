@@ -82,6 +82,7 @@ fn recording_a_query_allocates_nothing_once_the_ring_is_warm() {
     let stats = Stats::new(StatsSettings {
         top_k: 50,
         query_log_entries: LOG_ENTRIES,
+        ..StatsSettings::default()
     });
     record_all(&stats, &names_for(LOG_ENTRIES * 4));
     let names = names_for(5_000);

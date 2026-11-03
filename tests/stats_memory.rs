@@ -1,13 +1,14 @@
-//! Memory held by full stats with long names. This file has its own test
-//! binary so that the counting allocator sees only this one test.
+//! Memory held by full stats with long names and a full 90-day history. This file has its own
+//! test binary so that the counting allocator sees only this one test.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use picoguard::dns::wire::Name;
-use picoguard::stats::{Event, QueryResult, Stats, StatsSettings};
+use picoguard::stats::{Event, HISTORY_BYTES, QueryResult, Stats, StatsSettings};
 
 const BUDGET_BYTES: usize = 512 * 1024;
 /// What a malloc implementation adds to every block, on top of the size asked for.
@@ -38,6 +39,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// 2023-11-14 00:00:00 UTC.
+const START: u64 = 19_675 * 86_400;
 
 const LONG_NAME_LENGTH: usize = 4 * 61 + 3 + 4;
 
@@ -70,10 +74,18 @@ fn record(stats: &Stats, number: usize, text: &str) {
 }
 
 #[test]
-fn full_stats_with_long_names_stay_within_half_a_megabyte() {
+fn full_stats_with_long_names_and_ninety_days_stay_within_the_budget() {
     let bytes_before = LIVE_BYTES.load(Ordering::Relaxed);
     let allocations_before = LIVE_ALLOCATIONS.load(Ordering::Relaxed);
-    let stats = Stats::new(StatsSettings::default());
+    let time = Arc::new(AtomicU64::new(START));
+    let clock = Arc::clone(&time);
+    let stats = Stats::with_clock(
+        StatsSettings {
+            retention_days: 90,
+            ..StatsSettings::default()
+        },
+        Box::new(move || clock.load(Ordering::Relaxed)),
+    );
 
     // Fill the query-log ring with slightly shorter names first: overwriting a slot with a
     // longer name must not double the slot's buffer.
@@ -81,7 +93,10 @@ fn full_stats_with_long_names_stay_within_half_a_megabyte() {
         record(&stats, number, &name_with_tld(number, "c"));
     }
 
-    for number in 0..20_000 {
+    // Nine queries an hour for 100 days, ending at the end of a day: every slot of the ring
+    // is used, then reused.
+    for number in 0..21_600 {
+        time.store(START + (number as u64 / 9) * 3_600, Ordering::Relaxed);
         let text = long_name(number);
         assert_eq!(text.len(), LONG_NAME_LENGTH);
         record(&stats, number, &text);
@@ -96,6 +111,14 @@ fn full_stats_with_long_names_stay_within_half_a_megabyte() {
 
     assert_eq!(stats.query_log(usize::MAX).len(), 1_000);
     assert_eq!(stats.snapshot().top_queried.len(), 50);
+    let days = stats.daily(90, 0);
+    assert_eq!(days.len(), 90);
+    assert_eq!(
+        days.iter().map(|day| day.total).sum::<u64>(),
+        90 * 24 * 9,
+        "every hour of the last 90 days holds its nine queries"
+    );
+    assert!(bytes >= HISTORY_BYTES, "the ring is part of what is held");
     assert!(
         with_overhead <= BUDGET_BYTES,
         "stats hold {with_overhead} bytes, budget {BUDGET_BYTES}"
