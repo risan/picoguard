@@ -641,6 +641,48 @@ async fn the_page_has_four_tabs_kept_in_the_url_fragment() {
     }
 }
 
+/// No browser here: the polling is checked as source. One update runs at a time, a hidden page
+/// does not poll, and a tab's own data is fetched only while that tab is open.
+#[tokio::test]
+async fn the_page_polls_one_update_at_a_time_and_fetches_only_the_open_tabs_data() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "if (polling) {",
+        "pollAgain = true;",
+        "document.hidden",
+        "addEventListener(\"visibilitychange\", update)",
+        "$(\"panel-log\").hidden ? null : await api(\"/api/querylog?limit=50\")",
+        "$(\"panel-lists\").hidden ? null : await api(\"/api/rules\")",
+        "$(\"panel-settings\").hidden ? null : await api(\"/api/settings\")",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+
+    let on_hashchange = page.split("\"hashchange\"").nth(1).unwrap();
+    assert!(
+        on_hashchange
+            .split("});")
+            .next()
+            .unwrap()
+            .contains("update();")
+    );
+}
+
+/// No browser here: the pause countdown is checked as source. It counts the seconds the board
+/// says are left, not the board's clock against the browser's.
+#[tokio::test]
+async fn the_pause_countdown_uses_the_seconds_left_not_the_boards_clock() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    assert!(page.contains("Date.now() / 1000) + (pause.seconds_left || 0)"));
+    assert!(!page.contains("pause.until"));
+}
+
 /// No browser here: the Upstreams card is checked as source. The read-only view leaves the
 /// field out, so the card is hidden there with the top lists.
 #[tokio::test]
@@ -1333,6 +1375,23 @@ async fn the_query_log_is_newest_first_and_never_longer_than_the_ring() {
         let reply = site.send(get(&format!("/api/querylog?limit={bad}"))).await;
         assert_eq!(reply.status, 400, "limit={bad}");
     }
+}
+
+#[tokio::test]
+async fn one_query_log_answer_is_cut_to_a_thousand_entries() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    config.stats.query_log_entries = 1_500;
+    let site = site(config).await;
+    for index in 0..1_500 {
+        record_client(&site, "127.0.0.1", &format!("n{index}.example."));
+    }
+
+    let everything = site.send(get("/api/querylog?limit=100000")).await;
+    let entries = everything.json()["entries"].as_array().unwrap().clone();
+
+    assert_eq!(entries.len(), 1_000);
+    assert_eq!(entries[0]["qname"], "n1499.example");
 }
 
 /// Records a query from `client` straight into the site's stats: the names code sees only the
@@ -3085,16 +3144,37 @@ async fn oversized_request_heads_are_refused() {
     assert_eq!(after.status, 200, "the server still answers");
 }
 
-/// How many connections the page serves at once, and how long one may take to send its head:
-/// `MAX_CONNECTIONS` and `HEAD_TIMEOUT` in `src/web.rs`.
+/// How many connections the page serves at once, how many of them one client may hold, and how
+/// long one may take to send its head and its body: `MAX_CONNECTIONS`,
+/// `MAX_CONNECTIONS_PER_CLIENT`, `HEAD_TIMEOUT` and `BODY_TIMEOUT` in `src/web.rs`.
 const PAGE_CONNECTIONS: usize = 16;
+const PAGE_CONNECTIONS_PER_CLIENT: usize = 4;
+
+async fn connect_from(web: SocketAddr, from: &str) -> TcpStream {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddr::new(from.parse().unwrap(), 0))
+        .unwrap();
+
+    socket.connect(web).await.unwrap()
+}
+
+async fn closes_within(stream: &mut TcpStream, wait: Duration) -> bool {
+    let mut chunk = [0u8; 64];
+
+    matches!(
+        tokio::time::timeout(wait, stream.read(&mut chunk)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
 
 #[tokio::test]
 async fn connections_that_send_no_head_cannot_hold_the_page_down() {
     let (site, _upstream) = plain_site().await;
     let mut idle = Vec::new();
     for index in 0..PAGE_CONNECTIONS {
-        let mut stream = TcpStream::connect(site.web).await.unwrap();
+        let from = format!("127.0.0.{}", 1 + index / PAGE_CONNECTIONS_PER_CLIENT);
+        let mut stream = connect_from(site.web, &from).await;
         if index % 2 == 1 {
             stream
                 .write_all(b"GET /api/status HTTP/1.1\r\nHost: x\r\n")
@@ -3117,19 +3197,61 @@ async fn connections_that_send_no_head_cannot_hold_the_page_down() {
     );
 
     for (index, mut stream) in idle.into_iter().enumerate() {
-        let mut chunk = [0u8; 64];
-        let closed = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
-            .await
-            .unwrap_or_else(|_| panic!("connection {index} was still open after 15 s"));
-
         assert!(
-            matches!(closed, Ok(0) | Err(_)),
-            "connection {index} got {closed:?}"
+            closes_within(&mut stream, Duration::from_secs(15)).await,
+            "connection {index} was still open after 15 s"
         );
     }
 
     let after = site.send(get("/api/status")).await;
     assert_eq!(after.status, 200, "the page answers again");
+}
+
+#[tokio::test]
+async fn one_client_cannot_hold_more_than_its_share_of_the_page_connections() {
+    let (site, _upstream) = plain_site().await;
+    let stalled_login = "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                         Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{";
+    let mut stalled = Vec::new();
+    for _ in 0..PAGE_CONNECTIONS_PER_CLIENT {
+        let mut stream = connect_from(site.web, "127.0.0.1").await;
+        stream.write_all(stalled_login.as_bytes()).await.unwrap();
+        stalled.push(stream);
+    }
+
+    let mut fifth = connect_from(site.web, "127.0.0.1").await;
+
+    assert!(
+        closes_within(&mut fifth, Duration::from_secs(1)).await,
+        "a fifth connection from one client was kept"
+    );
+    let other = exchange_from(
+        site.web,
+        "127.0.0.2".parse().unwrap(),
+        &get("/api/status").bytes(site.web),
+    )
+    .await;
+    assert!(
+        parse_reply(&other).is_some_and(|reply| reply.status == 200 || reply.status == 401),
+        "another client was not answered: {other:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_sent_in_time_is_answered_with_408() {
+    let (site, _upstream) = plain_site().await;
+    let request = "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                   Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{";
+
+    let mut stream = TcpStream::connect(site.web).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut reply))
+        .await
+        .expect("the server kept the connection open")
+        .unwrap();
+
+    assert_eq!(parse_reply(&reply).unwrap().status, 408);
 }
 
 #[tokio::test]

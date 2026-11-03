@@ -711,8 +711,9 @@ pays the hash, and the same credentials after it are checked in microseconds.
 
 Wrong passwords are limited per client address. After 5 failed password checks within 15 minutes,
 sign-ins and basic auth from that address answer 429 ("too many attempts, try again later") until
-15 minutes after its last failure. A right password clears the address. picoguard tracks 64
-addresses; when the table is full, the one with the oldest last failure is dropped.
+15 minutes after its last failure. A right password clears the address. All addresses in one
+IPv6 /64 count as one client. picoguard tracks 64 clients; when the table is full, the one with
+the oldest last failure is dropped.
 
 Make a hash with `picoguard --hash-password`. It reads the password from standard input (it asks
 without echo on a terminal) and prints a line to paste into `[web]`:
@@ -812,7 +813,7 @@ logged) and picoguard starts with empty statistics.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `query_log_entries` | `1000` | Recent queries kept (up to 100000). Allocated in full. |
+| `query_log_entries` | `1000` | Recent queries kept (up to 100000). Allocated in full. One `/api/querylog` answer holds at most 1000. |
 | `top_k` | `50` | Entries in each top list (up to 1000). Allocated in full. |
 | `persist` | `true` | Save the statistics to `stats.json` and read them back at start. `false`: the file is never read or written, and the statistics start empty at every start. |
 | `retention_days` | `30` | How long the hourly history is kept: `1`, `7`, `30` or `90` days. The Settings tab can set it instead ([above](#statistics-retention-from-the-page)); a value from the page wins. The ring for 90 days (51,840 bytes) is always allocated; a save builds the file in memory for a moment: a few tens of KB with the defaults and a busy 30 days, up to about 1.4 MB at `top_k = 1000` with the longest names and 90 days. |

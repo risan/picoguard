@@ -2,7 +2,7 @@
 //! signed session cookie, the per-address failure table, and the one slot in which a password
 //! hash runs.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -324,7 +324,20 @@ fn lowercase_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     Some(bytes)
 }
 
-/// The newest failed password checks per address, in a table that is allocated once.
+/// An IPv6 host can take any address of its /64, so the /64 counts as one client.
+pub(super) fn client_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let [a, b, c, d, ..] = v6.segments();
+
+            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
+
+        v4 => v4,
+    }
+}
+
+/// The newest failed password checks per client, in a table that is allocated once.
 struct Limiter {
     start: Instant,
     entries: Vec<Strikes>,
@@ -359,7 +372,7 @@ impl Limiter {
 
     fn is_limited(&self, ip: IpAddr, now: Instant) -> bool {
         let now = self.seconds(now);
-        let ip = ip.to_canonical();
+        let ip = client_key(ip);
 
         self.entries
             .iter()
@@ -373,7 +386,7 @@ impl Limiter {
 
     fn record_failure(&mut self, ip: IpAddr, now: Instant) {
         let now = self.seconds(now);
-        let ip = ip.to_canonical();
+        let ip = client_key(ip);
 
         if let Some(strikes) = self.entries.iter_mut().find(|strikes| strikes.ip == ip) {
             if usize::from(strikes.count) == LIMITED_AFTER_FAILURES {
@@ -411,7 +424,7 @@ impl Limiter {
     }
 
     fn clear(&mut self, ip: IpAddr) {
-        let ip = ip.to_canonical();
+        let ip = client_key(ip);
 
         self.entries.retain(|strikes| strikes.ip != ip);
     }
@@ -420,7 +433,7 @@ impl Limiter {
     fn failures(&self, ip: IpAddr) -> usize {
         self.entries
             .iter()
-            .find(|strikes| strikes.ip == ip.to_canonical())
+            .find(|strikes| strikes.ip == client_key(ip))
             .map_or(0, |strikes| usize::from(strikes.count))
     }
 
@@ -814,6 +827,43 @@ mod tests {
         assert!(limiter.is_limited(ip("192.0.2.1"), start));
         assert!(!limiter.is_limited(ip("192.0.2.2"), start));
         assert!(!limiter.is_limited(ip("2001:db8::1"), start));
+    }
+
+    #[test]
+    fn every_address_of_one_ipv6_64_counts_as_one_client() {
+        let start = Instant::now();
+        let mut limiter = Limiter::new(start);
+        let address = |index: u16| IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, index));
+
+        for index in 1..=1000 {
+            if index <= 5 {
+                assert!(!limiter.is_limited(address(index), start));
+            }
+            limiter.record_failure(address(index), start);
+        }
+
+        assert!(limiter.is_limited(address(1), start));
+        assert!(limiter.is_limited(address(1000), start));
+        assert!(limiter.is_limited(ip("fe80:0:0:0:1:2:3:4"), start));
+        assert!(!limiter.is_limited(ip("fe80:0:0:1::1"), start));
+        assert_eq!(limiter.capacity(), 64);
+    }
+
+    #[test]
+    fn a_success_clears_only_the_key_of_that_client() {
+        let start = Instant::now();
+        let mut limiter = Limiter::new(start);
+
+        for _ in 0..4 {
+            limiter.record_failure(ip("fe80::1"), start);
+            limiter.record_failure(ip("fd00::1"), start);
+            limiter.record_failure(ip("192.0.2.1"), start);
+        }
+        limiter.clear(ip("fe80::99"));
+
+        assert_eq!(limiter.failures(ip("fe80::1")), 0);
+        assert_eq!(limiter.failures(ip("fd00::1")), 4);
+        assert_eq!(limiter.failures(ip("192.0.2.1")), 4);
     }
 
     #[test]
