@@ -376,9 +376,12 @@ impl Session {
             let mut state = self.state.lock().unwrap();
             if state.epoch == self.epoch {
                 state.heard_at = Some(Instant::now());
-            }
 
-            state.pending.remove(&id)
+                state.pending.remove(&id)
+            } else {
+                // A retired session may hear a late reply whose ID the new connection reuses.
+                None
+            }
         };
         let rest = (length - 2) as u64;
         let Some(waiting) = waiting else {
@@ -892,6 +895,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(&reply[12..], b"new");
+    }
+
+    #[tokio::test]
+    async fn a_retired_connection_does_not_consume_a_query_of_the_new_one() {
+        let client = client();
+        let (first, mut first_server) = duplex(4096);
+        client.attach(first);
+        // A query blocked on a full queue keeps the retired connection's writer, and so its
+        // session, alive after the replacement.
+        let retired_writer = client.state.lock().unwrap().writer.clone();
+        let (second, mut second_server) = duplex(4096);
+        client.attach(second);
+
+        let server_task = tokio::spawn(async move {
+            let received = read_frame(&mut second_server).await;
+            let id = [received[0], received[1]];
+            // The retired connection answers first, with the ID the new query drew.
+            write_reply(&mut first_server, id, b"old").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            write_reply(&mut second_server, id, b"new").await;
+            (first_server, second_server)
+        });
+        let reply = client
+            .query(&mut request("b.example."), deadline())
+            .await
+            .unwrap();
+
+        assert_eq!(&reply[12..], b"new");
+        drop(retired_writer);
+        drop(server_task.await.unwrap());
     }
 
     #[tokio::test]
