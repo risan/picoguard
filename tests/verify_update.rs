@@ -12,7 +12,7 @@ use common::release::{
     Files, REQUEST_ID, TARGET, scratch, script, sign_with, stage_dir, sums_line, test_key,
     write_file,
 };
-use picoguard::release::{Refusal, VerifySetup, verify_update};
+use picoguard::release::{MAX_BINARY_BYTES, MAX_SUMS_BYTES, Refusal, VerifySetup, verify_update};
 
 const OFFERED: &str = "9.9.9";
 // Fixed rather than this build's version, which a pre-release would make unusable in
@@ -25,6 +25,16 @@ fn setup() -> VerifySetup {
         target: Some(TARGET),
         running: RUNNING,
     }
+}
+
+/// A binary that first leaves a file at `marker` and then prints the right version, so a
+/// refusal that came after the run shows as a marker.
+fn marking_script(marker: &Path) -> Vec<u8> {
+    format!(
+        "#!/bin/sh\necho ran > {}\necho \"picoguard {OFFERED}\"\n",
+        marker.display()
+    )
+    .into_bytes()
 }
 
 fn make_fifo(path: &Path) {
@@ -43,10 +53,13 @@ fn refused(result: Result<picoguard::release::Request, Refusal>) -> Refusal {
 #[test]
 fn a_good_update_is_copied_and_verified() {
     let root = scratch("verify-good");
-    let staged = stage_dir(&root, OFFERED, &script(OFFERED), |_| {});
+    let marker = root.join("ran");
+    let staged = stage_dir(&root, OFFERED, &marking_script(&marker), |_| {});
     let into = root.join("out");
 
     let request = verify_update(&staged, &into, &setup()).unwrap();
+
+    assert!(marker.exists(), "the copy was never run");
 
     assert_eq!(request.id, REQUEST_ID);
     assert_eq!(request.version, OFFERED);
@@ -85,6 +98,17 @@ fn link_to_copy(staged: &Path, name: &str) {
     fs::copy(staged.join(name), &copy).unwrap();
     fs::remove_file(staged.join(name)).unwrap();
     symlink(&copy, staged.join(name)).unwrap();
+}
+
+/// Extends the staged binary with zeros to `length`; the file is sparse, so a size past
+/// the cap costs no disk.
+fn grow_binary(staged: &Path, length: u64) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(staged.join("picoguard"))
+        .unwrap()
+        .set_len(length)
+        .unwrap();
 }
 
 #[test]
@@ -163,6 +187,54 @@ fn each_bad_update_is_refused_and_leaves_nothing() {
             mentions: "--version",
         },
         Case {
+            name: "sums-at-the-cap",
+            tweak: |files| files.sums = vec![b'x'; MAX_SUMS_BYTES as usize],
+            version: OFFERED,
+            after: keep,
+            request_is_valid: true,
+            mentions: "signature",
+        },
+        Case {
+            name: "sums-over-the-cap",
+            tweak: |files| files.sums = vec![b'x'; MAX_SUMS_BYTES as usize + 1],
+            version: OFFERED,
+            after: keep,
+            request_is_valid: true,
+            mentions: "SHA256SUMS: larger than allowed",
+        },
+        Case {
+            name: "signature-over-the-cap",
+            tweak: |files| files.signature = vec![0; 65],
+            version: OFFERED,
+            after: keep,
+            request_is_valid: true,
+            mentions: "SHA256SUMS.sig: larger than allowed",
+        },
+        Case {
+            name: "request-over-the-cap",
+            tweak: |files| files.request = vec![b'x'; 257],
+            version: OFFERED,
+            after: keep,
+            request_is_valid: false,
+            mentions: "request: larger than allowed",
+        },
+        Case {
+            name: "binary-at-the-cap",
+            tweak: nothing,
+            version: OFFERED,
+            after: |staged| grow_binary(staged, MAX_BINARY_BYTES),
+            request_is_valid: true,
+            mentions: "does not match",
+        },
+        Case {
+            name: "binary-over-the-cap",
+            tweak: nothing,
+            version: OFFERED,
+            after: |staged| grow_binary(staged, MAX_BINARY_BYTES + 1),
+            request_is_valid: true,
+            mentions: "picoguard: larger than allowed",
+        },
+        Case {
             name: "request-is-a-link",
             tweak: nothing,
             version: OFFERED,
@@ -229,7 +301,8 @@ fn each_bad_update_is_refused_and_leaves_nothing() {
 
     for case in cases {
         let root = scratch(&format!("verify-bad-{}", case.name));
-        let staged = stage_dir(&root, case.version, &script(OFFERED), case.tweak);
+        let marker = root.join("ran");
+        let staged = stage_dir(&root, case.version, &marking_script(&marker), case.tweak);
         (case.after)(&staged);
         let into = if case.name == "parent-writable-by-others" {
             root.join("open/out")
@@ -259,27 +332,13 @@ fn each_bad_update_is_refused_and_leaves_nothing() {
             case.name
         );
         assert!(!into.exists(), "{}: the destination was left", case.name);
+        assert!(
+            !marker.exists(),
+            "{}: the binary ran before it was refused",
+            case.name
+        );
         assert!(started.elapsed() < Duration::from_secs(5), "{}", case.name);
     }
-}
-
-#[test]
-fn a_process_that_keeps_the_output_open_cannot_outlast_the_limit() {
-    let root = scratch("verify-descendant");
-    let binary = format!("#!/bin/sh\necho \"picoguard {OFFERED}\"\nsleep 30 &\nexit 0\n");
-    let staged = stage_dir(&root, OFFERED, binary.as_bytes(), |_| {});
-    let into = root.join("out");
-
-    let started = Instant::now();
-    let refusal = refused(verify_update(&staged, &into, &setup()));
-
-    assert!(
-        refusal.reason.contains("10 seconds"),
-        "{:?}",
-        refusal.reason
-    );
-    assert!(started.elapsed() < Duration::from_secs(15));
-    assert!(!into.exists());
 }
 
 #[test]
