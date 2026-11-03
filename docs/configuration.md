@@ -206,7 +206,7 @@ added from the page. The estimate is:
 ```
 estimate = 6 MiB                                    the idle process (binary, runtime, threads)
          + pending_bytes + tcp_max_connections x tcp_queue_bytes     buffers under load
-         + query_log_entries x 352 + 3 x top_k x 336                 the stats, when full
+         + query_log_entries x 352 + 3 x top_k x 336 + 51,840        the stats, when full
          + cache max_bytes x 1.25                                    the cache, when full
          + the memory of every list in force                         heap_bytes of each
          + the largest list's compile again                          a refresh builds a new copy
@@ -724,12 +724,19 @@ it.
 
 ## `[stats]`
 
-Statistics and the query log live in memory only and are lost on restart.
+The query log lives in memory only and is lost on restart. The counters, the hourly history,
+the top lists and what each upstream has answered are saved to `stats.json` in the
+[`[state] dir`](#state): once an hour while something changed, once on a clean stop, and when
+they are cleared. They are read back at start, so they count since the last clear and not since
+the start. A missing, damaged, too large or other-version file is ignored (the reason is
+logged) and picoguard starts with empty statistics.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `query_log_entries` | `1000` | Recent queries kept (up to 100000). Allocated in full. |
 | `top_k` | `50` | Entries in each top list (up to 1000). Allocated in full. |
+| `persist` | `true` | Save the statistics to `stats.json` and read them back at start. `false`: the file is never read or written, and the statistics start empty at every start. |
+| `retention_days` | `30` | How long the hourly history is kept: `1`, `7`, `30` or `90` days. The ring for 90 days (51,840 bytes) is always allocated; a save builds the file in memory for a moment: a few tens of KB with the defaults and a busy 30 days, up to about 1.4 MB at `top_k = 1000` with the longest names and 90 days. |
 
 ## `[state]`
 
