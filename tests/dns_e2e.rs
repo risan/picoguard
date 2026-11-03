@@ -1,19 +1,23 @@
 //! The whole DNS path on 127.0.0.1 and ::1 with random ports and fake
-//! upstreams written here. Nothing leaves the machine.
+//! upstreams. Nothing leaves the machine.
+
+mod common;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
+use common::harness::{
+    Running, a_record, answering_upstream, config_for, fake_upstream, name, reply_to,
+    silent_upstream, start_with_policy,
+};
+use hickory_proto::op::{Edns, Message, Query, ResponseCode};
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
-use hickory_proto::rr::rdata::{A, SOA, TXT};
-use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_proto::rr::rdata::{SOA, TXT};
+use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use picoguard::config::Config;
-use picoguard::pipeline::Pipeline;
 use picoguard::policy::Policy;
-use picoguard::server::{self, Listeners};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -22,10 +26,6 @@ const QUIET: Duration = Duration::from_millis(400);
 const PATIENT: Duration = Duration::from_secs(3);
 
 // ---------------------------------------------------------------- messages
-
-fn name(text: &str) -> Name {
-    Name::from_ascii(text).unwrap()
-}
 
 struct Ask {
     id: u16,
@@ -78,17 +78,9 @@ impl Ask {
 }
 
 fn answer_a(query: &Message, ttl: u32) -> Message {
-    let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-    reply.metadata.recursion_desired = query.metadata.recursion_desired;
-    reply.metadata.recursion_available = true;
-    reply.add_query(query.queries[0].clone());
-    reply.add_answer(Record::from_rdata(
-        query.queries[0].name().clone(),
-        ttl,
-        RData::A(A(ANSWER)),
-    ));
+    let owner = query.queries[0].name().to_ascii();
 
-    reply
+    reply_to(query, vec![a_record(&owner, ttl, ANSWER.octets())])
 }
 
 /// NXDOMAIN with a SOA whose TTL is 900 and whose MINIMUM is 45, so RFC 2308
@@ -126,116 +118,10 @@ fn big_txt(query: &Message) -> Message {
     reply
 }
 
-// --------------------------------------------------------- fake upstream
-
-type Handler = dyn Fn(&Message) -> Vec<(Duration, Message)> + Send + Sync;
-
-struct FakeUpstream {
-    address: SocketAddr,
-    received: Arc<Mutex<Vec<Vec<u8>>>>,
-    active: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
-}
-
-impl FakeUpstream {
-    fn count(&self) -> usize {
-        self.received.lock().unwrap().len()
-    }
-
-    fn peak(&self) -> usize {
-        self.peak.load(Ordering::SeqCst)
-    }
-
-    fn last_query(&self) -> Message {
-        Message::from_vec(self.received.lock().unwrap().last().unwrap()).unwrap()
-    }
-}
-
-async fn fake_upstream(
-    handler: impl Fn(&Message) -> Vec<(Duration, Message)> + Send + Sync + 'static,
-) -> FakeUpstream {
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let address = socket.local_addr().unwrap();
-    let received = Arc::new(Mutex::new(Vec::new()));
-    let active = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
-    let handler: Arc<Handler> = Arc::new(handler);
-    let (seen, in_flight, highest) = (
-        Arc::clone(&received),
-        Arc::clone(&active),
-        Arc::clone(&peak),
-    );
-
-    tokio::spawn(async move {
-        let mut buffer = [0u8; 4096];
-        while let Ok((length, peer)) = socket.recv_from(&mut buffer).await {
-            seen.lock().unwrap().push(buffer[..length].to_vec());
-            let Ok(query) = Message::from_vec(&buffer[..length]) else {
-                continue;
-            };
-
-            let replies = handler(&query);
-            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            highest.fetch_max(now, Ordering::SeqCst);
-            let (socket, in_flight) = (Arc::clone(&socket), Arc::clone(&in_flight));
-            tokio::spawn(async move {
-                for (delay, reply) in replies {
-                    tokio::time::sleep(delay).await;
-                    let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
-                }
-
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-            });
-        }
-    });
-
-    FakeUpstream {
-        address,
-        received,
-        active,
-        peak,
-    }
-}
-
-async fn answering_upstream() -> FakeUpstream {
-    fake_upstream(|query| vec![(Duration::ZERO, answer_a(query, 300))]).await
-}
-
-async fn slow_upstream(delay: Duration) -> FakeUpstream {
-    fake_upstream(move |query| vec![(delay, answer_a(query, 300))]).await
-}
-
-async fn silent_upstream() -> FakeUpstream {
-    fake_upstream(|_| Vec::new()).await
-}
-
 // --------------------------------------------------------------- server
 
-struct TestServer {
-    udp: SocketAddr,
-    tcp: SocketAddr,
-}
-
-fn config_for(upstream: &FakeUpstream) -> Config {
-    let mut config = Config::default();
-    config.server.bind = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
-    config.server.port = 0;
-    config.upstream.servers = vec![format!("udp://{}", upstream.address)];
-    config.upstream.timeout_ms = 1500;
-
-    config
-}
-
-async fn start(config: Config) -> TestServer {
-    let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
-    let listeners = Listeners::bind(&config.server).unwrap();
-    let server = TestServer {
-        udp: listeners.udp_addresses()[0],
-        tcp: listeners.tcp_addresses()[0],
-    };
-    server::spawn(listeners, pipeline, &config);
-
-    server
+async fn start(config: Config) -> Running {
+    start_with_policy(&config, Arc::new(Policy::new())).await
 }
 
 async fn udp_exchange(server: SocketAddr, request: &[u8], wait: Duration) -> Option<Vec<u8>> {
@@ -257,7 +143,7 @@ async fn udp_exchange(server: SocketAddr, request: &[u8], wait: Duration) -> Opt
     })
 }
 
-async fn udp_ask(server: &TestServer, ask: &Ask) -> Option<Message> {
+async fn udp_ask(server: &Running, ask: &Ask) -> Option<Message> {
     udp_exchange(server.udp, &ask.bytes(), PATIENT)
         .await
         .map(|bytes| Message::from_vec(&bytes).unwrap())
@@ -283,7 +169,7 @@ async fn read_framed(stream: &mut TcpStream) -> Option<Message> {
     Some(Message::from_vec(&reply).unwrap())
 }
 
-async fn tcp_ask(server: &TestServer, ask: &Ask) -> Option<Message> {
+async fn tcp_ask(server: &Running, ask: &Ask) -> Option<Message> {
     let mut stream = TcpStream::connect(server.tcp).await.unwrap();
     write_framed(&mut stream, &ask.bytes()).await;
 
@@ -302,7 +188,7 @@ fn first_a(message: &Message) -> Ipv4Addr {
 
 #[tokio::test]
 async fn queries_are_forwarded_over_udp_and_tcp() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let server = start(config_for(&upstream)).await;
 
     let udp = udp_ask(
@@ -328,7 +214,7 @@ async fn queries_are_forwarded_over_udp_and_tcp() {
 
 #[tokio::test]
 async fn the_answer_keeps_the_clients_letter_case_from_the_upstream_and_from_the_cache() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let server = start(config_for(&upstream)).await;
     let ask = Ask::new("MiXeD.Example.COM.", RecordType::A);
 
@@ -348,7 +234,7 @@ async fn the_answer_keeps_the_clients_letter_case_from_the_upstream_and_from_the
 
 #[tokio::test]
 async fn repeated_queries_come_from_the_cache_with_an_aged_ttl() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let server = start(config_for(&upstream)).await;
     let ask = Ask::new("cached.example.", RecordType::A);
 
@@ -569,7 +455,7 @@ async fn a_truncated_reply_from_a_tcp_upstream_reaches_the_client_marked_truncat
 
 #[tokio::test]
 async fn identical_queries_in_flight_share_one_upstream_query() {
-    let upstream = slow_upstream(Duration::from_millis(300)).await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::from_millis(300)).await;
     let server = Arc::new(start(config_for(&upstream)).await);
 
     let mut clients = Vec::new();
@@ -596,7 +482,7 @@ async fn identical_queries_in_flight_share_one_upstream_query() {
 
 #[tokio::test]
 async fn queries_with_different_rd_are_not_coalesced() {
-    let upstream = slow_upstream(Duration::from_millis(300)).await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::from_millis(300)).await;
     let server = Arc::new(start(config_for(&upstream)).await);
 
     let mut clients = Vec::new();
@@ -621,7 +507,7 @@ async fn queries_with_different_rd_are_not_coalesced() {
 
 #[tokio::test]
 async fn any_queries_get_notimp_and_blocked_hosts_get_refused() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let server = start(config_for(&upstream)).await;
     let mut version = Ask::new("version.bind.", RecordType::TXT);
     version.class = DNSClass::CH;
@@ -645,7 +531,7 @@ async fn any_queries_get_notimp_and_blocked_hosts_get_refused() {
 
 #[tokio::test]
 async fn any_is_forwarded_when_refuse_any_is_off() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let mut config = config_for(&upstream);
     config.refuse_any = false;
     let server = start(config).await;
@@ -660,7 +546,7 @@ async fn any_is_forwarded_when_refuse_any_is_off() {
 
 #[tokio::test]
 async fn private_reverse_lookups_without_a_local_resolver_get_nxdomain() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let server = start(config_for(&upstream)).await;
 
     let reply = udp_ask(
@@ -676,7 +562,7 @@ async fn private_reverse_lookups_without_a_local_resolver_get_nxdomain() {
 
 #[tokio::test]
 async fn private_reverse_lookups_and_local_domains_go_to_the_local_resolver() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let router = fake_upstream(|query| {
         let mut reply = answer_a(query, 30);
         reply.metadata.response_code = ResponseCode::NoError;
@@ -715,7 +601,7 @@ async fn private_reverse_lookups_and_local_domains_go_to_the_local_resolver() {
 
 #[tokio::test]
 async fn client_subnet_and_other_edns_options_are_not_forwarded() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let server = start(config_for(&upstream)).await;
     let mut ask = Ask::new("ecs.example.", RecordType::A).with_edns(4096);
     let edns = ask.edns.as_mut().unwrap();
@@ -769,7 +655,7 @@ async fn a_client_without_edns_still_gets_an_edns_query_upstream_and_no_opt_back
 
 #[tokio::test]
 async fn garbage_and_responses_get_no_answer_and_bad_queries_get_formerr() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let server = start(config_for(&upstream)).await;
     let mut response = Ask::new("example.com.", RecordType::A).bytes();
     response[2] |= 0x80;
@@ -795,7 +681,7 @@ async fn garbage_and_responses_get_no_answer_and_bad_queries_get_formerr() {
 
 #[tokio::test]
 async fn a_client_outside_allow_from_gets_no_answer_over_udp_or_tcp() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let mut config = config_for(&upstream);
     config.server.allow_from = vec!["10.0.0.0/8".parse().unwrap()];
     let server = start(config).await;
@@ -821,7 +707,7 @@ async fn an_ipv6_client_outside_allow_from_is_refused_and_inside_is_served() {
         return;
     }
 
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let mut config = config_for(&upstream);
     config.server.bind = vec!["::1".parse().unwrap()];
     config.server.allow_from = vec!["127.0.0.0/8".parse().unwrap()];
@@ -841,7 +727,7 @@ async fn an_ipv6_client_outside_allow_from_is_refused_and_inside_is_served() {
 
 #[tokio::test]
 async fn too_many_queries_in_flight_are_dropped_over_udp() {
-    let upstream = slow_upstream(Duration::from_millis(400)).await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::from_millis(400)).await;
     let mut config = config_for(&upstream);
     config.limits.max_inflight_queries = 2;
     let server = Arc::new(start(config).await);
@@ -867,7 +753,7 @@ async fn too_many_queries_in_flight_are_dropped_over_udp() {
 
 #[tokio::test]
 async fn too_many_waiting_clients_are_dropped_over_udp_even_when_coalesced() {
-    let upstream = slow_upstream(Duration::from_millis(400)).await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::from_millis(400)).await;
     let mut config = config_for(&upstream);
     config.limits.max_waiting_clients = 3;
     let server = Arc::new(start(config).await);
@@ -895,7 +781,7 @@ async fn too_many_waiting_clients_are_dropped_over_udp_even_when_coalesced() {
 
 #[tokio::test]
 async fn over_the_limits_tcp_clients_get_servfail() {
-    let upstream = slow_upstream(Duration::from_millis(500)).await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::from_millis(500)).await;
     let mut config = config_for(&upstream);
     config.limits.max_inflight_queries = 1;
     let server = start(config).await;
@@ -935,7 +821,7 @@ async fn an_exhausted_pending_bytes_budget_means_servfail_for_tcp_and_silence_fo
 
 #[tokio::test]
 async fn the_budget_is_released_after_delivery() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let mut config = config_for(&upstream);
     config.limits.pending_bytes = 200;
     let server = start(config).await;
@@ -961,7 +847,7 @@ async fn a_reply_is_charged_to_the_budget_exactly_once() {
         .len();
 
     for (capacity, served) in [(reply_len, true), (reply_len - 1, false)] {
-        let upstream = answering_upstream().await;
+        let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
         let mut config = config_for(&upstream);
         config.limits.pending_bytes = capacity;
         let server = start(config).await;
@@ -974,7 +860,7 @@ async fn a_reply_is_charged_to_the_budget_exactly_once() {
 
 #[tokio::test]
 async fn tcp_connections_over_the_limit_are_closed_at_once() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let mut config = config_for(&upstream);
     config.limits.tcp_max_connections = 2;
     let server = start(config).await;
@@ -1007,7 +893,7 @@ async fn tcp_connections_over_the_limit_are_closed_at_once() {
 
 #[tokio::test]
 async fn idle_tcp_connections_are_closed() {
-    let upstream = answering_upstream().await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::ZERO).await;
     let mut config = config_for(&upstream);
     config.limits.tcp_idle_secs = 1;
     let server = start(config).await;
@@ -1023,7 +909,7 @@ async fn idle_tcp_connections_are_closed() {
 
 #[tokio::test]
 async fn pipelined_tcp_queries_are_limited_per_connection() {
-    let upstream = slow_upstream(Duration::from_millis(200)).await;
+    let upstream = answering_upstream(ANSWER.octets(), Duration::from_millis(200)).await;
     let mut config = config_for(&upstream);
     config.limits.tcp_queue_replies = 2;
     let server = start(config).await;
@@ -1042,5 +928,5 @@ async fn pipelined_tcp_queries_are_limited_per_connection() {
 
     assert_eq!(ids, [0, 1, 2, 3, 4, 5]);
     assert_eq!(upstream.peak(), 2);
-    assert_eq!(upstream.active.load(Ordering::SeqCst), 0);
+    assert_eq!(upstream.in_flight(), 0);
 }
