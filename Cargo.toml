@@ -53,6 +53,11 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# PBKDF2 at 600,000 rounds takes over a second in an unoptimized ring, which makes the
+# password tests slow. Release builds are not affected.
+[profile.dev.package.ring]
+opt-level = 3
+
 [dev-dependencies]
 flate2 = "1.1.10"
 hickory-proto = "0.26.3"
