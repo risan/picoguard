@@ -223,12 +223,21 @@ impl Delivery {
         ReplyParts {
             bytes: &self.bytes,
             ttl_offsets: &self.info.ttl_offsets,
-            opt_start: self.info.opt_start,
+            extended_rcode: self.info.extended_rcode,
         }
     }
 }
 
 type Outcome = Result<Arc<Delivery>, Failure>;
+
+/// Why a cache hit could not be held for delivery.
+#[derive(Debug, PartialEq, Eq)]
+enum Unheld {
+    /// No such entry any more: it expired or was evicted since it was found.
+    Gone,
+    /// The pending-bytes budget cannot hold a copy.
+    NoRoom,
+}
 
 /// A query that waited for everything except its decision. See `Pipeline::prepare`.
 pub struct Prepared(Inner);
@@ -657,14 +666,15 @@ impl Pipeline {
         let asker = Asker::new(client);
         let mut out = Vec::new();
         let settled = self.settle(&request, protocol, None, &mut out);
-        if settled == Err(Quick::Dropped) {
-            return None;
+        match settled {
+            Err(Quick::Dropped) => return None,
+            // A malformed query or an unsupported EDNS version: the reply does not depend on
+            // any policy.
+            Err(Quick::Replied) => return Some(Prepared(Inner::Final(out))),
+            _ => {}
         }
 
-        let Ok(parsed) = Query::parse(&request) else {
-            // A malformed query: the header-only reply does not depend on any policy.
-            return Some(Prepared(Inner::Final(out)));
-        };
+        let parsed = Query::parse(&request).ok()?;
         let compact = build::compact_query(&parsed);
         drop(request);
         match settled {
@@ -672,16 +682,23 @@ impl Pipeline {
                 // The entry may be gone before the reply is written, so the reply keeps its
                 // own copy of the bytes, charged like an upstream reply.
                 let query = Query::parse(&compact).ok()?;
-                let Some(delivery) = self.hold_cache_hit(&query) else {
-                    return self.shed(compact, protocol, asker);
-                };
+                match self.hold_cache_hit(&query) {
+                    Ok(delivery) => {
+                        return Some(Prepared(Inner::Undecided {
+                            request: compact,
+                            protocol,
+                            asker,
+                            delivery: Some(delivery),
+                        }));
+                    }
 
-                return Some(Prepared(Inner::Undecided {
-                    request: compact,
-                    protocol,
-                    asker,
-                    delivery: Some(delivery),
-                }));
+                    Err(Unheld::NoRoom) => {
+                        return self.shed(compact, protocol, asker);
+                    }
+
+                    // Expired since `settle` found it: the upstream answers like for a miss.
+                    Err(Unheld::Gone) => {}
+                }
             }
 
             Ok(Settled::Static(_) | Settled::Blocked(_)) => {
@@ -993,6 +1010,12 @@ impl Pipeline {
             Quick::Dropped
         })?;
         let reply = Reply::new(&query, self.udp_size, protocol);
+        if query.edns.is_some_and(|edns| edns.version > 0) {
+            reply.bad_version(out);
+
+            return Err(Quick::Replied);
+        }
+
         let name = &query.question.name;
         let record = |result| {
             if let Some(asker) = asker {
@@ -1060,6 +1083,7 @@ impl Pipeline {
         let remembered = hit
             .memo
             .filter(|memo| !view.paused && memo.generation == view.generation);
+        let memo_is_current = remembered.is_some();
         let decision = match remembered {
             Some(memo) => memo.decision,
             None if request_verdict == Verdict::Allow => Decision::Pass,
@@ -1079,7 +1103,10 @@ impl Pipeline {
             }
         };
 
-        self.remember(&mut cache, &key, token, &view, &decision);
+        if !memo_is_current {
+            self.remember(&mut cache, &key, token, &view, &decision);
+        }
+
         // The inflight lock is never taken while the cache lock is held.
         drop(cache);
 
@@ -1221,16 +1248,20 @@ impl Pipeline {
         self.route_of(name) == Route::Local && self.local_resolver.is_none()
     }
 
-    /// A copy of the cached reply to `query`, charged to the pending-bytes budget. `None`
-    /// when there is no such entry or the budget cannot hold the copy.
-    fn hold_cache_hit(&self, query: &Query<'_>) -> Option<Arc<Delivery>> {
+    /// A copy of the cached reply to `query`, charged to the pending-bytes budget.
+    fn hold_cache_hit(&self, query: &Query<'_>) -> Result<Arc<Delivery>, Unheld> {
         let mut cache = self.cache.lock().unwrap();
-        let hit = cache.get(&CacheKey::new(query), Instant::now())?;
-        let charge = self.budget.try_charge(hit.parts.bytes.len())?;
+        let hit = cache
+            .get(&CacheKey::new(query), Instant::now())
+            .ok_or(Unheld::Gone)?;
+        let charge = self
+            .budget
+            .try_charge(hit.parts.bytes.len())
+            .ok_or(Unheld::NoRoom)?;
         let bytes = hit.parts.bytes.to_vec();
-        let info = ResponseInfo::parse(&bytes).ok()?;
+        let info = ResponseInfo::parse(&bytes).map_err(|_| Unheld::Gone)?;
 
-        Some(Arc::new(Delivery::new(
+        Ok(Arc::new(Delivery::new(
             bytes,
             info,
             Some(hit.token),
@@ -1500,7 +1531,8 @@ impl Pipeline {
                     _ => Failure::Upstream,
                 }
             })?;
-        let mut info = ResponseInfo::parse(&bytes).map_err(|_| Failure::Upstream)?;
+        let mut info =
+            ResponseInfo::parse_dropping_opt(&mut bytes).map_err(|_| Failure::Upstream)?;
         info.cap_soa_ttls(&mut bytes);
 
         let query = Query::parse(&request).map_err(|_| Failure::Upstream)?;
@@ -1545,7 +1577,7 @@ fn write_flattened(
         return;
     };
 
-    if header.truncated() || parts.extended_rcode() != 0 {
+    if header.truncated() || parts.extended_rcode != 0 {
         reply.error(rcode::SERVFAIL, out);
 
         return;
@@ -1672,15 +1704,19 @@ fn reverse_address(name: &Name) -> Option<IpAddr> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use hickory_proto::op::ResponseCode;
     use hickory_proto::rr::RecordType;
 
     use super::*;
-    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse, soa};
+    use crate::dns::test_util::{
+        OPT_BEFORE_ADDITIONALS_FIRST_START, OPT_BEFORE_ADDITIONALS_OPT_START, QuerySpec,
+        ResponseSpec, a, parse, response_with_opt_before_other_additionals, soa,
+    };
     use crate::dns::wire::{HEADER_LEN, skip_name};
     use crate::filter::engine::{CompiledList, Engine};
     use crate::filter::parse::ListFormat;
     use crate::names::reverse_name;
-    use crate::upstream::test_dns::{self, fake_dns, fake_router};
+    use crate::upstream::test_dns::{self, fake_dns, fake_router, scripted_dns};
 
     const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
 
@@ -2996,5 +3032,263 @@ mod tests {
             "{:?}",
             pipeline.upstream_tallies()
         );
+    }
+
+    const OPT_RECORD_LEN: usize = 11;
+
+    fn edns_query(name: &str) -> QuerySpec {
+        let mut spec = QuerySpec::new(name, RecordType::A);
+        spec.edns = Some((1232, false));
+
+        spec
+    }
+
+    /// `reply` with the ID of the query that is being answered.
+    fn answering(request: &[u8], mut reply: Vec<u8>) -> Vec<u8> {
+        reply[0..2].copy_from_slice(&request[0..2]);
+
+        reply
+    }
+
+    fn cached_bytes(pipeline: &Pipeline, spec: &QuerySpec) -> Option<Vec<u8>> {
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let mut cache = pipeline.cache.lock().unwrap();
+
+        cache
+            .get(&CacheKey::new(&query), Instant::now())
+            .map(|hit| hit.parts.bytes.to_vec())
+    }
+
+    async fn answer_over_udp(pipeline: &Arc<Pipeline>, spec: &QuerySpec) -> Vec<u8> {
+        let mut out = Vec::new();
+        pipeline
+            .answer(spec.bytes(), Protocol::Udp, CLIENT, &mut out)
+            .await;
+
+        out
+    }
+
+    #[tokio::test]
+    async fn the_cache_keeps_no_upstream_opt_and_the_client_gets_only_ours() {
+        let (address, _) = scripted_dns(|request| {
+            let spec = QuerySpec::new("www.example.com.", RecordType::A);
+            let reply = ResponseSpec {
+                answers: vec![a("www.example.com.", 300, Ipv4Addr::new(192, 0, 2, 1))],
+                edns: Some(4096),
+                ..ResponseSpec::default()
+            };
+
+            answering(request, reply.bytes(&spec))
+        })
+        .await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(address), Arc::new(Policy::new())).unwrap();
+        let spec = edns_query("www.example.com.");
+
+        let first = answer_over_udp(&pipeline, &spec).await;
+
+        let cached = cached_bytes(&pipeline, &spec).unwrap();
+        let cached_info = ResponseInfo::parse(&cached).unwrap();
+        assert_eq!(cached_info.opt_start, None);
+        assert_eq!(cached_info.header.additional_count, 0);
+
+        let mut hit = Vec::new();
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut hit), Quick::Replied);
+        for reply in [first, hit] {
+            let message = parse(&reply);
+            assert_eq!(message.answers.len(), 1);
+            assert_eq!(message.edns.unwrap().max_payload(), pipeline.udp_size);
+            assert_eq!(
+                ResponseInfo::parse(&reply).unwrap().header.additional_count,
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_opt_before_other_additional_records_is_dropped_before_caching() {
+        let (address, _) = scripted_dns(|request| {
+            answering(request, response_with_opt_before_other_additionals())
+        })
+        .await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(address), Arc::new(Policy::new())).unwrap();
+        let spec = edns_query("www.example.com.");
+
+        let reply = answer_over_udp(&pipeline, &spec).await;
+
+        let cached = cached_bytes(&pipeline, &spec).unwrap();
+        let cached_info = ResponseInfo::parse(&cached).unwrap();
+        assert_eq!(cached_info.opt_start, None);
+        assert_eq!(cached_info.header.additional_count, 3);
+        assert_eq!(cached_info.ttl_offsets.len(), 4);
+
+        let message = parse(&reply);
+        assert_eq!(message.additionals.len(), 3);
+        assert_eq!(message.edns.unwrap().max_payload(), pipeline.udp_size);
+        assert_eq!(
+            ResponseInfo::parse(&reply).unwrap().header.additional_count,
+            4
+        );
+    }
+
+    fn reply_with_extended_rcode(request: &[u8]) -> Vec<u8> {
+        let spec = QuerySpec::new("ext.example.com.", RecordType::A);
+        let mut reply = ResponseSpec {
+            answers: vec![a("ext.example.com.", 300, Ipv4Addr::new(192, 0, 2, 1))],
+            edns: Some(4096),
+            ..ResponseSpec::default()
+        }
+        .bytes(&spec);
+        let extended_rcode_at = reply.len() - OPT_RECORD_LEN + 5;
+        reply[extended_rcode_at] = 1;
+
+        answering(request, reply)
+    }
+
+    #[tokio::test]
+    async fn an_extended_rcode_reaches_an_edns_client_and_a_client_without_edns_gets_servfail() {
+        let (address, _) = scripted_dns(reply_with_extended_rcode).await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(address), Arc::new(Policy::new())).unwrap();
+        let with_edns = edns_query("ext.example.com.");
+
+        let reply = answer_over_udp(&pipeline, &with_edns).await;
+
+        assert_eq!(reply[reply.len() - OPT_RECORD_LEN + 5], 1);
+        assert_eq!(cached_bytes(&pipeline, &with_edns), None);
+
+        let without_edns = QuerySpec::new("ext.example.com.", RecordType::A);
+        let reply = answer_over_udp(&pipeline, &without_edns).await;
+
+        assert_eq!(parse(&reply).metadata.response_code, ResponseCode::ServFail);
+    }
+
+    #[tokio::test]
+    async fn a_record_pointing_into_the_upstream_opt_is_a_servfail_and_is_not_cached() {
+        let (address, _) = scripted_dns(|request| {
+            let mut reply = response_with_opt_before_other_additionals();
+            let second_start = OPT_BEFORE_ADDITIONALS_FIRST_START + 19;
+            reply[second_start] = 0xC0;
+            reply[second_start + 1] = OPT_BEFORE_ADDITIONALS_OPT_START as u8;
+
+            answering(request, reply)
+        })
+        .await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(address), Arc::new(Policy::new())).unwrap();
+        let spec = edns_query("www.example.com.");
+
+        let reply = answer_over_udp(&pipeline, &spec).await;
+
+        assert_eq!(parse(&reply).metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(cached_bytes(&pipeline, &spec), None);
+    }
+
+    fn version_one_query(name: &str) -> Vec<u8> {
+        let mut request = edns_query(name).bytes();
+        let version_at = request.len() - OPT_RECORD_LEN + 6;
+        request[version_at] = 1;
+
+        request
+    }
+
+    fn assert_bad_version(reply: &[u8]) {
+        let opt = &reply[reply.len() - OPT_RECORD_LEN..];
+
+        assert_eq!(reply[3] & 0x0F, rcode::NOERROR, "the header RCODE");
+        assert_eq!(&reply[6..8], &[0, 0], "no answers");
+        assert_eq!(opt[5], 1, "the extended RCODE: BADVERS");
+        assert_eq!(opt[6], 0, "our OPT says version 0");
+        assert_eq!(&reply[0..2], &edns_query("v1.example.").bytes()[0..2]);
+    }
+
+    #[tokio::test]
+    async fn an_edns_version_above_zero_is_answered_with_badvers_without_asking_the_upstream() {
+        let fake = fake_dns(vec![Ipv4Addr::new(2, 2, 2, 2)], vec![]).await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(fake.address), Arc::new(Policy::new())).unwrap();
+        let request = version_one_query("v1.example.");
+
+        let mut over_udp = Vec::new();
+        let quick = pipeline.answer_quickly(&request, Protocol::Udp, CLIENT, &mut over_udp);
+        assert_eq!(quick, Quick::Replied);
+        assert_bad_version(&over_udp);
+
+        let mut over_tcp = Vec::new();
+        let prepared = pipeline
+            .prepare(request.clone(), Protocol::Tcp, CLIENT)
+            .await
+            .unwrap();
+        assert!(pipeline.finish(&prepared, &mut over_tcp).await.is_some());
+        assert_bad_version(&over_tcp);
+
+        let mut whole = Vec::new();
+        assert!(
+            pipeline
+                .answer(request, Protocol::Tcp, CLIENT, &mut whole)
+                .await
+        );
+        assert_bad_version(&whole);
+
+        assert_eq!(fake.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(counters(&pipeline).total, 0);
+    }
+
+    #[tokio::test]
+    async fn an_edns_version_zero_query_is_still_resolved() {
+        let fake = fake_dns(vec![Ipv4Addr::new(2, 2, 2, 2)], vec![]).await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(fake.address), Arc::new(Policy::new())).unwrap();
+
+        let reply = answer_over_udp(&pipeline, &edns_query("v0.example.")).await;
+
+        assert_eq!(answer_addresses(&reply), ["2.2.2.2"]);
+        assert_eq!(fake.queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_that_expired_is_gone_and_one_the_budget_cannot_hold_has_no_room() {
+        let mut config = offline_config();
+        config.cache.optimistic = false;
+        config.limits.pending_bytes = 8;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("held.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+
+        assert_eq!(pipeline.hold_cache_hit(&query).err(), Some(Unheld::Gone));
+
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 60, 61).unwrap();
+        assert_eq!(pipeline.hold_cache_hit(&query).err(), Some(Unheld::Gone));
+
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 60, 0).unwrap();
+        assert_eq!(pipeline.hold_cache_hit(&query).err(), Some(Unheld::NoRoom));
+    }
+
+    #[tokio::test]
+    async fn a_second_hit_finds_the_decision_of_the_first_unchanged() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("memo.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let token = insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0).unwrap();
+        let memo_after = |pipeline: &Pipeline| {
+            let mut cache = pipeline.cache.lock().unwrap();
+            let hit = cache.get(&CacheKey::new(&query), Instant::now()).unwrap();
+
+            (hit.token, hit.memo.clone(), cache.bytes())
+        };
+        let mut out = Vec::new();
+
+        ask_quickly(&pipeline, &spec, &mut out);
+        let first = memo_after(&pipeline);
+        ask_quickly(&pipeline, &spec, &mut out);
+        let second = memo_after(&pipeline);
+
+        assert_eq!(first.0, token);
+        assert!(first.1.is_some());
+        assert_eq!(first, second);
     }
 }

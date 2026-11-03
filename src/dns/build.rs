@@ -1,17 +1,13 @@
 use std::net::IpAddr;
 
 use super::wire::{
-    CLASS_IN, HEADER_LEN, Header, MAX_MESSAGE_LEN, MAX_NAME_LEN, Name, Query, flags, rcode,
-    remove_opt, rtype,
+    CLASS_IN, HEADER_LEN, Header, MAX_MESSAGE_LEN, MAX_NAME_LEN, Name, Query, flags, rcode, rtype,
 };
 
 const CLASSIC_UDP_LIMIT: u16 = 512;
 const OPT_RECORD_LEN: usize = 11;
 /// Owner pointer, type, class, TTL and RDLENGTH: an answer record without its data.
 const ANSWER_FIXED_LEN: usize = 12;
-/// Owner (1 byte), type and class (4): the TTL field starts here, and its
-/// first byte is the extended RCODE.
-const OPT_EXTENDED_RCODE_AT: usize = 5;
 const EDNS_DO: u32 = 0x8000;
 const NAME_POINTER_TO_QUESTION: [u8; 2] = [0xC0, HEADER_LEN as u8];
 
@@ -49,23 +45,14 @@ impl TtlRule {
 }
 
 /// An upstream reply as the cache keeps it. `bytes` starts with a header and
-/// exactly the client's question, and `ttl_offsets` and `opt_start` were taken
-/// from a successful `ResponseInfo::parse` of `bytes`.
+/// exactly the client's question and no OPT record, and `ttl_offsets` was taken
+/// from a successful `ResponseInfo::parse` of `bytes`. `extended_rcode` is what the
+/// removed OPT record carried.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplyParts<'a> {
     pub bytes: &'a [u8],
     pub ttl_offsets: &'a [u16],
-    pub opt_start: Option<u16>,
-}
-
-impl ReplyParts<'_> {
-    /// The upper 8 bits of the RCODE, from the OPT record (0 without one).
-    pub fn extended_rcode(&self) -> u8 {
-        self.opt_start
-            .and_then(|start| self.bytes.get(usize::from(start) + OPT_EXTENDED_RCODE_AT))
-            .copied()
-            .unwrap_or(0)
-    }
+    pub extended_rcode: u8,
 }
 
 /// Writes the reply to one client query.
@@ -89,6 +76,13 @@ impl<'q, 'a> Reply<'q, 'a> {
     pub fn error(&self, rcode: u8, out: &mut Vec<u8>) {
         self.begin(rcode, out);
         self.end(out, 0);
+    }
+
+    /// RFC 6891 section 6.1.3: BADVERS (16) is RCODE 0 in the header and extended RCODE 1 in
+    /// our OPT record, which says version 0, the only one we speak.
+    pub fn bad_version(&self, out: &mut Vec<u8>) {
+        self.begin(rcode::NOERROR, out);
+        self.end(out, 1);
     }
 
     /// AdGuard "default" blocking: A is 0.0.0.0, AAAA is ::, HTTPS is empty,
@@ -188,7 +182,7 @@ impl<'q, 'a> Reply<'q, 'a> {
 
         // The upper 8 bits of the RCODE live in the OPT record's TTL field. Only
         // a client that sent an OPT can be given them.
-        let extended_rcode = parts.extended_rcode();
+        let extended_rcode = parts.extended_rcode;
         if extended_rcode != 0 && self.query.edns.is_none() {
             self.error(rcode::SERVFAIL, out);
 
@@ -207,14 +201,6 @@ impl<'q, 'a> Reply<'q, 'a> {
                 let ttl = u32::from_be_bytes([field[0], field[1], field[2], field[3]]);
                 field.copy_from_slice(&ttl_rule.apply(ttl).to_be_bytes());
             }
-        }
-
-        if let Some(opt_start) = parts.opt_start
-            && remove_opt(out, usize::from(opt_start)).is_err()
-        {
-            self.error(rcode::SERVFAIL, out);
-
-            return;
         }
 
         self.end(out, extended_rcode);
@@ -475,10 +461,12 @@ mod tests {
         })
     }
 
-    fn parts_of(bytes: &[u8]) -> (Vec<u16>, Option<u16>) {
-        let info = ResponseInfo::parse(bytes).unwrap();
+    /// What the cache keeps of `upstream`: its bytes without the OPT record, and the offsets.
+    fn stored(upstream: &[u8]) -> (Vec<u8>, ResponseInfo) {
+        let mut bytes = upstream.to_vec();
+        let info = ResponseInfo::parse_dropping_opt(&mut bytes).unwrap();
 
-        (info.ttl_offsets, info.opt_start)
+        (bytes, info)
     }
 
     fn from_upstream(
@@ -489,11 +477,11 @@ mod tests {
     ) -> Vec<u8> {
         let bytes = spec.bytes();
         let query = Query::parse(&bytes).unwrap();
-        let (ttl_offsets, opt_start) = parts_of(upstream);
+        let (stored_bytes, info) = stored(upstream);
         let parts = ReplyParts {
-            bytes: upstream,
-            ttl_offsets: &ttl_offsets,
-            opt_start,
+            bytes: &stored_bytes,
+            ttl_offsets: &info.ttl_offsets,
+            extended_rcode: info.extended_rcode,
         };
         let mut out = Vec::new();
 
@@ -970,7 +958,7 @@ mod tests {
         let parts = ReplyParts {
             bytes: &upstream,
             ttl_offsets: &[],
-            opt_start: None,
+            extended_rcode: 0,
         };
         let mut out = Vec::new();
 
@@ -991,11 +979,11 @@ mod tests {
         bytes[size_at..size_at + 2].copy_from_slice(&100u16.to_be_bytes());
         let query = Query::parse(&bytes).unwrap();
         assert_eq!(query.edns.unwrap().udp_size, 100);
-        let (ttl_offsets, opt_start) = parts_of(&upstream);
+        let (stored_bytes, info) = stored(&upstream);
         let parts = ReplyParts {
-            bytes: &upstream,
-            ttl_offsets: &ttl_offsets,
-            opt_start,
+            bytes: &stored_bytes,
+            ttl_offsets: &info.ttl_offsets,
+            extended_rcode: info.extended_rcode,
         };
         let mut out = Vec::new();
 
@@ -1157,7 +1145,7 @@ mod tests {
         let parts = ReplyParts {
             bytes: upstream,
             ttl_offsets: &[],
-            opt_start: None,
+            extended_rcode: 0,
         };
         let mut out = Vec::new();
 
@@ -1194,7 +1182,8 @@ mod tests {
             again.edns,
             Some(crate::dns::wire::Edns {
                 udp_size: 1400,
-                dnssec_ok: true
+                dnssec_ok: true,
+                version: 0
             })
         );
         let without_edns = QuerySpec::new("example.com.", RecordType::A).bytes();

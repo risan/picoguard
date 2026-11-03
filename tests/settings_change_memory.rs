@@ -20,7 +20,7 @@ const SWAPS: usize = 20;
 const HEADER_LEN: usize = 12;
 const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// The stats of the names asked (query log, top lists), which stay after the cache is replaced.
-/// Measured: 6,950 bytes held after the replacement, for 500 names; the full cache held 102,672.
+/// Measured: 7,014 bytes held after the replacement, for 500 names; the full cache held 94,544.
 const STATS_ALLOWANCE: usize = 16 * 1024;
 /// One query through a new pool: its cache entry and its stats. Measured: 6,032 bytes for 20
 /// replacements, 302 per replacement; a pool left behind would hold its TLS root store.
