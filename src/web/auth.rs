@@ -22,7 +22,8 @@ pub(super) const SIGNED_OUT_COOKIE: &str =
 const LIMITED_AFTER_FAILURES: usize = 5;
 /// Five failures within this span lock an address until this long after the last one.
 const LIMIT_WINDOW_SECONDS: u32 = 15 * 60;
-const LIMITER_ADDRESSES: usize = 64;
+/// How many client addresses the table of failed sign-ins holds; the oldest is replaced after that.
+pub const LIMITER_ADDRESSES: usize = 64;
 
 pub(super) enum Attempt<'a> {
     /// The credentials of an `Authorization: Basic` header, still encoded.

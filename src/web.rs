@@ -56,6 +56,8 @@ use crate::update::{Tag, UpdateView, Updates, parse_tag};
 
 mod auth;
 
+pub use auth::LIMITER_ADDRESSES;
+
 const PAGE: &str = include_str!("web/index.html");
 
 const MAX_BODY_BYTES: usize = 1024;

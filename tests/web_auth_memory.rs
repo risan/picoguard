@@ -19,7 +19,7 @@ use picoguard::stage::{StageSetup, StageTiming, Stager};
 use picoguard::stats_store::StatsSaver;
 use picoguard::update::{Build, Updates};
 use picoguard::upstream::tls::Tls;
-use picoguard::web::{self, Web, WebListeners};
+use picoguard::web::{self, LIMITER_ADDRESSES, Web, WebListeners};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpSocket;
 
@@ -161,22 +161,28 @@ fn logins_and_failures_from_many_addresses_keep_memory_within_ten_kilobytes() {
         let before = live();
 
         let (address, _config) = start(parts);
-        for host in 1..=150 {
+        let signed_in = 2 * LIMITER_ADDRESSES;
+        let evicting = LIMITER_ADDRESSES + 1;
+        for host in 1..=signed_in {
             let from = format!("127.0.1.{host}");
             for _ in 0..4 {
                 assert_eq!(login(address, &from, "wrong").await, (401, false));
             }
             assert_eq!(login(address, &from, "s3cret").await, (200, true));
         }
-        // The table ends full of live entries, with evictions done.
-        for host in 1..=250 {
+        // The table ends full of live entries, with an eviction done.
+        for host in 1..=evicting {
             let from = format!("127.0.2.{host}");
             assert_eq!(login(address, &from, "wrong").await, (401, false));
         }
         settle().await;
 
         let kept = live().saturating_sub(before);
-        println!("1,000 sign-in attempts from 400 addresses: kept {kept} bytes");
+        println!(
+            "{} sign-in attempts from {} addresses: kept {kept} bytes",
+            5 * signed_in + evicting,
+            signed_in + evicting
+        );
 
         assert!(kept <= KEPT_BUDGET_BYTES, "kept {kept} bytes");
     });
