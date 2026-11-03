@@ -806,7 +806,7 @@ logged) and picoguard starts with empty statistics.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `query_log_entries` | `1000` | Recent queries kept (up to 100000). Allocated in full. |
+| `query_log_entries` | `1000` | Recent queries kept (up to 100000). Allocated in full. One `/api/querylog` answer holds at most 1000. |
 | `top_k` | `50` | Entries in each top list (up to 1000). Allocated in full. |
 | `persist` | `true` | Save the statistics to `stats.json` and read them back at start. `false`: the file is never read or written, and the statistics start empty at every start. |
 | `retention_days` | `30` | How long the hourly history is kept: `1`, `7`, `30` or `90` days. The Settings tab can set it instead ([above](#statistics-retention-from-the-page)); a value from the page wins. The ring for 90 days (51,840 bytes) is always allocated; a save builds the file in memory for a moment: a few tens of KB with the defaults and a busy 30 days, up to about 1.4 MB at `top_k = 1000` with the longest names and 90 days. |

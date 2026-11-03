@@ -1335,6 +1335,23 @@ async fn the_query_log_is_newest_first_and_never_longer_than_the_ring() {
     }
 }
 
+#[tokio::test]
+async fn one_query_log_answer_is_cut_to_a_thousand_entries() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    config.stats.query_log_entries = 1_500;
+    let site = site(config).await;
+    for index in 0..1_500 {
+        record_client(&site, "127.0.0.1", &format!("n{index}.example."));
+    }
+
+    let everything = site.send(get("/api/querylog?limit=100000")).await;
+    let entries = everything.json()["entries"].as_array().unwrap().clone();
+
+    assert_eq!(entries.len(), 1_000);
+    assert_eq!(entries[0]["qname"], "n1499.example");
+}
+
 /// Records a query from `client` straight into the site's stats: the names code sees only the
 /// addresses the views show, however they got there.
 fn record_client(site: &Site, client: &str, qname: &str) {

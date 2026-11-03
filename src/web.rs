@@ -74,6 +74,8 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 const MIN_PAUSE_MINUTES: u32 = 1;
 const MAX_PAUSE_MINUTES: u32 = 24 * 60;
 const DEFAULT_QUERY_LOG_LIMIT: usize = 100;
+/// One answer is built under the lock every DNS answer takes, whatever the ring holds.
+const MAX_QUERY_LOG_ANSWER: usize = 1_000;
 const HISTORY_DAYS: [u32; 3] = [7, 30, 90];
 /// The furthest time zone from UTC is 14 hours east.
 const MAX_OFFSET_MINUTES: i32 = 14 * 60;
@@ -981,7 +983,7 @@ impl Web {
             }
         }
 
-        Ok(limit.min(self.query_log_entries))
+        Ok(limit.min(self.query_log_entries).min(MAX_QUERY_LOG_ANSWER))
     }
 
     fn pause_view(&self) -> PauseView {
