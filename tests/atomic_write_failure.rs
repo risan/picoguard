@@ -25,8 +25,18 @@ fn a_write_that_fails_part_way_removes_the_part_and_keeps_the_old_file() {
         assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
     }
 
-    let error = write_file(&dir, "data", &vec![b'x'; 10 * LIMIT_BYTES as usize], None).unwrap_err();
+    let written = write_file(&dir, "data", &vec![b'x'; 10 * LIMIT_BYTES as usize], None);
 
+    // The test harness writes its report to stdout, which can be a file past the limit.
+    unsafe {
+        let unlimited = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &unlimited), 0);
+    }
+
+    let error = written.unwrap_err();
     assert_eq!(error.raw_os_error(), Some(libc::EFBIG), "{error}");
     assert_eq!(fs::read(dir.join("data")).unwrap(), b"old");
     assert!(!dir.join("data.part").exists());
