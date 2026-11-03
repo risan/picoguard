@@ -25,13 +25,6 @@ pub(super) const MAX_BUCKET_BITS: u32 = 16;
 /// About this many hashes share a bucket.
 const HASHES_PER_BUCKET: usize = 16;
 
-/// A snapshot bucket may hold this many times the average, and never fewer than
-/// `MIN_BUCKET_LIMIT`. Uniform hashes stay far below it; it only stops a forged directory
-/// from making every lookup scan a huge bucket.
-const BUCKET_LIMIT_FACTOR: usize = 8;
-
-const MIN_BUCKET_LIMIT: usize = 64;
-
 pub(super) type Residual = [u8; RESIDUAL_BYTES];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -95,8 +88,9 @@ impl<const TAG_BITS: u32> HashSet48<TAG_BITS> {
 
     /// The set a snapshot holds, or `None` when the parts are not what `from_sorted` makes of
     /// some input: a directory that does not start at zero, decreases, or does not end at the
-    /// last residual; a bucket count other than the one for this many residuals; a bucket far
-    /// fuller than the average; or hash bits that are not in ascending order within a bucket.
+    /// last residual; a bucket count other than the one for this many residuals; hash bits that
+    /// are not in ascending order within a bucket (a lookup searches the bucket by them); or
+    /// more residuals with the same hash bits than there are tags.
     pub(super) fn from_parts(
         bucket_bits: u32,
         starts: Vec<u32>,
@@ -112,7 +106,7 @@ impl<const TAG_BITS: u32> HashSet48<TAG_BITS> {
             && starts.last().map(|&end| end as usize) == Some(residuals.len())
             && starts.windows(2).all(|pair| pair[0] <= pair[1])
             && bucket_bits == Self::bucket_bits_for(residuals.len())
-            && Self::buckets_are_bounded_and_ascending(&starts, &residuals);
+            && Self::buckets_are_searchable(&starts, &residuals);
 
         well_formed.then_some(HashSet48 {
             bucket_bits,
@@ -121,19 +115,17 @@ impl<const TAG_BITS: u32> HashSet48<TAG_BITS> {
         })
     }
 
-    /// Expects a directory that is well formed.
-    fn buckets_are_bounded_and_ascending(starts: &[u32], residuals: &[Residual]) -> bool {
-        let average = residuals.len().div_ceil(starts.len() - 1);
-        let limit = (average * BUCKET_LIMIT_FACTOR).max(MIN_BUCKET_LIMIT);
-
+    /// Expects a directory that is well formed. A crowded bucket is fine, since a lookup
+    /// searches it in logarithmic time; a run of equal hash bits is walked, so it is bounded.
+    fn buckets_are_searchable(starts: &[u32], residuals: &[Residual]) -> bool {
         starts.windows(2).all(|pair| {
             let bucket = &residuals[pair[0] as usize..pair[1] as usize];
 
-            bucket.len() <= limit
-                && bucket.windows(2).all(|neighbours| {
-                    Self::decode(neighbours[0]) >> TAG_BITS
-                        <= Self::decode(neighbours[1]) >> TAG_BITS
-                })
+            bucket.windows(2).all(|neighbours| {
+                Self::decode(neighbours[0]) >> TAG_BITS <= Self::decode(neighbours[1]) >> TAG_BITS
+            }) && bucket
+                .chunk_by(|a, b| Self::decode(*a) >> TAG_BITS == Self::decode(*b) >> TAG_BITS)
+                .all(|run| run.len() <= 1 << TAG_BITS)
         })
     }
 
@@ -163,22 +155,14 @@ impl<const TAG_BITS: u32> HashSet48<TAG_BITS> {
 
     /// True when some value has the hash of `value`, whatever its tag.
     pub(super) fn contains(&self, value: u64) -> bool {
-        let wanted = self.hash_part(value);
-
-        self.bucket(value)
-            .iter()
-            .any(|&residual| Self::decode(residual) >> TAG_BITS == wanted)
+        !self.with_hash(value).is_empty()
     }
 
     /// The tags of the values that have the hash of `value`, in the order they were stored.
     pub(super) fn tags_of(&self, value: u64) -> impl Iterator<Item = u64> + '_ {
-        let wanted = self.hash_part(value);
-
-        self.bucket(value).iter().filter_map(move |&residual| {
-            let residual = Self::decode(residual);
-
-            (residual >> TAG_BITS == wanted).then_some(residual & Self::TAG_MASK)
-        })
+        self.with_hash(value)
+            .iter()
+            .map(|&residual| Self::decode(residual) & Self::TAG_MASK)
     }
 
     /// The tag of every value.
@@ -186,6 +170,19 @@ impl<const TAG_BITS: u32> HashSet48<TAG_BITS> {
         self.residuals
             .iter()
             .map(|&residual| Self::decode(residual) & Self::TAG_MASK)
+    }
+
+    /// The residuals of the values that have the hash of `value`. The residuals of a bucket
+    /// ascend by their hash bits, so a bucket of any size is searched in logarithmic time.
+    fn with_hash(&self, value: u64) -> &[Residual] {
+        let wanted = self.hash_part(value);
+        let bucket = self.bucket(value);
+        let hash_bits_of = |residual: &Residual| Self::decode(*residual) >> TAG_BITS;
+        let first = bucket.partition_point(|residual| hash_bits_of(residual) < wanted);
+        let from_first = &bucket[first..];
+        let length = from_first.partition_point(|residual| hash_bits_of(residual) == wanted);
+
+        &from_first[..length]
     }
 
     fn bucket(&self, value: u64) -> &[Residual] {
@@ -395,26 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_that_packs_the_residuals_into_few_buckets_is_refused() {
-        let mut state = 29;
-        let sorted = sorted_distinct((0..20_000).map(|_| splitmix(&mut state)).collect());
-        let set = HashSet48::<0>::from_sorted(&sorted);
-        let length = sorted.len() as u32;
-
-        // The scaled-down form of 1.5 million residuals in two buckets.
-        let two_buckets = vec![0, length / 2, length];
-        assert!(HashSet48::<0>::from_parts(1, two_buckets, set.residuals().to_vec()).is_none());
-
-        // The right bucket count, with every residual in the first bucket.
-        let mut crowded = vec![length; set.starts().len()];
-        crowded[0] = 0;
-        assert!(
-            HashSet48::<0>::from_parts(set.bucket_bits(), crowded, set.residuals().to_vec())
-                .is_none()
-        );
-    }
-
-    #[test]
     fn the_parts_of_sets_the_builder_makes_are_accepted() {
         const GROUP_BITS: u32 = 10;
         let mut state = 41;
@@ -472,25 +449,55 @@ mod tests {
     }
 
     #[test]
-    fn a_bucket_over_eight_times_the_average_is_refused() {
-        // 4000 residuals make 128 buckets of 31.25 on average, so a bucket may hold 256.
-        let residuals = ascending_residuals(4000);
-        let directory_with_first_bucket = |first: usize| -> Vec<u32> {
-            let mut starts = vec![0u32];
-            for slot in 1..=128usize {
-                starts.push((first + (4000 - first) * (slot - 1) / 127) as u32);
-            }
+    fn a_crowded_bucket_is_accepted_and_searched_in_place() {
+        // All residuals in the first of the buckets the builder would make for them.
+        let count = 200_000;
+        let buckets = 1usize << HashSet48::<0>::bucket_bits_for(count);
+        let mut starts = vec![count as u32; buckets + 1];
+        starts[0] = 0;
+        let set = HashSet48::<0>::from_parts(
+            HashSet48::<0>::bucket_bits_for(count),
+            starts,
+            ascending_residuals(count),
+        )
+        .expect("a crowded bucket is not a reason to refuse a set");
+        // A value of bucket 0 whose hash bits are `hash_bits`.
+        let value_of = |hash_bits: u64| hash_bits << (64 - set.bucket_bits() - 48);
 
-            starts
+        for hash_bits in [0, 1, 99_999, count as u64 - 1] {
+            assert!(set.contains(value_of(hash_bits)), "{hash_bits}");
+        }
+
+        for hash_bits in [count as u64, count as u64 + 1, 1 << 40] {
+            assert!(!set.contains(value_of(hash_bits)), "{hash_bits}");
+        }
+    }
+
+    #[test]
+    fn more_residuals_with_one_hash_than_there_are_tags_are_refused() {
+        const TAG_BITS: u32 = 2;
+        // Ascending hash bits, then `same` more residuals that share the last of them.
+        let with_run = |same: usize| -> Vec<Residual> {
+            // The tag bits are zero, so each of these has hash bits of its own.
+            let mut residuals: Vec<Residual> = (0..(100 - same) as u64)
+                .map(|hash_bits| {
+                    let bytes = (hash_bits << TAG_BITS).to_le_bytes();
+
+                    [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]]
+                })
+                .collect();
+            let last = residuals.last().copied().unwrap();
+            residuals.extend(std::iter::repeat_n(last, same));
+
+            residuals
         };
+        let in_first_bucket = vec![0, 100, 100, 100, 100];
 
+        // Four residuals with the hash bits (one per tag) are the most a value can have.
         assert!(
-            HashSet48::<0>::from_parts(7, directory_with_first_bucket(256), residuals.clone())
-                .is_some()
+            HashSet48::<TAG_BITS>::from_parts(2, in_first_bucket.clone(), with_run(3)).is_some()
         );
-        assert!(
-            HashSet48::<0>::from_parts(7, directory_with_first_bucket(257), residuals).is_none()
-        );
+        assert!(HashSet48::<TAG_BITS>::from_parts(2, in_first_bucket, with_run(4)).is_none());
     }
 
     #[test]

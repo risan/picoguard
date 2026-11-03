@@ -1311,8 +1311,8 @@ mod tests {
 
     use super::*;
     use crate::filter::compile::{CompileWorker, HOST_GROUP_BYTES, slow_rule_cost};
-    use crate::filter::engine::MAX_HOST_GROUPS;
     use crate::filter::engine::{Decision, Engine, TYPE_A, TYPE_AAAA};
+    use crate::filter::engine::{MAX_HOST_GROUPS, MAX_HOST_IPS};
     use crate::lists::Piece;
     use crate::test_dir::TestDir;
 
@@ -1486,6 +1486,36 @@ ads.*.tracker
         }
 
         assert!(blocked > 10);
+    }
+
+    #[tokio::test]
+    async fn a_name_with_a_thousand_answer_ips_survives_a_save_and_a_load() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let store = SnapshotStore::open(state.path()).unwrap();
+        let text: String = (0..1024)
+            .map(|index| format!("10.1.{}.{} pool.example\n", index / 256, index % 256))
+            .collect();
+        let snapshot = snapshot_of(&worker, &text, ListFormat::Hosts).await;
+        assert_eq!(snapshot.list.hosts.ips.len(), 1024);
+
+        store.save(clone_of(&snapshot)).await.unwrap();
+        store.flush().await;
+        let loaded = load(&store.path_for(SOURCE).unwrap(), &caps()).unwrap();
+
+        let tags = |list: &CompiledList| {
+            list.hosts
+                .entries
+                .tags_of(xxh3_64(b"pool.example"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tags(&loaded.list), (0..1024).collect::<Vec<_>>());
+        assert_same_list(&loaded.list, &snapshot.list);
+        let reloaded = Engine::new(vec![loaded.list], Vec::new());
+        let Decision::Block { ips } = reloaded.check("pool.example", TYPE_A, false) else {
+            panic!("the name should be blocked with its addresses");
+        };
+        assert_eq!(ips.len(), MAX_HOST_IPS + 1);
     }
 
     #[tokio::test]
