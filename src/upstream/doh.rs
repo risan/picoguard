@@ -294,13 +294,14 @@ fn from_hyper(error: hyper::Error) -> UpstreamError {
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use http::request::Parts;
     use rustls::pki_types::ServerName;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::watch;
 
     use super::*;
     use crate::upstream::endpoint::Remote;
@@ -473,25 +474,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_connection_is_reopened_after_the_server_restarts() {
+    async fn the_connection_is_reopened_after_the_server_closes_it() {
         let pki = TestPki::new();
-        let server = doh_server(&pki, |_, body| respond_with_answer(body)).await;
+        // The server closes its connections but keeps its listener: stopping and binding the port
+        // again would let another test take the port, and a connection the server has not yet
+        // dropped could still answer.
+        let (close_connections, closing) = watch::channel(0usize);
+        let closed = Arc::new(AtomicUsize::new(0));
+        let serve = serve_doh(Arc::new(|_: &Parts, body: &[u8]| respond_with_answer(body)));
+        let counter = Arc::clone(&closed);
+        let server = TlsServer::start(doh_config(&pki), move |stream| {
+            let served = serve(stream);
+            let mut closing = closing.clone();
+            let born = *closing.borrow();
+            let counter = Arc::clone(&counter);
+
+            async move {
+                tokio::select! {
+                    _ = served => {}
+                    _ = closing.wait_for(|now| *now != born) => {}
+                }
+
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
         let upstream = upstream(&pki, &server);
         upstream
             .query(&query_for("example.com."), deadline())
             .await
             .unwrap();
 
-        let address = server.stop().await;
-        let listener = TcpListener::bind(address).await.unwrap();
-        let behavior = Arc::new(|_: &Parts, body: &[u8]| respond_with_answer(body));
-        let restarted = TlsServer::start_on(listener, doh_config(&pki), serve_doh(behavior));
-
+        close_connections.send_modify(|generation| *generation += 1);
+        until(|| closed.load(Ordering::SeqCst) == 1).await;
         let reply = upstream.query(&query_for("example.com."), deadline()).await;
 
         assert_eq!(address_of(&reply.unwrap()), ANSWER_MARKER);
-        restarted.wait_for_handshakes(1).await;
-        assert_eq!(restarted.handshakes.load(Ordering::SeqCst), 1);
+        assert_eq!(server.handshakes.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

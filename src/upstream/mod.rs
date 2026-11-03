@@ -780,6 +780,18 @@ mod tests {
         fake_udp(|_| Vec::new()).await
     }
 
+    /// A UDP address nobody listens on: a query to it fails at once, without waiting for a timeout.
+    async fn closed_udp_url() -> String {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        format!("udp://{}", socket.local_addr().unwrap())
+    }
+
+    fn back_off(upstreams: &Upstreams, server: usize) {
+        upstreams.servers[server].health.lock().unwrap().retry_at =
+            Some(Instant::now() + MAX_BACKOFF);
+    }
+
     fn upstreams(servers: Vec<String>, timeout_ms: u64) -> Upstreams {
         let config = UpstreamConfig {
             servers,
@@ -1052,7 +1064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dead_server_times_out_after_two_tries_within_the_budget() {
+    async fn a_dead_server_times_out_within_the_budget() {
         let server = dead_udp().await;
         let upstreams = upstreams(vec![udp_url(&server)], 600);
         let started = Instant::now();
@@ -1062,14 +1074,32 @@ mod tests {
         assert!(matches!(result, Err(UpstreamError::Timeout)));
         assert!(started.elapsed() >= Duration::from_millis(590));
         assert!(started.elapsed() < Duration::from_millis(2000));
-        assert_eq!(server.received.load(Ordering::SeqCst), 2, "one retry");
+        // A stall can make the second try start after the budget, and it then sends nothing.
+        assert!((1..=2).contains(&server.received.load(Ordering::SeqCst)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_try_is_retried_exactly_once() {
+        let refusing = closed_udp_url().await;
+        let silent = dead_udp().await;
+        let upstreams = upstreams(vec![refusing, udp_url(&silent)], 600);
+        back_off(&upstreams, 1);
+
+        let result = upstreams.query(&mut query_for("example.com.")).await;
+
+        assert!(matches!(result, Err(UpstreamError::Timeout)));
+        assert_eq!(silent.received.load(Ordering::SeqCst), 1);
+        let failed: Vec<u64> = upstreams.tallies().map(|(_, tally)| tally.failed).collect();
+        assert_eq!(failed, [1, 1]);
     }
 
     #[tokio::test]
     async fn queries_fail_over_to_the_other_server() {
-        let dead = dead_udp().await;
+        let dead = closed_udp_url().await;
         let good = good_udp().await;
-        let upstreams = upstreams(vec![udp_url(&dead), udp_url(&good)], 1000);
+        let upstreams = upstreams(vec![dead, udp_url(&good)], 1000);
+        // The dead server is the first pick of the first query, so that query must fail over.
+        back_off(&upstreams, 1);
 
         for _ in 0..6 {
             let reply = upstreams
@@ -1079,6 +1109,10 @@ mod tests {
 
             assert_eq!(address_of(&reply), ANSWER_MARKER);
         }
+
+        let tallies: Vec<Tally> = upstreams.tallies().map(|(_, tally)| tally).collect();
+        assert_eq!((tallies[0].answered, tallies[0].failed), (0, 1));
+        assert_eq!((tallies[1].answered, tallies[1].failed), (6, 0));
     }
 
     #[tokio::test]
@@ -1436,18 +1470,20 @@ mod tests {
         let upstreams = upstreams(vec!["udp://192.0.2.1:53".to_string()], 1000);
         let server = &upstreams.servers[0];
 
-        server.record_failure(&UpstreamError::Timeout);
-        let first = server.health.lock().unwrap().retry_at.unwrap();
-        server.record_failure(&UpstreamError::Timeout);
-        let second = server.health.lock().unwrap().retry_at.unwrap();
-        for _ in 0..20 {
+        // Each failure doubles the wait, from the first backoff up to the cap.
+        for seconds in [1, 2, 4, 8, 16, 32, 60, 60] {
+            let before = Instant::now();
             server.record_failure(&UpstreamError::Timeout);
+            let after = Instant::now();
+
+            let retry_at = server.health.lock().unwrap().retry_at.unwrap();
+            let wait = Duration::from_secs(seconds);
+            assert!(
+                retry_at >= before + wait && retry_at <= after + wait,
+                "a wait of {seconds} s"
+            );
         }
 
-        let capped = server.health.lock().unwrap().retry_at.unwrap();
-
-        assert!(second > first + Duration::from_millis(500));
-        assert!(capped <= Instant::now() + MAX_BACKOFF);
         server.record_success(Duration::from_millis(5));
         let health = server.health.lock().unwrap();
         assert_eq!(health.failures, 0);
