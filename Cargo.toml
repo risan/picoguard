@@ -58,6 +58,11 @@ strip = true
 [profile.dev.package.ring]
 opt-level = 3
 
+# The 57 test binaries are linked again after every change in src/. Line tables keep panic
+# backtraces readable and cut their size to a third. Use `debug = true` here for a debugger.
+[profile.test]
+debug = "line-tables-only"
+
 [dev-dependencies]
 flate2 = "1.1.10"
 hickory-proto = "0.26.3"
