@@ -8,7 +8,9 @@ is the default, and most are commented out. Check a file without starting the se
 picoguard --check -c /etc/picoguard/picoguard.toml
 ```
 
-It prints `OK` or the first error. Unknown keys are errors, so a typo cannot hide.
+It prints `OK` or the first error. Unknown keys are errors, so a typo cannot hide. The check refuses
+what the start would refuse: a `blocked_hosts` or `local.domains` name with an empty, non-ASCII or
+too long label, and a list or catalog URL the downloader cannot use.
 
 Top-level keys (`blocked_ttl`, `rules`, ...) must come before the first `[section]` header. This
 is a TOML rule.
@@ -414,7 +416,7 @@ and once among the `[[allowlists]]`.
 | Key | Default | Meaning |
 |---|---|---|
 | `name` | none | Label on the status page. |
-| `url` | none | `http://` or `https://` address, without a user name or password (the download refuses `user:pass@`, so the list would fail at every refresh; the page refuses to add one). Set `url` or `path`, not both. |
+| `url` | none | `http://` or `https://` address, without a user name or password (the download refuses `user:pass@`, so the list would fail at every refresh; the check and the page refuse one). Set `url` or `path`, not both. |
 | `path` | none | Local file. Read at start and again every `refresh_hours`. |
 | `format` | `"auto"` | `auto`, `adblock`, `hosts`, `domains`, `wildcard`, `dnsmasq` or `rpz`. |
 | `refresh_hours` | `24` | How often to download again. |
@@ -424,8 +426,9 @@ and once among the `[[allowlists]]`.
 | `enabled` | `true` | A list that is off is not downloaded and holds no memory. The page can turn lists on and off. |
 | `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A regex is charged the memory it really holds (about 8 KB for `/track[0-9]+/`, close to 1 MB for `/(\pL\|\pN){1,50}x/`), a wildcard rule 64 bytes for each of its parts, and every distinct rule at least 32 bytes more, even a regex that does not compile. A list over it is not used. |
 
-Downloads use `If-None-Match` and `If-Modified-Since`. A failed download keeps the last good list.
-A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private,
+Downloads use `If-None-Match` and `If-Modified-Since`, and send `Accept-Encoding: identity`:
+picoguard does not decompress, so a reply that is compressed anyway fails. A failed download keeps the last good list.
+A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private, shared (`100.64.0.0/10`, Tailscale),
 link-local or unspecified address fails too, unless the list URL itself points into those ranges.
 A list in `[[lists]]` that blocks any of three made-up check names (for example because of a rule
 like `||*^` or `/./`) is refused the same way: the last good copy stays and the status page shows the
@@ -525,6 +528,10 @@ block = ["tiktok", "youtube"]
   that fails, whose lists would pass the [memory budget](#the-memory-budget), or with a service
   whose rules cannot be used (they would block nearly every name) keeps all the lists in force,
   shows why in `GET /api/services` `error`, and tries again later, with the same waits as a list.
+- A service that stays switched on but is missing from a refreshed catalog, or has no usable rules
+  there (over a cap, or every rule left out), keeps the list it had; `error` names it, and the
+  page lists it as on under "Unavailable" until it is switched off. A service with no list yet
+  stays unblocked, and `error` names it too.
 - Each service switched on is a list of its own, named "Blocked service: <name>": **Check a
   name** names it, a pause turns it off like every list, and an allowlist or an Allow rule wins
   over it as over any list.
