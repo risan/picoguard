@@ -115,6 +115,13 @@ async fn heap_bytes_is_what_a_list_holds_and_the_compile_charge_covers_its_peak(
             held <= heap + 4096,
             "{name}: holds {held}, heap_bytes {heap}"
         );
+        // Plain rules take a little over 6 bytes each (a 48-bit residual and a share of the
+        // bucket directory); a big list of nothing else shows it.
+        if list.slow_rule_count() == 0 && list.rule_count() > 100_000 {
+            let per_rule = held as f64 / list.rule_count() as f64;
+            assert!(per_rule <= 6.5, "{name}: {per_rule:.2} bytes a rule");
+        }
+
         // The slow rules are charged more than they hold, never less.
         assert!(
             heap <= held * 2 + 4096,

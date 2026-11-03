@@ -1,14 +1,14 @@
 //! The lookup engine: per-list compiled rules, the `$badfilter` index and the decision of
 //! plan section 4.5.
 //!
-//! Plain rules are stored as sorted arrays of xxh3-64 hashes of the lowercase name, one array
-//! per rule shape and list (plan D3, D4): 8 bytes per rule and no per-entry allocation. A
-//! lookup hashes the candidate substrings of the input (see [`super::pattern`]) and
-//! binary-searches the arrays. Everything else is a slow rule with a [`Matcher`].
+//! Plain rules are stored as sets of xxh3-64 hashes of the lowercase name, one set per rule
+//! shape and list (plan D3, D4): about 6.2 bytes per rule and no per-entry allocation (see
+//! [`HashSet48`]). A lookup hashes the candidate substrings of the input (see
+//! [`super::pattern`]) and looks them up in the sets. Everything else is a slow rule with a
+//! [`Matcher`].
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use super::compile::{COMPILE_PEAK_BYTES_PER_RULE, SEEN_SLOW_RULE_BYTES, slow_rule_cost};
+use super::hash_set::HashSet48;
 use super::parse::{FastKind, ListFormat, NetworkRule, ParseSummary, Parser, Rule, fast_rule};
 use super::pattern::{
     Matcher, PatternError, for_each_exact_candidate, for_each_strict_suffix_candidate,
@@ -57,9 +58,9 @@ fn hash(name: &str) -> u64 {
 // ---- Compiled lists ----
 
 /// The low bits of a host entry hold the group (the answer IP) its name maps to; the rest is
-/// the hash of the name. One sorted array per list therefore finds a name whatever the number
-/// of groups, at 8 bytes per name and group.
-const HOST_GROUP_BITS: u32 = 10;
+/// the hash of the name. One set per list therefore finds a name whatever the number of
+/// groups, at about 6.2 bytes per name and group.
+pub(super) const HOST_GROUP_BITS: u32 = 10;
 const HOST_GROUP_MASK: u64 = (1 << HOST_GROUP_BITS) - 1;
 
 /// The most distinct answer IPs the host rules of one list may have.
@@ -70,9 +71,12 @@ pub(super) const MAX_HOST_GROUPS: usize = 1 << HOST_GROUP_BITS;
 pub(super) struct HostRules {
     /// The answer IP of each group, in the order the groups first appeared in the list.
     pub(super) ips: Vec<IpAddr>,
-    /// Sorted, distinct: the hash of a name with its group in the low bits.
-    pub(super) entries: Vec<u64>,
+    /// The hash of each name, tagged with its group.
+    pub(super) entries: HashSet48<HOST_GROUP_BITS>,
 }
+
+/// The plain rules of one shape: the hashes of their names.
+pub(super) type PlainRules = HashSet48<0>;
 
 impl HostRules {
     fn entry(name_hash: u64, group: usize) -> u64 {
@@ -82,19 +86,15 @@ impl HostRules {
     /// True when every entry names a group that exists.
     pub(super) fn groups_exist(&self) -> bool {
         self.entries
-            .iter()
-            .all(|entry| ((entry & HOST_GROUP_MASK) as usize) < self.ips.len())
+            .all_tags()
+            .all(|group| (group as usize) < self.ips.len())
     }
 
     /// The answer IPs `name_hash` maps to, in the order the groups appeared.
     fn ips_of(&self, name_hash: u64) -> impl Iterator<Item = &IpAddr> {
-        let first = name_hash & !HOST_GROUP_MASK;
-        let start = lower_bound(&self.entries, first);
-
-        self.entries[start..]
-            .iter()
-            .take_while(move |entry| *entry & !HOST_GROUP_MASK == first)
-            .map(|entry| &self.ips[(*entry & HOST_GROUP_MASK) as usize])
+        self.entries
+            .tags_of(name_hash)
+            .map(|group| &self.ips[group as usize])
     }
 }
 
@@ -140,7 +140,7 @@ impl SlowRule {
 /// The rules of one list, ready for lookups. Shared between engines through an `Arc`
 /// (plan D6): a refresh of another list does not rebuild it.
 pub struct CompiledList {
-    pub(super) fast: [Vec<u64>; FAST_KINDS],
+    pub(super) fast: [PlainRules; FAST_KINDS],
     pub(super) hosts: HostRules,
     pub(super) slow: Vec<SlowRule>,
     pub(super) regex_failed: u64,
@@ -187,22 +187,20 @@ impl CompiledList {
 
     /// Distinct rules: plain rules, host names and slow rules.
     pub fn rule_count(&self) -> usize {
-        self.fast.iter().map(Vec::len).sum::<usize>() + self.hosts.entries.len() + self.slow.len()
+        self.fast.iter().map(HashSet48::len).sum::<usize>()
+            + self.hosts.entries.len()
+            + self.slow.len()
     }
 
     pub fn slow_rule_count(&self) -> usize {
         self.slow.len()
     }
 
-    /// The heap the list holds: the capacities of its arrays, and its slow rules as the
+    /// The heap the list holds: the capacities of its sets, and its slow rules as the
     /// slow-rule budget estimates them (plan D6).
     pub fn heap_bytes(&self) -> usize {
-        let arrays = self
-            .fast
-            .iter()
-            .chain([&self.hosts.entries])
-            .map(|hashes| hashes.capacity() * size_of::<u64>())
-            .sum::<usize>()
+        let arrays = self.fast.iter().map(HashSet48::heap_bytes).sum::<usize>()
+            + self.hosts.entries.heap_bytes()
             + self.hosts.ips.capacity() * size_of::<IpAddr>()
             + self.slow.capacity() * size_of::<SlowRule>();
 
@@ -222,10 +220,13 @@ impl CompiledList {
     }
 }
 
-/// Collects the rules of one list. Hashes go straight into arrays; `finish` sorts them.
+/// Collects the rules of one list. Hashes go straight into arrays; `finish` sorts them and
+/// turns them into sets.
 pub struct ListBuilder {
     fast: [Vec<u64>; FAST_KINDS],
-    hosts: HostRules,
+    host_ips: Vec<IpAddr>,
+    /// A name hash with its group in the low bits.
+    host_entries: Vec<u64>,
     host_index: HashMap<IpAddr, usize>,
     slow: Vec<SlowRule>,
     regex_failed: u64,
@@ -243,7 +244,8 @@ impl ListBuilder {
     pub fn new() -> ListBuilder {
         ListBuilder {
             fast: Default::default(),
-            hosts: HostRules::default(),
+            host_ips: Vec::new(),
+            host_entries: Vec::new(),
             host_index: HashMap::new(),
             slow: Vec::new(),
             regex_failed: 0,
@@ -268,17 +270,17 @@ impl ListBuilder {
                 let group = match self.host_index.get(&ip) {
                     Some(group) => *group,
 
-                    None if self.hosts.ips.len() < MAX_HOST_GROUPS => {
-                        self.hosts.ips.push(ip);
-                        self.host_index.insert(ip, self.hosts.ips.len() - 1);
+                    None if self.host_ips.len() < MAX_HOST_GROUPS => {
+                        self.host_ips.push(ip);
+                        self.host_index.insert(ip, self.host_ips.len() - 1);
 
-                        self.hosts.ips.len() - 1
+                        self.host_ips.len() - 1
                     }
 
                     None => return,
                 };
 
-                self.hosts.entries.push(HostRules::entry(hash(name), group));
+                self.host_entries.push(HostRules::entry(hash(name), group));
             }
             Rule::Fast { kind, name } => self.fast[kind_index(kind)].push(hash(name)),
             Rule::Slow(rule) => self.add_slow(SlowRule::compile(rule)),
@@ -293,18 +295,19 @@ impl ListBuilder {
         }
     }
 
-    /// Sorts, deduplicates and trims the arrays. `format` is the effective list format.
+    /// Sorts and deduplicates the arrays and turns them into sets. `format` is the effective
+    /// list format.
     pub fn finish(mut self, format: ListFormat) -> CompiledList {
         for hashes in self.fast.iter_mut() {
             sort_dedup(hashes);
         }
 
-        sort_dedup(&mut self.hosts.entries);
+        sort_dedup(&mut self.host_entries);
         if format == ListFormat::Rpz {
             self.merge_rpz_pairs();
         }
 
-        self.hosts.ips.shrink_to_fit();
+        self.host_ips.shrink_to_fit();
         self.slow.shrink_to_fit();
 
         // The compile worker charges each rule as it comes and replaces this.
@@ -315,9 +318,17 @@ impl ListBuilder {
                 .map(|slow| slow_rule_cost(slow) + SEEN_SLOW_RULE_BYTES + slow.build_bytes())
                 .sum::<usize>();
 
+        // One array at a time, so only the biggest one is held twice.
+        let fast = self.fast.map(|hashes| PlainRules::from_sorted(&hashes));
+        let hosts = HostRules {
+            ips: self.host_ips,
+            entries: HashSet48::from_sorted(&self.host_entries),
+        };
+        drop(self.host_entries);
+
         CompiledList {
-            fast: self.fast,
-            hosts: self.hosts,
+            fast,
+            hosts,
             slow: self.slow,
             regex_failed: self.regex_failed,
             compile_charge,
@@ -350,73 +361,6 @@ impl ListBuilder {
     }
 }
 
-/// Membership in a sorted array of distinct xxh3 hashes. The hashes are uniformly spread, so
-/// the position of `needle` can be estimated from its value: a few probes find it where a
-/// binary search needs log2(n) probes that miss the CPU cache. Anything unexpected (a
-/// skewed array) falls back to the binary search after a few rounds.
-fn contains_hash(sorted: &[u64], needle: u64) -> bool {
-    const ROUNDS: usize = 6;
-
-    const LINEAR_TAIL: usize = 8;
-
-    let (mut low, mut high) = (0, sorted.len());
-    for _ in 0..ROUNDS {
-        if high - low <= LINEAR_TAIL {
-            return sorted[low..high].contains(&needle);
-        }
-
-        let (first, last) = (sorted[low], sorted[high - 1]);
-        if needle < first || needle > last {
-            return false;
-        }
-
-        let share = (needle - first) as f64 / (last - first) as f64;
-        let at = low + (share * (high - low - 1) as f64) as usize;
-        match sorted[at].cmp(&needle) {
-            Ordering::Equal => return true,
-            Ordering::Less => low = at + 1,
-            Ordering::Greater => high = at,
-        }
-    }
-
-    sorted[low..high].binary_search(&needle).is_ok()
-}
-
-/// Index of the first element of `sorted` that is not below `needle`. Found like
-/// `contains_hash` does, by estimating the position first.
-fn lower_bound(sorted: &[u64], needle: u64) -> usize {
-    const ROUNDS: usize = 6;
-
-    const LINEAR_TAIL: usize = 8;
-
-    // Everything before `low` is below `needle`; everything from `high` on is not.
-    let (mut low, mut high) = (0, sorted.len());
-    for _ in 0..ROUNDS {
-        if high - low <= LINEAR_TAIL {
-            break;
-        }
-
-        let (first, last) = (sorted[low], sorted[high - 1]);
-        if needle <= first {
-            return low;
-        }
-
-        if needle > last {
-            return high;
-        }
-
-        let share = (needle - first) as f64 / (last - first) as f64;
-        let at = low + (share * (high - low - 1) as f64) as usize;
-        if sorted[at] < needle {
-            low = at + 1;
-        } else {
-            high = at;
-        }
-    }
-
-    low + sorted[low..high].partition_point(|value| *value < needle)
-}
-
 fn sort_dedup(hashes: &mut Vec<u64>) {
     hashes.sort_unstable();
     hashes.dedup();
@@ -436,8 +380,8 @@ fn identity_hash(rule: &NetworkRule) -> u64 {
 fn fast_key(rule: &NetworkRule) -> Option<(usize, u64)> {
     if rule.important
         || rule.restricted_types != 0
-        || !rule.restricted_clients.is_empty()
-        || !rule.restricted_ctags.is_empty()
+        || !rule.modifiers().restricted_clients.is_empty()
+        || !rule.modifiers().restricted_ctags.is_empty()
     {
         return None;
     }
@@ -573,10 +517,12 @@ struct Condition {
 
 impl Condition {
     fn of(rule: &NetworkRule) -> Condition {
+        let modifiers = rule.modifiers();
+
         Condition {
-            permitted: rule.dns_permitted.clone(),
-            restricted: rule.dns_restricted.clone(),
-            denyallow: rule.denyallow.clone(),
+            permitted: modifiers.dns_permitted.clone(),
+            restricted: modifiers.dns_restricted.clone(),
+            denyallow: modifiers.denyallow.clone(),
         }
     }
 
@@ -735,15 +681,27 @@ const KEY_BYTES: usize = 4;
 /// Finds the slow rules whose shortcut can occur in a URL, like urlfilter's shortcut table:
 /// a rule is filed under the first [`KEY_BYTES`] bytes of its shortcut, and a check looks up
 /// every window of that length in the URL. Rules with a shorter shortcut are always tried.
+/// A bitmap of the keys answers most windows before the search of `keyed` is paid for.
 #[derive(Default)]
 struct SlowIndex {
     /// `(key, list, rule)` sorted by key.
     keyed: Vec<(u32, u32, u32)>,
     always: Vec<(u32, u32)>,
+    key_bits: Box<[u64]>,
+    key_bits_shift: u32,
 }
+
+/// Bits of the key bitmap per keyed rule: about one window in sixteen that matches no key
+/// still goes on to the search.
+const KEY_BITS_PER_RULE: usize = 16;
 
 fn key_of(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// Where a key is in the bitmap: the top bits of a multiplicative hash.
+fn key_slot(key: u32, shift: u32) -> usize {
+    (key.wrapping_mul(0x9E37_79B1) >> shift) as usize
 }
 
 impl SlowIndex {
@@ -764,6 +722,18 @@ impl SlowIndex {
         index.keyed.sort_unstable();
         index.keyed.shrink_to_fit();
         index.always.shrink_to_fit();
+
+        let slots = (index.keyed.len() * KEY_BITS_PER_RULE)
+            .next_power_of_two()
+            .clamp(64, 1 << 16);
+        index.key_bits_shift = 32 - slots.trailing_zeros();
+        let mut key_bits = vec![0u64; slots / 64];
+        for &(key, _, _) in &index.keyed {
+            let slot = key_slot(key, index.key_bits_shift);
+            key_bits[slot / 64] |= 1 << (slot % 64);
+        }
+
+        index.key_bits = key_bits.into_boxed_slice();
 
         index
     }
@@ -787,6 +757,11 @@ impl SlowIndex {
 
         for window in url.as_bytes().windows(KEY_BYTES) {
             let key = key_of(window);
+            let slot = key_slot(key, self.key_bits_shift);
+            if self.key_bits[slot / 64] & (1 << (slot % 64)) == 0 {
+                continue;
+            }
+
             let first = self.keyed.partition_point(|entry| entry.0 < key);
             for &(found, list, rule) in &self.keyed[first..] {
                 if found != key {
@@ -868,10 +843,7 @@ impl RuleSet {
     }
 
     fn fast_hit(&self, kind: usize, name: u64, query: &Query<'_>) -> bool {
-        let present = self
-            .lists
-            .iter()
-            .any(|list| contains_hash(&list.fast[kind], name));
+        let present = self.lists.iter().any(|list| list.fast[kind].contains(name));
         if !present || self.disabled_fast[kind].contains(&name) {
             return false;
         }
@@ -954,10 +926,11 @@ impl RuleSet {
     /// matches and no badfilter disables it.
     fn slow_matches(&self, slow: &SlowRule, query: &Query<'_>, url: &str) -> bool {
         let rule = &slow.rule;
+        let modifiers = rule.modifiers();
         let allowed = conditions_hold(
-            &rule.dns_permitted,
-            &rule.dns_restricted,
-            &rule.denyallow,
+            &modifiers.dns_permitted,
+            &modifiers.dns_restricted,
+            &modifiers.denyallow,
             query,
         );
 
@@ -995,7 +968,7 @@ impl RuleSet {
                 let first = self
                     .lists
                     .iter()
-                    .position(|list| contains_hash(&list.fast[kind], name));
+                    .position(|list| list.fast[kind].contains(name));
                 if let Some(list) = first
                     && best.as_ref().is_none_or(|(at, _)| list < *at)
                 {
@@ -1275,6 +1248,15 @@ fn lowercase(input: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_slow_rule_keeps_its_rare_modifiers_off_the_inline_struct() {
+        assert!(
+            std::mem::size_of::<SlowRule>() <= 128,
+            "{} bytes",
+            std::mem::size_of::<SlowRule>()
+        );
+    }
+
     fn engine(main: &[(&str, ListFormat)], allow: &[&str]) -> Engine {
         let compile = |text: &str, format| Arc::new(CompiledList::from_text(format, text).0);
 
@@ -1446,8 +1428,9 @@ mod tests {
         assert_eq!(summary.counters.block_sub, 3);
         assert_eq!(list.rule_count(), 4);
         assert_eq!(list.slow_rule_count(), 1);
-        assert!(list.fast[SUB_BLOCK].windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(list.fast[SUB_BLOCK].capacity(), 2);
+        assert_eq!(list.fast[SUB_BLOCK].len(), 2);
+        assert!(list.fast[SUB_BLOCK].contains(hash("a.example")));
+        assert!(list.fast[SUB_BLOCK].contains(hash("b.example")));
     }
 
     #[test]
@@ -1507,6 +1490,18 @@ mod tests {
         assert!(blocked(&engine, "x.sub.example", TYPE_A));
         assert!(!blocked(&engine, "ok.example", TYPE_A));
         assert!(!blocked(&engine, "www.ok.example", TYPE_A));
+    }
+
+    #[test]
+    fn an_rpz_passthru_wins_over_every_block_it_covers_even_a_more_specific_one() {
+        let zone = "*.example.com CNAME rpz-passthru.\nads.example.com CNAME .\n*.ads.example.com CNAME .\n*.example.org CNAME .\nok.example.org CNAME rpz-passthru.\n";
+        let (list, _) = CompiledList::from_text(ListFormat::Rpz, zone);
+        let engine = Engine::new(vec![Arc::new(list)], Vec::new());
+
+        assert!(!blocked(&engine, "ads.example.com", TYPE_A));
+        assert!(!blocked(&engine, "x.ads.example.com", TYPE_A));
+        assert!(blocked(&engine, "x.example.org", TYPE_A));
+        assert!(!blocked(&engine, "ok.example.org", TYPE_A));
     }
 
     #[test]
@@ -1676,6 +1671,48 @@ mod tests {
         );
 
         count
+    }
+
+    #[test]
+    fn the_key_bitmap_never_hides_a_rule_whose_key_is_in_the_url() {
+        // 4,000 keys in a bitmap of 65,536 bits, and urls made from the same few letters,
+        // so windows both collide with keys and hit them.
+        let letters = b"abcdefghij";
+        let key = |n: usize| -> String {
+            (0..4)
+                .map(|i| letters[n / 10usize.pow(i) % 10] as char)
+                .collect()
+        };
+        let text: String = (0..4000).map(|n| format!("*{}*\n", key(n))).collect();
+        let engine = adblock(&text);
+        let rules = &engine.lists.main.lists;
+        assert_eq!(rules[0].slow_rule_count(), 4000);
+
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..300 {
+            let mut url = String::from("http://");
+            for _ in 0..30 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                url.push(letters[(state >> 33) as usize % 10] as char);
+            }
+
+            let mut found = HashSet::new();
+            engine
+                .lists
+                .main
+                .slow_index
+                .for_each_candidate(rules, &url, &mut |_, slow| {
+                    found.insert(slow.rule.pattern.clone());
+                });
+
+            let expected: HashSet<String> = (0..4000)
+                .filter(|&n| url.contains(&key(n)))
+                .map(|n| format!("*{}*", key(n)))
+                .collect();
+            assert_eq!(found, expected, "{url}");
+        }
     }
 
     fn explained(allowed: bool, side: Side, list: usize, rule: &str) -> Option<Explanation> {
@@ -1889,57 +1926,33 @@ mod tests {
         }
     }
 
-    /// Sorted arrays of every shape the interpolated search meets, each with the values
-    /// around its entries as needles.
-    fn arrays_with_needles() -> Vec<(Vec<u64>, Vec<u64>)> {
-        let uniform: Vec<u64> = (0..5000u64)
-            .map(|n| xxh3_64(&n.to_le_bytes()))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let clustered: Vec<u64> = (0..5000u64)
-            .map(|n| if n < 4990 { n * 3 } else { u64::MAX - n })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-
-        [uniform, clustered, vec![], vec![7], vec![7, 9]]
-            .into_iter()
-            .map(|sorted| {
-                let mut needles: Vec<u64> = sorted
-                    .iter()
-                    .flat_map(|&n| [n, n.wrapping_add(1), n.wrapping_sub(1)])
-                    .collect();
-                needles.extend([0, 1, u64::MAX, u64::MAX - 1]);
-
-                (sorted, needles)
-            })
-            .collect()
-    }
-
     #[test]
-    fn lower_bound_agrees_with_partition_point_on_any_distribution() {
-        for (sorted, needles) in arrays_with_needles() {
-            for needle in needles {
-                assert_eq!(
-                    lower_bound(&sorted, needle),
-                    sorted.partition_point(|value| *value < needle),
-                    "{needle}"
-                );
+    fn a_name_with_many_groups_gives_every_address_in_the_order_they_appeared() {
+        let mut text = String::new();
+        for group in 0..40 {
+            text.push_str(&format!("10.0.0.{group} multi.example\n"));
+            for name in 0..30 {
+                text.push_str(&format!("10.0.0.{group} filler{name}.example\n"));
             }
         }
-    }
 
-    #[test]
-    fn hash_membership_agrees_with_binary_search_on_any_distribution() {
-        for (sorted, needles) in arrays_with_needles() {
-            for needle in needles {
-                assert_eq!(
-                    contains_hash(&sorted, needle),
-                    sorted.binary_search(&needle).is_ok(),
-                    "{needle}"
-                );
-            }
-        }
+        let (list, _) = CompiledList::from_text(ListFormat::Hosts, &text);
+        let ips = |name: &str| -> Vec<String> {
+            list.hosts
+                .ips_of(hash(name))
+                .map(IpAddr::to_string)
+                .collect()
+        };
+
+        assert_eq!(list.hosts.ips.len(), 40);
+        assert!(list.hosts.groups_exist());
+        assert_eq!(
+            ips("multi.example"),
+            (0..40)
+                .map(|group| format!("10.0.0.{group}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ips("filler7.example").len(), 40);
+        assert!(ips("absent.example").is_empty());
     }
 }

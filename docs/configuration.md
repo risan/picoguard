@@ -471,7 +471,7 @@ The detected format shows on the status page. If auto picks wrong, set `format` 
 | `domains` | One domain per line. Each blocks that exact name only. |
 | `wildcard` | `domain` or `*.domain` per line. Each blocks the domain and all its subdomains. HaGeZi "wildcard" lists. |
 | `dnsmasq` | `address=/domain/...`, `local=/domain/`, `server=/domain/`. Each blocks the domain and its subdomains. |
-| `rpz` | RPZ zone files: `domain CNAME .` blocks the name; `*.domain CNAME .` blocks the subdomains; `CNAME rpz-passthru.` allows. Other record types are skipped and counted. |
+| `rpz` | RPZ zone files: `domain CNAME .` blocks the name; `*.domain CNAME .` blocks the subdomains; `CNAME rpz-passthru.` allows. A passthru entry wins over any block entry it covers, even a more specific one: with `*.example.com CNAME rpz-passthru.` and `ads.example.com CNAME .`, `ads.example.com` is allowed (most RPZ servers would block it). Other record types are skipped and counted. |
 
 Rules that need features picoguard does not have (`$client`, `$ctag`, `$dnsrewrite`) are parsed and
 counted, not fatal. Unknown lines are counted and logged once per list. See the README for the

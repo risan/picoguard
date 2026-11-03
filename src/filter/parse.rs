@@ -57,6 +57,14 @@ pub struct NetworkRule {
     pub pattern: String,
     /// Content types excluded with `~`, kept for the identity of the rule.
     pub restricted_types: u32,
+    /// `None` when every modifier is empty, so equal rules compare equal.
+    modifiers: Option<Box<Modifiers>>,
+}
+
+/// The modifiers a rule rarely has. Each is a full `Vec` header, which on the many rules of a
+/// big list would be paid for nothing, so a rule holds them behind an optional box.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Modifiers {
     pub dns_permitted: Vec<u16>,
     pub dns_restricted: Vec<u16>,
     /// `$denyallow` domains, case as written.
@@ -65,6 +73,23 @@ pub struct NetworkRule {
     pub restricted_clients: ClientSet,
     /// Restricted `$ctag` values (sorted), kept for the identity of the rule.
     pub restricted_ctags: Vec<String>,
+}
+
+static NO_MODIFIERS: Modifiers = Modifiers {
+    dns_permitted: Vec::new(),
+    dns_restricted: Vec::new(),
+    denyallow: Vec::new(),
+    restricted_clients: ClientSet {
+        nets: Vec::new(),
+        names: Vec::new(),
+    },
+    restricted_ctags: Vec::new(),
+};
+
+impl Modifiers {
+    fn is_empty(&self) -> bool {
+        *self == NO_MODIFIERS
+    }
 }
 
 /// The entries of a `$client` modifier in the canonical form urlfilter compares: client IPs
@@ -160,6 +185,28 @@ pub struct Identity {
 }
 
 impl NetworkRule {
+    pub fn new(
+        whitelist: bool,
+        important: bool,
+        badfilter: bool,
+        pattern: String,
+        restricted_types: u32,
+        modifiers: Modifiers,
+    ) -> NetworkRule {
+        NetworkRule {
+            whitelist,
+            important,
+            badfilter,
+            pattern,
+            restricted_types,
+            modifiers: (!modifiers.is_empty()).then(|| Box::new(modifiers)),
+        }
+    }
+
+    pub fn modifiers(&self) -> &Modifiers {
+        self.modifiers.as_deref().unwrap_or(&NO_MODIFIERS)
+    }
+
     pub fn is_regex(&self) -> bool {
         self.pattern.len() > 1 && self.pattern.starts_with('/') && self.pattern.ends_with('/')
     }
@@ -170,22 +217,25 @@ impl NetworkRule {
             important: self.important,
             pattern: self.pattern.clone(),
             restricted_types: self.restricted_types,
-            restricted_clients: self.restricted_clients.clone(),
-            restricted_ctags: self.restricted_ctags.clone(),
+            restricted_clients: self.modifiers().restricted_clients.clone(),
+            restricted_ctags: self.modifiers().restricted_ctags.clone(),
         }
     }
 
     /// True when the rule only applies to some record types or names.
     pub fn is_conditional(&self) -> bool {
-        !self.dns_permitted.is_empty()
-            || !self.dns_restricted.is_empty()
-            || !self.denyallow.is_empty()
+        let modifiers = self.modifiers();
+
+        !modifiers.dns_permitted.is_empty()
+            || !modifiers.dns_restricted.is_empty()
+            || !modifiers.denyallow.is_empty()
     }
 
     /// The rule as text that parses back to this rule: the pattern as stored, then the
     /// modifiers, if any, in a fixed order and spelling. No original line is kept, so a rule
     /// with modifiers may read differently from its list.
     pub fn text(&self) -> String {
+        let rare = self.modifiers();
         let mut modifiers = Vec::new();
         if self.important {
             modifiers.push("important".to_string());
@@ -207,12 +257,12 @@ impl NetworkRule {
                 .find(|(_, known)| known == code)
                 .map_or_else(|| code.to_string(), |(name, _)| name.to_string())
         };
-        let types: Vec<String> = self
+        let types: Vec<String> = rare
             .dns_permitted
             .iter()
             .map(type_name)
             .chain(
-                self.dns_restricted
+                rare.dns_restricted
                     .iter()
                     .map(|code| format!("~{}", type_name(code))),
             )
@@ -221,12 +271,12 @@ impl NetworkRule {
             modifiers.push(format!("dnstype={}", types.join("|")));
         }
 
-        if !self.denyallow.is_empty() {
-            modifiers.push(format!("denyallow={}", self.denyallow.join("|")));
+        if !rare.denyallow.is_empty() {
+            modifiers.push(format!("denyallow={}", rare.denyallow.join("|")));
         }
 
-        if !self.restricted_clients.is_empty() {
-            let clients: Vec<String> = self
+        if !rare.restricted_clients.is_empty() {
+            let clients: Vec<String> = rare
                 .restricted_clients
                 .entries()
                 .iter()
@@ -235,8 +285,8 @@ impl NetworkRule {
             modifiers.push(format!("client={}", clients.join("|")));
         }
 
-        if !self.restricted_ctags.is_empty() {
-            let tags: Vec<String> = self
+        if !rare.restricted_ctags.is_empty() {
+            let tags: Vec<String> = rare
                 .restricted_ctags
                 .iter()
                 .map(|tag| format!("~{tag}"))
@@ -1454,18 +1504,20 @@ fn parse_network_rule(text: &str) -> Result<NetworkRule, Drop> {
             .unwrap_or_default()
     };
 
-    Ok(NetworkRule {
+    Ok(NetworkRule::new(
         whitelist,
-        important: options.enabled & IMPORTANT != 0,
-        badfilter: options.enabled & BADFILTER != 0,
-        pattern: normalized,
-        restricted_types: options.restricted_types,
-        restricted_clients: ClientSet::new(&restricted(&options.client)),
-        restricted_ctags: restricted(&options.ctag),
-        dns_permitted: options.dns_permitted,
-        dns_restricted: options.dns_restricted,
-        denyallow: options.denyallow,
-    })
+        options.enabled & IMPORTANT != 0,
+        options.enabled & BADFILTER != 0,
+        normalized,
+        options.restricted_types,
+        Modifiers {
+            restricted_clients: ClientSet::new(&restricted(&options.client)),
+            restricted_ctags: restricted(&options.ctag),
+            dns_permitted: options.dns_permitted,
+            dns_restricted: options.dns_restricted,
+            denyallow: options.denyallow,
+        },
+    ))
 }
 
 /// Record type names urlfilter accepts in `$dnstype` (the miekg/dns table).
@@ -1583,29 +1635,30 @@ mod tests {
                         .map(|t| format!("{prefix}{t}"))
                         .collect::<Vec<_>>()
                 };
-                let mut dns = types(&rule.dns_permitted, "");
-                dns.extend(types(&rule.dns_restricted, "~"));
+                let rare = rule.modifiers();
+                let mut dns = types(&rare.dns_permitted, "");
+                dns.extend(types(&rare.dns_restricted, "~"));
                 if !dns.is_empty() {
                     text.push_str(&format!(" dnstype={}", dns.join("|")));
                 }
 
-                if !rule.denyallow.is_empty() {
-                    text.push_str(&format!(" denyallow={}", rule.denyallow.join("|")));
+                if !rare.denyallow.is_empty() {
+                    text.push_str(&format!(" denyallow={}", rare.denyallow.join("|")));
                 }
 
-                if !rule.restricted_clients.is_empty() {
-                    let nets = rule
+                if !rare.restricted_clients.is_empty() {
+                    let nets = rare
                         .restricted_clients
                         .nets
                         .iter()
                         .map(|(ip, bits)| format!("{ip}/{bits}"));
-                    let names = rule.restricted_clients.names.iter().cloned();
+                    let names = rare.restricted_clients.names.iter().cloned();
                     let entries: Vec<String> = nets.chain(names).collect();
                     text.push_str(&format!(" client={}", entries.join("|")));
                 }
 
-                if !rule.restricted_ctags.is_empty() {
-                    text.push_str(&format!(" ctag={}", rule.restricted_ctags.join("|")));
+                if !rare.restricted_ctags.is_empty() {
+                    text.push_str(&format!(" ctag={}", rare.restricted_ctags.join("|")));
                 }
 
                 text
