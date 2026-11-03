@@ -512,13 +512,13 @@ async fn the_page_is_served_with_protective_headers() {
     assert!(reply.header("access-control-allow-origin").is_none());
 }
 
-/// The page's ceiling for release 2, raised on purpose for the settings: static bytes in the
-/// binary, no memory at run time.
-const PAGE_HARD_CAP_BYTES: usize = 64 * 1024;
+/// The page's ceiling, raised on purpose for the redesign: static bytes in the binary, no memory
+/// at run time.
+const PAGE_HARD_CAP_BYTES: usize = 80 * 1024;
 
-/// Release 3, the history ranges, the statistics card and the clear buttons; raised on purpose,
-/// never past the cap.
-const PAGE_BUDGET_BYTES: usize = 59 * 1024;
+/// The redesign: card descriptions that say what each setting does, save-at-once settings and a
+/// notice line; raised on purpose, never past the cap.
+const PAGE_BUDGET_BYTES: usize = 72 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -655,7 +655,7 @@ async fn the_dashboard_has_an_upstreams_card_drawn_as_text() {
         "showUpstreams(status.upstreams)",
         "\"local: \"",
         "\"\\u2014\"",
-        "th:not(:first-child)",
+        "[\"Answered\", \"num\"]",
         "[\"pause\", \"tops\", \"upstreams\"",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
@@ -746,7 +746,7 @@ async fn the_lists_tab_has_your_rules_and_a_name_check() {
     for needed in [
         "\"/api/rules/remove\"",
         "\"/api/explain?name=\" + encodeURIComponent(",
-        "Saved on this device.",
+        "[\"settings-note\", \"rules-note\"]",
         "\"refresh-row\", \"list-add\", \"rules\", \"check\"]",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
@@ -789,7 +789,7 @@ async fn the_lists_tab_turns_lists_on_and_off_adds_removes_and_resets_them_and_s
         "showLists(await api(\"/api/lists\"))",
         "\"from the config file\"",
         "\"Set on this page\"",
-        ">Use the config file<",
+        ">Reset to config file<",
         "\"Memory estimate: \"",
         "#list-table td.name { min-width: 12rem; white-space: normal; overflow-wrap: anywhere; }",
         "confirm(\"Remove this list?\")",
@@ -847,7 +847,6 @@ async fn the_settings_tab_edits_the_upstream_servers_and_the_cache() {
         "upstream-add",
         "upstream-new",
         "bootstrap",
-        "upstream-save",
         "upstream-reset",
         "upstream-note",
         "cache-card",
@@ -857,9 +856,8 @@ async fn the_settings_tab_edits_the_upstream_servers_and_the_cache() {
         "c-min",
         "c-max",
         "c-optimistic",
-        "cache-save",
         "cache-reset",
-        "cache-set-note",
+        "cache-note",
     ] {
         assert!(
             page.contains(&format!("id=\"{id}\"")),
@@ -869,16 +867,19 @@ async fn the_settings_tab_edits_the_upstream_servers_and_the_cache() {
 
     for needed in [
         "\"From the config file\"",
-        "\"Set on this page\"",
-        ">Use the config file<",
-        "Saving clears the cache.",
+        "\"Changed on this page\"",
+        ">Reset to config file<",
+        "A change clears the cache.",
+        "saveServers(",
+        "data-reset=\"upstream\"",
+        "data-reset=\"cache\"",
         "\"Move up\"",
         "\"Move down\"",
         "\"Remove\"",
         "editing[key]",
         "{ [key]: value }",
         "max_bytes",
-        "#upstream-list code",
+        ".items li > :first-child",
         "overflow-wrap: anywhere",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
@@ -898,13 +899,11 @@ async fn the_settings_tab_edits_the_rewrites_and_safe_search() {
         "rewrite-add",
         "rewrite-name",
         "rewrite-answer",
-        "rewrites-save",
         "rewrites-reset",
         "rewrites-note",
         "safe-search-card",
         "safe_search-from",
         "safe-search",
-        "safe_search-save",
         "safe_search-reset",
         "safe_search-note",
     ] {
@@ -920,7 +919,9 @@ async fn the_settings_tab_edits_the_rewrites_and_safe_search() {
         "rewritten: \"rewritten\"",
         "data.decision === \"rewritten\"",
         "counters.rewritten",
-        "#rewrite-table td",
+        "#rewrite-table li",
+        "saveSetting(\"rewrites\", [...rewrites,",
+        "saveSetting(\"safe_search\", $(\"safe-search\").checked)",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
@@ -938,7 +939,6 @@ async fn the_settings_tab_switches_blocked_services_by_group_with_a_filter() {
         "service-filter",
         "services-state",
         "service-groups",
-        "services-save",
         "services-reset",
         "services-note",
     ] {
@@ -1000,7 +1000,7 @@ async fn the_chart_has_four_ranges_that_keep_to_the_retention_and_are_remembered
         "HISTORY_REFRESH_MS = 60000",
         "localStorage.getItem(",
         "localStorage.setItem(",
-        "\"since \" + new Date(status.since * 1000)",
+        "\"since \" + when(status.since)",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
@@ -1022,10 +1022,9 @@ async fn the_statistics_card_and_the_clear_buttons_ask_before_they_clear() {
         "id=\"retention\"",
         "id=\"stats-saving\"",
         "id=\"stats-clear\"",
-        "id=\"stats-save\"",
         "id=\"stats-reset\"",
         "saveSetting(\"stats\", { retention_days:",
-        "saveSetting(\"stats\", null",
+        "saveSetting(key, null)",
         "showSaving(status.stats_saving)",
         "\"Clear the statistics?",
         "act(\"/api/stats/clear\"",
@@ -1060,7 +1059,7 @@ async fn the_pause_form_sends_only_whole_minutes_from_1_to_1440() {
         "min=\"1\"",
         "max=\"1440\"",
         "Number.isInteger(",
-        "\"1 to 1440 minutes\"",
+        "\"Enter 1 to 1440 minutes\"",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
     }
@@ -1085,9 +1084,9 @@ async fn the_update_notice_is_hidden_until_a_newer_version_is_known() {
     let page = site.send(get("/")).await.body;
 
     assert!(page.contains("<section id=\"update\" hidden>"));
-    assert!(
-        page.contains("$(\"update\").hidden = !status.update.latest && !status.update.install;")
-    );
+    assert!(page.contains(
+        "$(\"update\").hidden = !u.latest && !installing && !(watchingInstall && state);"
+    ));
     for filled_as_text in [
         "$(\"version\").textContent",
         "$(\"update-text\").textContent",
@@ -1098,7 +1097,7 @@ async fn the_update_notice_is_hidden_until_a_newer_version_is_known() {
         assert!(page.contains(filled_as_text), "{filled_as_text}");
     }
 
-    assert!(page.contains("\"update available: v\""));
+    assert!(page.contains("\" is available\""));
 }
 
 /// No browser here: the click handler's source must ask before it posts.

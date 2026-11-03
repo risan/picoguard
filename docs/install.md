@@ -237,11 +237,12 @@ The restart signs out every browser. In Docker, make the line with
 
 #### From the status page
 
-When a newer release exists, the status page says "update available". If you are signed in (set
+When a newer release exists, the status page says "picoguard vX.Y.Z is available". If you are signed in (set
 `web.user` and `web.password_hash` or `web.password`), it also shows a button,
 **Update to vX.Y.Z**. The button needs a release binary that `install.sh` installed: `install.sh`
 also sets up the root program that installs the update ("the installer" below). A manual install,
-a Docker image and a build from source show the command to run instead.
+a Docker image and a build from source show the command to run instead. When the update is done,
+the page that started it says so once, and the version in the page header shows the new version.
 
 What one click does:
 

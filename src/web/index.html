@@ -7,273 +7,362 @@
 <style>
 :root {
   color-scheme: light dark;
-  --bg: #f7f7f8; --card: #ffffff; --text: #16171a; --muted: #5f6672; --line: #e4e5e9;
-  --accent: #4f46e5; --on-accent: #ffffff; --blocked: #dc2626; --good: #15803d; --warn: #b45309;
-  --tint: #4f46e51f; --tint-bad: #dc26261a;
-  --t-sm: 12px; --t-md: 14px; --t-lg: 18px; --t-xl: 34px;
-  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px;
+  --bg: #f4f5f7; --panel: #fff; --sunk: #eef0f3; --line: #e1e4e8; --line-2: #cdd1d8;
+  --text: #16181c; --muted: #5c636e; --faint: #8b919b;
+  --accent: #2563eb; --accent-text: #1d4ed8; --accent-soft: #2563eb17; --on-accent: #fff;
+  --bad: #d92d33; --bad-soft: #d92d3314; --ok: #16803c; --ok-soft: #16803c14; --warn: #a75a00; --warn-soft: #f59e0b24;
+  --q: #86a8ec; --b: #e5484d;
+  --r: 6px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #09090b; --card: #111114; --text: #ececf0; --muted: #9a9ea8; --line: #26272d;
-    --accent: #818cf8; --on-accent: #09090b; --blocked: #f87171; --good: #4ade80; --warn: #fbbf24;
-    --tint: #818cf833; --tint-bad: #f8717126;
+    --bg: #0d0e10; --panel: #15161a; --sunk: #1c1e22; --line: #26282e; --line-2: #363940;
+    --text: #e8e9ec; --muted: #9a9fa8; --faint: #6c727c;
+    --accent: #2f6ee0; --accent-text: #80aaff; --accent-soft: #3b82f624; --on-accent: #fff;
+    --bad: #f2666b; --bad-soft: #f2666b1f; --ok: #4cc26a; --ok-soft: #4cc26a1f; --warn: #f2b14c; --warn-soft: #f2b14c1f;
+    --q: #3f6cc4; --b: #f2666b;
   }
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--text); -webkit-text-size-adjust: 100%;
-  font: var(--t-md)/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-.wrap { max-width: 1120px; margin: 0 auto; padding: 0 var(--s4); }
-header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--line); }
-header .wrap { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s1) var(--s3); padding-top: var(--s3); padding-bottom: var(--s3); }
-h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
-h1 small { margin-left: var(--s1); font-size: var(--t-sm); font-weight: 400; color: var(--muted); }
-h2 { margin: 0 0 var(--s3); font-size: 13px; font-weight: 600; color: var(--muted); }
-h2 small { font-weight: 400; }
-.badge { display: inline-flex; align-items: center; gap: 6px; padding: 1px 10px; font-size: var(--t-sm);
-  font-weight: 500; white-space: nowrap; border: 1px solid var(--line); border-radius: 99px; }
-.badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--dot, var(--muted)); }
-#badge { --dot: var(--good); }
-.paused #badge { --dot: var(--warn); }
-#badge:empty { display: none; }
-.r-pass { --dot: var(--accent); }
-.r-cached { --dot: var(--good); }
-.r-blocked_request, .r-blocked_response, .d-blocked { --dot: var(--blocked); }
-.d-allowed { --dot: var(--good); }
-.r-rewritten, .d-rewritten { --dot: var(--accent); }
-.r-error { --dot: var(--warn); }
-#state { margin-left: auto; font-size: var(--t-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
-#state.bad { color: var(--blocked); }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-nav { display: flex; gap: var(--s1); margin: var(--s4) 0; border-bottom: 1px solid var(--line); overflow-x: auto; }
-nav button { margin-bottom: -1px; padding: var(--s2) var(--s3); border: 0; border-bottom: 2px solid transparent;
-  border-radius: 0; background: none; color: var(--muted); font-weight: 500; }
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px; }
+.ico { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round; }
+header { position: sticky; top: 0; z-index: 3; background: var(--panel); border-bottom: 1px solid var(--line); }
+.bar { display: flex; align-items: center; flex-wrap: wrap; column-gap: 20px; min-height: 52px; }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 650; font-size: 15px; }
+.brand .ico { width: 18px; height: 18px; color: var(--accent-text); }
+.brand small { font-size: 12px; font-weight: 400; color: var(--muted); }
+nav { display: flex; align-self: stretch; overflow: auto hidden; scrollbar-width: none; }
+nav::-webkit-scrollbar { display: none; }
+nav button { height: auto; padding: 0 10px; border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+  background: none; color: var(--muted); font-size: 14px; white-space: nowrap; }
 nav button:hover { color: var(--text); background: none; }
 nav button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
-main { padding-bottom: var(--s5); }
-.grid { display: grid; gap: var(--s4); grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); }
+.spacer { flex: 1; }
+.tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+#badge { padding: 2px 8px; font-size: 12px; font-weight: 600; color: var(--warn); background: var(--warn-soft);
+  border-radius: 4px; white-space: nowrap; }
+#state { font-size: 12px; color: var(--bad); }
+#badge:empty, #state:empty { display: none; }
+main.wrap { padding: 16px 16px 48px; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr)); }
 .wide { grid-column: 1 / -1; }
-section { min-width: 0; padding: var(--s4); background: var(--card); border: 1px solid var(--line);
-  border-radius: 12px; box-shadow: 0 1px 2px #0000000d; }
-code { display: block; font-size: 13px; word-break: break-all; }
-#update { grid-column: 1 / -1; border-color: var(--accent); }
-#update-notes, #install-state, #settings-file { overflow-wrap: anywhere; }
-p { margin: 0 0 var(--s2); }
-.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s4) var(--s3); }
-.card span { display: block; font-size: var(--t-sm); color: var(--muted); }
-.card b { display: block; font-size: var(--t-lg); font-weight: 600; font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere; }
-.headline { grid-column: span 2; padding-bottom: var(--s4); border-bottom: 1px solid var(--line); }
-.headline b { font-size: var(--t-xl); line-height: 1.2; letter-spacing: -.02em; }
+section { min-width: 0; padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); }
+.head { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; min-height: 28px; margin-bottom: 10px; }
+.head .tools { margin-left: auto; }
+h2 { margin: 0; font-size: 14px; font-weight: 600; }
+h3 { margin: 14px 0 6px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.meta { font-size: 12px; color: var(--muted); }
+.chip { padding: 1px 6px; font-size: 11px; font-weight: 600; color: var(--accent-text); background: var(--accent-soft); border-radius: 4px; }
+p { margin: 0 0 8px; }
+.desc { max-width: 72ch; margin: -4px 0 12px; font-size: 13px; color: var(--muted); }
+.err { color: var(--bad); overflow-wrap: anywhere; }
+p.err { font-size: 13px; }
+.empty { color: var(--muted); }
+code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+pre code, code.block { display: block; padding: 8px 10px; background: var(--sunk); border-radius: 4px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+button, input, select { font: inherit; font-size: 13px; color: var(--text); }
+button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 30px; padding: 0 12px;
+  font-weight: 500; white-space: nowrap; background: var(--panel); border: 1px solid var(--line-2);
+  border-radius: 5px; cursor: pointer; }
+button:hover { background: var(--sunk); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button.primary:hover { filter: brightness(1.1); }
+button.ghost { background: none; border-color: transparent; color: var(--muted); }
+button.ghost:hover { background: var(--sunk); color: var(--text); }
+button.danger { color: var(--bad); }
+button.danger:hover { background: var(--bad-soft); }
+button.sm { height: 24px; padding: 0 8px; font-size: 12px; }
+button.icon { width: 26px; height: 26px; padding: 0; color: var(--muted); }
+input, select { height: 30px; padding: 0 9px; background: var(--panel); border: 1px solid var(--line-2); border-radius: 5px; }
+input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+input::placeholder { color: var(--faint); }
+input[type="checkbox"] { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
+input.switch { appearance: none; position: relative; flex: none; width: 30px; height: 18px; padding: 0;
+  background: var(--line-2); border: 0; border-radius: 9px; cursor: pointer; transition: background .15s; }
+input.switch::before { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px;
+  background: #fff; border-radius: 50%; transition: transform .15s; }
+input.switch:checked { background: var(--accent); }
+input.switch:checked::before { transform: translateX(12px); }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.row input:not([type]), .row input[type="search"] { flex: 1 1 12rem; min-width: 0; }
+.field { display: grid; gap: 4px; font-size: 12px; font-weight: 500; color: var(--muted); }
+.field input, .field select { width: 100%; }
+.fields { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr)); margin-bottom: 12px; }
+.toggle { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+.toggle .switch { margin-top: 1px; }
+.toggle span { display: grid; }
+.toggle small { font-size: 13px; color: var(--muted); }
+.seg { display: inline-flex; padding: 2px; background: var(--sunk); border-radius: 6px; }
+.seg button { height: 26px; padding: 0 10px; color: var(--muted); background: none; border: 0; border-radius: 4px; }
+.seg button:hover { color: var(--text); background: none; }
+.seg button[aria-pressed="true"] { color: var(--text); background: var(--panel); box-shadow: 0 0 0 1px var(--line-2); }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th { text-align: left; font-weight: 500; font-size: var(--t-sm); color: var(--muted); white-space: nowrap; }
-th, td { padding: var(--s2) var(--s3) var(--s2) 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { padding: 0 12px 6px 0; text-align: left; font-size: 12px; font-weight: 500; color: var(--muted); white-space: nowrap;
+  border-bottom: 1px solid var(--line); }
+td { padding: 7px 12px 7px 0; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th:last-child, td:last-child { padding-right: 0; }
 tr:last-child td { border-bottom: 0; }
-td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.name, td.who { overflow-wrap: anywhere; }
-.ip { color: var(--muted); }
-#queries td, #list-table td { white-space: nowrap; }
-#list-table td.err { min-width: 14rem; white-space: normal; }
-#list-table td.name { min-width: 12rem; white-space: normal; overflow-wrap: anywhere; }
-#list-table small { display: block; color: var(--muted); }
-#list-table input[type="number"] { width: 4.5rem; padding: 1px var(--s2); }
-#queries td.name { min-width: 12rem; white-space: normal; }
-#queries td.who { white-space: normal; }
-.bars table { border-collapse: separate; border-spacing: 0 2px; }
-.bars td { padding: 6px 0 6px var(--s2); border-bottom: 0; }
-.bars td.name { border-radius: 4px;
-  background: linear-gradient(to right, var(--bar, var(--tint)) var(--share, 0%), transparent 0); }
-#top-blocked { --bar: var(--tint-bad); }
-.bars th { padding-left: var(--s2); }
-.bars td.num, .bars th:not(:first-child) { padding-right: var(--s2); text-align: right; }
-#upstreams td, #upstreams th { padding-left: var(--s1); }
-#upstreams td.num, #upstreams th:not(:first-child) { padding-right: var(--s1); }
+.ip { margin-left: 4px; color: var(--muted); }
 .scroll { overflow-x: auto; }
-#chart-readout { margin: 0 0 var(--s2); font-size: var(--t-sm); color: var(--muted); font-variant-numeric: tabular-nums; }
-#chart { display: block; }
-#chart text { font-size: 10px; fill: var(--muted); }
-#chart line { stroke: var(--line); }
-#chart .base { stroke: var(--muted); }
-#chart .total { fill: var(--accent); }
-#chart .blocked { fill: var(--blocked); }
-#chart .hit { fill: transparent; pointer-events: all; }
-#chart .hit.on { fill: var(--tint); }
-#ranges { margin-bottom: var(--s3); }
-#ranges button[aria-pressed="true"] { border-color: var(--accent); background: var(--tint); }
-button:disabled { opacity: .5; cursor: default; }
-#chart-totals { margin: 0 0 var(--s1); }
-.actions { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
-.actions p { margin: 0 auto 0 0; flex: 1 1 12rem; font-size: 15px; }
-.paused #pause { border-color: var(--warn); }
-.paused #pause-text { color: var(--warn); font-weight: 600; }
-#pause-form { display: flex; gap: var(--s2); }
-#pause-error { flex: 1 0 100%; font-size: var(--t-sm); color: var(--blocked); }
-input, select { width: 6.5rem; padding: 6px var(--s3); font: inherit; color: var(--text); background: var(--card);
-  border: 1px solid var(--line); border-radius: 8px; }
-button { font: inherit; padding: 6px var(--s3); border-radius: 8px; border: 1px solid var(--line);
-  background: var(--card); color: var(--text); cursor: pointer; }
-button:hover { background: var(--bg); }
-button.go { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 500; }
-button.go:hover { background: var(--accent); opacity: .9; }
+.pill { display: inline-block; padding: 1px 6px; font-size: 12px; font-weight: 500; white-space: nowrap;
+  color: var(--muted); background: var(--sunk); border-radius: 4px; }
+.r-blocked_request, .r-blocked_response, .d-blocked { color: var(--bad); background: var(--bad-soft); }
+.r-cached, .d-allowed { color: var(--ok); background: var(--ok-soft); }
+.r-rewritten, .d-rewritten { color: var(--accent-text); background: var(--accent-soft); }
+.r-error { color: var(--warn); background: var(--warn-soft); }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9.5rem), 1fr)); gap: 12px 24px; }
+.kpi span, .kpi small { display: block; font-size: 12px; color: var(--muted); }
+.kpi b { display: block; margin: 2px 0; font-size: 24px; font-weight: 600; line-height: 1.2; letter-spacing: -.01em;
+  font-variant-numeric: tabular-nums; }
+#pause { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; }
+#pause .state { display: flex; align-items: flex-start; gap: 10px; flex: 1 1 18rem; }
+#pause .state .ico { width: 20px; height: 20px; margin-top: 1px; color: var(--ok); }
+#pause-text { margin: 0; font-weight: 600; }
+#pause-sub { margin: 0; font-size: 13px; color: var(--muted); }
+.paused #pause { border-color: var(--warn); background: linear-gradient(var(--warn-soft), var(--warn-soft)), var(--panel); }
+.paused #pause .state .ico, .paused #pause-text { color: var(--warn); }
+#pause-form input { width: 5.5rem; }
+#pause-error { flex-basis: 100%; font-size: 12px; color: var(--bad); text-align: right; }
 #resume { display: none; }
 .paused #resume { display: inline-block; }
-.err { color: var(--warn); overflow-wrap: anywhere; }
-.empty { color: var(--muted); }
-.signed-out nav, .signed-out [data-panel], .signed-out #logout { display: none; }
-#login { max-width: 22rem; margin: var(--s5) auto; }
-#login-form { display: grid; gap: var(--s3); }
-#login label { display: grid; gap: var(--s1); font-size: var(--t-sm); color: var(--muted); }
-#login input { width: 100%; }
-#login-note { margin: var(--s3) 0 0; }
-td button { padding: 1px var(--s2); font-size: var(--t-sm); }
-#check-name { flex: 1 1 12rem; width: auto; min-width: 0; }
-#check-result, #config-rules { margin-top: var(--s3); overflow-wrap: anywhere; }
-#check-result { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--s1) var(--s3); margin-bottom: 0; }
-#check-result dt { color: var(--muted); }
+#update { grid-column: 1 / -1; border-color: var(--accent); background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--panel); }
+#update h2 { font-size: 15px; }
+#update-notes, #install-state, #settings-file { overflow-wrap: anywhere; }
+#update-notes { color: var(--text); }
+#install-state { font-size: 13px; }
+#update-manual { margin-top: 12px; }
+#chart-readout { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.legend { display: flex; gap: 12px; margin-left: auto; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 8px; height: 8px; margin-right: 5px; border-radius: 2px; background: var(--q); }
+.legend i.b { background: var(--b); }
+#chart { display: block; margin-top: 6px; }
+#chart text { font-size: 10px; fill: var(--faint); }
+#chart line { stroke: var(--line); stroke-dasharray: 2 3; }
+#chart .base { stroke: var(--line-2); stroke-dasharray: none; }
+#chart .total { fill: var(--q); }
+#chart .blocked { fill: var(--b); }
+#chart .hit { fill: transparent; pointer-events: all; }
+#chart .hit.on { fill: var(--text); fill-opacity: .06; }
+.bars td { padding: 5px 0 9px; }
+.bars td.name { width: 100%; max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 16px;
+  background: linear-gradient(var(--bar, var(--q)), var(--bar, var(--q))) no-repeat left bottom 3px / var(--share, 0%) 3px,
+    linear-gradient(var(--sunk), var(--sunk)) no-repeat left bottom 3px / calc(100% - 16px) 3px; }
+#top-blocked { --bar: var(--b); }
+#upstreams td.name { width: auto; max-width: none; white-space: normal; overflow-wrap: anywhere; }
+#upstreams td { padding-right: 16px; }
+#upstreams td:last-child { padding-right: 0; }
+.split { display: grid; gap: 12px; }
+#cache .kpi b { font-size: 20px; }
+#cache .kpis { margin-bottom: 12px; }
+#queries td { white-space: nowrap; }
+#queries td.name { min-width: 12rem; white-space: normal; }
+#queries td.who { white-space: normal; }
+#queries td { padding-top: 5px; padding-bottom: 5px; }
+#queries td:last-child { text-align: right; }
+#queries tr:hover td { background: var(--sunk); }
+@media (hover: hover) {
+  #queries tr:not(:hover):not(:focus-within) td:last-child button { opacity: 0; }
+}
+#stats-card .fields { max-width: 16rem; }
+#bootstrap-field { max-width: 36rem; }
+#list-table td { white-space: nowrap; }
+#list-table td.err { min-width: 12rem; white-space: normal; font-size: 12px; }
+#list-table td.name { min-width: 12rem; white-space: normal; overflow-wrap: anywhere; }
+#list-table small { display: block; font-size: 12px; color: var(--muted); }
+#list-table input[type="number"] { width: 4.5rem; height: 26px; }
+.memory { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+.meter { width: 96px; height: 6px; overflow: hidden; background: var(--sunk); border-radius: 3px;
+  background-image: linear-gradient(var(--accent), var(--accent)); background-repeat: no-repeat; background-size: var(--fill, 0%) 100%; }
+.memory.err .meter { background-image: linear-gradient(var(--bad), var(--bad)); }
+.memory.err { color: var(--bad); }
+#list-add-note { font-size: 13px; }
+#list-add .fields { grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); align-items: end; }
+#list-add .grow { grid-column: span 2; }
+#config-rules code { display: block; padding: 3px 0; }
+#check-result { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 16px; margin: 12px 0 0; overflow-wrap: anywhere; }
+#check-result:empty { display: none; }
+#check-result dt { font-size: 13px; color: var(--muted); }
 #check-result dd { margin: 0; }
-#upstream-list { margin: 0 0 var(--s3); padding-left: var(--s5); }
-#upstream-list li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); padding: var(--s1) 0; }
-#upstream-list code { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
-#upstream-list button { padding: 1px var(--s2); font-size: var(--t-sm); }
-#upstream-new, #bootstrap, #rewrite-name, #rewrite-answer { flex: 1 1 12rem; width: auto; min-width: 0; }
-#rewrite-table td { overflow-wrap: anywhere; }
-#rewrite-table td:nth-child(2) { min-width: 7.5rem; }
-#rewrite-table td:last-child { width: 1%; white-space: nowrap; }
-#service-filter { width: 100%; max-width: 20rem; margin-bottom: var(--s2); }
-#service-groups { margin-bottom: var(--s3); }
-#service-groups h3 { margin: var(--s3) 0 var(--s1); font-size: var(--t-sm); font-weight: 600; color: var(--muted); }
-#service-groups div { display: grid; gap: var(--s1) var(--s3); grid-template-columns: repeat(auto-fill, minmax(min(100%, 11rem), 1fr)); }
-#service-groups label { display: flex; align-items: center; gap: var(--s2); overflow-wrap: anywhere; }
-.fields { display: grid; gap: var(--s3); margin: var(--s3) 0; grid-template-columns: repeat(auto-fit, minmax(min(100%, 9rem), 1fr)); }
-.fields label { display: grid; gap: var(--s1); font-size: var(--t-sm); color: var(--muted); }
-.fields input, .fields select { width: 100%; }
-#list-add-note { flex: 1 1 12rem; overflow-wrap: anywhere; }
-.fields .switch { display: flex; align-items: center; grid-column: 1 / -1; color: var(--text); }
-input[type="checkbox"] { width: auto; margin: 0; }
+.items { margin: 0 0 10px; padding: 0; list-style: none; border: 1px solid var(--line); border-radius: 5px; }
+.items li { display: flex; align-items: center; gap: 4px; min-height: 38px; padding: 4px 6px 4px 12px; border-bottom: 1px solid var(--line); }
+.items li:last-child { border-bottom: 0; }
+.items li > :first-child { flex: 1; min-width: 0; }
+.items li.empty { padding-left: 12px; }
+.items .arrow { color: var(--faint); }
+#rewrite-table li > :first-child { display: flex; flex-wrap: wrap; gap: 2px 10px; overflow-wrap: anywhere; }
+#bootstrap-field { margin: 12px 0 0; }
+#settings-top { padding: 0 2px; font-size: 13px; color: var(--muted); }
+#settings-top p { margin: 0 0 4px; }
+#settings-top .memory { margin: 0; }
+#service-groups { margin-bottom: 4px; }
+#service-groups h3:first-child { margin-top: 4px; }
+#service-groups div { display: grid; gap: 2px 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 10.5rem), 1fr)); }
+#service-groups label { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 13px; overflow-wrap: anywhere; cursor: pointer; }
+#service-filter { width: 13rem; }
+#services-state { margin: 8px 0 0; font-size: 12px; }
+.danger-zone { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.danger-zone p { flex: 1 1 16rem; margin: 0; font-size: 13px; color: var(--muted); }
+#toast { position: fixed; left: 50%; bottom: 20px; z-index: 5; max-width: min(92vw, 34rem); padding: 9px 14px;
+  font-size: 13px; color: var(--panel); background: var(--text); border-radius: 6px; transform: translateX(-50%);
+  box-shadow: 0 6px 24px #0000003d; }
+#toast.bad { color: #fff; background: var(--bad); }
+.signed-out nav, .signed-out [data-panel], .signed-out #logout { display: none; }
+#login { max-width: 22rem; margin: 48px auto; padding: 22px; }
+#login h2 { margin-bottom: 14px; font-size: 16px; }
+#login-form { display: grid; gap: 12px; }
+#login input { width: 100%; height: 34px; }
+#login button { height: 34px; }
+#login-note { margin: 12px 0 0; }
+#login-note:empty { display: none; }
 @media (max-width: 719px) {
+  nav { order: 5; flex-basis: calc(100% + 32px); height: 40px; margin: 0 -16px; padding: 0 6px; border-top: 1px solid var(--line); }
+  .bar { column-gap: 10px; }
+  #pause-error { text-align: left; }
+  #list-add .grow { grid-column: auto; }
   #queries table { display: block; }
-  #queries tr { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; padding: var(--s2) 0;
+  #queries tr { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; padding: 8px 0;
     border-bottom: 1px solid var(--line); }
   #queries tr:last-child { border: 0; }
   /* A full-width break between the name and result and the rest of the row. */
   #queries tr::after { content: ""; flex-basis: 100%; order: -1; }
   #queries tr:first-child, #queries td:nth-child(6) { display: none; }
-  #queries td { padding: 0; border: 0; font-size: var(--t-sm); color: var(--muted); }
+  #queries td { padding: 0; border: 0; font-size: 12px; color: var(--muted); }
   #queries td.name { flex: 1 1 0; min-width: 0; order: -3; font-size: 13px; color: var(--text); }
-  #queries td:nth-child(5) { order: -2; color: var(--text); }
+  #queries td:nth-child(5) { order: -2; }
   #queries td:last-child { margin-left: auto; }
 }
-@media (min-width: 720px) {
-  .cards { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-  .headline { grid-column: span 3; }
+@media (min-width: 900px) {
+  .split { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
 }
 </style>
 </head>
 <body class="signed-out">
 <header>
-  <div class="wrap">
-    <h1>picoguard <small id="version"></small></h1>
-    <span id="badge" class="badge"></span>
-    <span id="state">connecting</span>
-    <button id="logout" hidden>Sign out</button>
+  <div class="wrap bar">
+    <div class="brand"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z"/></svg>picoguard <small id="version"></small></div>
+    <nav role="tablist">
+      <button role="tab" id="tab-dashboard" data-tab="dashboard" aria-controls="panel-dashboard" aria-selected="true">Dashboard</button>
+      <button role="tab" id="tab-log" data-tab="log" aria-controls="panel-log" aria-selected="false">Query log</button>
+      <button role="tab" id="tab-lists" data-tab="lists" aria-controls="panel-lists" aria-selected="false">Lists</button>
+      <button role="tab" id="tab-settings" data-tab="settings" aria-controls="panel-settings" aria-selected="false">Settings</button>
+    </nav>
+    <span class="spacer"></span>
+    <span id="badge" title="Blocking is paused"></span>
+    <span id="state" role="status"></span>
+    <button id="logout" class="ghost" hidden><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H4"/></svg>Sign out</button>
   </div>
 </header>
 
 <main class="wrap">
-  <section id="login" class="wide" hidden>
-    <h2>Sign in</h2>
+  <section id="login" hidden>
+    <h2>Sign in to picoguard</h2>
     <form id="login-form">
-      <label>User <input id="login-user" autocomplete="username" autocapitalize="none" required></label>
-      <label>Password <input id="login-password" type="password" autocomplete="current-password" required></label>
-      <button class="go">Sign in</button>
+      <label class="field">User <input id="login-user" autocomplete="username" autocapitalize="none" required></label>
+      <label class="field">Password <input id="login-password" type="password" autocomplete="current-password" required></label>
+      <button class="primary">Sign in</button>
     </form>
     <p id="login-note" class="err"></p>
   </section>
 
-  <nav role="tablist">
-    <button role="tab" id="tab-dashboard" data-tab="dashboard" aria-controls="panel-dashboard" aria-selected="true">Dashboard</button>
-    <button role="tab" id="tab-log" data-tab="log" aria-controls="panel-log" aria-selected="false">Query log</button>
-    <button role="tab" id="tab-lists" data-tab="lists" aria-controls="panel-lists" aria-selected="false">Lists</button>
-    <button role="tab" id="tab-settings" data-tab="settings" aria-controls="panel-settings" aria-selected="false">Settings</button>
-  </nav>
-
   <div class="grid" role="tabpanel" id="panel-dashboard" data-panel="dashboard" aria-labelledby="tab-dashboard">
     <section id="update" hidden>
-      <h2>Update</h2>
-      <p id="update-text"></p>
+      <div class="head"><h2 id="update-text"></h2></div>
       <p id="update-notes"></p>
-      <p id="install-state"></p>
-      <button id="install" class="go" hidden>Update</button>
-      <code id="update-how"></code>
+      <div class="row">
+        <button id="install" class="primary" hidden>Update</button>
+        <span id="install-state"></span>
+      </div>
+      <div id="update-manual" hidden>
+        <p class="desc">To update, run this on the picoguard server:</p>
+        <code id="update-how" class="block"></code>
+      </div>
     </section>
 
     <section id="limited" class="wide" hidden>
-      <h2>Read-only</h2>
-      <p id="limited-note"></p>
+      <div class="head"><h2>Read-only view</h2></div>
+      <p id="limited-note" class="desc"></p>
     </section>
 
     <section id="pause" class="wide">
-      <div class="actions">
-        <p id="pause-text">Blocking is on.</p>
-        <button data-minutes="5">Pause 5 min</button>
-        <button data-minutes="30">30 min</button>
-        <button data-minutes="60">1 h</button>
-        <button data-minutes="1440">1 day</button>
-        <form id="pause-form" novalidate>
+      <div class="state">
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z"/></svg>
+        <div><p id="pause-text">Blocking is on</p><p id="pause-sub"></p></div>
+      </div>
+      <div class="tools">
+        <span class="meta">Pause for</span>
+        <span class="seg">
+          <button data-minutes="5">5 min</button>
+          <button data-minutes="30">30 min</button>
+          <button data-minutes="60">1 hour</button>
+          <button data-minutes="1440">1 day</button>
+        </span>
+        <form id="pause-form" class="row" novalidate>
           <input id="pause-minutes" type="number" min="1" max="1440" step="1" inputmode="numeric" placeholder="Minutes" aria-label="Minutes to pause">
-          <button class="go">Pause</button>
+          <button>Pause</button>
         </form>
-        <button id="resume" class="go">Resume</button>
-        <span id="pause-error" hidden></span>
+        <button id="resume" class="primary">Resume blocking</button>
       </div>
+      <span id="pause-error" hidden></span>
     </section>
 
     <section class="wide">
-      <h2>Totals <small id="totals-since"></small></h2>
-      <div class="cards" id="cards"></div>
+      <div class="head"><h2>Totals</h2><span class="meta" id="totals-since"></span></div>
+      <div class="kpis" id="cards"></div>
     </section>
 
     <section class="wide">
-      <h2><span id="chart-title">Last 24 hours</span> <small>(queries, blocked in red)</small></h2>
-      <div id="ranges" class="actions">
-        <button data-days="1">24 hours</button>
-        <button data-days="7">7 days</button>
-        <button data-days="30">30 days</button>
-        <button data-days="90">90 days</button>
+      <div class="head">
+        <h2 id="chart-title">Last 24 hours</h2>
+        <span class="meta" id="chart-totals"></span>
+        <div class="tools">
+          <span id="ranges" class="seg">
+            <button data-days="1">24 hours</button>
+            <button data-days="7">7 days</button>
+            <button data-days="30">30 days</button>
+            <button data-days="90">90 days</button>
+          </span>
+        </div>
       </div>
-      <p id="chart-totals"></p>
-      <p id="chart-readout"></p>
+      <div class="row">
+        <span id="chart-readout"></span>
+        <span class="legend"><span><i></i>Queries</span><span><i class="b"></i>Blocked</span></span>
+      </div>
       <svg id="chart" width="100%" height="150"></svg>
     </section>
 
     <div id="tops" class="grid wide bars">
-      <section><h2>Top domains <small id="a-queried"></small></h2><div class="scroll" id="top-queried"></div></section>
-      <section><h2>Top blocked <small id="a-blocked"></small></h2><div class="scroll" id="top-blocked"></div></section>
-      <section><h2>Top clients <small id="a-clients"></small></h2><div class="scroll" id="top-clients"></div></section>
+      <section><div class="head"><h2>Top domains</h2></div><div id="top-queried"></div></section>
+      <section><div class="head"><h2>Top blocked domains</h2></div><div id="top-blocked"></div></section>
+      <section><div class="head"><h2>Top clients</h2></div><div id="top-clients"></div></section>
     </div>
 
-    <section id="upstreams" class="wide bars">
-      <h2>Upstreams <small id="upstreams-since"></small></h2>
-      <div class="scroll" id="upstream-table"></div>
-    </section>
+    <div class="split wide">
+      <section id="upstreams" class="bars">
+        <div class="head"><h2>Upstream servers</h2><span class="meta">Where queries not blocked or cached are sent</span></div>
+        <div class="scroll" id="upstream-table"></div>
+      </section>
 
-    <section id="cache" class="wide">
-      <h2>Cache</h2>
-      <div class="actions">
-        <p id="cache-size"></p>
+      <section id="cache">
+        <div class="head"><h2>DNS cache</h2></div>
+        <div class="kpis" id="cache-size"></div>
         <button id="clear-cache">Clear cache</button>
-        <span id="cache-note" class="empty"></span>
-      </div>
-    </section>
+      </section>
+    </div>
   </div>
 
   <div class="grid" role="tabpanel" id="panel-log" data-panel="log" aria-labelledby="tab-log" hidden>
     <section class="wide">
-      <h2>Recent queries</h2>
-      <div class="actions">
-        <button id="clear-log">Clear query log</button>
-        <span id="log-note" class="empty"></span>
+      <div class="head">
+        <h2>Query log</h2><span class="meta">The last 50 queries, newest first. Kept in memory only.</span>
+        <div class="tools"><button id="clear-log" class="danger">Clear query log</button></div>
       </div>
       <div class="scroll" id="queries"></div>
     </section>
@@ -281,147 +370,152 @@ input[type="checkbox"] { width: auto; margin: 0; }
 
   <div class="grid" role="tabpanel" id="panel-lists" data-panel="lists" aria-labelledby="tab-lists" hidden>
     <section class="wide">
-      <h2>Lists <small id="lists-from"></small></h2>
-      <p id="list-memory" class="empty"></p>
+      <div class="head">
+        <h2>Filter lists</h2><span id="lists-from" class="meta"></span>
+        <div class="tools">
+          <span id="refresh-row"><button id="refresh">Refresh all lists</button></span>
+          <button id="lists-reset" class="ghost" hidden>Reset to config file</button>
+        </div>
+      </div>
+      <p id="list-memory" class="memory"></p>
       <div class="scroll" id="list-table"></div>
-      <p id="refresh-row"><button id="refresh">Refresh all lists</button> <span id="refresh-note" class="empty"></span></p>
+      <p id="refresh-note" class="empty"></p>
     </section>
 
     <section id="list-add" class="wide">
-      <h2>Add a list</h2>
+      <div class="head"><h2>Add a list</h2></div>
+      <p class="desc">picoguard downloads the list and checks that it fits in memory before it uses it.</p>
       <form id="list-form">
         <div class="fields">
-          <label>Name <input id="l-name" maxlength="100"></label>
-          <label>Address <input id="l-url" autocapitalize="none" required></label>
-          <label>Kind <select id="l-role"><option value="block">Block list</option><option value="allow">Allowlist</option></select></label>
-          <label>Refresh (hours, 1 to 168) <input id="l-hours" type="number" min="1" max="168" step="1" value="24" inputmode="numeric"></label>
+          <label class="field">Name <input id="l-name" maxlength="100" placeholder="Optional"></label>
+          <label class="field grow">Address <input id="l-url" autocapitalize="none" placeholder="Web address of the list file" required></label>
+          <label class="field">Type <select id="l-role"><option value="block">Block list</option><option value="allow">Allowlist</option></select></label>
+          <label class="field">Refresh every (hours) <input id="l-hours" type="number" min="1" max="168" step="1" value="24" inputmode="numeric"></label>
         </div>
-        <p class="empty">It is downloaded and must fit the memory budget before it is used.</p>
-        <div class="actions">
-          <button class="go">Add</button>
+        <div class="row">
+          <button class="primary">Add list</button>
           <span id="list-add-note"></span>
-          <button id="lists-reset" type="button">Use the config file</button>
         </div>
       </form>
     </section>
 
     <section id="rules" class="wide">
-      <h2>Your rules <small id="rule-count"></small></h2>
-      <p id="rules-note" class="empty">Saved on this device.</p>
+      <div class="head"><h2>Your rules</h2><span id="rule-count" class="meta"></span></div>
+      <p class="desc">Single domains you blocked or allowed with the Block and Allow buttons in the query log. They win over every list.</p>
+      <p id="rules-note" class="err" hidden></p>
       <div class="scroll" id="rule-table"></div>
       <div id="config-rules"></div>
     </section>
 
     <section id="check" class="wide">
-      <h2>Check a name</h2>
-      <form id="check-form" class="actions">
-        <input id="check-name" autocapitalize="none" placeholder="example.org" aria-label="Name to check">
-        <button class="go">Check</button>
+      <div class="head"><h2>Check a domain</h2></div>
+      <p class="desc">Shows whether picoguard blocks a domain, and which list and rule decide it.</p>
+      <form id="check-form" class="row">
+        <input id="check-name" autocapitalize="none" placeholder="example.org" aria-label="Domain to check">
+        <button class="primary">Check</button>
       </form>
       <dl id="check-result"></dl>
     </section>
   </div>
 
   <div class="grid" role="tabpanel" id="panel-settings" data-panel="settings" aria-labelledby="tab-settings" hidden>
-    <section class="wide">
-      <h2>Settings</h2>
-      <p id="settings-note" class="empty">Saved on this device.</p>
-      <p id="settings-file" class="empty"></p>
-      <p id="settings-memory" class="empty"></p>
-    </section>
+    <div id="settings-top" class="wide">
+      <p id="settings-file"></p>
+      <p id="settings-note" class="err" hidden></p>
+      <p id="settings-memory" class="memory"></p>
+    </div>
 
     <section id="upstream-card" class="wide">
-      <h2>Upstream servers <small id="upstream-from"></small></h2>
-      <p class="empty">Queries go to these servers (udp, tcp, tls or https addresses); the faster ones get more.</p>
-      <ol id="upstream-list"></ol>
-      <form id="upstream-add" class="actions">
+      <div class="head">
+        <h2>Upstream servers</h2><span id="upstream-from"></span>
+        <div class="tools"><button id="upstream-reset" class="ghost sm" data-reset="upstream" hidden>Reset to config file</button></div>
+      </div>
+      <p class="desc">picoguard asks these servers for every name it does not block or have in its cache, and sends more queries to the faster ones. Use udp, tcp, tls or https addresses.</p>
+      <ol id="upstream-list" class="items"></ol>
+      <form id="upstream-add" class="row">
         <input id="upstream-new" autocapitalize="none" placeholder="tls://9.9.9.9#dns.quad9.net" aria-label="Server to add">
-        <button>Add</button>
+        <button>Add server</button>
       </form>
-      <div class="fields">
-        <label>Bootstrap (IP addresses that resolve server names) <input id="bootstrap" autocapitalize="none" placeholder="9.9.9.9, 1.1.1.1"></label>
+      <div class="fields" id="bootstrap-field">
+        <label class="field">Bootstrap: plain IP addresses that look up the names in the addresses above <input id="bootstrap" autocapitalize="none" placeholder="9.9.9.9, 1.1.1.1"></label>
       </div>
-      <div class="actions">
-        <button id="upstream-save" class="go">Save</button>
-        <button id="upstream-reset">Use the config file</button>
-        <span id="upstream-note"></span>
-      </div>
-    </section>
-
-    <section id="cache-card" class="wide">
-      <h2>Cache <small id="cache-from"></small></h2>
-      <div class="fields">
-        <label>Answers <input id="c-entries" type="number" min="1" step="1" inputmode="numeric"></label>
-        <label>Size (KiB, 256 to 16384) <input id="c-kib" type="number" min="256" max="16384" step="1" inputmode="numeric"></label>
-        <label>Min TTL (s) <input id="c-min" type="number" min="0" step="1" inputmode="numeric"></label>
-        <label>Max TTL (s) <input id="c-max" type="number" min="0" step="1" inputmode="numeric"></label>
-        <label class="switch"><input id="c-optimistic" type="checkbox"> Answer from expired entries while they are refreshed</label>
-      </div>
-      <p class="empty">Saving clears the cache.</p>
-      <div class="actions">
-        <button id="cache-save" class="go">Save</button>
-        <button id="cache-reset">Use the config file</button>
-        <span id="cache-set-note"></span>
-      </div>
+      <p id="upstream-note" class="err" hidden></p>
     </section>
 
     <section id="rewrites-card" class="wide">
-      <h2>Rewrites <small id="rewrites-from"></small></h2>
-      <p class="empty">picoguard answers these names itself, before any list and while paused: with the addresses given, or with the addresses of another name. *.name covers the names under it.</p>
-      <div id="rewrite-table"></div>
-      <form id="rewrite-add" class="actions">
-        <input id="rewrite-name" autocapitalize="none" placeholder="nas.lan or *.nas.lan" aria-label="Name">
-        <input id="rewrite-answer" autocapitalize="none" placeholder="192.168.1.10 or another name" aria-label="Answer">
-        <button>Add</button>
+      <div class="head">
+        <h2>Rewrites</h2><span id="rewrites-from"></span>
+        <div class="tools"><button id="rewrites-reset" class="ghost sm" data-reset="rewrites" hidden>Reset to config file</button></div>
+      </div>
+      <p class="desc">Answer a name with your own address, such as nas.lan &rarr; 192.168.1.10, or with the addresses of another name. *.nas.lan covers every name under nas.lan. Rewrites work before any list, and while blocking is paused.</p>
+      <ul id="rewrite-table" class="items"></ul>
+      <form id="rewrite-add" class="row">
+        <input id="rewrite-name" autocapitalize="none" placeholder="Name: nas.lan or *.nas.lan" aria-label="Name">
+        <input id="rewrite-answer" autocapitalize="none" placeholder="Answer: 192.168.1.10 or another name" aria-label="Answer">
+        <button>Add rewrite</button>
       </form>
-      <div class="actions">
-        <button id="rewrites-save" class="go">Save</button>
-        <button id="rewrites-reset">Use the config file</button>
-        <span id="rewrites-note"></span>
-      </div>
-    </section>
-
-    <section id="safe-search-card" class="wide">
-      <h2>SafeSearch <small id="safe_search-from"></small></h2>
-      <div class="fields">
-        <label class="switch"><input id="safe-search" type="checkbox"> Force SafeSearch on Google, Bing and DuckDuckGo, and restricted mode on YouTube (off while filtering is paused)</label>
-      </div>
-      <div class="actions">
-        <button id="safe_search-save" class="go">Save</button>
-        <button id="safe_search-reset">Use the config file</button>
-        <span id="safe_search-note"></span>
-      </div>
-    </section>
-
-    <section id="stats-card" class="wide">
-      <h2>Statistics <small id="stats-from"></small></h2>
-      <div class="fields">
-        <label>Keep the history for <select id="retention"><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option></select></label>
-      </div>
-      <p class="empty">Shortening it drops the older days for good.</p>
-      <p id="stats-saving" class="empty"></p>
-      <div class="actions">
-        <button id="stats-save" class="go">Save</button>
-        <button id="stats-reset">Use the config file</button>
-        <button id="stats-clear">Clear statistics</button>
-        <span id="stats-note"></span>
-      </div>
+      <p id="rewrites-note" class="err" hidden></p>
     </section>
 
     <section id="services-card" class="wide">
-      <h2>Blocked services <small id="services-from"></small></h2>
-      <p class="empty">Blocks every name of a service, off while filtering is paused. The list of services is AdGuard's, downloaded when it is needed.</p>
-      <input id="service-filter" type="search" autocapitalize="none" placeholder="Filter" aria-label="Filter the services">
-      <p id="services-state" class="empty"></p>
+      <div class="head">
+        <h2>Blocked services</h2><span id="services-from"></span><span id="services-count" class="meta"></span>
+        <div class="tools">
+          <input id="service-filter" type="search" autocapitalize="none" placeholder="Find a service" aria-label="Find a service">
+          <button id="services-reset" class="ghost sm" data-reset="services" hidden>Reset to config file</button>
+        </div>
+      </div>
+      <p class="desc">Tick a service to block every domain it uses, on every device. Off while blocking is paused. The list of services comes from AdGuard.</p>
       <div id="service-groups"></div>
-      <div class="actions">
-        <button id="services-save" class="go">Save</button>
-        <button id="services-reset">Use the config file</button>
-        <span id="services-note"></span>
+      <p id="services-state" class="empty"></p>
+      <p id="services-note" class="err" hidden></p>
+    </section>
+
+    <section id="safe-search-card" class="wide">
+      <div class="head">
+        <h2>SafeSearch</h2><span id="safe_search-from"></span>
+        <div class="tools"><button id="safe_search-reset" class="ghost sm" data-reset="safe_search" hidden>Reset to config file</button></div>
+      </div>
+      <label class="toggle"><input id="safe-search" class="switch" type="checkbox">
+        <span>Force SafeSearch <small>Google, Bing and DuckDuckGo show only safe results, and YouTube uses Restricted Mode. Off while blocking is paused.</small></span></label>
+      <p id="safe_search-note" class="err" hidden></p>
+    </section>
+
+    <section id="cache-card" class="wide">
+      <div class="head">
+        <h2>DNS cache</h2><span id="cache-from"></span>
+        <div class="tools"><button id="cache-reset" class="ghost sm" data-reset="cache" hidden>Reset to config file</button></div>
+      </div>
+      <p class="desc">Answers are kept for their lifetime (TTL), within the limits below. A change clears the cache.</p>
+      <div class="fields">
+        <label class="field">Most answers <input id="c-entries" type="number" min="1" step="1" inputmode="numeric"></label>
+        <label class="field">Most memory (KiB, 256 to 16384) <input id="c-kib" type="number" min="256" max="16384" step="1" inputmode="numeric"></label>
+        <label class="field">Shortest lifetime (seconds) <input id="c-min" type="number" min="0" step="1" inputmode="numeric"></label>
+        <label class="field">Longest lifetime (seconds) <input id="c-max" type="number" min="0" step="1" inputmode="numeric"></label>
+      </div>
+      <label class="toggle"><input id="c-optimistic" class="switch" type="checkbox">
+        <span>Answer from expired entries <small>Answers at once with the old address while it is looked up again. Faster, rarely out of date.</small></span></label>
+      <p id="cache-note" class="err" hidden></p>
+    </section>
+
+    <section id="stats-card" class="wide">
+      <div class="head">
+        <h2>Statistics</h2><span id="stats-from"></span>
+        <div class="tools"><button id="stats-reset" class="ghost sm" data-reset="stats" hidden>Reset to config file</button></div>
+      </div>
+      <div class="fields">
+        <label class="field">Keep the chart history for <select id="retention"><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option></select></label>
+      </div>
+      <p id="stats-saving" class="desc"></p>
+      <p id="stats-note" class="err" hidden></p>
+      <div class="danger-zone">
+        <p>Set all counters, the chart, the top lists and the upstream numbers back to zero.</p>
+        <button id="stats-clear" class="danger">Clear statistics</button>
       </div>
     </section>
   </div>
 </main>
+<div id="toast" role="status" aria-live="polite" hidden></div>
 
 <script>
 "use strict";
@@ -431,20 +525,26 @@ const QTYPES = { 1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16:
 const RESULTS = { pass: "upstream", cached: "cached", blocked_request: "blocked",
   blocked_response: "blocked (answer)", rewritten: "rewritten", error: "error" };
 const INSTALL_TEXT = {
-  checking: () => "Checking the release...",
-  downloading: (i) => "Downloading " + (i.bytes / 1048576).toFixed(1) + " MB...",
-  verifying: () => "Verifying...",
-  waiting: () => "Installing, picoguard restarts...",
-  updated: (i) => "Updated to v" + i.version,
-  rolled_back: (i) => "Rolled back: " + i.reason,
-  failed: (i) => "Update failed: " + i.reason,
+  checking: () => "Checking the release\u2026",
+  downloading: (i) => "Downloading " + (i.bytes / 1048576).toFixed(1) + " MB\u2026",
+  verifying: () => "Verifying the download\u2026",
+  waiting: () => "Installing. picoguard restarts, and DNS stops for a few seconds\u2026",
+  updated: (i) => "Updated to v" + i.version + ".",
+  rolled_back: (i) => "The update did not start, so v" + i.version + " was removed again: " + i.reason,
+  failed: (i) => "The update failed: " + i.reason,
 };
+const INSTALLING = ["checking", "downloading", "verifying", "waiting"];
+const LABELS = { upstream: "Upstream servers", cache: "DNS cache", rewrites: "Rewrites",
+  safe_search: "SafeSearch", services: "Blocked services", stats: "Statistics" };
+const GROUP_NAMES = { ai: "AI", cdn: "CDN", vpn: "VPN" };
 const SVG = $("chart").namespaceURI;
 const CHART_HEIGHT = 150;
 const CHART_TOP = 18;
 const CHART_BASE = 132;
 let pausedUntil = null;
 let latestVersion = null;
+// Set while this page watches an install, so only that page hears how it ended.
+let watchingInstall = false;
 const RANGE_KEY = "picoguard.range";
 const HISTORY_REFRESH_MS = 60000;
 // Where the date labels of a day chart go: every this many bars.
@@ -461,6 +561,8 @@ let authEpoch = 0;
 // One sign-in or sign-out at a time: a late second sign-in would store a cookie again.
 let authBusy = false;
 let signedIn = false;
+let toastTimer = 0;
+let upstreamOrder = [];
 
 // Names and errors come from the network: only ever set as text.
 function el(tag, text, className) {
@@ -480,14 +582,14 @@ function el(tag, text, className) {
 function table(head, rows) {
   const t = el("table");
   const tr = el("tr");
-  head.forEach((h) => tr.append(el("th", h)));
+  head.forEach((h) => tr.append(typeof h === "string" ? el("th", h) : el("th", h[0], h[1])));
   t.append(tr);
   rows.forEach((row) => t.append(row));
 
   return t;
 }
 
-// A cell is [text, className, badge], or a td built already.
+// A cell is [text, className, pill], or a td built already.
 function row(cells) {
   const tr = el("tr");
   cells.forEach((cell) => {
@@ -497,11 +599,11 @@ function row(cells) {
       return;
     }
 
-    const [text, className, badge] = cell;
-    const td = el("td", badge ? undefined : text, className);
+    const [text, className, pill] = cell;
+    const td = el("td", pill ? undefined : text, className);
 
-    if (badge) {
-      td.append(el("span", text, "badge " + badge));
+    if (pill) {
+      td.append(el("span", text, "pill " + pill));
     }
 
     tr.append(td);
@@ -514,9 +616,10 @@ function row(cells) {
 // (a client without a name, and every domain in the top lists).
 function who(name, ip) {
   const td = el("td", name ? undefined : ip, "who");
+  td.title = name ? name + " " + ip : ip;
 
   if (name) {
-    td.append(el("span", name), " ", el("small", ip, "ip"));
+    td.append(el("span", name), el("small", ip, "ip"));
   }
 
   return td;
@@ -540,6 +643,30 @@ function duration(seconds) {
   }
 
   return Math.floor(seconds / 86400) + " d " + Math.floor(seconds % 86400 / 3600) + " h";
+}
+
+function when(seconds) {
+  return new Date(seconds * 1000).toLocaleString(undefined,
+    { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function count(n) {
+  return n.toLocaleString();
+}
+
+function toast(text, bad) {
+  const node = $("toast");
+  node.textContent = text;
+  node.className = bad ? "bad" : "";
+  node.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { node.hidden = true; }, bad ? 6000 : 2500);
+}
+
+// The error line of a settings card; empty text hides it.
+function note(key, text) {
+  $(key + "-note").textContent = text;
+  $(key + "-note").hidden = !text;
 }
 
 // The header tells the server not to answer 401 with the browser's own sign-in prompt.
@@ -571,8 +698,7 @@ function showLogin(note) {
   $("login").hidden = false;
   $("logout").hidden = true;
   $("login-note").textContent = note;
-  $("state").textContent = "signed out";
-  $("state").className = "";
+  $("state").textContent = "";
 }
 
 function sessionEnded() {
@@ -595,21 +721,23 @@ function showTab() {
   });
 }
 
+function share(part, whole) {
+  return (whole ? part / whole * 100 : 0).toFixed(1) + " % of queries";
+}
+
 function showCards(counters, percent) {
+  const blocked = counters.blocked_request + counters.blocked_response;
   const items = [
-    ["Queries", counters.total], ["Blocked", percent + " %"],
-    ["Blocked by name", counters.blocked_request], ["Blocked by answer", counters.blocked_response],
-    ["Cached", counters.cached], ["Upstream", counters.upstream],
-    ["Errors", counters.errors], ["Dropped", counters.dropped],
+    ["Queries", counters.total, counters.rewritten ? count(counters.rewritten) + " answered by your rewrites" : "From every device"],
+    ["Blocked", blocked, percent + " % of queries"
+      + (counters.blocked_response ? ", " + count(counters.blocked_response) + " of them by the answer" : "")],
+    ["Answered from cache", counters.cached, share(counters.cached, counters.total)],
+    ["Sent upstream", counters.upstream, count(counters.errors) + " failed, " + count(counters.dropped) + " dropped while busy"],
   ];
 
-  if (counters.rewritten) {
-    items.push(["Rewritten", counters.rewritten]);
-  }
-
-  $("cards").replaceChildren(...items.map(([label, value], i) => {
-    const card = el("div", undefined, i < 2 ? "card headline" : "card");
-    card.append(el("span", label), el("b", typeof value === "number" ? value.toLocaleString() : value));
+  $("cards").replaceChildren(...items.map(([label, value, sub]) => {
+    const card = el("div", undefined, "kpi");
+    card.append(el("span", label), el("b", count(value)), el("small", sub));
 
     return card;
   }));
@@ -670,8 +798,7 @@ function markBucket() {
   const bucket = chartData[i];
   const name = activeRange() === 1 ? hourOf(bucket) + ":00"
     : dayOf(bucket, { weekday: "short", month: "short", day: "numeric" });
-  $("chart-readout").textContent = name + " \u00b7 " + bucket.total.toLocaleString()
-    + " queries \u00b7 " + bucket.blocked.toLocaleString() + " blocked";
+  $("chart-readout").textContent = name + ": " + count(bucket.total) + " queries, " + count(bucket.blocked) + " blocked";
   $("chart").querySelectorAll("[data-i]").forEach((hit) =>
     hit.classList.toggle("on", Number(hit.dataset.i) === i));
 }
@@ -683,8 +810,8 @@ function showChart(buckets) {
   const days = activeRange();
   const total = buckets.reduce((sum, b) => sum + b.total, 0);
   const blocked = buckets.reduce((sum, b) => sum + b.blocked, 0);
-  $("chart-totals").textContent = buckets.length ? total.toLocaleString() + " queries \u00b7 "
-    + blocked.toLocaleString() + " blocked (" + (total ? blocked / total * 100 : 0).toFixed(1) + " %)" : "";
+  $("chart-totals").textContent = buckets.length ? count(total) + " queries, "
+    + count(blocked) + " blocked (" + (total ? blocked / total * 100 : 0).toFixed(1) + " %)" : "";
 
   if (!buckets.length) {
     $("chart").replaceChildren();
@@ -699,11 +826,11 @@ function showChart(buckets) {
   const parts = [
     svg("line", { x1: 0, x2: "100%", y1: CHART_TOP, y2: CHART_TOP }),
     svg("line", { class: "base", x1: 0, x2: "100%", y1: CHART_BASE, y2: CHART_BASE }),
-    svg("text", { x: 0, y: CHART_TOP - 5 }, peak.toLocaleString()),
+    svg("text", { x: 0, y: CHART_TOP - 5 }, count(peak)),
   ];
   buckets.forEach((b, i) => {
     const height = b.total / Math.max(1, peak) * room;
-    const bar = { x: (i + .15) * slot + "%", width: slot * .7 + "%", rx: 2 };
+    const bar = { x: (i + .15) * slot + "%", width: slot * .7 + "%", rx: 1.5 };
     const blockedHeight = b.total ? b.blocked / b.total * height : 0;
     parts.push(
       svg("rect", { ...bar, class: "total", y: CHART_BASE - height, height }),
@@ -711,7 +838,7 @@ function showChart(buckets) {
 
     if (i % LABEL_STEP[days] === 0) {
       parts.push(days === 1
-        ? svg("text", { x: (i + .5) * slot + "%", y: CHART_HEIGHT - 2, "text-anchor": "middle" }, hourOf(b))
+        ? svg("text", { x: (i + .5) * slot + "%", y: CHART_HEIGHT - 2, "text-anchor": "middle" }, hourOf(b) + ":00")
         : svg("text", { x: i * slot + "%", y: CHART_HEIGHT - 2 }, dayOf(b, { month: "short", day: "numeric" })));
     }
   });
@@ -730,6 +857,7 @@ function showRanges() {
   document.querySelectorAll("button[data-days]").forEach((button) => {
     const days = Number(button.dataset.days);
     button.disabled = days > retention;
+    button.title = button.disabled ? "Keep the history longer in Settings, Statistics" : "";
     button.setAttribute("aria-pressed", String(days === activeRange()));
   });
 }
@@ -767,7 +895,7 @@ async function loadHistory(force) {
       if (error.status === 401) {
         sessionEnded();
       } else {
-        $("chart-readout").textContent = "History: " + error.message;
+        $("chart-readout").textContent = "The history could not be loaded: " + error.message;
       }
     }
   } finally {
@@ -781,35 +909,45 @@ function worthShowing(entry) {
   return entry.max_error === 0 || entry.count - entry.max_error > 1;
 }
 
-function showTop(id, noteId, top, name) {
-  $(noteId).textContent = top.approximate ? "(approximate)" : "";
+function showTop(id, top, name) {
   const shown = top.entries.filter(worthShowing).slice(0, 10);
   const rows = shown.map((e) => {
     const exact = e.max_error === 0;
-    const count = el("td", (exact ? "" : "~") + e.count.toLocaleString(), "num");
+    const cell = el("td", (exact ? "" : "~") + count(e.count), "num");
 
     if (!exact) {
-      count.title = "may be too high by up to " + e.max_error;
+      cell.title = "Estimated: may be too high by up to " + e.max_error;
     }
 
     const key = who(e.name, e.key);
     key.classList.add("name");
     key.style.setProperty("--share", e.count / shown[0].count * 100 + "%");
     const tr = el("tr");
-    tr.append(key, count);
+    tr.append(key, cell);
 
     return tr;
   });
-  $(id).replaceChildren(rows.length ? table([name, "Queries"], rows) : el("p", "Nothing yet.", "empty"));
+  $(id).replaceChildren(rows.length ? table([name, ["Queries", "num"]], rows) : el("p", "Nothing yet.", "empty"));
 }
 
 // A button that a delegated listener reads by its data-act and data-name.
 function actButton(text, action, name) {
-  const button = el("button", text);
+  const button = el("button", text, "sm");
   button.dataset.act = action;
   button.dataset.name = name;
 
   return button;
+}
+
+// The log names a server by its place in `upstreams`, which keeps the order of the config.
+function serverName(i) {
+  if (i === null) {
+    return "";
+  }
+
+  const server = upstreamOrder[i];
+
+  return server ? server.label.replace(/^[a-z]+:\/\//, "").replace(/[/#].*$/, "") : "#" + i;
 }
 
 function showQueries(entries) {
@@ -819,7 +957,7 @@ function showQueries(entries) {
     const ms = e.latency_us < 1000 ? "<1" : Math.round(e.latency_us / 1000);
     const blocked = e.result === "blocked_request" || e.result === "blocked_response";
     const tr = row([[time], who(e.name, e.client), [e.qname, "name"], [QTYPES[e.qtype] || e.qtype],
-      [result, "", "r-" + e.result], [e.upstream === null ? "" : "#" + e.upstream], [ms + " ms", "num"]]);
+      [result, "", "r-" + e.result], [serverName(e.upstream)], [ms + " ms", "num"]]);
     const buttons = el("td");
     buttons.append(blocked ? actButton("Allow", "allow", e.qname) : actButton("Block", "block", e.qname),
       " ", actButton("Why", "why", e.qname));
@@ -828,14 +966,14 @@ function showQueries(entries) {
     return tr;
   });
   $("queries").replaceChildren(rows.length
-    ? table(["Time", "Client", "Name", "Type", "Result", "Via", "Time taken", ""], rows)
+    ? table(["Time", "Client", "Domain", "Type", "Result", "Server", ["Took", "num"], ""], rows)
     : el("p", "No queries yet.", "empty"));
 }
 
 function showRules(data) {
   $("rule-count").textContent = data.rules.length + " of " + data.max;
   const rows = data.rules.map((r) => {
-    const tr = row([[r.name, "name"], [r.action]]);
+    const tr = row([[r.name, "name"], [r.action === "block" ? "Blocked" : "Allowed", "", r.action === "block" ? "d-blocked" : "d-allowed"]]);
     const remove = el("td");
     remove.append(actButton("Remove", "remove", r.name));
     tr.append(remove);
@@ -843,13 +981,13 @@ function showRules(data) {
     return tr;
   });
   $("rule-table").replaceChildren(rows.length
-    ? table(["Name", "Action", ""], rows)
-    : el("p", "None yet: use Block or Allow in the query log.", "empty"));
-  $("config-rules").replaceChildren(el("h2", "Config rules (read-only)"),
+    ? table(["Domain", "Rule", ""], rows)
+    : el("p", "No rules yet.", "empty"));
+  $("config-rules").replaceChildren(el("h3", "From the config file (change them there)"),
     ...(data.config_rules.length ? data.config_rules.map((rule) => el("code", rule)) : [el("p", "None.", "empty")]));
 }
 
-// Whether page changes are saved, on the Settings tab and under Your rules.
+// Shows why saving may not work, on the Settings tab and under Your rules.
 function showSettings(s) {
   const notes = [];
 
@@ -862,10 +1000,11 @@ function showSettings(s) {
   }
 
   ["settings-note", "rules-note"].forEach((id) => {
-    $(id).textContent = notes.join(" ") || "Saved on this device.";
-    $(id).className = notes.length ? "err" : "empty";
+    $(id).textContent = notes.join(" ");
+    $(id).hidden = !notes.length;
   });
-  $("settings-file").textContent = "File: " + s.file;
+  $("settings-file").textContent = "Changes apply at once and are saved in " + s.file
+    + ". They win over the config file until you reset them.";
   showMemory(s.memory);
   showSettingCards(s);
 }
@@ -878,13 +1017,15 @@ function megabytes(bytes) {
 function showMemory(m) {
   const over = m.estimate_bytes > m.budget_bytes;
   ["list-memory", "settings-memory"].forEach((id) => {
-    $(id).textContent = "Memory estimate: " + megabytes(m.estimate_bytes) + " of " + megabytes(m.budget_bytes)
-      + (over ? ", over the budget: no list or larger cache can be added." : "");
-    $(id).className = over ? "err" : "empty";
+    const meter = el("span", undefined, "meter");
+    meter.style.setProperty("--fill", Math.min(100, m.estimate_bytes / m.budget_bytes * 100) + "%");
+    $(id).replaceChildren(meter, "Memory estimate: " + megabytes(m.estimate_bytes) + " of " + megabytes(m.budget_bytes)
+      + (over ? ". Over the limit: no list or larger cache can be added." : ""));
+    $(id).className = over ? "memory err" : "memory";
   });
 }
 
-// A card being edited is left alone by the refresh until it is saved or reset.
+// A card being edited is left alone by the refresh until its change is saved.
 const editing = { upstream: false, cache: false, rewrites: false, safe_search: false, services: false, stats: false };
 const CACHE_FIELDS = [["c-entries", "max_entries", 1], ["c-kib", "max_bytes", 1024],
   ["c-min", "min_ttl", 1], ["c-max", "max_ttl", 1]];
@@ -892,17 +1033,28 @@ let servers = [];
 let rewrites = [];
 let chosen = new Set();
 let catalog = [];
+let catalogAt = null;
+let servicesTimer = 0;
+
+function same(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
 
 function showSettingCards(s) {
   [["upstream", s.upstream], ["cache", s.cache], ["rewrites", s.rewrites], ["safe_search", s.safe_search], ["services", s.services], ["stats", s.stats]].forEach(([key, value]) => {
-    $(key + "-from").textContent = value.from === "page" ? "Set on this page" : "From the config file";
-    $(key + "-reset").hidden = value.from !== "page";
+    const page = value.from === "page";
+    $(key + "-from").textContent = page ? "Changed on this page" : "From the config file";
+    $(key + "-from").className = page ? "chip" : "meta";
+    $(key + "-reset").hidden = !page;
   });
 
   if (!editing.upstream) {
-    servers = s.upstream.servers.slice();
     $("bootstrap").value = s.upstream.bootstrap.join(", ");
-    showServers();
+
+    if (!same(servers, s.upstream.servers)) {
+      servers = s.upstream.servers.slice();
+      showServers();
+    }
   }
 
   if (!editing.cache) {
@@ -911,15 +1063,19 @@ function showSettingCards(s) {
   }
 
   if (!editing.rewrites) {
-    rewrites = s.rewrites.entries.map((r) => ({ name: r.name, answer: r.answer }));
-    showRewrites();
+    const next = s.rewrites.entries.map((r) => ({ name: r.name, answer: r.answer }));
+
+    if (!same(rewrites, next) || !$("rewrite-table").firstChild) {
+      rewrites = next;
+      showRewrites();
+    }
   }
 
   if (!editing.safe_search) {
     $("safe-search").checked = s.safe_search.on;
   }
 
-  if (!editing.services) {
+  if (!editing.services && !same([...chosen].sort(), s.services.block.slice().sort())) {
     chosen = new Set(s.services.block);
     showServiceSwitches();
   }
@@ -930,23 +1086,35 @@ function showSettingCards(s) {
 }
 
 function showSaving(saving) {
-  const text = !saving.enabled ? "Saving is off ([stats] persist): statistics are lost when picoguard stops."
-    : "Saved hourly when changed, and when picoguard stops. "
-      + (saving.last_saved ? "Last saved " + new Date(saving.last_saved * 1000).toLocaleString() + "." : "Not saved since start.");
+  const text = !saving.enabled ? "Saving is off ([stats] persist = false): statistics start from zero when picoguard restarts."
+    : "Statistics are saved every hour when they change, and when picoguard stops. "
+      + (saving.last_saved ? "Last saved " + when(saving.last_saved) + "." : "Not saved yet.");
   $("stats-saving").textContent = saving.error ? "Cannot save: " + saving.error + ". " + text : text;
-  $("stats-saving").className = saving.error ? "err" : "empty";
+  $("stats-saving").className = saving.error ? "desc err" : "desc";
 }
 
 // The catalog is read on the first visit of the Settings tab, not before.
 async function loadServices() {
   const v = await api("/api/services");
   const state = $("services-state");
-  catalog = v.services;
   state.className = v.error ? "err" : "empty";
   state.textContent = v.loading ? "Loading the list of services\u2026"
     : v.error ? "The list of services could not be downloaded: " + v.error
-    : v.loaded_at ? "List of services downloaded " + new Date(v.loaded_at * 1000).toLocaleString() + "." : "";
-  showServiceSwitches();
+    : v.loaded_at ? "List of services downloaded " + when(v.loaded_at) + "." : "";
+
+  if (catalogAt !== v.loaded_at || catalog.length !== v.services.length) {
+    catalog = v.services;
+    catalogAt = v.loaded_at;
+    showServiceSwitches();
+  }
+}
+
+function groupName(group) {
+  return GROUP_NAMES[group] || group.charAt(0).toUpperCase() + group.slice(1).replace(/_/g, " ");
+}
+
+function showServicesCount() {
+  $("services-count").textContent = chosen.size ? chosen.size + " blocked" : "None blocked";
 }
 
 function showServiceSwitches() {
@@ -965,35 +1133,42 @@ function showServiceSwitches() {
     const div = el("div");
     div.append(...labels);
 
-    return [el("h3", group.replace(/_/g, " ")), div];
+    return [el("h3", groupName(group)), div];
   }));
+
+  if (catalog.length && !groups.size) {
+    $("service-groups").replaceChildren(el("p", "No service matches.", "empty"));
+  }
+
+  showServicesCount();
 }
 
 function showRewrites() {
-  const rows = rewrites.map((r, i) => {
-    const tr = row([[r.name], [r.answer]]);
-    const td = el("td");
-    const remove = el("button", "Remove");
+  $("rewrite-table").replaceChildren(...(rewrites.length ? rewrites.map((r, i) => {
+    const li = el("li");
+    const text = el("span");
+    text.append(el("code", r.name), el("span", "\u2192", "arrow"), el("code", r.answer));
+    const remove = el("button", "\u00d7", "icon ghost");
     remove.dataset.i = i;
-    td.append(remove);
-    tr.append(td);
+    remove.title = "Remove";
+    remove.setAttribute("aria-label", "Remove " + r.name);
+    li.append(text, remove);
 
-    return tr;
-  });
-  $("rewrite-table").replaceChildren(rows.length
-    ? table(["Name", "Answer", ""], rows)
-    : el("p", "None.", "empty"));
+    return li;
+  }) : [el("li", "No rewrites yet.", "empty")]));
 }
 
 function showServers() {
   $("upstream-list").replaceChildren(...servers.map((server, i) => {
     const li = el("li");
     li.append(el("code", server));
-    [["\u2191", "up", "Move up"], ["\u2193", "down", "Move down"], ["Remove", "remove", "Remove"]].forEach(([text, act, label]) => {
-      const button = el("button", text);
+    [["\u2191", "up", "Move up"], ["\u2193", "down", "Move down"], ["\u00d7", "remove", "Remove"]].forEach(([text, act, label]) => {
+      const button = el("button", text, "icon ghost");
       button.dataset.act = act;
       button.dataset.i = i;
+      button.title = label;
       button.setAttribute("aria-label", label);
+      button.disabled = (act === "up" && i === 0) || (act === "down" && i === servers.length - 1);
       li.append(button);
     });
 
@@ -1001,30 +1176,40 @@ function showServers() {
   }));
 }
 
-function editServers(change) {
-  editing.upstream = true;
-  change();
-  showServers();
-}
-
-// `value` null goes back to the config file. A refused change keeps the card as edited.
-function saveSetting(key, value, note) {
+// Every change is saved at once; `value` null goes back to the config file. A refused change
+// shows why in its card, and the next refresh puts the card back as it is saved.
+function saveSetting(key, value, done) {
+  editing[key] = true;
   act("/api/settings", { [key]: value }, (data) => {
     editing[key] = false;
+    note(key, "");
     showSettings(data);
-    $(note).textContent = value === null ? "Back to the config file." : "Saved.";
-    $(note).className = "empty";
+    toast(LABELS[key] + (value === null ? ": back to the config file" : ": saved"));
+
+    if (done) {
+      done();
+    }
   }, (message) => {
-    $(note).textContent = message;
-    $(note).className = "err";
+    editing[key] = false;
+    note(key, "Not saved: " + message);
   });
 }
 
+function saveServers(list, done) {
+  saveSetting("upstream", { servers: list, bootstrap: $("bootstrap").value.split(/[\s,]+/).filter(Boolean) }, done);
+}
+
+function saveCache() {
+  const cache = { optimistic: $("c-optimistic").checked };
+  CACHE_FIELDS.forEach(([id, key, unit]) => { cache[key] = Math.round(Number($(id).value) * unit); });
+  saveSetting("cache", cache);
+}
+
 function showExplain(data) {
-  const lines = [["Name", data.name], ["Decision", el("span", data.decision, "badge d-" + data.decision)]];
+  const lines = [["Domain", data.name], ["Decision", el("span", data.decision, "pill d-" + data.decision)]];
 
   if (data.decision === "none") {
-    lines.push(["Rule", "no rule decides it"]);
+    lines.push(["Rule", "No list or rule matches it, so it is answered normally."]);
   } else if (data.decision === "rewritten") {
     lines.push(["Answer", data.rule]);
   } else {
@@ -1067,7 +1252,7 @@ async function checkName() {
       return;
     }
 
-    $("check-result").textContent = error.message;
+    $("check-result").replaceChildren(el("dd", error.message, "err"));
   }
 }
 
@@ -1085,7 +1270,7 @@ function showLists(data) {
   showPending(data.pending);
   const page = data.from === "page";
   $("lists-from").textContent = page ? "Set on this page"
-    : "From the config file; the first change here copies its lists to this page";
+    : "From the config file. Your first change here copies them to this page.";
   $("lists-reset").hidden = !page;
 
   // A refresh would take the hours being typed away.
@@ -1096,115 +1281,141 @@ function showLists(data) {
   const rows = data.lists.map((l) => {
     const name = el("td", undefined, "name");
     name.append(el("span", l.name));
-    [l.source, l.editable ? null : "from the config file"].forEach((note) => {
-      if (note) {
-        name.append(el("small", note));
+    [l.source, l.editable ? null : "from the config file"].forEach((text) => {
+      if (text) {
+        name.append(el("small", text));
       }
     });
     const on = el("td");
-    const hours = el("td", l.refresh_hours + " h", "num");
+    const hours = el("td", "every " + l.refresh_hours + " h", "num");
     const remove = el("td");
 
     if (l.editable && l.source) {
-      const box = listControl(el("input"), l, "enabled");
+      const box = listControl(el("input", undefined, "switch"), l, "enabled");
       box.type = "checkbox";
       box.checked = l.enabled;
-      box.setAttribute("aria-label", "On");
+      box.setAttribute("aria-label", "Use " + l.name);
       const field = listControl(el("input"), l, "hours");
       field.type = "number";
       field.min = 1;
       field.max = 168;
       field.value = l.refresh_hours;
-      field.setAttribute("aria-label", "Refresh hours");
+      field.setAttribute("aria-label", "Refresh every so many hours");
       on.append(box);
-      hours.replaceChildren(field);
-      remove.append(listControl(el("button", "Remove"), l, "remove"));
+      hours.replaceChildren(field, " h");
+      remove.append(listControl(el("button", "Remove", "sm"), l, "remove"));
     } else {
       on.textContent = l.enabled ? "on" : "off";
     }
 
-    return row([name, [l.kind], on, [l.format || "-"], [l.rules.toLocaleString(), "num"], hours,
-      [duration(l.age_seconds), "num"], [l.last_error || "", "err"], remove]);
+    return row([name, [l.kind === "allowlist" ? "Allow" : "Block", "", l.kind === "allowlist" ? "d-allowed" : "d-blocked"], on,
+      [l.format || "-"], [count(l.rules), "num"], hours,
+      [l.age_seconds === null || l.age_seconds === undefined ? "never" : duration(l.age_seconds) + " ago", "num"],
+      [l.last_error || "", "err"], remove]);
   });
 
   if (data.pending && data.pending.state === "checking") {
     rows.push(row([[data.pending.name || data.pending.source, "name"], [data.pending.kind], [""], [""],
-      [""], [""], [""], ["checking", "empty"], [""]]));
+      [""], [""], [""], ["checking\u2026", "empty"], [""]]));
   }
 
   $("list-table").replaceChildren(rows.length
-    ? table(["Name", "Kind", "On", "Format", "Rules", "Refresh", "Checked", "Last error", ""], rows)
-    : el("p", "No lists configured.", "empty"));
+    ? table(["Name", "Type", "On", "Format", ["Rules", "num"], ["Refresh", "num"], ["Updated", "num"], "Last error", ""], rows)
+    : el("p", "No lists yet. Add one below.", "empty"));
 }
 
 // Why the last Add was refused at once; it stays until the next Add.
 let addRefused = null;
 
 function showPending(pending) {
-  const note = $("list-add-note");
+  const text = $("list-add-note");
   const name = pending && (pending.name || pending.source);
-  note.textContent = addRefused || (!pending ? "" : pending.state === "checking" ? "Checking " + name + "..."
+  text.textContent = addRefused || (!pending ? "" : pending.state === "checking" ? "Checking " + name + "\u2026"
     : pending.state === "added" ? "Added " + name + "." : pending.state);
-  note.className = addRefused || pending && /^(refused|failed)/.test(pending.state) ? "err" : "empty";
+  text.className = addRefused || pending && /^(refused|failed)/.test(pending.state) ? "err" : "empty";
 }
 
-function editList(node, change, note) {
-  act("/api/lists/" + change, { role: node.dataset.role, source: node.dataset.source, ...note }, showLists,
-    (message) => {
-      $("refresh-note").textContent = message;
-      $("refresh-note").className = "err";
-    });
+function editList(node, change, body) {
+  act("/api/lists/" + change, { role: node.dataset.role, source: node.dataset.source, ...body }, showLists,
+    (message) => toast(message, true));
 }
 
 function showUpstreams(upstreams) {
   const answeredTotal = upstreams.reduce((sum, u) => sum + u.answered, 0);
   const rows = upstreams.slice().sort((a, b) => b.answered - a.answered || a.failed - b.failed).map((u) => {
-    const share = answeredTotal ? u.answered / answeredTotal * 100 : 0;
+    const part = answeredTotal ? u.answered / answeredTotal * 100 : 0;
     const tr = row([
-      [(u.kind === "local" ? "local: " : "") + u.label, "name"], [u.answered.toLocaleString(), "num"],
-      [share.toFixed(1) + " %", "num"], [u.failed.toLocaleString(), u.failed ? "num err" : "num"],
+      [(u.kind === "local" ? "local: " : "") + u.label, "name"], [count(u.answered), "num"],
+      [part.toFixed(1) + " %", "num"], [count(u.failed), u.failed ? "num err" : "num"],
       [u.avg_ms === null ? "\u2014" : u.avg_ms.toFixed(1) + " ms", "num"],
     ]);
-    tr.firstChild.style.setProperty("--share", share + "%");
+    tr.firstChild.style.setProperty("--share", part + "%");
 
     return tr;
   });
-  $("upstream-table").replaceChildren(table(["Server", "Answered", "Share", "Failed", "Avg"], rows));
+  $("upstream-table").replaceChildren(table(["Server", ["Answered", "num"], ["Share", "num"], ["Failed", "num"], ["Avg time", "num"]], rows));
 }
 
 function showCache(cache) {
-  $("cache-size").textContent = cache.entries.toLocaleString() + " answers \u00b7 " +
-    Math.round(cache.bytes / 1024).toLocaleString() + " KB";
+  $("cache-size").replaceChildren(...[["Answers stored", count(cache.entries)],
+    ["Memory used", count(Math.round(cache.bytes / 1024)) + " KB"]].map(([label, value]) => {
+    const kpi = el("div", undefined, "kpi");
+    kpi.append(el("span", label), el("b", value));
+
+    return kpi;
+  }));
 }
 
 function showPause(pause) {
   pausedUntil = pause.paused ? pause.until : null;
   document.body.classList.toggle("paused", pause.paused);
-  $("badge").textContent = pause.paused ? "Paused" : "Blocking on";
   tick();
 }
 
 function tick() {
   const left = pausedUntil === null ? 0 : pausedUntil - Math.floor(Date.now() / 1000);
-  $("pause-text").textContent = left > 0
-    ? "Blocking is paused for " + duration(left) + " more."
-    : "Blocking is on.";
+  const paused = document.body.classList.contains("paused");
+  $("pause-text").textContent = paused ? "Blocking is paused" : "Blocking is on";
+  $("pause-sub").textContent = !paused ? "Ads, trackers and malware are blocked on every device that uses picoguard."
+    : left > 0 ? "Everything gets through. Blocking comes back on in " + duration(left) + "."
+    : "Everything gets through until you resume.";
+  $("badge").textContent = paused ? "Paused" + (left > 0 ? " \u00b7 " + duration(left) : "") : "";
+}
+
+function notesSummary(notes) {
+  return (notes || "").split(/\s+-\s+/)[0].replace(/\*\*/g, "").trim();
 }
 
 function showUpdate(status) {
+  const u = status.update;
+  const state = u.install ? u.install.state : null;
+  const installing = INSTALLING.includes(state);
   $("version").textContent = "v" + status.version;
-  $("update").hidden = !status.update.latest && !status.update.install;
-  $("update-text").textContent = status.update.latest ? "update available: v" + status.update.latest : "";
-  $("update-notes").textContent = status.update.notes || "";
-  $("update-notes").hidden = !status.update.notes;
-  $("update-how").textContent = status.update.how || "";
-  showInstall(status.update);
+
+  if (installing) {
+    watchingInstall = true;
+  }
+
+  if (watchingInstall && state === "updated") {
+    watchingInstall = false;
+    toast("picoguard is updated to v" + u.install.version + ".");
+  }
+
+  // A finished install is news only to the page that watched it; after that, the version in
+  // the header says it.
+  $("update").hidden = !u.latest && !installing && !(watchingInstall && state);
+  $("update-text").textContent = u.latest ? "picoguard v" + u.latest + " is available" : "Updating picoguard";
+  $("update-notes").textContent = u.latest ? "You have v" + status.version + ". " + notesSummary(u.notes) : "";
+  $("update-how").textContent = u.how || "";
+  $("update-manual").hidden = !u.latest || u.can_install || !u.how || installing;
+  showInstall(u);
 }
 
 function showInstall(update) {
   const install = update.install;
   latestVersion = update.latest || null;
-  $("install-state").textContent = install ? (INSTALL_TEXT[install.state] || (() => ""))(install) : "";
+  $("install-state").textContent = install && install.state !== "updated" ? (INSTALL_TEXT[install.state] || (() => ""))(install) : "";
+  $("install-state").className = install && /^(failed|rolled_back)$/.test(install.state) ? "err" : "empty";
   $("install").hidden = !update.can_install;
 
   if (update.can_install) {
@@ -1246,12 +1457,12 @@ async function update() {
     showRanges();
     drawChart();
     loadHistory(false);
-    $("totals-since").textContent = "since " + new Date(status.since * 1000).toLocaleString();
+    $("totals-since").textContent = "since " + when(status.since);
     showLists(await api("/api/lists"));
 
     if (!status.limited) {
+      upstreamOrder = status.upstreams;
       showUpstreams(status.upstreams);
-      $("upstreams-since").textContent = $("totals-since").textContent;
       showCache(status.cache);
       showSaving(status.stats_saving);
       const log = await api("/api/querylog?limit=50");
@@ -1262,9 +1473,9 @@ async function update() {
         return;
       }
 
-      showTop("top-queried", "a-queried", status.top_queried, "Domain");
-      showTop("top-blocked", "a-blocked", status.top_blocked, "Domain");
-      showTop("top-clients", "a-clients", status.top_clients, "Client");
+      showTop("top-queried", status.top_queried, "Domain");
+      showTop("top-blocked", status.top_blocked, "Domain");
+      showTop("top-clients", status.top_clients, "Client");
       showQueries(log.entries);
       showRules(rules);
       showSettings(saved);
@@ -1274,8 +1485,7 @@ async function update() {
       }
     }
 
-    $("state").textContent = "updated " + new Date().toLocaleTimeString();
-    $("state").className = "";
+    $("state").textContent = "";
   } catch (error) {
     if (epoch !== authEpoch) {
       return;
@@ -1287,8 +1497,7 @@ async function update() {
       return;
     }
 
-    $("state").textContent = "no connection: " + error.message;
-    $("state").className = "bad";
+    $("state").textContent = "Cannot reach picoguard (" + error.message + "). Trying again\u2026";
   }
 }
 
@@ -1319,8 +1528,7 @@ async function act(path, body, done, failed) {
     if (failed) {
       failed(error.message);
     } else {
-      $("state").textContent = error.message;
-      $("state").className = "bad";
+      toast(error.message, true);
     }
   }
 
@@ -1346,20 +1554,21 @@ $("pause-form").addEventListener("submit", (event) => {
   $("pause-error").hidden = valid;
 
   if (valid) {
-    act("/api/pause", { minutes });
+    act("/api/pause", { minutes }, () => { $("pause-minutes").value = ""; });
   } else {
-    $("pause-error").textContent = "1 to 1440 minutes";
+    $("pause-error").textContent = "Enter 1 to 1440 minutes";
   }
 });
 $("resume").addEventListener("click", () => act("/api/resume", {}));
 $("install").addEventListener("click", () => {
-  if (confirm("Install v" + latestVersion + "? picoguard restarts.")) {
+  if (confirm("Update to v" + latestVersion + "? picoguard restarts, and DNS stops for a few seconds.")) {
+    watchingInstall = true;
     act("/api/update", { version: latestVersion });
   }
 });
 $("refresh").addEventListener("click", () =>
   act("/api/lists/refresh", {}, () => {
-    $("refresh-note").textContent = "Refresh started; the table updates as lists finish.";
+    $("refresh-note").textContent = "Refreshing. The table updates as each list finishes.";
   }));
 $("list-table").addEventListener("change", (event) => {
   const node = event.target.closest("[data-act]");
@@ -1394,30 +1603,28 @@ $("list-form").addEventListener("submit", (event) => {
   });
 });
 $("lists-reset").addEventListener("click", () => {
-  if (confirm("Go back to the lists of the config file? Lists added on this page are removed.")) {
+  if (confirm("Go back to the lists in the config file? Lists added on this page are removed.")) {
     act("/api/lists/reset", {}, showLists);
   }
 });
 $("clear-cache").addEventListener("click", () => {
   if (confirm("Clear the DNS cache? Answers are fetched again as they are asked for.")) {
     act("/api/cache/clear", {}, (data) => {
-      $("cache-note").textContent = "Cache cleared (" + data.cleared.toLocaleString() + " answers)";
+      toast("Cache cleared (" + count(data.cleared) + " answers)");
     });
   }
 });
 $("clear-log").addEventListener("click", () => {
   if (confirm("Clear the query log? It is kept in memory only.")) {
-    act("/api/querylog/clear", {}, () => {
-      $("log-note").textContent = "Query log cleared";
-    });
+    act("/api/querylog/clear", {}, () => toast("Query log cleared"));
   }
 });
 $("stats-clear").addEventListener("click", () => {
-  if (confirm("Clear the statistics? Counters, history, top lists and upstream tallies start again from zero.")) {
+  if (confirm("Clear the statistics? Counters, chart history, top lists and upstream numbers start again from zero.")) {
     act("/api/stats/clear", {}, (data) => {
       histories = {};
-      $("stats-note").textContent = data.save_error ? "Cleared, not saved: " + data.save_error : "Statistics cleared";
-      $("stats-note").className = data.save_error ? "err" : "empty";
+      note("stats", data.save_error ? "Cleared, but not saved: " + data.save_error : "");
+      toast("Statistics cleared");
     });
   }
 });
@@ -1443,14 +1650,20 @@ $("queries").addEventListener("click", (event) => {
     location.hash = "lists";
     checkName();
   } else {
-    act("/api/rules", { name, action: button.dataset.act }, showRules);
+    act("/api/rules", { name, action: button.dataset.act }, (data) => {
+      showRules(data);
+      toast((button.dataset.act === "block" ? "Blocked " : "Allowed ") + name + ". Undo it under Lists, Your rules.");
+    });
   }
 });
 $("rule-table").addEventListener("click", (event) => {
   const button = event.target.closest("[data-act]");
 
   if (button) {
-    act("/api/rules/remove", { name: button.dataset.name }, showRules);
+    act("/api/rules/remove", { name: button.dataset.name }, (data) => {
+      showRules(data);
+      toast("Rule for " + button.dataset.name + " removed");
+    });
   }
 });
 $("upstream-list").addEventListener("click", (event) => {
@@ -1462,42 +1675,37 @@ $("upstream-list").addEventListener("click", (event) => {
 
   const i = Number(button.dataset.i);
   const to = { up: i - 1, down: i + 1 }[button.dataset.act];
-  editServers(() => {
-    if (button.dataset.act === "remove") {
-      servers.splice(i, 1);
-    } else if (to >= 0 && to < servers.length) {
-      [servers[i], servers[to]] = [servers[to], servers[i]];
-    }
-  });
+  const next = servers.slice();
+
+  if (button.dataset.act === "remove") {
+    next.splice(i, 1);
+  } else if (to >= 0 && to < next.length) {
+    [next[i], next[to]] = [next[to], next[i]];
+  }
+
+  servers = next;
+  showServers();
+  saveServers(next);
 });
 $("upstream-add").addEventListener("submit", (event) => {
   event.preventDefault();
   const server = $("upstream-new").value.trim();
 
   if (server) {
-    editServers(() => servers.push(server));
-    $("upstream-new").value = "";
+    saveServers([...servers, server], () => { $("upstream-new").value = ""; });
   }
 });
 $("bootstrap").addEventListener("input", () => { editing.upstream = true; });
+$("bootstrap").addEventListener("change", () => saveServers(servers));
 $("cache-card").addEventListener("input", () => { editing.cache = true; });
-$("upstream-save").addEventListener("click", () => saveSetting("upstream", {
-  servers,
-  bootstrap: $("bootstrap").value.split(/[\s,]+/).filter(Boolean),
-}, "upstream-note"));
-$("cache-save").addEventListener("click", () => {
-  const cache = { optimistic: $("c-optimistic").checked };
-  CACHE_FIELDS.forEach(([id, key, unit]) => { cache[key] = Math.round(Number($(id).value) * unit); });
-  saveSetting("cache", cache, "cache-set-note");
-});
-$("upstream-reset").addEventListener("click", () => saveSetting("upstream", null, "upstream-note"));
+$("cache-card").addEventListener("change", saveCache);
 $("rewrite-table").addEventListener("click", (event) => {
   const button = event.target.closest("button");
 
   if (button) {
-    editing.rewrites = true;
-    rewrites.splice(Number(button.dataset.i), 1);
+    rewrites = rewrites.filter((_, i) => i !== Number(button.dataset.i));
     showRewrites();
+    saveSetting("rewrites", rewrites);
   }
 });
 $("rewrite-add").addEventListener("submit", (event) => {
@@ -1506,35 +1714,42 @@ $("rewrite-add").addEventListener("submit", (event) => {
   const answer = $("rewrite-answer").value.trim();
 
   if (name && answer) {
-    editing.rewrites = true;
-    rewrites.push({ name, answer });
-    showRewrites();
-    $("rewrite-name").value = "";
-    $("rewrite-answer").value = "";
+    saveSetting("rewrites", [...rewrites, { name, answer }], () => {
+      $("rewrite-name").value = "";
+      $("rewrite-answer").value = "";
+    });
   }
 });
-$("rewrites-save").addEventListener("click", () => saveSetting("rewrites", rewrites, "rewrites-note"));
-$("rewrites-reset").addEventListener("click", () => saveSetting("rewrites", null, "rewrites-note"));
-$("safe-search").addEventListener("change", () => { editing.safe_search = true; });
-$("safe_search-save").addEventListener("click", () => saveSetting("safe_search", $("safe-search").checked, "safe_search-note"));
-$("safe_search-reset").addEventListener("click", () => saveSetting("safe_search", null, "safe_search-note"));
-$("retention").addEventListener("change", () => { editing.stats = true; });
-$("stats-save").addEventListener("click", () => {
+$("safe-search").addEventListener("change", () => saveSetting("safe_search", $("safe-search").checked));
+$("retention").addEventListener("change", () => {
+  const days = Number($("retention").value);
+
+  if (days < retention && !confirm("Keep only " + days + (days === 1 ? " day" : " days") + " of history? Older days are deleted for good.")) {
+    $("retention").value = retention;
+
+    return;
+  }
+
   histories = {};
-  saveSetting("stats", { retention_days: Number($("retention").value) }, "stats-note");
+  saveSetting("stats", { retention_days: days });
 });
-$("stats-reset").addEventListener("click", () => {
-  histories = {};
-  saveSetting("stats", null, "stats-note");
-});
+document.querySelectorAll("[data-reset]").forEach((button) => button.addEventListener("click", () => {
+  const key = button.dataset.reset;
+
+  if (confirm("Reset " + LABELS[key] + " to the config file? What you changed on this page is dropped.")) {
+    histories = {};
+    saveSetting(key, null);
+  }
+}));
 $("service-filter").addEventListener("input", showServiceSwitches);
+// Ticking several services in a row saves them once.
 $("service-groups").addEventListener("change", (event) => {
   editing.services = true;
   chosen[event.target.checked ? "add" : "delete"](event.target.value);
+  showServicesCount();
+  clearTimeout(servicesTimer);
+  servicesTimer = setTimeout(() => saveSetting("services", [...chosen]), 600);
 });
-$("services-save").addEventListener("click", () => saveSetting("services", [...chosen], "services-note"));
-$("services-reset").addEventListener("click", () => saveSetting("services", null, "services-note"));
-$("cache-reset").addEventListener("click", () => saveSetting("cache", null, "cache-set-note"));
 $("check-form").addEventListener("submit", (event) => {
   event.preventDefault();
   checkName();
@@ -1597,8 +1812,7 @@ $("logout").addEventListener("click", async () => {
     }
 
     authEpoch++;
-    $("state").textContent = error.message;
-    $("state").className = "bad";
+    toast(error.message, true);
   } finally {
     setBusy(false);
   }
