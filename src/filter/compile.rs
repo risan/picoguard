@@ -151,16 +151,17 @@ impl SlowRuleBudget {
 
 pub(super) fn slow_rule_cost(slow: &SlowRule) -> usize {
     let rule = &slow.rule;
+    let modifiers = rule.modifiers();
     let text = rule.pattern.len()
-        + (NET_TEXT_BYTES + NAME_OVERHEAD_BYTES) * rule.restricted_clients.nets.len()
-        + rule
+        + (NET_TEXT_BYTES + NAME_OVERHEAD_BYTES) * modifiers.restricted_clients.nets.len()
+        + modifiers
             .denyallow
             .iter()
-            .chain(&rule.restricted_clients.names)
-            .chain(&rule.restricted_ctags)
+            .chain(&modifiers.restricted_clients.names)
+            .chain(&modifiers.restricted_ctags)
             .map(|name| name.len() + NAME_OVERHEAD_BYTES)
             .sum::<usize>()
-        + 2 * (rule.dns_permitted.len() + rule.dns_restricted.len());
+        + 2 * (modifiers.dns_permitted.len() + modifiers.dns_restricted.len());
 
     SLOW_RULE_BYTES + TEXT_BYTE_COST * text + slow.matcher_cost_bytes()
 }

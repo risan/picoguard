@@ -38,7 +38,7 @@ use super::compile::{
     SlowRuleBudget, TEXT_BYTE_COST, blocks_a_canary,
 };
 use super::engine::{CompiledList, FAST_KINDS, HostRules, MAX_HOST_GROUPS, SlowRule};
-use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
+use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, Modifiers, NetworkRule};
 use super::pattern::too_complex_build_bytes;
 use crate::lists::Validators;
 
@@ -436,12 +436,13 @@ impl<W: Write> Encoder<W> {
         self.u8(flags)?;
         self.u32(rule.restricted_types)?;
         self.text(&rule.pattern)?;
-        self.u16s(&rule.dns_permitted)?;
-        self.u16s(&rule.dns_restricted)?;
-        self.texts(&rule.denyallow)?;
-        self.texts(&rule.restricted_clients.entries())?;
+        let modifiers = rule.modifiers();
+        self.u16s(&modifiers.dns_permitted)?;
+        self.u16s(&modifiers.dns_restricted)?;
+        self.texts(&modifiers.denyallow)?;
+        self.texts(&modifiers.restricted_clients.entries())?;
 
-        self.texts(&rule.restricted_ctags)
+        self.texts(&modifiers.restricted_ctags)
     }
 }
 
@@ -701,18 +702,22 @@ impl<R: Read> Decoder<R> {
         self.name_allowance = self.slow_budget.remaining();
         let flags = self.u8()?;
         let restricted_types = self.u32()?;
-        let rule = NetworkRule {
-            whitelist: flags & WHITELIST != 0,
-            important: flags & IMPORTANT != 0,
-            badfilter: flags & BADFILTER != 0,
-            restricted_types,
-            pattern: self.text(MAX_LINE_BYTES, "rule pattern")?,
+        let pattern = self.text(MAX_LINE_BYTES, "rule pattern")?;
+        let modifiers = Modifiers {
             dns_permitted: self.u16s("record types")?,
             dns_restricted: self.u16s("record types")?,
             denyallow: self.names("deny-allow names")?,
             restricted_clients: ClientSet::new(&self.names("client entries")?),
             restricted_ctags: self.names("tag entries")?,
         };
+        let rule = NetworkRule::new(
+            flags & WHITELIST != 0,
+            flags & IMPORTANT != 0,
+            flags & BADFILTER != 0,
+            pattern,
+            restricted_types,
+            modifiers,
+        );
 
         self.charge(1, "slow rules")?;
         let slow = SlowRule::compile(rule)

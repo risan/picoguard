@@ -436,8 +436,8 @@ fn identity_hash(rule: &NetworkRule) -> u64 {
 fn fast_key(rule: &NetworkRule) -> Option<(usize, u64)> {
     if rule.important
         || rule.restricted_types != 0
-        || !rule.restricted_clients.is_empty()
-        || !rule.restricted_ctags.is_empty()
+        || !rule.modifiers().restricted_clients.is_empty()
+        || !rule.modifiers().restricted_ctags.is_empty()
     {
         return None;
     }
@@ -573,10 +573,12 @@ struct Condition {
 
 impl Condition {
     fn of(rule: &NetworkRule) -> Condition {
+        let modifiers = rule.modifiers();
+
         Condition {
-            permitted: rule.dns_permitted.clone(),
-            restricted: rule.dns_restricted.clone(),
-            denyallow: rule.denyallow.clone(),
+            permitted: modifiers.dns_permitted.clone(),
+            restricted: modifiers.dns_restricted.clone(),
+            denyallow: modifiers.denyallow.clone(),
         }
     }
 
@@ -954,10 +956,11 @@ impl RuleSet {
     /// matches and no badfilter disables it.
     fn slow_matches(&self, slow: &SlowRule, query: &Query<'_>, url: &str) -> bool {
         let rule = &slow.rule;
+        let modifiers = rule.modifiers();
         let allowed = conditions_hold(
-            &rule.dns_permitted,
-            &rule.dns_restricted,
-            &rule.denyallow,
+            &modifiers.dns_permitted,
+            &modifiers.dns_restricted,
+            &modifiers.denyallow,
             query,
         );
 
@@ -1274,6 +1277,15 @@ fn lowercase(input: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slow_rule_keeps_its_rare_modifiers_off_the_inline_struct() {
+        assert!(
+            std::mem::size_of::<SlowRule>() <= 128,
+            "{} bytes",
+            std::mem::size_of::<SlowRule>()
+        );
+    }
 
     fn engine(main: &[(&str, ListFormat)], allow: &[&str]) -> Engine {
         let compile = |text: &str, format| Arc::new(CompiledList::from_text(format, text).0);
