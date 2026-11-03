@@ -236,7 +236,7 @@ fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize, usize), Pat
         return Err(PatternError::TooBig);
     }
 
-    let hir = if may_name_a_non_ascii_character(source) {
+    let hir = if may_name_a_non_ascii_character(&translated) {
         translate_hir(&translated, &ast, Alphabet::Unicode)
     } else {
         translate_hir(&translated, &ast, Alphabet::Ascii)
@@ -278,14 +278,15 @@ fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize, usize), Pat
     Ok((regex, cost, parse_bytes))
 }
 
-/// True when `source` may spell a character beyond ASCII, by itself or through an escape.
+/// True when `pattern`, as translated (octal escapes are spelled out by then), may spell a
+/// character beyond ASCII, by itself or through an escape.
 /// Case folding in the ASCII alphabet loses what such a character folds to: U+212A (the Kelvin
 /// sign) is a `k`, U+017F a `s`. A false positive only costs a larger automaton.
-fn may_name_a_non_ascii_character(source: &str) -> bool {
-    !source.is_ascii()
+fn may_name_a_non_ascii_character(pattern: &str) -> bool {
+    !pattern.is_ascii()
         || ["\\x{", "\\u", "\\p", "\\P"]
             .iter()
-            .any(|escape| source.contains(escape))
+            .any(|escape| pattern.contains(escape))
 }
 
 /// What a regex is matched against.
@@ -910,7 +911,12 @@ fn translate_octal(chars: &[char], at: usize, out: &mut String) -> Result<usize,
     }
 
     let value = digits.iter().fold(0, |value, digit| value * 8 + digit);
-    out.push_str(&format!("\\x{{{value:X}}}"));
+    // Kept as `\xHH` while it is ASCII, so such a pattern is still built for ASCII.
+    if value < 0x80 {
+        out.push_str(&format!("\\x{value:02X}"));
+    } else {
+        out.push_str(&format!("\\x{{{value:X}}}"));
+    }
 
     Ok(at + 1 + digits.len())
 }
@@ -1630,6 +1636,8 @@ mod tests {
         let cases = [
             (r"^(?:\x{212a})ey\.example$", "key.example"),
             (r"^\x{212A}ey\.example$", "KEY.example"),
+            (r"^(?:\577)ite\.example$", "site.example"),
+            (r"^[\577]ite\.example$", "SITE.example"),
             (r"^\x{017f}ite\.example$", "site.example"),
             ("^\u{212a}ey\\.example$", "key.example"),
             ("^\u{17f}ite\\.example$", "SITE.example"),
@@ -1644,16 +1652,28 @@ mod tests {
 
     #[test]
     fn an_ordinary_regex_is_built_for_ascii() {
+        let for_unicode =
+            |source: &str| may_name_a_non_ascii_character(&translate_go_regex(source).unwrap());
+
         for source in [
             r"^ads[0-9]+\.example$",
             r"^(?:a|b)\w*\.(com|net)$",
             r"\0\.x",
+            r"\101\57[\07]",
         ] {
-            assert!(!may_name_a_non_ascii_character(source), "{source}");
+            assert!(!for_unicode(source), "{source}");
         }
 
-        for source in [r"\x{212a}", r"\pL", r"\P{Greek}", "caf\u{e9}", r"K"] {
-            assert!(may_name_a_non_ascii_character(source), "{source}");
+        for source in [
+            r"\x{212a}",
+            r"\pL",
+            r"\P{Greek}",
+            "caf\u{e9}",
+            "\u{212a}",
+            r"\577",
+            r"[\577]",
+        ] {
+            assert!(for_unicode(source), "{source}");
         }
     }
 
