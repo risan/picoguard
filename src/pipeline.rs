@@ -230,6 +230,15 @@ impl Delivery {
 
 type Outcome = Result<Arc<Delivery>, Failure>;
 
+/// Why a cache hit could not be held for delivery.
+#[derive(Debug, PartialEq, Eq)]
+enum Unheld {
+    /// No such entry any more: it expired or was evicted since it was found.
+    Gone,
+    /// The pending-bytes budget cannot hold a copy.
+    NoRoom,
+}
+
 /// A query that waited for everything except its decision. See `Pipeline::prepare`.
 pub struct Prepared(Inner);
 
@@ -673,16 +682,23 @@ impl Pipeline {
                 // The entry may be gone before the reply is written, so the reply keeps its
                 // own copy of the bytes, charged like an upstream reply.
                 let query = Query::parse(&compact).ok()?;
-                let Some(delivery) = self.hold_cache_hit(&query) else {
-                    return self.shed(compact, protocol, asker);
-                };
+                match self.hold_cache_hit(&query) {
+                    Ok(delivery) => {
+                        return Some(Prepared(Inner::Undecided {
+                            request: compact,
+                            protocol,
+                            asker,
+                            delivery: Some(delivery),
+                        }));
+                    }
 
-                return Some(Prepared(Inner::Undecided {
-                    request: compact,
-                    protocol,
-                    asker,
-                    delivery: Some(delivery),
-                }));
+                    Err(Unheld::NoRoom) => {
+                        return self.shed(compact, protocol, asker);
+                    }
+
+                    // Expired since `settle` found it: the upstream answers like for a miss.
+                    Err(Unheld::Gone) => {}
+                }
             }
 
             Ok(Settled::Static(_) | Settled::Blocked(_)) => {
@@ -1067,6 +1083,7 @@ impl Pipeline {
         let remembered = hit
             .memo
             .filter(|memo| !view.paused && memo.generation == view.generation);
+        let memo_is_current = remembered.is_some();
         let decision = match remembered {
             Some(memo) => memo.decision,
             None if request_verdict == Verdict::Allow => Decision::Pass,
@@ -1086,7 +1103,10 @@ impl Pipeline {
             }
         };
 
-        self.remember(&mut cache, &key, token, &view, &decision);
+        if !memo_is_current {
+            self.remember(&mut cache, &key, token, &view, &decision);
+        }
+
         // The inflight lock is never taken while the cache lock is held.
         drop(cache);
 
@@ -1228,16 +1248,20 @@ impl Pipeline {
         self.route_of(name) == Route::Local && self.local_resolver.is_none()
     }
 
-    /// A copy of the cached reply to `query`, charged to the pending-bytes budget. `None`
-    /// when there is no such entry or the budget cannot hold the copy.
-    fn hold_cache_hit(&self, query: &Query<'_>) -> Option<Arc<Delivery>> {
+    /// A copy of the cached reply to `query`, charged to the pending-bytes budget.
+    fn hold_cache_hit(&self, query: &Query<'_>) -> Result<Arc<Delivery>, Unheld> {
         let mut cache = self.cache.lock().unwrap();
-        let hit = cache.get(&CacheKey::new(query), Instant::now())?;
-        let charge = self.budget.try_charge(hit.parts.bytes.len())?;
+        let hit = cache
+            .get(&CacheKey::new(query), Instant::now())
+            .ok_or(Unheld::Gone)?;
+        let charge = self
+            .budget
+            .try_charge(hit.parts.bytes.len())
+            .ok_or(Unheld::NoRoom)?;
         let bytes = hit.parts.bytes.to_vec();
-        let info = ResponseInfo::parse(&bytes).ok()?;
+        let info = ResponseInfo::parse(&bytes).map_err(|_| Unheld::Gone)?;
 
-        Some(Arc::new(Delivery::new(
+        Ok(Arc::new(Delivery::new(
             bytes,
             info,
             Some(hit.token),
@@ -3195,5 +3219,49 @@ mod tests {
 
         assert_eq!(answer_addresses(&reply), ["2.2.2.2"]);
         assert_eq!(fake.queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_that_expired_is_gone_and_one_the_budget_cannot_hold_has_no_room() {
+        let mut config = offline_config();
+        config.cache.optimistic = false;
+        config.limits.pending_bytes = 8;
+        let pipeline = Pipeline::new(&config, Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("held.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+
+        assert_eq!(pipeline.hold_cache_hit(&query).err(), Some(Unheld::Gone));
+
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 60, 61).unwrap();
+        assert_eq!(pipeline.hold_cache_hit(&query).err(), Some(Unheld::Gone));
+
+        insert_aged(&pipeline, &spec, [9, 9, 9, 9], 60, 0).unwrap();
+        assert_eq!(pipeline.hold_cache_hit(&query).err(), Some(Unheld::NoRoom));
+    }
+
+    #[tokio::test]
+    async fn a_second_hit_finds_the_decision_of_the_first_unchanged() {
+        let pipeline = Pipeline::new(&offline_config(), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("memo.example.", RecordType::A);
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let token = insert_aged(&pipeline, &spec, [9, 9, 9, 9], 300, 0).unwrap();
+        let memo_after = |pipeline: &Pipeline| {
+            let mut cache = pipeline.cache.lock().unwrap();
+            let hit = cache.get(&CacheKey::new(&query), Instant::now()).unwrap();
+
+            (hit.token, hit.memo.clone(), cache.bytes())
+        };
+        let mut out = Vec::new();
+
+        ask_quickly(&pipeline, &spec, &mut out);
+        let first = memo_after(&pipeline);
+        ask_quickly(&pipeline, &spec, &mut out);
+        let second = memo_after(&pipeline);
+
+        assert_eq!(first.0, token);
+        assert!(first.1.is_some());
+        assert_eq!(first, second);
     }
 }
