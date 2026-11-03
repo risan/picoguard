@@ -5312,6 +5312,77 @@ async fn a_failed_refresh_keeps_the_service_lists_and_no_refresh_writes_a_file()
     assert!(written.is_empty(), "{written:?}");
 }
 
+/// Waits until the services view reports an error that names `id`.
+async fn wait_for_services_error_naming(site: &Site, id: &str) -> Value {
+    for _ in 0..400 {
+        let services = site.send(get("/api/services")).await.json();
+        if services["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(id))
+        {
+            return services;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("the services view never named {id} in its error");
+}
+
+/// A service stays switched on, and blocking, after a refreshed catalog stops offering usable
+/// rules for it; the page keeps it listed as on and says why.
+async fn assert_video_stays_blocked_after(catalog_without_usable_video: &str) {
+    let (site, catalog, _upstream) = services_site(&["chat", "video"], fast_timing(), |config| {
+        config.services.refresh_hours = 1;
+    })
+    .await;
+    wait_until_blocked(&site, "chat.example.", true).await;
+    wait_until_blocked(&site, "video.example.", true).await;
+
+    catalog.serve(CATALOG_PATH, catalog_without_usable_video, None);
+    let services = wait_for_services_error_naming(&site, "video").await;
+
+    let video = services["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|service| service["id"] == "video")
+        .unwrap_or_else(|| panic!("video is not listed: {services}"));
+    assert_eq!(video["on"], true, "{services}");
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert!(
+        is_blocked(&site, "video.example.").await,
+        "video is still switched on but no longer blocked"
+    );
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(
+        settings["services"]["block"],
+        serde_json::json!(["chat", "video"])
+    );
+}
+
+#[tokio::test]
+async fn a_service_missing_from_the_new_catalog_keeps_its_list() {
+    let video = "{\"id\": \"video\", \"name\": \"Video\", \"group\": \"streaming\", \"icon_svg\": \"<svg>video</svg>\",\n     \"rules\": [\"||video.example^\"]},";
+    let without_video = CATALOG.replace(video, "");
+    assert!(!without_video.contains("\"video\""));
+
+    assert_video_stays_blocked_after(&without_video).await;
+}
+
+#[tokio::test]
+async fn a_service_grown_over_the_rule_cap_keeps_its_list() {
+    let many_rules = (0..2001)
+        .map(|index| format!("\"||video{index}.example^\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let video = "\"rules\": [\"||video.example^\"]},";
+    let grown = CATALOG.replace(video, &format!("\"rules\": [{many_rules}]}},"));
+    assert!(grown.contains("video2000.example"));
+
+    assert_video_stays_blocked_after(&grown).await;
+}
+
 #[tokio::test]
 async fn no_catalog_is_downloaded_without_a_service_switched_on() {
     let (site, catalog, _upstream) = services_site(&[], fast_timing(), |config| {

@@ -27,6 +27,8 @@ const MAX_RULE_BYTES: usize = 256;
 /// The services switched on together; AdGuard's whole catalog held 2,406 in 2026.
 pub const MAX_SELECTED_RULES: usize = 20_000;
 /// How long the page waits before it asks for a catalog that failed to download again.
+/// The group the page lists a switched-on service under when the catalog no longer has it.
+const DROPPED_GROUP: &str = "unavailable";
 const INDEX_RETRY: Duration = Duration::from_secs(60);
 
 /// The compiled list of one service switched on, put in force like any list.
@@ -183,10 +185,9 @@ impl Services {
     /// The page's view of the catalog.
     pub fn view(&self) -> ServicesView {
         let state = self.state.lock().unwrap();
-        let services = state
-            .index
+        let index = state.index.as_deref().unwrap_or_default();
+        let mut services: Vec<ServiceView> = index
             .iter()
-            .flatten()
             .map(|service| ServiceView {
                 id: service.id.to_string(),
                 name: service.name.to_string(),
@@ -194,6 +195,19 @@ impl Services {
                 on: state.selection.iter().any(|id| **id == *service.id),
             })
             .collect();
+        if state.index.is_some() {
+            // A service the catalog dropped stays on until the page switches it off.
+            for id in &state.selection {
+                if !index.iter().any(|service| *service.id == **id) {
+                    services.push(ServiceView {
+                        id: id.clone(),
+                        name: id.clone(),
+                        group: DROPPED_GROUP.to_string(),
+                        on: true,
+                    });
+                }
+            }
+        }
         let waiting = state.error.is_none()
             && (state.index.is_none()
                 || (!state.selection.is_empty() && state.loaded_at.is_none()));

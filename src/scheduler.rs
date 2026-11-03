@@ -704,7 +704,8 @@ impl ListControl {
 
     /// Downloads the catalog again and puts the lists of the services switched on in force,
     /// when they changed and fit the budget in place of those in force. A failure keeps the
-    /// lists in force and tries again later.
+    /// lists in force and tries again later. A service that stays switched on but has no usable
+    /// rules in the new catalog keeps its list in force, and the error names it.
     async fn refresh_services(&self, timing: &Timing) {
         let admitted = self.admission.lock().await;
         let selection = self.services.state.lock().unwrap().selection.clone();
@@ -712,31 +713,46 @@ impl ListControl {
             return;
         }
 
+        let mut unavailable = Vec::new();
         let refreshed = match self.services.fetch(&selection).await {
-            Ok(wanted) => self
-                .compile_services(
-                    Vec::new(),
-                    wanted,
-                    self.cache_max_bytes.load(Ordering::Relaxed),
-                )
-                .await
-                .map_err(|error| match error {
-                    ChangeError::Invalid(reason)
-                    | ChangeError::OverBudget(reason)
-                    | ChangeError::Unavailable(reason) => reason,
-                    other => format!("{other:?}"),
-                }),
+            Ok(wanted) => {
+                unavailable = selection
+                    .iter()
+                    .filter(|id| !wanted.iter().any(|(wanted_id, _, _)| **wanted_id == **id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let kept = self
+                    .assembly
+                    .lock()
+                    .await
+                    .services
+                    .iter()
+                    .filter(|list| unavailable.iter().any(|id| **id == *list.id))
+                    .cloned()
+                    .collect();
+
+                self.compile_services(kept, wanted, self.cache_max_bytes.load(Ordering::Relaxed))
+                    .await
+                    .map_err(|error| match error {
+                        ChangeError::Invalid(reason)
+                        | ChangeError::OverBudget(reason)
+                        | ChangeError::Unavailable(reason) => reason,
+                        other => format!("{other:?}"),
+                    })
+            }
+
             Err(error) => Err(error),
         };
 
         match refreshed {
             Ok(lists) => {
                 let in_force = self.assembly.lock().await;
-                let same =
-                    in_force.services.len() == lists.len()
-                        && in_force.services.iter().zip(&lists).all(|(old, new)| {
-                            old.id == new.id && old.fingerprint == new.fingerprint
-                        });
+                let same = in_force.services.len() == lists.len()
+                    && in_force.services.iter().all(|old| {
+                        lists
+                            .iter()
+                            .any(|new| old.id == new.id && old.fingerprint == new.fingerprint)
+                    });
                 drop(in_force);
 
                 if same {
@@ -748,6 +764,15 @@ impl ListControl {
                 } else {
                     log::info!("blocked services: {} lists", lists.len());
                     self.put_services_in_force(lists, selection, true).await;
+                }
+
+                if !unavailable.is_empty() {
+                    let message = format!(
+                        "the catalog has no usable rules for {}; a list already in force stays",
+                        unavailable.join(", ")
+                    );
+                    log::warn!("blocked services: {message}");
+                    self.services.state.lock().unwrap().error = Some(message);
                 }
             }
 

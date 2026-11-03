@@ -527,6 +527,10 @@ block = ["tiktok", "youtube"]
   that fails, whose lists would pass the [memory budget](#the-memory-budget), or with a service
   whose rules cannot be used (they would block nearly every name) keeps all the lists in force,
   shows why in `GET /api/services` `error`, and tries again later, with the same waits as a list.
+- A service that stays switched on but is missing from a refreshed catalog, or has no usable rules
+  there (over a cap, or every rule left out), keeps the list it had; `error` names it, and the
+  page lists it as on under "Unavailable" until it is switched off. A service with no list yet
+  stays unblocked, and `error` names it too.
 - Each service switched on is a list of its own, named "Blocked service: <name>": **Check a
   name** names it, a pause turns it off like every list, and an allowlist or an Allow rule wins
   over it as over any list.
