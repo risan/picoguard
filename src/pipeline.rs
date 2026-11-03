@@ -1831,6 +1831,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_config_the_check_accepts_is_one_the_pipeline_starts_with() {
+        let long_label = "a".repeat(64);
+        let texts = [
+            "blocked_hosts = [\"ads.example\"]".to_string(),
+            "blocked_hosts = [\"ads..example\"]".to_string(),
+            "blocked_hosts = [\"büro.example\"]".to_string(),
+            format!("blocked_hosts = [\"{long_label}.example\"]"),
+            format!("blocked_hosts = [\"{}\"]", ["a"; 130].join(".")),
+            "[local]\ndomains = [\"home.arpa\"]".to_string(),
+            "[local]\ndomains = [\"a..b\"]".to_string(),
+            "[local]\ndomains = [\"büro\"]".to_string(),
+        ];
+
+        for text in texts {
+            let checked = Config::parse(&text);
+            let started = match &checked {
+                Ok(config) => Pipeline::new(config, Arc::new(Policy::new())).map(|_| ()),
+                Err(_) => continue,
+            };
+
+            assert!(started.is_ok(), "{text}: {:?}", started.err());
+        }
+        assert!(Config::parse("blocked_hosts = [\"ads.example\"]").is_ok());
+        assert!(Config::parse("blocked_hosts = [\"ads..example\"]").is_err());
+    }
+
+    #[tokio::test]
     async fn the_default_encrypted_upstreams_build_a_pipeline() {
         let config = Config::default();
 

@@ -8,7 +8,9 @@ is the default, and most are commented out. Check a file without starting the se
 picoguard --check -c /etc/picoguard/picoguard.toml
 ```
 
-It prints `OK` or the first error. Unknown keys are errors, so a typo cannot hide.
+It prints `OK` or the first error. Unknown keys are errors, so a typo cannot hide. The check refuses
+what the start would refuse: a `blocked_hosts` or `local.domains` name with an empty, non-ASCII or
+too long label, and a list or catalog URL the downloader cannot use.
 
 Top-level keys (`blocked_ttl`, `rules`, ...) must come before the first `[section]` header. This
 is a TOML rule.
@@ -414,7 +416,7 @@ and once among the `[[allowlists]]`.
 | Key | Default | Meaning |
 |---|---|---|
 | `name` | none | Label on the status page. |
-| `url` | none | `http://` or `https://` address, without a user name or password (the download refuses `user:pass@`, so the list would fail at every refresh; the page refuses to add one). Set `url` or `path`, not both. |
+| `url` | none | `http://` or `https://` address, without a user name or password (the download refuses `user:pass@`, so the list would fail at every refresh; the check and the page refuse one). Set `url` or `path`, not both. |
 | `path` | none | Local file. Read at start and again every `refresh_hours`. |
 | `format` | `"auto"` | `auto`, `adblock`, `hosts`, `domains`, `wildcard`, `dnsmasq` or `rpz`. |
 | `refresh_hours` | `24` | How often to download again. |

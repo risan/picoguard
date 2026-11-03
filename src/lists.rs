@@ -319,7 +319,7 @@ async fn look_up(
 
 /// A parsed `http://` or `https://` URL.
 #[derive(Debug, Clone)]
-struct Target {
+pub(crate) struct Target {
     https: bool,
     host: String,
     port: u16,
@@ -328,7 +328,7 @@ struct Target {
 }
 
 impl Target {
-    fn parse(url: &str) -> Result<Target, FetchError> {
+    pub(crate) fn parse(url: &str) -> Result<Target, FetchError> {
         let bad = || FetchError::BadUrl(url.to_string());
         let uri: Uri = url.parse().map_err(|_| bad())?;
         let https = match uri.scheme_str() {
