@@ -228,6 +228,10 @@ impl DeviceNames {
             .unwrap_or_default()
     }
 
+    pub(crate) fn clear_tally(&self) {
+        self.resolver.clear_tallies();
+    }
+
     /// The name known for `address`, if any. Starts its lookup in the background when one is
     /// due, and never waits for it. Must be called on the runtime.
     pub(crate) fn name_of(self: &Arc<Self>, address: IpAddr) -> Option<Box<str>> {

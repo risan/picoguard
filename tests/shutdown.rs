@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use common::harness::{a_record, fake_upstream, name, reply_to};
+use common::harness::{a_record, answering_upstream, fake_upstream, name, reply_to};
 use common::http::ListServer;
 use common::process::{Running, exit_within, send_signal, start};
 use hickory_proto::op::{Message, Query};
@@ -256,4 +256,47 @@ async fn sigterm_exits_within_the_allowance_while_a_download_stalls_and_keeps_th
         stopping.elapsed()
     );
     assert_eq!(state.snapshot_files(), last_good);
+}
+
+#[tokio::test]
+async fn sigterm_saves_the_statistics_within_the_allowance_while_a_download_stalls() {
+    let state = StateDir::new("stalled-stats");
+    let list_server = ListServer::start().await;
+    list_server.serve("/l.txt", LIST, Some("\"v1\""));
+    list_server.set_delay(Duration::from_secs(120));
+    let url = list_server.url("/l.txt");
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut server = Reaped(start("shutdown-stalled-stats.toml", |port| {
+        format!(
+            "[[lists]]\nurl = {url:?}\nformat = \"adblock\"\n\
+             [server]\nbind = [\"127.0.0.1\"]\nport = {port}\n\
+             [upstream]\nservers = [\"udp://{}\"]\n\
+             [web]\nenabled = false\n[state]\ndir = {:?}\n",
+            upstream.address, state.0
+        )
+    }));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while list_server.requests() == 0 {
+        assert!(Instant::now() < deadline, "the list was never asked for");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    ask_udp(server.0.port, "one.example.").await;
+    ask_udp(server.0.port, "two.example.").await;
+    assert!(!state.0.join("stats.json").exists());
+
+    send_signal(&server.0.child, "TERM");
+    let stopping = Instant::now();
+
+    let status = exit_within(&mut server.0.child, Duration::from_secs(15)).await;
+    assert_eq!(status.and_then(|status| status.code()), Some(0));
+    assert!(
+        stopping.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        stopping.elapsed()
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.0.join("stats.json")).unwrap()).unwrap();
+    assert!(saved["counters"]["total"].as_u64().unwrap() >= 2, "{saved}");
+    assert!(!state.0.join("stats.json.part").exists());
 }

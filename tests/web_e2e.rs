@@ -32,6 +32,7 @@ use picoguard::scheduler::{Action, ListControl, Scheduler, Timing};
 use picoguard::settings;
 use picoguard::stage::{StageSetup, StageTiming, Stager};
 use picoguard::stats::{Event, QueryResult};
+use picoguard::stats_store::StatsSaver;
 use picoguard::update::{self, Build, CheckTiming, Latest, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
@@ -452,6 +453,11 @@ async fn site_timed(
     let web_state = Web::new(
         &config,
         Arc::clone(&dns.pipeline),
+        Arc::new(if config.stats.persist {
+            StatsSaver::open(state.clone())
+        } else {
+            StatsSaver::disabled()
+        }),
         Arc::clone(&policy),
         Arc::clone(&control),
         Arc::clone(&updates),
@@ -510,8 +516,9 @@ async fn the_page_is_served_with_protective_headers() {
 /// binary, no memory at run time.
 const PAGE_HARD_CAP_BYTES: usize = 64 * 1024;
 
-/// The last part, the blocked services; raised on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 54 * 1024;
+/// Release 3, the history ranges, the statistics card and the clear buttons; raised on purpose,
+/// never past the cap.
+const PAGE_BUDGET_BYTES: usize = 59 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -547,6 +554,9 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/login",
         "/api/logout",
         "/api/cache/clear",
+        "/api/stats/clear",
+        "/api/querylog/clear",
+        "/api/history?days=",
         "/api/rules",
         "/api/rules/remove",
         "/api/explain?name=",
@@ -964,6 +974,73 @@ async fn the_chart_is_inline_svg_drawn_with_create_element_ns() {
         "id=\"chart-readout\"",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+/// No browser here: the ranges are checked as source, and in the build's browser check.
+#[tokio::test]
+async fn the_chart_has_four_ranges_that_keep_to_the_retention_and_are_remembered() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for days in ["1", "7", "30", "90"] {
+        assert!(
+            page.contains(&format!("<button data-days=\"{days}\">")),
+            "{days}"
+        );
+    }
+
+    for needed in [
+        "id=\"chart-totals\"",
+        "id=\"chart-title\"",
+        "button.disabled = days > retention",
+        "status.retention_days",
+        "\"&offset=\" + -new Date().getTimezoneOffset()",
+        "HISTORY_REFRESH_MS = 60000",
+        "localStorage.getItem(",
+        "localStorage.setItem(",
+        "\"since \" + new Date(status.since * 1000)",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+
+    // Storage can be blocked: each use of it sits in a try.
+    assert!(page.matches("try {").count() >= 2);
+    assert!(!page.contains("(since start)"));
+}
+
+/// No browser here: the statistics card and the two clear buttons are checked as source.
+#[tokio::test]
+async fn the_statistics_card_and_the_clear_buttons_ask_before_they_clear() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "id=\"stats-card\"",
+        "id=\"retention\"",
+        "id=\"stats-saving\"",
+        "id=\"stats-clear\"",
+        "id=\"stats-save\"",
+        "id=\"stats-reset\"",
+        "saveSetting(\"stats\", { retention_days:",
+        "saveSetting(\"stats\", null",
+        "showSaving(status.stats_saving)",
+        "\"Clear the statistics?",
+        "act(\"/api/stats/clear\"",
+        "id=\"clear-log\"",
+        "\"Clear the query log?",
+        "act(\"/api/querylog/clear\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+
+    for option in ["1", "7", "30", "90"] {
+        assert!(
+            page.contains(&format!("<option value=\"{option}\">")),
+            "{option}"
+        );
     }
 }
 
@@ -1979,6 +2056,8 @@ fn change_routes(seeded_list: &str) -> Vec<ChangeRoute> {
         route("refresh", "/api/lists/refresh", ""),
         route("update", "/api/update", UPDATE_BODY),
         route("cache clear", "/api/cache/clear", "{}"),
+        route("stats clear", "/api/stats/clear", "{}"),
+        route("query log clear", "/api/querylog/clear", "{}"),
         ChangeRoute {
             reads_by_get: true,
             ..route("rule add", "/api/rules", NEW_RULE_BODY)
@@ -3855,7 +3934,7 @@ async fn site_with_saved(saved: &str) -> (Site, common::harness::FakeUpstream) {
 #[tokio::test]
 async fn the_settings_show_each_value_with_where_it_comes_from_and_no_web_value() {
     let (site, upstream) = site_with_saved(
-        "{\"version\": 1, \"safe_search\": true, \"cache\": {\"max_entries\": 500, \
+        "{\"version\": 1, \"safe_search\": true, \"stats\": {\"retention_days\": 90}, \"cache\": {\"max_entries\": 500, \
          \"max_bytes\": 1048576, \"min_ttl\": 5, \"max_ttl\": 600, \"optimistic\": false}}",
     )
     .await;
@@ -3886,6 +3965,7 @@ async fn the_settings_show_each_value_with_where_it_comes_from_and_no_web_value(
             "rewrites": {"entries": [], "from": "file"},
             "safe_search": {"on": true, "from": "page"},
             "services": {"block": [], "from": "file"},
+            "stats": {"retention_days": 90, "from": "page"},
             "memory": {
                 "estimate_bytes": site.control.memory().estimate_bytes,
                 "budget_bytes": 48 * 1024 * 1024,
@@ -5516,4 +5596,452 @@ async fn a_refresh_with_a_service_that_cannot_be_used_keeps_every_service_list()
     assert!(!is_blocked(&site, "games.example.").await);
     assert!(is_blocked(&site, "chat.example.").await);
     assert!(saved_settings(&site).is_none());
+}
+
+/// The last day of a history answer, which is today in the zone of the request.
+fn today_of(history: &Value) -> &Value {
+    history["days"].as_array().unwrap().last().unwrap()
+}
+
+#[tokio::test]
+async fn the_history_has_a_bucket_per_day_in_the_zone_asked_for() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    config.stats.retention_days = 90;
+    without_credentials(&mut config);
+    let site = site(config).await;
+    for name in ["a.example.", "b.example.", "ads.example."] {
+        ask(&site.dns, name, RecordType::A).await;
+    }
+
+    for days in [7, 30, 90] {
+        let reply = site.send(get(&format!("/api/history?days={days}"))).await;
+        let history = reply.json();
+
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert_eq!(history["days"].as_array().unwrap().len(), days);
+        assert_eq!(history["retention_days"], 90);
+    }
+
+    let utc = site.send(get("/api/history?days=7&offset=0")).await.json();
+    let default = site.send(get("/api/history?days=7")).await.json();
+    let today = today_of(&utc);
+    assert_eq!(today["total"], 3);
+    assert_eq!(today["blocked"], 1);
+    assert_eq!(utc, default);
+    assert_eq!(today["day_start"].as_u64().unwrap() % 86_400, 0);
+    let earlier: u64 = utc["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|day| day["total"].as_u64().unwrap())
+        .sum();
+    assert_eq!(earlier, 3);
+
+    let east = site.send(get("/api/history?days=7&offset=60")).await.json();
+    assert_eq!(
+        (today_of(&east)["day_start"].as_u64().unwrap() + 3600) % 86_400,
+        0
+    );
+    let west = site
+        .send(get("/api/history?days=7&offset=-300"))
+        .await
+        .json();
+    assert_eq!(
+        (today_of(&west)["day_start"].as_u64().unwrap() - 300 * 60) % 86_400,
+        0
+    );
+
+    for beyond in ["841", "100000", "-841", "-100000"] {
+        let clamped = site
+            .send(get(&format!("/api/history?days=7&offset={beyond}")))
+            .await
+            .json();
+        let limit = if beyond.starts_with('-') {
+            "-840"
+        } else {
+            "840"
+        };
+        let at_limit = site
+            .send(get(&format!("/api/history?days=7&offset={limit}")))
+            .await
+            .json();
+
+        assert_eq!(clamped, at_limit, "{beyond}");
+    }
+}
+
+#[tokio::test]
+async fn the_history_is_cut_to_the_retention_and_refuses_other_ranges() {
+    let (site, _upstream) = plain_site().await;
+    ask(&site.dns, "a.example.", RecordType::A).await;
+
+    let long = site.send(get("/api/history?days=90&offset=0")).await.json();
+
+    assert_eq!(long["retention_days"], 30);
+    assert_eq!(long["days"].as_array().unwrap().len(), 30);
+    for bad in [
+        "",
+        "?days=1",
+        "?days=8",
+        "?days=0",
+        "?days=-7",
+        "?days=abc",
+        "?days=7.5",
+        "?days=",
+        "?offset=0",
+        "?days=7&offset=abc",
+        "?days=7&offset=1.5",
+        "?days=7&offset=",
+        "?days=7&offset=99999999999",
+        "?days=7&days=abc",
+    ] {
+        let reply = site.send(get(&format!("/api/history{bad}"))).await;
+
+        assert_eq!(reply.status, 400, "{bad}: {}", reply.body);
+        assert!(reply.json()["error"].is_string(), "{bad}");
+    }
+
+    let wrong_method = site.send(post("/api/history", "{}")).await;
+    assert_eq!(wrong_method.status, 405);
+    assert_eq!(wrong_method.header("allow"), Some("GET"));
+}
+
+#[tokio::test]
+async fn the_history_needs_no_password_when_none_is_set_and_a_sign_in_when_one_is() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut open = local_config(&upstream);
+    without_credentials(&mut open);
+    let open = site(open).await;
+    let (closed, _upstream) = plain_site().await;
+
+    assert_eq!(open.send(get("/api/history?days=7")).await.status, 200);
+    assert_eq!(
+        closed.send_as_is(get("/api/history?days=7")).await.status,
+        401
+    );
+    assert_eq!(closed.send(get("/api/history?days=7")).await.status, 200);
+}
+
+#[tokio::test]
+async fn the_status_has_the_start_for_everyone_and_the_saving_state_for_a_signed_in_user() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut open = local_config(&upstream);
+    without_credentials(&mut open);
+    let open = site(open).await;
+    let (closed, _upstream) = plain_site().await;
+    let mut unsaved = local_config(&upstream);
+    unsaved.stats.persist = false;
+    let unsaved = site(unsaved).await;
+
+    let read = open.send(get("/api/status")).await.json();
+    assert!(read["since"].as_u64().unwrap() > 1_700_000_000);
+    assert_eq!(read["retention_days"], 30);
+    assert!(read.get("stats_saving").is_none(), "{read}");
+
+    let signed_in = closed.send(get("/api/status")).await.json();
+    assert!(signed_in["since"].as_u64().unwrap() > 1_700_000_000);
+    assert_eq!(
+        signed_in["stats_saving"],
+        serde_json::json!({"enabled": true, "last_saved": null, "error": null})
+    );
+
+    let off = unsaved.send(get("/api/status")).await.json();
+    assert_eq!(off["stats_saving"]["enabled"], false);
+}
+
+#[tokio::test]
+async fn clearing_the_statistics_starts_again_from_zero_saves_at_once_and_keeps_the_query_log() {
+    let (site, _upstream) = plain_site().await;
+    for name in ["a.example.", "a.example.", "ads.example."] {
+        ask(&site.dns, name, RecordType::A).await;
+    }
+
+    let before = site.send(get("/api/status")).await.json();
+    assert_eq!(before["counters"]["total"], 3);
+    assert_eq!(before["top_queried"]["entries"][0]["key"], "a.example");
+    assert!(before["upstreams"][0]["answered"].as_u64().unwrap() >= 1);
+    let stats_file = site.state.join("stats.json");
+    assert!(!stats_file.exists());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let cleared = site.send(post("/api/stats/clear", "{}")).await;
+
+    assert_eq!(cleared.status, 200);
+    assert_eq!(cleared.body, "{\"cleared\":true,\"save_error\":null}");
+    let after = site.send(get("/api/status")).await.json();
+    assert_eq!(after["counters"]["total"], 0);
+    assert_eq!(after["counters"]["blocked_request"], 0);
+    assert!(after["since"].as_u64().unwrap() > before["since"].as_u64().unwrap());
+    assert!(
+        after["top_queried"]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        after["top_clients"]["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(after["upstreams"][0]["answered"], 0);
+    assert!(
+        after["hourly"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|bucket| bucket["total"] == 0)
+    );
+    assert!(after["stats_saving"]["last_saved"].is_u64());
+    let saved: Value = serde_json::from_slice(&std::fs::read(&stats_file).unwrap()).unwrap();
+    assert_eq!(saved["counters"]["total"], 0);
+    assert_eq!(saved["since"], after["since"]);
+    assert!(saved["top_queried"].as_array().unwrap().is_empty());
+    let log = site.send(get("/api/querylog")).await.json();
+    assert_eq!(log["entries"].as_array().unwrap().len(), 3);
+
+    ask(&site.dns, "b.example.", RecordType::A).await;
+    let counting = site.send(get("/api/status")).await.json();
+    assert_eq!(counting["counters"]["total"], 1);
+}
+
+#[tokio::test]
+async fn clearing_the_statistics_with_saving_off_writes_nothing() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    config.stats.persist = false;
+    let site = site(config).await;
+    ask(&site.dns, "a.example.", RecordType::A).await;
+
+    let cleared = site.send(post("/api/stats/clear", "{}")).await;
+
+    assert_eq!(cleared.status, 200);
+    assert_eq!(
+        site.send(get("/api/status")).await.json()["counters"]["total"],
+        0
+    );
+    assert!(!site.state.join("stats.json").exists());
+}
+
+#[tokio::test]
+async fn clearing_the_statistics_says_when_the_file_could_not_be_written() {
+    let (site, _upstream) = plain_site().await;
+    ask(&site.dns, "a.example.", RecordType::A).await;
+    let stats_file = site.state.join("stats.json");
+    std::fs::create_dir(&stats_file).unwrap();
+
+    let cleared = site.send(post("/api/stats/clear", "{}")).await;
+
+    assert_eq!(cleared.status, 200);
+    assert!(cleared.json()["save_error"].is_string(), "{}", cleared.body);
+    let status = site.send(get("/api/status")).await.json();
+    assert_eq!(status["counters"]["total"], 0);
+    assert!(status["stats_saving"]["error"].is_string());
+}
+
+#[tokio::test]
+async fn clearing_the_query_log_empties_it_and_leaves_the_statistics() {
+    let (site, _upstream) = plain_site().await;
+    for name in ["a.example.", "b.example."] {
+        ask(&site.dns, name, RecordType::A).await;
+    }
+    let log = site.send(get("/api/querylog")).await.json();
+    assert_eq!(log["entries"].as_array().unwrap().len(), 2);
+
+    let cleared = site.send(post("/api/querylog/clear", "{}")).await;
+
+    assert_eq!(cleared.status, 200);
+    assert_eq!(cleared.body, "{\"cleared\":true}");
+    let log = site.send(get("/api/querylog")).await.json();
+    assert!(log["entries"].as_array().unwrap().is_empty());
+    let status = site.send(get("/api/status")).await.json();
+    assert_eq!(status["counters"]["total"], 2);
+    assert!(!site.state.join("stats.json").exists());
+
+    ask(&site.dns, "c.example.", RecordType::A).await;
+    let log = site.send(get("/api/querylog")).await.json();
+    assert_eq!(log["entries"][0]["qname"], "c.example");
+}
+
+#[tokio::test]
+async fn the_clear_routes_refuse_without_a_password_or_a_sign_in_and_change_nothing() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut open = local_config(&upstream);
+    without_credentials(&mut open);
+    let open = site(open).await;
+    let (closed, _upstream) = plain_site().await;
+
+    for site in [&open, &closed] {
+        ask(&site.dns, "a.example.", RecordType::A).await;
+    }
+
+    for path in ["/api/stats/clear", "/api/querylog/clear"] {
+        assert_eq!(open.send(post(path, "{}")).await.status, 403, "{path}");
+        assert_eq!(
+            closed.send_as_is(post(path, "{}")).await.status,
+            401,
+            "{path}"
+        );
+        assert_eq!(closed.send(get(path)).await.status, 405, "{path}");
+    }
+
+    for site in [&open, &closed] {
+        let status = site.send(get("/api/status")).await.json();
+        assert_eq!(status["counters"]["total"], 1);
+    }
+
+    assert!(!open.state.join("stats.json").exists());
+    assert!(!closed.state.join("stats.json").exists());
+    assert_eq!(
+        closed.send(get("/api/querylog")).await.json()["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Statistics saved with `queries` in the hour of each of the days ago.
+fn saved_hours(days_ago: &[(u64, u64)]) -> picoguard::stats_store::SavedStats {
+    use picoguard::stats::Counters;
+    use picoguard::stats_store::SavedStats;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    SavedStats {
+        version: SavedStats::VERSION,
+        since: now - 90 * 86_400,
+        counters: Counters::default(),
+        hours: days_ago
+            .iter()
+            .map(|(days, queries)| (now / 3600 - days * 24, *queries, 0))
+            .collect(),
+        top_queried: Vec::new(),
+        top_blocked: Vec::new(),
+        top_clients: Vec::new(),
+        upstreams: Vec::new(),
+    }
+}
+
+async fn ninety_days(site: &Site) -> Value {
+    site.send(get("/api/history?days=90&offset=0")).await.json()
+}
+
+fn history_total(history: &Value) -> u64 {
+    history["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|day| day["total"].as_u64().unwrap())
+        .sum()
+}
+
+#[tokio::test]
+async fn the_retention_set_on_the_page_applies_at_once_and_goes_back_to_the_config_file() {
+    let (site, _upstream) = plain_site().await;
+    let settings_file = site.state.join(settings::FILE_NAME);
+    site.dns.pipeline.stats().set_retention(90);
+    site.dns
+        .pipeline
+        .restore_stats(&saved_hours(&[(60, 40), (3, 7)]));
+
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(
+        settings["stats"],
+        serde_json::json!({"retention_days": 30, "from": "file"})
+    );
+    let history = ninety_days(&site).await;
+    assert_eq!(history["retention_days"], 90);
+    assert_eq!(history_total(&history), 47);
+    assert_eq!(history["days"].as_array().unwrap().len(), 90);
+
+    let page = site
+        .send(post(
+            "/api/settings",
+            "{\"stats\": {\"retention_days\": 7}}",
+        ))
+        .await;
+
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(
+        page.json()["stats"],
+        serde_json::json!({"retention_days": 7, "from": "page"})
+    );
+    let history = ninety_days(&site).await;
+    assert_eq!(history["retention_days"], 7);
+    assert_eq!(history["days"].as_array().unwrap().len(), 7);
+    assert_eq!(history_total(&history), 7);
+    let written: Value = serde_json::from_slice(&std::fs::read(&settings_file).unwrap()).unwrap();
+    assert_eq!(written["stats"], serde_json::json!({"retention_days": 7}));
+
+    let longer = site
+        .send(post(
+            "/api/settings",
+            "{\"stats\": {\"retention_days\": 90}}",
+        ))
+        .await;
+    assert_eq!(longer.status, 200);
+    let history = ninety_days(&site).await;
+    assert_eq!(history["days"].as_array().unwrap().len(), 90);
+    assert_eq!(history_total(&history), 7, "what was dropped stays dropped");
+
+    let unchanged = std::fs::read(&settings_file).unwrap();
+    let again = site
+        .send(post(
+            "/api/settings",
+            "{\"stats\": {\"retention_days\": 90}}",
+        ))
+        .await;
+    assert_eq!(again.status, 200);
+    assert_eq!(std::fs::read(&settings_file).unwrap(), unchanged);
+
+    let reset = site.send(post("/api/settings", "{\"stats\": null}")).await;
+    assert_eq!(reset.status, 200);
+    assert_eq!(
+        reset.json()["stats"],
+        serde_json::json!({"retention_days": 30, "from": "file"})
+    );
+    let history = ninety_days(&site).await;
+    assert_eq!(history["retention_days"], 30);
+    assert_eq!(history["days"].as_array().unwrap().len(), 30);
+    let written: Value = serde_json::from_slice(&std::fs::read(&settings_file).unwrap()).unwrap();
+    assert!(written.get("stats").is_none(), "{written}");
+}
+
+#[tokio::test]
+async fn a_retention_the_page_does_not_offer_is_refused_and_changes_nothing() {
+    let (site, _upstream) = plain_site().await;
+
+    for body in [
+        "{\"stats\": {\"retention_days\": 14}}",
+        "{\"stats\": {\"retention_days\": 0}}",
+        "{\"stats\": {\"retention_days\": 91}}",
+    ] {
+        let reply = site.send(post("/api/settings", body)).await;
+
+        assert_eq!(reply.status, 400, "{body}: {}", reply.body);
+        assert_eq!(
+            reply.json()["error"],
+            "stats.retention_days must be 1, 7, 30 or 90"
+        );
+    }
+
+    for body in [
+        "{\"stats\": {}}",
+        "{\"stats\": {\"retention_days\": \"7\"}}",
+        "{\"stats\": {\"retention_days\": 7, \"top_k\": 5}}",
+        "{\"stats\": 7}",
+    ] {
+        let reply = site.send(post("/api/settings", body)).await;
+
+        assert_eq!(reply.status, 400, "{body}: {}", reply.body);
+    }
+
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(settings["stats"]["from"], "file");
+    assert!(!site.state.join(settings::FILE_NAME).exists());
 }

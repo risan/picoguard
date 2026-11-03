@@ -6,6 +6,7 @@
 use serde::Serialize;
 
 use crate::config::{LimitsConfig, StatsConfig};
+use crate::stats::HISTORY_BYTES;
 
 const MIB: usize = 1024 * 1024;
 
@@ -45,7 +46,9 @@ pub fn fixed_bytes(limits: &LimitsConfig, stats: &StatsConfig) -> usize {
 }
 
 pub fn stats_bytes(stats: &StatsConfig) -> usize {
-    stats.query_log_entries * QUERY_LOG_ENTRY_BYTES + 3 * stats.top_k * TOP_ENTRY_BYTES
+    stats.query_log_entries * QUERY_LOG_ENTRY_BYTES
+        + 3 * stats.top_k * TOP_ENTRY_BYTES
+        + HISTORY_BYTES
 }
 
 pub fn cache_bytes(max_bytes: usize) -> usize {
@@ -105,6 +108,25 @@ mod tests {
         assert_eq!(steady_bytes(10_000, 400, &lists), 10_000 + 500 + 1500);
         assert_eq!(estimate(10_000, 400, &lists), 10_000 + 500 + 1500 + 4000);
         assert_eq!(estimate(10_000, 400, &[]), 10_500);
+    }
+
+    #[test]
+    fn the_stats_estimate_counts_the_ninety_day_ring_whatever_the_retention() {
+        let empty = StatsConfig {
+            query_log_entries: 1,
+            top_k: 1,
+            ..StatsConfig::default()
+        };
+        let short = StatsConfig {
+            retention_days: 1,
+            ..empty.clone()
+        };
+
+        assert_eq!(
+            stats_bytes(&empty),
+            QUERY_LOG_ENTRY_BYTES + 3 * TOP_ENTRY_BYTES + 90 * 24 * 24
+        );
+        assert_eq!(stats_bytes(&short), stats_bytes(&empty));
     }
 
     #[test]

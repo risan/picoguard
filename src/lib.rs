@@ -1,3 +1,4 @@
+pub mod atomic;
 pub mod budget;
 pub mod cache;
 pub mod config;
@@ -19,6 +20,7 @@ pub mod services;
 pub mod settings;
 pub mod stage;
 pub mod stats;
+pub mod stats_store;
 pub mod update;
 pub mod upstream;
 pub mod web;

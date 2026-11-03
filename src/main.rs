@@ -18,6 +18,7 @@ use picoguard::settings::{self, Loaded};
 use picoguard::stage::{
     INSTALLER_DIR, MAX_BINARY_BYTES, RELEASE_DOWNLOAD_URL, StageSetup, StageTiming, Stager,
 };
+use picoguard::stats_store::{SAVE_INTERVAL, StatsSaver};
 use picoguard::update::{self, Build, CheckTiming, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
@@ -26,9 +27,12 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/picoguard/picoguard.toml";
-/// After SIGTERM or SIGINT: how long the refresh in progress and the snapshot writer may take
-/// to finish before the process exits anyway.
+/// After SIGTERM or SIGINT: how long the refresh in progress, the snapshot writer and the
+/// statistics save may take to finish before the process exits anyway.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// The end of `SHUTDOWN_WAIT` kept for the statistics, so a stalled download cannot take the
+/// whole allowance and leave them unsaved.
+const STATS_SAVE_RESERVE: Duration = Duration::from_secs(2);
 
 const USAGE: &str = "\
 Usage: picoguard [OPTIONS]
@@ -420,6 +424,12 @@ fn serve(loaded: Loaded) -> Result<(), String> {
         )
         .await?;
         let pipeline = Pipeline::new(&config, scheduler.policy())?;
+        let stats_saver = Arc::new(if config.stats.persist {
+            StatsSaver::open(config.state.dir.clone())
+        } else {
+            StatsSaver::disabled()
+        });
+        stats_saver.load(&pipeline);
         let listeners = Listeners::bind(&config.server)?;
         let status_page = if config.web.enabled {
             Some(WebListeners::bind(&config.web)?)
@@ -458,6 +468,7 @@ fn serve(loaded: Loaded) -> Result<(), String> {
             let web = Web::new(
                 &config,
                 Arc::clone(&pipeline),
+                Arc::clone(&stats_saver),
                 scheduler.policy(),
                 scheduler.control(),
                 Arc::clone(&updates),
@@ -483,14 +494,16 @@ fn serve(loaded: Loaded) -> Result<(), String> {
             updates,
             CheckTiming::default(),
         );
-        server::spawn(listeners, pipeline, &config);
+        tokio::spawn(Arc::clone(&stats_saver).run(Arc::clone(&pipeline), SAVE_INTERVAL));
+        server::spawn(listeners, Arc::clone(&pipeline), &config);
 
         stop_signals.received().await;
         log::info!("stopping");
         let _ = stop_refreshing.send(());
 
         let deadline = Instant::now() + SHUTDOWN_WAIT;
-        if tokio::time::timeout_at(deadline, &mut refreshing)
+        let lists_deadline = deadline - STATS_SAVE_RESERVE;
+        if tokio::time::timeout_at(lists_deadline, &mut refreshing)
             .await
             .is_err()
         {
@@ -498,9 +511,17 @@ fn serve(loaded: Loaded) -> Result<(), String> {
             refreshing.abort();
         }
 
-        let writer_wait = deadline.saturating_duration_since(Instant::now());
+        let writer_wait = lists_deadline.saturating_duration_since(Instant::now());
         if !store.drain(writer_wait).await {
             log::warn!("the snapshot writer did not finish in time");
+        }
+
+        let saver_wait = deadline.saturating_duration_since(Instant::now());
+        if tokio::time::timeout(saver_wait, stats_saver.save_if_changed(&pipeline))
+            .await
+            .is_err()
+        {
+            log::warn!("the statistics were not saved in time");
         }
 
         Ok(deadline)

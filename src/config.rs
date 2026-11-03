@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::filter::compile::DEFAULT_SLOW_RULE_BUDGET;
 use crate::password::PasswordHash;
 use crate::scheduler::normalized_name;
+use crate::stats::{DEFAULT_RETENTION_DAYS, RETENTION_CHOICES};
 use crate::upstream::Upstreams;
 
 const UPSTREAM_SCHEMES: [&str; 4] = ["https://", "tls://", "udp://", "tcp://"];
@@ -875,6 +876,10 @@ impl WebConfig {
 pub struct StatsConfig {
     pub query_log_entries: usize,
     pub top_k: usize,
+    /// Whether statistics are saved to `stats.json` in the state folder and read back at start.
+    pub persist: bool,
+    /// How long the hourly history is kept: 1, 7, 30 or 90.
+    pub retention_days: u32,
 }
 
 impl Default for StatsConfig {
@@ -882,6 +887,8 @@ impl Default for StatsConfig {
         StatsConfig {
             query_log_entries: 1000,
             top_k: 50,
+            persist: true,
+            retention_days: DEFAULT_RETENTION_DAYS,
         }
     }
 }
@@ -894,7 +901,13 @@ impl StatsConfig {
             MAX_QUERY_LOG_ENTRIES,
         )?;
 
-        in_range("stats.top_k", self.top_k, MAX_TOP_K)
+        in_range("stats.top_k", self.top_k, MAX_TOP_K)?;
+
+        if !RETENTION_CHOICES.contains(&self.retention_days) {
+            return invalid("stats.retention_days must be 1, 7, 30 or 90");
+        }
+
+        Ok(())
     }
 }
 
@@ -1158,6 +1171,8 @@ mod tests {
             [stats]
             query_log_entries = 200
             top_k = 20
+            persist = false
+            retention_days = 90
 
             [state]
             dir = "/tmp/picoguard"
@@ -1185,6 +1200,8 @@ mod tests {
         assert_eq!(config.lists[1].refresh_hours, 24);
         assert_eq!(config.stats.query_log_entries, 200);
         assert_eq!(config.stats.top_k, 20);
+        assert!(!config.stats.persist);
+        assert_eq!(config.stats.retention_days, 90);
         assert_eq!(config.allowlists.len(), 1);
         assert_eq!(config.cache.max_ttl, 3600);
         assert!(!config.cache.optimistic);
@@ -1449,6 +1466,14 @@ mod tests {
             ),
             ("[stats]\ntop_k = 0", "stats.top_k must be > 0"),
             ("[stats]\ntop_k = 1001", "stats.top_k must be <= 1000"),
+            (
+                "[stats]\nretention_days = 0",
+                "stats.retention_days must be 1, 7, 30 or 90",
+            ),
+            (
+                "[stats]\nretention_days = 14",
+                "stats.retention_days must be 1, 7, 30 or 90",
+            ),
             (
                 "[web]\nquery_log_entries = 10",
                 "unknown field `query_log_entries`",

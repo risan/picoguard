@@ -188,10 +188,12 @@ async fn the_estimate_covers_full_stats_a_full_cache_and_real_lists() {
         let config = StatsConfig {
             query_log_entries,
             top_k,
+            ..StatsConfig::default()
         };
         let (stats, bytes) = fill_stats(StatsSettings {
             query_log_entries,
             top_k,
+            ..StatsSettings::default()
         });
         let reserved = memory::stats_bytes(&config);
         println!(

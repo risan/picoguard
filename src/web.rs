@@ -47,10 +47,12 @@ use crate::scheduler::{
 };
 use crate::server::bind_tcp;
 use crate::settings::{
-    CacheSettings, ChangeError, ListRole, PageChange, SaveError, UpstreamSettings,
+    CacheSettings, ChangeError, ListRole, PageChange, SaveError, StatsPageSettings,
+    UpstreamSettings,
 };
 use crate::stage::{Refused, Stager};
-use crate::stats::{Counters, HourlyBucket, QueryLogEntry, TopEntry};
+use crate::stats::{Counters, DailyBucket, HourlyBucket, QueryLogEntry, TopEntry};
+use crate::stats_store::{SaveStatus, StatsSaver};
 use crate::update::{Tag, UpdateView, Updates, parse_tag};
 
 mod auth;
@@ -72,6 +74,9 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 const MIN_PAUSE_MINUTES: u32 = 1;
 const MAX_PAUSE_MINUTES: u32 = 24 * 60;
 const DEFAULT_QUERY_LOG_LIMIT: usize = 100;
+const HISTORY_DAYS: [u32; 3] = [7, 30, 90];
+/// The furthest time zone from UTC is 14 hours east.
+const MAX_OFFSET_MINUTES: i32 = 14 * 60;
 const PASSWORD_NEEDED: &str = "set web.user and web.password_hash (or web.password) to use this";
 const NOT_A_DOMAIN_NAME: &str = "not a domain name";
 const HIDDEN_LIST_ERROR: &str = "the last refresh failed (set a password to see why)";
@@ -79,6 +84,7 @@ const HIDDEN_LIST_ERROR: &str = "the last refresh failed (set a password to see 
 /// Everything the handlers read or change.
 pub struct Web {
     pipeline: Arc<Pipeline>,
+    stats_saver: Arc<StatsSaver>,
     policy: Arc<Policy>,
     lists: Arc<ListControl>,
     updates: Arc<Updates>,
@@ -96,6 +102,7 @@ impl Web {
     pub fn new(
         config: &Config,
         pipeline: Arc<Pipeline>,
+        stats_saver: Arc<StatsSaver>,
         policy: Arc<Policy>,
         lists: Arc<ListControl>,
         updates: Arc<Updates>,
@@ -113,6 +120,7 @@ impl Web {
 
         Ok(Web {
             pipeline,
+            stats_saver,
             policy,
             lists,
             updates,
@@ -227,6 +235,7 @@ async fn serve_connection(
 enum Read {
     Page,
     Status,
+    History,
     QueryLog,
     Lists,
     Rules,
@@ -242,6 +251,8 @@ enum Change {
     Resume,
     RefreshLists,
     ClearCache,
+    ClearStats,
+    ClearQueryLog,
     Install,
     Login,
     Logout,
@@ -281,6 +292,7 @@ impl Route {
             "/api/services" => Some(Route::Read(Read::Services)),
             "/" => Some(Route::Read(Read::Page)),
             "/api/status" => Some(Route::Read(Read::Status)),
+            "/api/history" => Some(Route::Read(Read::History)),
             "/api/querylog" => Some(Route::Read(Read::QueryLog)),
             "/api/lists" => Some(Route::Read(Read::Lists)),
             "/api/pause" => Some(Route::Change(Change::Pause)),
@@ -291,6 +303,8 @@ impl Route {
             "/api/lists/remove" => Some(Route::Change(Change::RemoveList)),
             "/api/lists/reset" => Some(Route::Change(Change::ResetLists)),
             "/api/cache/clear" => Some(Route::Change(Change::ClearCache)),
+            "/api/stats/clear" => Some(Route::Change(Change::ClearStats)),
+            "/api/querylog/clear" => Some(Route::Change(Change::ClearQueryLog)),
             "/api/update" => Some(Route::Change(Change::Install)),
             "/api/login" => Some(Route::Change(Change::Login)),
             "/api/logout" => Some(Route::Change(Change::Logout)),
@@ -322,7 +336,7 @@ impl Route {
                 Read::QueryLog | Read::Rules | Read::Explain | Read::Settings | Read::Services,
             )
             | Route::Change(_) => true,
-            Route::Read(Read::Page | Read::Status | Read::Lists) => false,
+            Route::Read(Read::Page | Read::Status | Read::History | Read::Lists) => false,
         }
     }
 }
@@ -486,6 +500,8 @@ impl Web {
                     &StatusView {
                         version: env!("CARGO_PKG_VERSION"),
                         update: self.update_view(),
+                        since: snapshot.since,
+                        retention_days: self.pipeline.stats().retention_days(),
                         counters: &snapshot.counters,
                         blocked_percent: blocked_percent(&snapshot.counters),
                         hourly: &snapshot.hourly,
@@ -511,9 +527,23 @@ impl Web {
                                 .collect()
                         }),
                         cache: is_open.then(|| self.pipeline.cache_size()),
+                        stats_saving: is_open.then(|| self.stats_saver.status()),
                         lists: self.list_views(),
                         generation: view.generation,
                         pause: self.pause_view(),
+                    },
+                ))
+            }
+
+            Read::History => {
+                let (days, utc_offset_seconds) = history_params(query)?;
+                let stats = self.pipeline.stats();
+
+                Ok(json(
+                    StatusCode::OK,
+                    &HistoryView {
+                        days: stats.daily(days, utc_offset_seconds),
+                        retention_days: stats.retention_days(),
                     },
                 ))
             }
@@ -658,6 +688,12 @@ impl Web {
                     block: settings.services.as_deref().unwrap_or(&file.services.block),
                     from: Source::of(&settings.services),
                 },
+                stats: StatsSetting {
+                    retention_days: settings
+                        .stats
+                        .map_or(file.stats.retention_days, |stats| stats.retention_days),
+                    from: Source::of(&settings.stats),
+                },
                 memory: self.lists.memory(),
             },
         )
@@ -711,6 +747,25 @@ impl Web {
                     cleared: self.pipeline.clear_cache(),
                 },
             )),
+
+            Change::ClearStats => {
+                self.pipeline.clear_stats();
+                let saved = self.stats_saver.save_if_changed(&self.pipeline).await;
+
+                Ok(json(
+                    StatusCode::OK,
+                    &StatsClearedView {
+                        cleared: true,
+                        save_error: saved.err().map(|error| error.to_string()),
+                    },
+                ))
+            }
+
+            Change::ClearQueryLog => {
+                self.pipeline.stats().clear_query_log();
+
+                Ok(json(StatusCode::OK, &QueryLogClearedView { cleared: true }))
+            }
 
             Change::Install => {
                 let version = install_version(body).ok_or_else(|| {
@@ -866,7 +921,7 @@ impl Web {
                 let request = settings_request(body).ok_or_else(|| {
                     Rejection::new(
                         StatusCode::BAD_REQUEST,
-                        "send an object of upstream, cache, rewrites, safe_search and services",
+                        "send an object of upstream, cache, rewrites, safe_search, services and stats",
                     )
                 })?;
 
@@ -878,6 +933,7 @@ impl Web {
                         .map(|rewrites| rewrites.map(|list| list.iter().map(normalized).collect())),
                     safe_search: request.safe_search,
                     services: request.services,
+                    stats: request.stats,
                 };
                 self.lists
                     .change_settings(&self.pipeline, change)
@@ -1382,6 +1438,8 @@ struct SettingsRequest {
     safe_search: Option<Option<bool>>,
     #[serde(default, deserialize_with = "set_or_reset")]
     services: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "set_or_reset")]
+    stats: Option<Option<StatsPageSettings>>,
 }
 
 /// Like `rule_request`, the first byte must open an object.
@@ -1436,6 +1494,35 @@ fn save_rejection(error: &SaveError) -> Rejection {
     Rejection::new(status, error.to_string())
 }
 
+/// The days (7, 30 or 90) and the viewer's offset from UTC in seconds, from `days=` and
+/// `offset=` (minutes east of UTC, none for UTC, cut to the zones that exist).
+fn history_params(query: Option<&str>) -> Result<(u32, i32), Rejection> {
+    let mut days = None;
+    let mut offset_minutes = 0;
+
+    for pair in query.unwrap_or_default().split('&') {
+        if let Some(value) = pair.strip_prefix("days=") {
+            days = value
+                .parse()
+                .ok()
+                .filter(|days| HISTORY_DAYS.contains(days));
+        } else if let Some(value) = pair.strip_prefix("offset=") {
+            offset_minutes = value.parse::<i32>().map_err(|_| {
+                Rejection::new(
+                    StatusCode::BAD_REQUEST,
+                    "offset must be the minutes east of UTC",
+                )
+            })?;
+        }
+    }
+
+    let days =
+        days.ok_or_else(|| Rejection::new(StatusCode::BAD_REQUEST, "days must be 7, 30 or 90"))?;
+    let offset_minutes = offset_minutes.clamp(-MAX_OFFSET_MINUTES, MAX_OFFSET_MINUTES);
+
+    Ok((days, offset_minutes * 60))
+}
+
 /// The `name` of the query, normalized; `None` when missing or not a domain name. The value is
 /// used as sent: a valid name never needs percent-encoding, so a `%` or `+` makes it invalid.
 fn name_param(query: Option<&str>) -> Option<String> {
@@ -1480,6 +1567,7 @@ struct SettingsView<'a> {
     rewrites: RewritesSetting<'a>,
     safe_search: SafeSearchSetting,
     services: ServicesSetting<'a>,
+    stats: StatsSetting,
     /// The estimate of the whole process and the budget it is admitted against (plan D6).
     memory: Memory,
 }
@@ -1517,6 +1605,12 @@ struct ServicesSetting<'a> {
 }
 
 #[derive(Serialize)]
+struct StatsSetting {
+    retention_days: u32,
+    from: Source,
+}
+
+#[derive(Serialize)]
 struct ExplainView {
     name: String,
     /// `rewritten`, `blocked`, `allowed` or `none`.
@@ -1546,6 +1640,26 @@ struct RefreshView {
 #[derive(Serialize)]
 struct ClearedView {
     cleared: usize,
+}
+
+#[derive(Serialize)]
+struct StatsClearedView {
+    cleared: bool,
+    /// Why the cleared statistics could not be written to their file at once; they are
+    /// written again with the next hourly save.
+    save_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct QueryLogClearedView {
+    cleared: bool,
+}
+
+#[derive(Serialize)]
+struct HistoryView {
+    /// Oldest first; the last day is today in the viewer's time zone.
+    days: Vec<DailyBucket>,
+    retention_days: u32,
 }
 
 /// A top list is a Space-Saving summary: counts may be too high by up to `max_error`.
@@ -1736,6 +1850,10 @@ struct QueryLogView {
 struct StatusView<'a> {
     version: &'static str,
     update: UpdateView,
+    /// Unix seconds: the start, or the last clear, that the counters and lists count from.
+    since: u64,
+    /// How many days the history keeps, so the page knows which ranges it can offer.
+    retention_days: u32,
     counters: &'a Counters,
     /// Of answered queries, blocked by a request or a response rule; one decimal.
     blocked_percent: f64,
@@ -1755,6 +1873,9 @@ struct StatusView<'a> {
     upstreams: Option<Vec<UpstreamView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache: Option<CacheSize>,
+    /// Left out with the top lists: a failed write names a path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats_saving: Option<SaveStatus>,
     lists: Vec<ListView>,
     generation: u64,
     pause: PauseView,
@@ -1813,6 +1934,7 @@ mod tests {
         Web::new(
             config,
             Pipeline::new(config, Arc::clone(&policy)).unwrap(),
+            Arc::new(StatsSaver::disabled()),
             policy,
             lists,
             updates,

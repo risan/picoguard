@@ -19,6 +19,7 @@ use picoguard::policy::Policy;
 use picoguard::scheduler::ListControl;
 use picoguard::settings::{Saved, Settings};
 use picoguard::stage::{StageSetup, StageTiming, Stager};
+use picoguard::stats_store::StatsSaver;
 use picoguard::update::{Build, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
@@ -118,6 +119,7 @@ fn start(parts: Parts) -> (SocketAddr, Config) {
     let web = Web::new(
         &parts.config,
         parts.pipeline,
+        Arc::new(StatsSaver::disabled()),
         parts.policy,
         parts.lists,
         parts.updates,

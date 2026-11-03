@@ -549,20 +549,30 @@ does not. These changes cut the rest. Do the ones you want. Reboot at the end.
 
 ### What picoguard writes
 
-- **No query log, no statistics file.** The status page and the query log live in memory and are
-  lost on restart.
+- **No query log.** The query log lives in memory and is lost on restart.
+- **Statistics.** The counters, the history for the chart (30 days by default), the top lists and
+  the upstream counts are saved to `/var/lib/picoguard/stats.json` (usually tens of KB, at most
+  about 1.4 MB). It is written at most once an hour and only if something changed, once more when
+  picoguard stops (a restart, an update, a reboot), and when you press Clear statistics. It is
+  written whole, to a temporary file that is then renamed. A power cut loses at most the last
+  hour. An idle board writes nothing.
 - **List copies.** When a list changes, picoguard writes one copy of it (about 8 bytes per rule, so
   a few MB for all lists) to `/var/lib/picoguard`. It writes to a temporary file and renames it.
   If a list did not change, nothing is written. Normally that means a few writes per day at most.
-- **Zero writes.** Set this to stop even those writes:
+- **Zero writes.** Set these to stop even those writes:
 
   ```toml
   [state]
   persist_lists = false
+
+  [stats]
+  persist = false
   ```
 
   The lists then live in memory only, and picoguard downloads them again at every start. If the
-  internet is down at boot, there is no blocking until it is back.
+  internet is down at boot, there is no blocking until it is back. The statistics start empty at
+  every start. Each switch is separate: keep `[stats] persist` on if you want the history and
+  turn off only the lists.
 - **Check it.** The number of bytes written by picoguard since it started:
 
   ```sh

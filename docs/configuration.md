@@ -22,7 +22,7 @@ What you change on the status page is saved in `settings.json` in `[state] dir`
 (`/var/lib/picoguard/settings.json` by default), never in this file: picoguard cannot write
 `/etc/picoguard`. Today that is the Block and Allow rules from the query log, the upstream servers
 and bootstrap addresses, the cache settings, the block lists and allowlists, the DNS rewrites,
-SafeSearch and the blocked services (below).
+SafeSearch, the blocked services and how long the statistics history is kept (below).
 
 - A value saved from the page wins over the same value in this file. The page's rules join your
   `rules`; they never replace them.
@@ -51,6 +51,7 @@ comes from (`"from": "page"` or `"file"`), and nothing of `[web]`:
  "rewrites": {"entries": [], "from": "file"},
  "safe_search": {"on": false, "from": "file"},
  "services": {"block": [], "from": "file"},
+ "stats": {"retention_days": 30, "from": "file"},
  "memory": {"estimate_bytes": 26535936, "budget_bytes": 50331648}}
 ```
 
@@ -83,8 +84,8 @@ file** goes back to this file's values.
   the cache is checked together with the services of that change, and passing the budget answers
   409 "the blocked services and a cache of 16.0 MB would pass the memory budget: ...".
 
-`POST /api/settings` takes any of `upstream`, `cache`, `rewrites`, `safe_search` and
-`services`. A value sets it, `null` goes back to this file. The body may be up to 64 KiB. It
+`POST /api/settings` takes any of `upstream`, `cache`, `rewrites`, `safe_search`, `services`
+and `stats`. A value sets it, `null` goes back to this file. The body may be up to 64 KiB. It
 answers the same as `GET`, 400 with the reason for a value that is refused, 409 as above or for
 blocked services that would pass the memory budget, 502 when the catalog of services cannot be
 downloaded or a service's rules cannot be used, or 503 when the file cannot be saved; in every refusal nothing changes.
@@ -94,10 +95,29 @@ downloaded or a service's rules cannot be used, or 503 when the file cannot be s
  "cache": null,
  "rewrites": [{"name": "nas.lan", "answer": "192.168.1.10"}, {"name": "*.nas.lan", "answer": "nas.lan"}],
  "safe_search": true,
- "services": ["tiktok"]}
+ "services": ["tiktok"],
+ "stats": {"retention_days": 90}}
 ```
 
 A change that leaves the saved values as they are writes nothing.
+
+### Statistics retention from the page
+
+The Settings tab's Statistics card sets how long the history is kept: 1, 7, 30 or 90 days, the
+same values as [`[stats] retention_days`](#stats) (any other value answers 400 "stats.retention_days
+must be 1, 7, 30 or 90"). Saved from the page it is written to `settings.json` as
+`"stats": {"retention_days": 90}` and wins over this file; **Use the config file** removes it.
+The key is left out of the file until it is set, so a `settings.json` without it still reads
+in an older picoguard after a rollback; one with it is refused whole by a version that does not
+know it (it then starts on the config file alone).
+
+- It applies at once. Shortening it drops the older hours for good: lengthening it again does not
+  bring them back.
+- It is read before `stats.json` is, so a value of 90 from the page keeps 60-day-old hours that
+  a file value of 30 would have dropped at start.
+- The card also shows whether saving is on, when `stats.json` was last written and why the last
+  write failed, and has the **Clear statistics** button
+  ([below](#statistics-history-and-clearing)).
 
 ### Rewrites and SafeSearch from the page
 
@@ -206,7 +226,7 @@ added from the page. The estimate is:
 ```
 estimate = 6 MiB                                    the idle process (binary, runtime, threads)
          + pending_bytes + tcp_max_connections x tcp_queue_bytes     buffers under load
-         + query_log_entries x 352 + 3 x top_k x 336                 the stats, when full
+         + query_log_entries x 352 + 3 x top_k x 336 + 51,840        the stats, when full
          + cache max_bytes x 1.25                                    the cache, when full
          + the memory of every list in force                         heap_bytes of each
          + the largest list's compile again                          a refresh builds a new copy
@@ -584,8 +604,8 @@ can pause blocking for a set time, refresh the lists, clear the DNS cache, block
 and check which rule decides a name.
 
 Without a password the page is read-only and limited: it shows totals and list status only. The
-query log, pause, resume, refresh, Clear cache, `/api/rules`, `/api/rules/remove`,
-`/api/explain` and `/api/settings` answer 403 ("set web.user and web.password_hash (or web.password) to use this"),
+query log, pause, resume, refresh, Clear cache, Clear statistics, Clear query log, `/api/rules`,
+`/api/rules/remove`, `/api/explain` and `/api/settings` answer 403 ("set web.user and web.password_hash (or web.password) to use this"),
 and the page says so. The top lists, the
 upstream servers and the cache size are left out of `/api/status`, and the page hides them.
 picoguard logs one warning at start when no password is set. Every device that may open the page
@@ -597,7 +617,9 @@ order; the card sorts them by answered count, highest first. Each entry has `lab
 written in `[upstream] servers`, or the `[local] resolver` address), `kind` (`upstream` or `local`),
 `answered`, `failed` and `avg_ms` (`null` before the first answer).
 
-- The counts start at picoguard's start. A try that is repeated on the next server counts as a
+- The counts start at picoguard's start, or at the last Clear statistics, and are saved with the
+  statistics ([`[stats]`](#stats)), so they carry over a restart; a saved count of a server that
+  is no longer configured is dropped. A try that is repeated on the next server counts as a
   failure on the first one, and the repeat counts on the second as its own answer or failure.
 - picoguard's own lookups count too: list downloads and the update check, and device-name lookups
   (on the local entry).
@@ -615,6 +637,42 @@ confirmation, then calls `POST /api/cache/clear`, which empties the cache, frees
 answers `{"cleared": n}` with the number of answers removed; the card shows "Cache cleared (n
 answers)". The next query for any name goes upstream. Lookups already under way are not stopped,
 and their answers are cached when they land.
+
+### Statistics, history and clearing
+
+`GET /api/status` has `since` (Unix seconds: the start, or the last clear, that the counters,
+top lists and Upstreams card count from), `retention_days` and `hourly`, the last 24 hourly
+buckets (UTC hours, oldest first). With a password it also has
+`"stats_saving": {"enabled": true, "last_saved": 1730600000, "error": null}`: `enabled` is
+`[stats] persist`, `last_saved` the Unix time of the last write of `stats.json` since start (`null`
+before one) and `error` why the last write failed, until one works.
+
+`GET /api/history?days=7|30|90&offset=<minutes>` is open without a password like the counters. It
+answers one bucket per local day, oldest first, the last being today:
+
+```json
+{"days": [{"day_start": 1730592000, "total": 1520, "blocked": 301}], "retention_days": 30}
+```
+
+- `day_start` is the Unix second of local midnight. `offset` is the viewer's minutes east of UTC
+  (the page sends `-new Date().getTimezoneOffset()`); without it the days are UTC days; a value
+  beyond 14 hours is cut to 14 hours. One offset serves the whole range, so a day with a clock
+  change in it is split an hour off.
+- `days` above the retention is cut to it (`retention_days` says what it is). Any other `days`, or
+  an `offset` that is not a whole number, answers 400.
+
+The dashboard's chart has the buttons 24 hours, 7 days, 30 days and 90 days, each with its totals
+(queries, blocked, percent); a range above the retention is disabled. 24 hours uses `hourly`; the
+others ask `/api/history` when picked and then at most once a minute. The last choice is
+remembered in the browser. The history holds hours, so no names are in it: the top lists
+stay "since the last clear" and are not per range.
+
+Two buttons clear, both signed-in only and both asking for confirmation:
+
+| Route | Body | Does |
+|---|---|---|
+| `POST /api/stats/clear` | `{}` | Zeroes the counters, the history, the three top lists and every upstream tally (the local resolver's too), starts `since` again, and writes `stats.json` at once. Answers `{"cleared": true, "save_error": null}`; `save_error` says why the file could not be written (the next hourly write tries again). Device names and the query log stay. |
+| `POST /api/querylog/clear` | `{}` | Empties the query log, which is in memory only. Answers `{"cleared": true}`. The statistics stay. |
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -724,19 +782,38 @@ it.
 
 ## `[stats]`
 
-Statistics and the query log live in memory only and are lost on restart.
+The query log lives in memory only and is lost on restart. The counters, the hourly history,
+the top lists and what each upstream has answered are saved to `stats.json` in the
+[`[state] dir`](#state): once an hour while something changed, once on a clean stop, and when
+they are cleared. They are read back at start, so they count since the last clear and not since
+the start. A missing, damaged, too large or other-version file is ignored (the reason is
+logged) and picoguard starts with empty statistics.
+
+- `stats.json` is written whole, to `stats.json.part` and then renamed, readable by picoguard's
+  user only. It holds counters, hours with queries inside the retention, the top lists (names as
+  hex), the upstream tallies and `since`; never the query log or device names.
+- It is written at most once an hour, and only when its content differs from what was last
+  written or read; an idle board writes nothing. A clean stop (SIGTERM or SIGINT: a restart, an
+  update, a reboot) writes it once more within the 10 second stop allowance; a power cut or a
+  kill loses at most the last hour.
+- A write that fails (a read-only or full state folder) is logged, shown to the signed-in page
+  and in `stats_saving.error`, and tried again at the next hour. picoguard keeps running.
+- `persist = false` turns all of it off: nothing is read or written, and nothing else changes.
+- The statistics are also cleared from the page (see [`[web]`](#statistics-history-and-clearing)).
 
 | Key | Default | Meaning |
 |---|---|---|
 | `query_log_entries` | `1000` | Recent queries kept (up to 100000). Allocated in full. |
 | `top_k` | `50` | Entries in each top list (up to 1000). Allocated in full. |
+| `persist` | `true` | Save the statistics to `stats.json` and read them back at start. `false`: the file is never read or written, and the statistics start empty at every start. |
+| `retention_days` | `30` | How long the hourly history is kept: `1`, `7`, `30` or `90` days. The Settings tab can set it instead ([above](#statistics-retention-from-the-page)); a value from the page wins. The ring for 90 days (51,840 bytes) is always allocated; a save builds the file in memory for a moment: a few tens of KB with the defaults and a busy 30 days, up to about 1.4 MB at `top_k = 1000` with the longest names and 90 days. |
 
 ## `[state]`
 
 | Key | Default | Meaning |
 |---|---|---|
-| `dir` | `"/var/lib/picoguard"` | Where list snapshots and the settings saved from the status page (`settings.json`) go. The systemd unit creates this directory (`StateDirectory=picoguard`). |
-| `persist_lists` | `true` | Keep a copy of each changed list on disk. This is the only routine write; `settings.json` is written only when you save a change on the page. When `false`, no list is written; lists live in memory and download again at every start. |
+| `dir` | `"/var/lib/picoguard"` | Where list snapshots, the settings saved from the status page (`settings.json`) and the saved statistics (`stats.json`) go. The systemd unit creates this directory (`StateDirectory=picoguard`). |
+| `persist_lists` | `true` | Keep a copy of each changed list on disk, only when the list changed. With [`[stats] persist`](#stats) (`stats.json`, at most once an hour and only when the statistics changed) these are the only routine writes; `settings.json` is written only when you save a change on the page. When `false`, no list is written; lists live in memory and download again at every start. |
 
 ## `[update]`
 

@@ -7,16 +7,15 @@
 //! keeps the reason for the page. Only a save from the page writes the file, whole, through a
 //! `.part` file and a rename.
 
-use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::net::IpAddr;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::atomic;
 use crate::config::{CacheConfig, Config, ConfigError, ListConfig, Rewrite};
 use crate::pipeline::Pipeline;
 use crate::release;
@@ -27,7 +26,6 @@ use crate::scheduler::{
 use crate::upstream::Upstreams;
 
 pub const FILE_NAME: &str = "settings.json";
-const PART_NAME: &str = "settings.json.part";
 pub const MAX_FILE_BYTES: usize = 256 * 1024;
 const VERSION: u32 = 1;
 
@@ -62,6 +60,10 @@ pub struct Settings {
     /// The ids of the blocked services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub services: Option<Vec<String>>,
+    /// Left out of the file until set, so a file without it is still read by v0.5.0 after a
+    /// rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<StatsPageSettings>,
 }
 
 impl Default for Settings {
@@ -75,6 +77,7 @@ impl Default for Settings {
             rewrites: None,
             safe_search: None,
             services: None,
+            stats: None,
         }
     }
 }
@@ -107,6 +110,13 @@ impl CacheSettings {
             optimistic: config.optimistic,
         }
     }
+}
+
+/// How many days of statistics are kept; one of the config file's choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatsPageSettings {
+    pub retention_days: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +206,10 @@ impl Settings {
 
         if let Some(services) = &self.services {
             config.services.block.clone_from(services);
+        }
+
+        if let Some(stats) = &self.stats {
+            config.stats.retention_days = stats.retention_days;
         }
     }
 }
@@ -417,9 +431,11 @@ impl Saved {
         let bytes = encode(settings)?;
         let dir = self.file_config.state.dir.clone();
         let before_rename = self.before_rename.lock().unwrap().clone();
-        let written = tokio::task::spawn_blocking(move || write(&dir, &bytes, before_rename))
-            .await
-            .unwrap_or_else(|_| Err(io::Error::other("the write was stopped")));
+        let written = tokio::task::spawn_blocking(move || {
+            atomic::write_file(&dir, FILE_NAME, &bytes, before_rename.as_deref())
+        })
+        .await
+        .unwrap_or_else(|_| Err(io::Error::other("the write was stopped")));
         self.can_save.store(written.is_ok(), Ordering::Relaxed);
 
         match written {
@@ -438,8 +454,8 @@ impl Saved {
     }
 }
 
-/// A change of the page's upstream, cache, rewrite, SafeSearch and blocked services settings.
-/// For each key,
+/// A change of the page's upstream, cache, rewrite, SafeSearch, blocked services and
+/// statistics settings. For each key,
 /// `None` leaves it as it is, `Some(None)` goes back to the config file's value and
 /// `Some(Some(value))` sets it.
 #[derive(Debug, Default)]
@@ -449,6 +465,7 @@ pub struct PageChange {
     pub rewrites: Option<Option<Vec<Rewrite>>>,
     pub safe_search: Option<Option<bool>>,
     pub services: Option<Option<Vec<String>>>,
+    pub stats: Option<Option<StatsPageSettings>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +490,7 @@ struct Prepared {
     cache: Option<CacheConfig>,
     rewrites: Option<Arc<Rewrites>>,
     safe_search: bool,
+    retention_days: Option<u32>,
 }
 
 /// Builds the change, saves it, then puts it in force, all under the settings lock. Whatever
@@ -493,11 +511,13 @@ pub(crate) async fn apply(
     let rewrites = change.rewrites.unwrap_or_else(|| settings.rewrites.clone());
     let safe_search = change.safe_search.unwrap_or(settings.safe_search);
     let services = change.services.unwrap_or_else(|| settings.services.clone());
+    let stats = change.stats.unwrap_or(settings.stats);
     if upstream == settings.upstream
         && cache == settings.cache
         && rewrites == settings.rewrites
         && safe_search == settings.safe_search
         && services == settings.services
+        && stats == settings.stats
     {
         let _ = answer.send(Ok(()));
 
@@ -537,6 +557,7 @@ pub(crate) async fn apply(
         rewrites: std::mem::replace(&mut settings.rewrites, rewrites),
         safe_search: std::mem::replace(&mut settings.safe_search, safe_search),
         services: std::mem::replace(&mut settings.services, services),
+        stats: std::mem::replace(&mut settings.stats, stats),
     };
     let prepared = match prepare(saved.file_config(), &settings, &old, pipeline).await {
         Ok(prepared) if services_change => {
@@ -579,6 +600,7 @@ pub(crate) async fn apply(
             settings.rewrites = old.rewrites;
             settings.safe_search = old.safe_search;
             settings.services = old.services;
+            settings.stats = old.stats;
             let _ = answer.send(Err(error));
 
             return;
@@ -600,6 +622,10 @@ pub(crate) async fn apply(
         .rewrites
         .map(|rewrites| pipeline.replace_rewrites(rewrites));
     pipeline.set_safe_search(prepared.safe_search);
+    if let Some(days) = prepared.retention_days {
+        pipeline.stats().set_retention(days);
+    }
+
     control.set_cache_max_bytes(new_max_bytes);
     let _ = answer.send(Ok(()));
 
@@ -616,6 +642,7 @@ struct Replaced {
     rewrites: Option<Vec<Rewrite>>,
     safe_search: Option<bool>,
     services: Option<Vec<String>>,
+    stats: Option<StatsPageSettings>,
 }
 
 /// Whether `a` and `b` switch on the same services, in any order.
@@ -641,6 +668,10 @@ async fn prepare(
     let new_cache = cache_in_force(&old.cache) != cache_in_force(&settings.cache);
     let new_rewrites =
         rewrites_in_force(&old.rewrites, file) != rewrites_in_force(&settings.rewrites, file);
+    let retention_in_force = |page: &Option<StatsPageSettings>| {
+        page.map_or(file.stats.retention_days, |stats| stats.retention_days)
+    };
+    let new_retention = retention_in_force(&old.stats) != retention_in_force(&settings.stats);
     let shared = Arc::clone(pipeline.upstreams());
     let file = file.clone();
     let settings = settings.clone();
@@ -673,6 +704,7 @@ async fn prepare(
             cache: new_cache.then_some(config.cache),
             rewrites,
             safe_search: config.safe_search,
+            retention_days: new_retention.then_some(config.stats.retention_days),
         })
     })
     .await
@@ -725,48 +757,10 @@ fn encode(settings: &Settings) -> Result<Vec<u8>, SaveError> {
     Ok(bytes)
 }
 
-/// The file appears whole or not at all (as `stage::write_whole`). Once it is renamed in place
-/// it is saved: a failed sync of the folder after that is only logged.
-fn write(dir: &Path, bytes: &[u8], before_rename: Option<BeforeRename>) -> io::Result<()> {
-    let part = dir.join(PART_NAME);
-    match fs::remove_file(&part) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-            return Err(error);
-        }
-
-        _ => {}
-    }
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&part)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
-
-    if let Err(error) = written {
-        let _ = fs::remove_file(&part);
-
-        return Err(error);
-    }
-
-    if let Some(hook) = before_rename {
-        hook();
-    }
-
-    fs::rename(&part, dir.join(FILE_NAME))?;
-
-    if let Err(error) = File::open(dir).and_then(|dir| dir.sync_all()) {
-        log::warn!("saved settings, but cannot sync {}: {error}", dir.display());
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
+    use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -827,6 +821,7 @@ mod tests {
             }]),
             safe_search: Some(true),
             services: Some(vec!["tiktok".to_string()]),
+            stats: Some(StatsPageSettings { retention_days: 90 }),
             ..Settings::default()
         };
 
@@ -845,6 +840,9 @@ mod tests {
         assert_eq!(config.rewrites, settings.rewrites.unwrap());
         assert!(config.safe_search);
         assert_eq!(config.services.block, ["tiktok"]);
+        assert_eq!(config.stats.retention_days, 90);
+        assert_eq!(config.stats.top_k, file.stats.top_k);
+        assert_eq!(config.stats.persist, file.stats.persist);
         assert_eq!(config.lists, file.lists);
         assert_eq!(config.web, file.web);
     }
@@ -1177,6 +1175,20 @@ mod tests {
                 },
                 "services.block[0] must be 1 to 64 visible characters",
             ),
+            (
+                Settings {
+                    stats: Some(StatsPageSettings { retention_days: 14 }),
+                    ..Settings::default()
+                },
+                "stats.retention_days must be 1, 7, 30 or 90",
+            ),
+            (
+                Settings {
+                    stats: Some(StatsPageSettings { retention_days: 0 }),
+                    ..Settings::default()
+                },
+                "stats.retention_days must be 1, 7, 30 or 90",
+            ),
         ];
 
         for (settings, expected) in cases {
@@ -1205,11 +1217,38 @@ mod tests {
             settings
         );
         assert!(text.contains("\n  \"version\": 1,\n"), "{text}");
-        for absent in ["upstream", "cache", "lists", "rewrites", "services"] {
+        for absent in [
+            "upstream", "cache", "lists", "rewrites", "services", "stats",
+        ] {
             assert!(!text.contains(absent), "{absent}: {text}");
         }
 
         assert_eq!(bytes.capacity(), bytes.len());
+    }
+
+    #[test]
+    fn the_retention_is_saved_under_stats_and_a_file_without_it_leaves_the_config_value() {
+        let settings = Settings {
+            stats: Some(StatsPageSettings { retention_days: 7 }),
+            ..Settings::default()
+        };
+        let text = String::from_utf8(encode(&settings).unwrap()).unwrap();
+        let mut file = Config::default();
+        file.stats.retention_days = 90;
+
+        assert!(
+            text.contains("\"stats\": {\n    \"retention_days\": 7\n  }"),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Settings>(&text).unwrap(), settings);
+        assert_eq!(merged(&file, &settings).unwrap().stats.retention_days, 7);
+        assert_eq!(
+            merged(&file, &Settings::default())
+                .unwrap()
+                .stats
+                .retention_days,
+            90
+        );
     }
 
     #[test]
@@ -1223,6 +1262,10 @@ mod tests {
             (
                 "{\"version\": 1, \"page_rules\": [{\"name\": \"a.example\", \"action\": \"block\", \"x\": 1}]}",
                 "unknown field `x`",
+            ),
+            (
+                "{\"version\": 1, \"stats\": {\"retention_days\": 7, \"top_k\": 5}}",
+                "unknown field `top_k`",
             ),
             ("{\"safe_search\": true}", "missing field `version`"),
         ] {
@@ -1333,7 +1376,7 @@ mod tests {
         file.web.user = Some("admin".to_string());
         file.web.password = Some("s3cret-password".to_string());
         let saved = Saved::new(file.clone(), Settings::default(), Some("bad".to_string()));
-        fs::write(dir.path().join(PART_NAME), "stale").unwrap();
+        fs::write(dir.path().join("settings.json.part"), "stale").unwrap();
         let settings = Settings {
             page_rules: vec![rule("ads.example", Action::Block)],
             ..Settings::default()
@@ -1347,7 +1390,7 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(!dir.path().join(PART_NAME).exists());
+        assert!(!dir.path().join("settings.json.part").exists());
         let text = fs::read_to_string(&path).unwrap();
         assert!(
             !text.contains("s3cret") && !text.contains("admin"),

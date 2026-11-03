@@ -233,6 +233,14 @@ impl Tally {
         self.failed += 1;
     }
 
+    pub fn plus(self, other: Tally) -> Tally {
+        Tally {
+            answered: self.answered + other.answered,
+            failed: self.failed + other.failed,
+            answer_micros: self.answer_micros.saturating_add(other.answer_micros),
+        }
+    }
+
     /// Milliseconds with one decimal, over the answers only.
     pub fn average_ms(&self) -> Option<f64> {
         if self.answered == 0 {
@@ -437,6 +445,22 @@ impl Upstreams {
         self.servers
             .iter()
             .map(|server| (server.label.as_str(), *server.tally.lock().unwrap()))
+    }
+
+    /// Puts `tally` on the server labelled `label`; false when there is none.
+    pub fn restore_tally(&self, label: &str, tally: Tally) -> bool {
+        let Some(server) = self.servers.iter().find(|server| server.label == label) else {
+            return false;
+        };
+        *server.tally.lock().unwrap() = tally;
+
+        true
+    }
+
+    pub fn clear_tallies(&self) {
+        for server in &self.servers {
+            *server.tally.lock().unwrap() = Tally::default();
+        }
     }
 
     fn carry_tallies(&self, replaced: &Upstreams) {

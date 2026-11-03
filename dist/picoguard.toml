@@ -164,6 +164,11 @@ format = "adblock"
 # allocated in full.
 # query_log_entries = 1000
 # top_k = 50
+# Save the counters, hourly history and top lists to stats.json in the state
+# directory (once an hour if changed, and on a clean stop). false: never.
+# persist = true
+# Hours of history kept: 1, 7, 30 or 90.
+# retention_days = 30
 
 # [state]
 # dir = "/var/lib/picoguard"
