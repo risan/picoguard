@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::harness::{
-    Running, a_record, answering_upstream, ask, config_for, fake_upstream, name, reply_to,
-    start_with_policy,
+    Running, a_record, answering_upstream, ask, config_for, fake_upstream, fake_upstream_with_gate,
+    name, reply_to, start_with_policy,
 };
 use common::http::ListServer;
 use common::release::{Files, TARGET, scratch, test_key};
@@ -3992,12 +3992,26 @@ async fn the_file_is_written_only_when_a_setting_in_force_changes() {
     }
 }
 
-/// Upstreams that answer after a while, so queries are still waiting when the servers change.
-async fn slow_upstreams() -> [common::harness::FakeUpstream; 2] {
-    [
-        answering_upstream([1, 1, 1, 1], Duration::from_millis(1500)).await,
-        answering_upstream([2, 2, 2, 2], Duration::from_millis(1500)).await,
-    ]
+/// An upstream that holds every reply until its gate opens, so a query is waiting for as long as
+/// the test wants and not for a time that a slow machine can use up.
+async fn gated_upstream(
+    address: [u8; 4],
+) -> (
+    common::harness::FakeUpstream,
+    tokio::sync::watch::Sender<bool>,
+) {
+    fake_upstream_with_gate(
+        move |query| {
+            let owner = query.queries[0].name().to_string();
+
+            vec![(
+                Duration::ZERO,
+                reply_to(query, vec![a_record(&owner, 300, address)]),
+            )]
+        },
+        |_| true,
+    )
+    .await
 }
 
 fn ask_later(site: &Site, name: String) -> tokio::task::JoinHandle<hickory_proto::op::Message> {
@@ -4008,60 +4022,56 @@ fn ask_later(site: &Site, name: String) -> tokio::task::JoinHandle<hickory_proto
 
 #[tokio::test]
 async fn queries_waiting_through_upstream_changes_all_get_their_answer() {
-    let upstreams = slow_upstreams().await;
-    let mut config = local_config(&upstreams[0]);
-    // A busy test machine must not turn a slow answer into a timeout.
-    config.upstream.timeout_ms = 6000;
+    let (first, first_gate) = gated_upstream([1, 1, 1, 1]).await;
+    let (second, second_gate) = gated_upstream([2, 2, 2, 2]).await;
+    let upstreams = [&first, &second];
+    let mut config = local_config(&first);
+    // Held queries must outlast a busy test machine.
+    config.upstream.timeout_ms = 60_000;
     let site = site(config).await;
     let generations = || site.dns.pipeline.upstreams().generations();
     let mut waiting = Vec::new();
 
     for round in 0..2 {
-        waiting.extend((0..5).map(|index| ask_later(&site, format!("r{round}-{index}.example."))));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let next = upstream_body(&[udp(&upstreams[(round + 1) % 2])]);
+        waiting.push((
+            round,
+            (0..5)
+                .map(|index| ask_later(&site, format!("r{round}-{index}.example.")))
+                .collect::<Vec<_>>(),
+        ));
+        until("the five queries reached their upstream", || {
+            upstreams[round].count() == 5
+        })
+        .await;
+        let next = upstream_body(&[udp(upstreams[(round + 1) % 2])]);
 
         assert_eq!(site.send(post("/api/settings", &next)).await.status, 200);
     }
 
     assert_eq!(generations(), 3);
-    let refused = site
-        .send(post("/api/settings", &upstream_body(&[udp(&upstreams[1])])))
-        .await;
+    let again = upstream_body(&[udp(&second)]);
+    let refused = site.send(post("/api/settings", &again)).await;
     assert_eq!(refused.status, 409, "{}", refused.body);
     assert_eq!(
         refused.json()["error"],
         "the previous upstream change is still finishing; try again in a few seconds"
     );
 
-    for round in 2..8 {
-        waiting.extend((0..3).map(|index| ask_later(&site, format!("r{round}-{index}.example."))));
-        let next = upstream_body(&[udp(&upstreams[round % 2])]);
-        loop {
-            let reply = site.send(post("/api/settings", &next)).await;
-            assert!(generations() <= 3);
-            if reply.status == 200 {
-                break;
-            }
+    first_gate.send(true).unwrap();
+    second_gate.send(true).unwrap();
+    for (round, queries) in waiting {
+        let address = format!("{0}.{0}.{0}.{0}", round + 1);
+        for query in queries {
+            let reply = query.await.unwrap();
 
-            assert_eq!(reply.status, 409, "{}", reply.body);
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(reply.response_code, ResponseCode::NoError);
+            assert_eq!(reply.answers.len(), 1);
+            assert_eq!(reply.answers[0].data.to_string(), address);
         }
     }
 
-    let total = waiting.len();
-    for query in waiting {
-        let reply = query.await.unwrap();
-        assert_eq!(reply.response_code, ResponseCode::NoError);
-        assert_eq!(reply.answers.len(), 1);
-    }
-
-    assert_eq!(total, 28);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while generations() > 1 {
-        assert!(Instant::now() < deadline, "replaced pools are still alive");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until("the replaced pools finished", || generations() == 1).await;
+    assert_eq!(site.send(post("/api/settings", &again)).await.status, 200);
 }
 
 fn cache_body(min_ttl: u32) -> String {
