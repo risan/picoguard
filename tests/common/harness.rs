@@ -145,6 +145,19 @@ pub fn reply_to(query: &Message, answers: Vec<Record>) -> Message {
     reply
 }
 
+/// Polls `condition` every 5 ms for up to 5 s and panics naming `what` when it never holds.
+pub async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if condition() {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    panic!("{what} did not happen within 5 s");
+}
+
 pub fn name(text: &str) -> Name {
     Name::from_ascii(text).unwrap()
 }

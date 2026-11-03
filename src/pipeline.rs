@@ -442,6 +442,11 @@ impl Pipeline {
         }))
     }
 
+    /// How many clients wait for the answer of an upstream lookup right now.
+    pub fn waiting_clients(&self) -> usize {
+        self.inflight.lock().unwrap().waiting
+    }
+
     /// What the pipeline records about the queries it answers.
     pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
@@ -2497,6 +2502,37 @@ mod tests {
 
         assert_eq!(counters(&pipeline).errors, 0);
         assert!(first_tally(&pipeline).failed >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_servfail_reply_to_a_refresh_keeps_the_stale_entry() {
+        let (address, queries) = scripted_dns(|request| {
+            let reply = ResponseSpec {
+                rcode: rcode::SERVFAIL,
+                ..ResponseSpec::default()
+            };
+
+            answering(
+                request,
+                reply.bytes(&QuerySpec::new("stale.example.", RecordType::A)),
+            )
+        })
+        .await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(address), Arc::new(Policy::new())).unwrap();
+        let spec = QuerySpec::new("stale.example.", RecordType::A);
+        insert_aged(&pipeline, &spec, [1, 1, 1, 1], 300, 301).unwrap();
+        let mut out = Vec::new();
+
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+        wait_for_refreshes(&pipeline).await;
+
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert_eq!(pipeline.cache.lock().unwrap().len(), 1);
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut out), Quick::Replied);
+        assert_eq!(answer_addresses(&out), ["1.1.1.1"]);
+        assert_eq!(answer_ttls(&out), [30]);
+        assert_eq!(counters(&pipeline).errors, 0);
     }
 
     #[tokio::test]
