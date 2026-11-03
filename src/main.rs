@@ -468,6 +468,7 @@ fn serve(loaded: Loaded) -> Result<(), String> {
             let web = Web::new(
                 &config,
                 Arc::clone(&pipeline),
+                Arc::clone(&stats_saver),
                 scheduler.policy(),
                 scheduler.control(),
                 Arc::clone(&updates),

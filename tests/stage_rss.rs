@@ -23,6 +23,7 @@ use picoguard::lists::{Downloader, Names};
 use picoguard::scheduler::{ListControl, Scheduler, Timing};
 use picoguard::settings::{Saved, Settings};
 use picoguard::stage::{StageSetup, StageTiming, Stager};
+use picoguard::stats_store::StatsSaver;
 use picoguard::update::{Build, Latest, Updates};
 use picoguard::upstream::tls::Tls;
 use picoguard::web::{self, Web, WebListeners};
@@ -201,6 +202,7 @@ async fn a_list_refresh_during_an_update_download_stays_within_the_memory_limit(
             Web::new(
                 &config,
                 Arc::clone(&dns.pipeline),
+                Arc::new(StatsSaver::disabled()),
                 Arc::clone(&policy),
                 Arc::clone(&control),
                 updates,

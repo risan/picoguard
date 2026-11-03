@@ -49,20 +49,36 @@ impl Daemon {
             .unwrap();
     }
 
-    async fn status(&self) -> serde_json::Value {
+    async fn send(&self, method: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
         let mut stream = TcpStream::connect(("127.0.0.1", self.web_port))
             .await
             .unwrap();
         let request = format!(
-            "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {ADMIN}\r\n\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Basic {ADMIN}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
         );
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut reply = String::new();
         stream.read_to_string(&mut reply).await.unwrap();
         let (head, body) = reply.split_once("\r\n\r\n").expect("a reply with a body");
-        assert!(head.starts_with("HTTP/1.1 200"), "{reply}");
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
 
-        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error}: {reply}"))
+        (
+            status,
+            serde_json::from_str(body).unwrap_or_else(|error| panic!("{error}: {reply}")),
+        )
+    }
+
+    async fn get(&self, path: &str) -> serde_json::Value {
+        let (status, body) = self.send("GET", path, "").await;
+        assert_eq!(status, 200, "{body}");
+
+        body
+    }
+
+    async fn status(&self) -> serde_json::Value {
+        self.get("/api/status").await
     }
 
     async fn total(&self) -> u64 {
@@ -229,4 +245,114 @@ async fn the_status_page_shows_the_restored_history() {
         .map(|bucket| bucket["total"].as_u64().unwrap())
         .sum();
     assert!(queries >= asked, "{queries} < {asked}");
+}
+
+fn now_hour() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 3600
+}
+
+fn history_total(history: &serde_json::Value) -> u64 {
+    history["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|day| day["total"].as_u64().unwrap())
+        .sum()
+}
+
+/// The config file says 30 days. The page says 90, and the saved hour of 60 days ago is read
+/// under the page's value, then kept by the next save. Setting 7 on the page drops it for
+/// good, and the 7 survives a restart.
+#[tokio::test]
+async fn a_retention_from_the_page_is_in_force_when_the_saved_history_is_read() {
+    let state = State::new("persist-retention");
+    let old_hour = now_hour() - 60 * 24;
+    let recent_hour = now_hour() - 2 * 24;
+    fs::write(
+        state.stats_file(),
+        MINIMAL.replace(
+            "\"hours\":[]",
+            &format!("\"hours\":[[{old_hour},40,0],[{recent_hour},5,1]]"),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        state.0.join("settings.json"),
+        "{\"version\":1,\"stats\":{\"retention_days\":90}}",
+    )
+    .unwrap();
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+
+    let first = start("persist-retention-1", &state.0, &upstream, true);
+    let history = first.get("/api/history?days=90&offset=0").await;
+    assert_eq!(history["retention_days"], 90);
+    assert!(history_total(&history) >= 45, "{history}");
+    first.stop().await;
+
+    let hours = state.saved()["hours"].clone();
+    assert!(
+        hours
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hour| hour[0] == old_hour && hour[1] == 40),
+        "{hours}"
+    );
+    let second = start("persist-retention-2", &state.0, &upstream, true);
+    let (status, settings) = second
+        .send(
+            "POST",
+            "/api/settings",
+            "{\"stats\": {\"retention_days\": 7}}",
+        )
+        .await;
+    assert_eq!(status, 200, "{settings}");
+    let history = second.get("/api/history?days=90&offset=0").await;
+    assert_eq!(history["retention_days"], 7);
+    let total = history_total(&history);
+    assert!((5..40).contains(&total), "{history}");
+    second.stop().await;
+
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.0.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(written["stats"]["retention_days"], 7);
+    let hours = state.saved()["hours"].clone();
+    assert!(
+        hours
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hour| hour[0] != old_hour),
+        "{hours}"
+    );
+    let third = start("persist-retention-3", &state.0, &upstream, true);
+    let history = third.get("/api/history?days=90&offset=0").await;
+    assert_eq!(history["retention_days"], 7);
+    assert_eq!(history["days"].as_array().unwrap().len(), 7);
+    assert!(history_total(&history) >= total);
+    third.stop().await;
+}
+
+/// Without a page value the config file's 30 days apply, and a 60-day-old hour is not kept.
+#[tokio::test]
+async fn without_a_page_value_the_config_files_retention_drops_older_hours() {
+    let state = State::new("persist-retention-config");
+    let old_hour = now_hour() - 60 * 24;
+    fs::write(
+        state.stats_file(),
+        MINIMAL.replace("\"hours\":[]", &format!("\"hours\":[[{old_hour},40,0]]")),
+    )
+    .unwrap();
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+
+    let daemon = start("persist-retention-config", &state.0, &upstream, true);
+    let history = daemon.get("/api/history?days=90&offset=0").await;
+
+    assert_eq!(history["retention_days"], 30);
+    assert!(history_total(&history) < 40, "{history}");
+    daemon.stop().await;
 }
