@@ -1,3 +1,4 @@
+pub mod atomic;
 pub mod budget;
 pub mod cache;
 pub mod config;

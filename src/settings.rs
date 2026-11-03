@@ -7,16 +7,15 @@
 //! keeps the reason for the page. Only a save from the page writes the file, whole, through a
 //! `.part` file and a rename.
 
-use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::net::IpAddr;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::atomic;
 use crate::config::{CacheConfig, Config, ConfigError, ListConfig, Rewrite};
 use crate::pipeline::Pipeline;
 use crate::release;
@@ -27,7 +26,6 @@ use crate::scheduler::{
 use crate::upstream::Upstreams;
 
 pub const FILE_NAME: &str = "settings.json";
-const PART_NAME: &str = "settings.json.part";
 pub const MAX_FILE_BYTES: usize = 256 * 1024;
 const VERSION: u32 = 1;
 
@@ -417,9 +415,11 @@ impl Saved {
         let bytes = encode(settings)?;
         let dir = self.file_config.state.dir.clone();
         let before_rename = self.before_rename.lock().unwrap().clone();
-        let written = tokio::task::spawn_blocking(move || write(&dir, &bytes, before_rename))
-            .await
-            .unwrap_or_else(|_| Err(io::Error::other("the write was stopped")));
+        let written = tokio::task::spawn_blocking(move || {
+            atomic::write_file(&dir, FILE_NAME, &bytes, before_rename.as_deref())
+        })
+        .await
+        .unwrap_or_else(|_| Err(io::Error::other("the write was stopped")));
         self.can_save.store(written.is_ok(), Ordering::Relaxed);
 
         match written {
@@ -725,48 +725,10 @@ fn encode(settings: &Settings) -> Result<Vec<u8>, SaveError> {
     Ok(bytes)
 }
 
-/// The file appears whole or not at all (as `stage::write_whole`). Once it is renamed in place
-/// it is saved: a failed sync of the folder after that is only logged.
-fn write(dir: &Path, bytes: &[u8], before_rename: Option<BeforeRename>) -> io::Result<()> {
-    let part = dir.join(PART_NAME);
-    match fs::remove_file(&part) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-            return Err(error);
-        }
-
-        _ => {}
-    }
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&part)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
-    drop(file);
-
-    if let Err(error) = written {
-        let _ = fs::remove_file(&part);
-
-        return Err(error);
-    }
-
-    if let Some(hook) = before_rename {
-        hook();
-    }
-
-    fs::rename(&part, dir.join(FILE_NAME))?;
-
-    if let Err(error) = File::open(dir).and_then(|dir| dir.sync_all()) {
-        log::warn!("saved settings, but cannot sync {}: {error}", dir.display());
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
+    use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1333,7 +1295,7 @@ mod tests {
         file.web.user = Some("admin".to_string());
         file.web.password = Some("s3cret-password".to_string());
         let saved = Saved::new(file.clone(), Settings::default(), Some("bad".to_string()));
-        fs::write(dir.path().join(PART_NAME), "stale").unwrap();
+        fs::write(dir.path().join("settings.json.part"), "stale").unwrap();
         let settings = Settings {
             page_rules: vec![rule("ads.example", Action::Block)],
             ..Settings::default()
@@ -1347,7 +1309,7 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(!dir.path().join(PART_NAME).exists());
+        assert!(!dir.path().join("settings.json.part").exists());
         let text = fs::read_to_string(&path).unwrap();
         assert!(
             !text.contains("s3cret") && !text.contains("admin"),
