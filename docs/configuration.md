@@ -704,8 +704,9 @@ pays the hash, and the same credentials after it are checked in microseconds.
 
 Wrong passwords are limited per client address. After 5 failed password checks within 15 minutes,
 sign-ins and basic auth from that address answer 429 ("too many attempts, try again later") until
-15 minutes after its last failure. A right password clears the address. picoguard tracks 64
-addresses; when the table is full, the one with the oldest last failure is dropped.
+15 minutes after its last failure. A right password clears the address. All addresses in one
+IPv6 /64 count as one client. picoguard tracks 64 clients; when the table is full, the one with
+the oldest last failure is dropped.
 
 Make a hash with `picoguard --hash-password`. It reads the password from standard input (it asks
 without echo on a terminal) and prints a line to paste into `[web]`:
