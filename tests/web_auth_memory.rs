@@ -2,14 +2,11 @@
 //! failure table is allocated once, and only one right credential is cached. This file has its
 //! own test binary so that the counting allocator sees only this test.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use picoguard::config::Config;
 use picoguard::lists::Names;
@@ -28,39 +25,16 @@ use tokio::net::TcpSocket;
 
 const KEPT_BUDGET_BYTES: usize = 10 * 1024;
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
+use counting::{live, settle};
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// The tests share one allocator, so they must not overlap.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-fn live() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
-
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(50)).await;
-}
 
 /// Everything a `Web` needs, built before anything is measured.
 struct Parts {

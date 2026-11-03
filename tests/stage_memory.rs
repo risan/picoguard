@@ -5,10 +5,8 @@
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -27,53 +25,17 @@ const VERSION: &str = "9.9.9";
 const SHORT_RUNS: usize = 60;
 const LONG_RUNS: usize = 8;
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
+
+use counting::{live, peak_since, reset_peak, settle};
+
+#[global_allocator]
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// The counters are the process's, so the tests take turns: each holds this while it prepares
 /// and measures.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            let live = LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-fn live() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
-
-fn start_measuring() -> usize {
-    let before = live();
-    PEAK_BYTES.store(before, Ordering::Relaxed);
-
-    before
-}
-
-fn peak_since(before: usize) -> usize {
-    PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before)
-}
-
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(50)).await;
-}
 
 fn base(version: &str, file: &str) -> String {
     format!("/download/v{version}/{file}")
@@ -105,7 +67,7 @@ async fn until(what: &str, mut done: impl FnMut() -> bool) {
 /// Stages the release on the server, answers it as the installer with a failure, and returns
 /// the peak and what stayed.
 async fn stage_once(stager: &Arc<Stager>, root: &std::path::Path) -> (usize, usize) {
-    let before = start_measuring();
+    let before = reset_peak();
 
     stager.start(VERSION).unwrap();
     until("waiting", || {
@@ -220,7 +182,7 @@ fn verifying_an_update_peaks_below_a_megabyte() {
         target: Some(TARGET),
         running: env!("CARGO_PKG_VERSION"),
     };
-    let before = start_measuring();
+    let before = reset_peak();
 
     let outcome = verify_update(&root.join("staged"), &root.join("out"), &setup);
 

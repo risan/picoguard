@@ -4,12 +4,10 @@
 //! far above what was measured. This file has its own test binary, with one test, so that the
 //! allocator sees nothing else.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use picoguard::cache::{Cache, CacheKey};
@@ -25,40 +23,17 @@ use picoguard::stats::{Event, QueryResult, Stats, StatsSettings};
 /// What a malloc implementation adds to every block, on top of the size asked for.
 const ALLOCATION_OVERHEAD: usize = 16;
 
-struct Counting;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static LIVE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        LIVE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        LIVE_ALLOCATIONS.fetch_sub(1, Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+use counting::{live, live_allocations};
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// The heap held now, with the allocator's overhead on every block.
 fn held() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-        + LIVE_ALLOCATIONS.load(Ordering::Relaxed) * ALLOCATION_OVERHEAD
+    live() + live_allocations() * ALLOCATION_OVERHEAD
 }
 
 /// A name of 253 characters, the longest, that differs for every `number`.

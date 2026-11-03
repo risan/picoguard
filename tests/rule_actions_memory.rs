@@ -5,11 +5,9 @@
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::http::ListServer;
@@ -25,38 +23,13 @@ use picoguard::settings::{self, Saved, Settings};
 use picoguard::upstream::tls::Tls;
 use tokio::task::JoinHandle;
 
-struct Counting;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-fn grow(bytes: usize) {
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    PEAK.fetch_max(live, Ordering::Relaxed);
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        grow(layout.size());
-
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        grow(new_size);
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+use counting::{live, peak_since, reset_peak};
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 const PAGE_RULES: usize = 500;
 
@@ -89,22 +62,6 @@ const PER_WAITING_CALLER_BYTES: usize = 512;
 
 /// Idle blocking-pool threads made before any baseline; tokio keeps an idle one for 10 s.
 const BLOCKING_THREADS: usize = 16;
-
-fn live() -> usize {
-    LIVE.load(Ordering::Relaxed)
-}
-
-/// Starts a peak measurement; returns the live bytes it counts from.
-fn reset_peak() -> usize {
-    let live = live();
-    PEAK.store(live, Ordering::Relaxed);
-
-    live
-}
-
-fn peak_since(before: usize) -> usize {
-    PEAK.load(Ordering::Relaxed).saturating_sub(before)
-}
 
 /// The live bytes once three reads 50 ms apart agree: drops run on the blocking pool and the
 /// compile worker. Two seconds at most.

@@ -3,9 +3,7 @@
 //! behind. This file has its own test binary so that the counting allocator sees only this
 //! one test.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use picoguard::config::{Config, Rewrite};
 use picoguard::pipeline::Pipeline;
@@ -21,32 +19,13 @@ const TYPICAL_BUDGET: usize = 96 * 1024;
 /// 520,960 bytes.
 const LONGEST_BUDGET: usize = 640 * 1024;
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
+use counting::live;
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-fn live() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 fn rewrite(name: String, answer: String) -> Rewrite {
     Rewrite { name, answer }

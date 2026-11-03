@@ -3,48 +3,20 @@
 //! counting allocator that keeps the highest total, and one test, so nothing else allocates
 //! while it measures.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use picoguard::filter::compile::{CompileError, CompileOptions, CompileWorker};
 use picoguard::filter::engine::CompiledList;
 use picoguard::filter::parse::ListFormat;
 use picoguard::lists::Piece;
 
-struct Counting;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-fn grow(size: usize) {
-    let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
-    PEAK.fetch_max(live, Ordering::Relaxed);
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        grow(layout.size());
-
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    /// Counted as a move: the old and the new block both live until the copy is done.
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        grow(new_size);
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+use counting::{peak_bytes, reset_peak};
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// About 620 KB once compiled: well under the regex size cap, far over the admission below.
 const EXPENSIVE: &str = "||plain.example^\n/\\pL{40}/\n";
@@ -59,8 +31,7 @@ async fn compile(
     text: &str,
 ) -> (Result<Arc<CompiledList>, CompileError>, usize) {
     let options = CompileOptions::new(ListFormat::Adblock, 1000);
-    let before = LIVE.load(Ordering::Relaxed);
-    PEAK.store(before, Ordering::Relaxed);
+    let before = reset_peak();
 
     let compilation = worker.start_within(options, admission_bytes);
     compilation
@@ -72,7 +43,7 @@ async fn compile(
     // the result says why.
     let _ = compilation.pieces.send(Piece::End).await;
     let result = compilation.result().await.map(|compiled| compiled.list);
-    let peak = PEAK.load(Ordering::Relaxed) - before;
+    let peak = peak_bytes() - before;
 
     (result, peak)
 }

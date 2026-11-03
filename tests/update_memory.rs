@@ -3,13 +3,10 @@
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use common::http::ListServer;
 use picoguard::lists::{Downloader, Names};
@@ -23,52 +20,16 @@ const FAILURE_BUDGET_BYTES: usize = 1024;
 const MANY_WORDS_PEAK_BUDGET_BYTES: usize = 1024 * 1024;
 const JSON: Option<&str> = Some("application/json");
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            let live = LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
+use counting::{live, peak_since, reset_peak, settle};
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// The tests share one allocator, so they must not overlap.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-fn live() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
-
-fn start_measuring() -> usize {
-    let before = live();
-    PEAK_BYTES.store(before, Ordering::Relaxed);
-
-    before
-}
-
-fn peak_since(before: usize) -> usize {
-    PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(before)
-}
-
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(50)).await;
-}
 
 fn checker(url: &str) -> Checker {
     let downloader = Downloader::new(
@@ -107,7 +68,7 @@ async fn measure_a_check_against(server: &ListServer, label: &str) {
     warm_up(&url).await;
     let updates = Updates::new(Build::current());
     let mut checker = checker(&url);
-    let before = start_measuring();
+    let before = reset_peak();
 
     let (outcome, _) = checker.check(&updates).await;
     settle().await;
@@ -156,7 +117,7 @@ fn a_failed_check_after_a_good_one_keeps_nothing_more() {
 
         good.check(&updates).await;
         settle().await;
-        let before = start_measuring();
+        let before = reset_peak();
 
         let (outcome, _) = failing.check(&updates).await;
         settle().await;
@@ -182,7 +143,7 @@ fn a_near_limit_answer_of_one_letter_words_stays_within_a_megabyte() {
         warm_up(&url).await;
         let updates = Updates::new(Build::current());
         let mut checker = checker(&url);
-        let before = start_measuring();
+        let before = reset_peak();
 
         let (outcome, _) = checker.check(&updates).await;
         settle().await;

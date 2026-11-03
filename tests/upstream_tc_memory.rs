@@ -1,7 +1,6 @@
 //! A truncated UDP reply must not stay in memory while the TCP retry waits. This file has its
 //! own test binary so that the counting allocator sees only this one test.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,28 +20,13 @@ const LARGE_TRUNCATED_REPLY: usize = 1472;
 const SMALL_TRUNCATED_REPLY: usize = 40;
 const TRUNCATED_FLAGS: [u8; 2] = 0x8380u16.to_be_bytes();
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
+use counting::live;
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 fn query_for(name: &str) -> Vec<u8> {
     let mut message = Message::query();
@@ -99,7 +83,7 @@ async fn bytes_held_while_the_tcp_retry_stalls(reply_size: usize) -> usize {
     };
     let upstreams = Arc::new(Upstreams::plain(server, &upstream, &limits));
     let budget = Budget::new(usize::MAX);
-    let before = LIVE_BYTES.load(Ordering::Relaxed);
+    let before = live();
 
     let queries: Vec<_> = (0..QUERIES)
         .map(|index| {
@@ -118,7 +102,7 @@ async fn bytes_held_while_the_tcp_retry_stalls(reply_size: usize) -> usize {
     }
     tokio::time::sleep(SETTLE).await;
 
-    let held = LIVE_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+    let held = live().saturating_sub(before);
     assert!(
         queries.iter().all(|query| !query.is_finished()),
         "every query must still wait for the TCP answer"

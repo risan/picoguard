@@ -4,10 +4,8 @@
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::http::ListServer;
@@ -26,32 +24,13 @@ const CYCLES: usize = 20;
 const ALLOWANCE: usize = 16 * 1024;
 const RULES: usize = 20_000;
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
+use counting::live;
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-fn live() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 async fn add_and_remove(control: &Arc<ListControl>, url: &str) {
     control

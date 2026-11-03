@@ -1,10 +1,9 @@
 //! Memory held by full stats with long names and a full 90-day history. This file has its own
 //! test binary so that the counting allocator sees only this one test.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use picoguard::dns::wire::Name;
@@ -14,31 +13,13 @@ const BUDGET_BYTES: usize = 512 * 1024;
 /// What a malloc implementation adds to every block, on top of the size asked for.
 const ALLOCATION_OVERHEAD: usize = 16;
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static LIVE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-            LIVE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        LIVE_ALLOCATIONS.fetch_sub(1, Ordering::Relaxed);
-    }
-}
+use counting::{live, live_allocations};
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// 2023-11-14 00:00:00 UTC.
 const START: u64 = 19_675 * 86_400;
@@ -75,8 +56,8 @@ fn record(stats: &Stats, number: usize, text: &str) {
 
 #[test]
 fn full_stats_with_long_names_and_ninety_days_stay_within_the_budget() {
-    let bytes_before = LIVE_BYTES.load(Ordering::Relaxed);
-    let allocations_before = LIVE_ALLOCATIONS.load(Ordering::Relaxed);
+    let bytes_before = live();
+    let allocations_before = live_allocations();
     let time = Arc::new(AtomicU64::new(START));
     let clock = Arc::clone(&time);
     let stats = Stats::with_clock(
@@ -102,8 +83,8 @@ fn full_stats_with_long_names_and_ninety_days_stay_within_the_budget() {
         record(&stats, number, &text);
     }
 
-    let bytes = LIVE_BYTES.load(Ordering::Relaxed) - bytes_before;
-    let allocations = LIVE_ALLOCATIONS.load(Ordering::Relaxed) - allocations_before;
+    let bytes = live() - bytes_before;
+    let allocations = live_allocations() - allocations_before;
     let with_overhead = bytes + allocations * ALLOCATION_OVERHEAD;
     println!(
         "stats memory: {bytes} bytes in {allocations} allocations, {with_overhead} with malloc overhead"
