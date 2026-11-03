@@ -477,7 +477,7 @@ impl Stats {
         let kept_hours = retention_hours(days.min(inner.retention_days));
 
         for hour in inner.hours.iter_mut() {
-            if !is_kept(hour.number, now_hour, kept_hours) {
+            if !within_retention(hour.number, now_hour, kept_hours) {
                 *hour = Hour::default();
             }
         }
@@ -549,7 +549,7 @@ impl Stats {
         let mut hours: Vec<(u64, u64, u64)> = inner
             .hours
             .iter()
-            .filter(|hour| hour.total > 0 && is_kept(hour.number, now_hour, kept_hours))
+            .filter(|hour| hour.total > 0 && within_retention(hour.number, now_hour, kept_hours))
             .map(|hour| (hour.number, hour.total, hour.blocked))
             .collect();
         hours.sort_unstable();
@@ -573,19 +573,34 @@ impl Stats {
 
     /// Puts what `saved` read back from the file in place of what is counted now. Hours
     /// outside the retention or in the future, and names that are not names, are skipped; a
-    /// top list keeps the highest counts that fit.
+    /// top list keeps the highest counts that fit. A file that began after the clock now reads
+    /// came from a clock that was set, so the clock is the one that is behind: nothing is
+    /// "in the future" then.
     pub fn restore(&self, saved: &SavedStats) {
         let now = (self.clock)();
         let now_hour = now / SECONDS_PER_HOUR;
         let mut inner = self.inner.lock().unwrap();
         let kept_hours = retention_hours(inner.retention_days);
 
-        inner.since = saved.since.min(now);
+        // A board without a battery clock can start before the network sets the time. Then the
+        // file is newer than the clock, and its hours are the past, not the future.
+        let clock_is_behind = now < saved.since;
+        let newest_saved = saved.hours.iter().map(|&(number, ..)| number).max();
+        let reference_hour = match newest_saved {
+            Some(newest) if clock_is_behind => now_hour.max(newest),
+            _ => now_hour,
+        };
+
+        inner.since = if clock_is_behind {
+            saved.since
+        } else {
+            saved.since.min(now)
+        };
         inner.counters = saved.counters;
         inner.hours.fill(Hour::default());
 
         for &(number, total, blocked) in &saved.hours {
-            if is_kept(number, now_hour, kept_hours) {
+            if is_kept(number, reference_hour, kept_hours) {
                 inner.hours[number as usize % MAX_HISTORY_HOURS] = Hour {
                     number,
                     total,
@@ -620,7 +635,14 @@ fn retention_hours(days: u32) -> u64 {
 
 /// Whether the hour `number` is not in the future and lies within the last `kept_hours`.
 fn is_kept(number: u64, now_hour: u64, kept_hours: u64) -> bool {
-    number <= now_hour && now_hour - number < kept_hours
+    number <= now_hour && within_retention(number, now_hour, kept_hours)
+}
+
+/// Whether the hour `number` is no older than `kept_hours`. An hour ahead of the clock is kept:
+/// only a restore under a clock that is behind puts one there, and it is the past once the
+/// clock catches up.
+fn within_retention(number: u64, now_hour: u64, kept_hours: u64) -> bool {
+    now_hour.saturating_sub(number) < kept_hours
 }
 
 fn saved_names(top: &TopK<Name>) -> Vec<(String, u64, u64)> {
@@ -1335,7 +1357,7 @@ mod tests {
         let (stats, time) = stats_at(retaining(7), MIDNIGHT + 10 * HOUR);
         let now_hour = time.load(Ordering::Relaxed) / HOUR;
         let mut saved = busy_stats().0.saved();
-        saved.since = u64::MAX;
+        saved.since = MIDNIGHT + 5 * HOUR;
         saved.hours = vec![
             (now_hour, 4, 9),
             (now_hour - 7 * 24, 5, 0),
@@ -1353,7 +1375,7 @@ mod tests {
         stats.restore(&saved);
         let snapshot = stats.snapshot();
 
-        assert_eq!(snapshot.since, time.load(Ordering::Relaxed));
+        assert_eq!(snapshot.since, saved.since);
         assert_eq!(snapshot.hourly[23].total, 4);
         assert_eq!(snapshot.hourly[23].blocked, 4);
         assert_eq!(
@@ -1366,5 +1388,48 @@ mod tests {
             .map(|entry| (entry.key.to_string(), entry.count, entry.max_error))
             .collect();
         assert_eq!(names, [("example".to_string(), 7, 7)]);
+    }
+
+    #[test]
+    fn restore_keeps_a_since_that_is_after_now_in_the_past() {
+        let (stats, time) = stats_at(retaining(7), MIDNIGHT + 10 * HOUR);
+        let now_hour = time.load(Ordering::Relaxed) / HOUR;
+        let mut saved = busy_stats().0.saved();
+        saved.since = MIDNIGHT + 20 * HOUR;
+        saved.hours = vec![(now_hour - 7 * 24, 5, 0), (now_hour + 1, 7, 0)];
+
+        stats.restore(&saved);
+
+        assert_eq!(stats.snapshot().since, saved.since);
+        assert_eq!(stats.saved().hours, [(now_hour + 1, 7, 0)]);
+    }
+
+    #[test]
+    fn a_clock_that_was_behind_at_start_keeps_the_history_and_since() {
+        let (original, original_time) = busy_stats();
+        let saved = original.saved();
+        let (stats, time) = stats_at(small(3, 10), 60);
+
+        stats.restore(&saved);
+        assert_eq!(stats.snapshot().since, saved.since);
+        assert_eq!(stats.saved().hours, saved.hours);
+
+        time.store(original_time.load(Ordering::Relaxed), Ordering::Relaxed);
+
+        assert_eq!(stats.saved().hours, saved.hours);
+        assert_eq!(stats.snapshot().since, saved.since);
+        assert_eq!(stats.snapshot().hourly, original.snapshot().hourly,);
+    }
+
+    #[test]
+    fn a_retention_change_keeps_hours_ahead_of_a_clock_that_is_behind() {
+        let (original, _) = busy_stats();
+        let saved = original.saved();
+        let (stats, _) = stats_at(small(3, 10), 60);
+        stats.restore(&saved);
+
+        stats.set_retention(7);
+
+        assert_eq!(stats.saved().hours, saved.hours);
     }
 }

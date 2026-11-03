@@ -356,3 +356,43 @@ async fn without_a_page_value_the_config_files_retention_drops_older_hours() {
     assert!(history_total(&history) < 40, "{history}");
     daemon.stop().await;
 }
+
+/// A board without a battery clock can start before the network sets the time. The saved file
+/// is then newer than the clock: its history and `since` stay, also in the next save.
+#[tokio::test]
+async fn a_file_newer_than_the_clock_keeps_its_history_and_since() {
+    let state = State::new("persist-clock-behind");
+    let since = now_hour() * 3600 + 3 * 24 * 3600;
+    let ahead_hour = now_hour() + 2 * 24;
+    let older_hour = now_hour() + 24;
+    fs::write(
+        state.stats_file(),
+        MINIMAL.replace("1700000000", &since.to_string()).replace(
+            "\"hours\":[]",
+            &format!("\"hours\":[[{older_hour},40,0],[{ahead_hour},5,1]]"),
+        ),
+    )
+    .unwrap();
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+
+    let daemon = start("persist-clock-behind", &state.0, &upstream, true);
+    assert_eq!(daemon.status().await["since"], since);
+    daemon.ask("a.example.").await;
+    daemon.stop().await;
+
+    let saved = state.saved();
+    assert_eq!(saved["since"], since);
+    let hours = saved["hours"].as_array().unwrap();
+    assert!(
+        hours
+            .iter()
+            .any(|hour| hour[0] == older_hour && hour[1] == 40),
+        "{hours:?}"
+    );
+    assert!(
+        hours
+            .iter()
+            .any(|hour| hour[0] == ahead_hour && hour[1] == 5 && hour[2] == 1),
+        "{hours:?}"
+    );
+}
