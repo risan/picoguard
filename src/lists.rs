@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{
-    ACCEPT, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, HeaderMap,
-    HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
-    TRANSFER_ENCODING, USER_AGENT,
+    ACCEPT, ACCEPT_ENCODING, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
+    HOST, HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
+    LOCATION, TRANSFER_ENCODING, USER_AGENT,
 };
 use http::{Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty};
@@ -319,7 +319,7 @@ async fn look_up(
 
 /// A parsed `http://` or `https://` URL.
 #[derive(Debug, Clone)]
-struct Target {
+pub(crate) struct Target {
     https: bool,
     host: String,
     port: u16,
@@ -328,7 +328,7 @@ struct Target {
 }
 
 impl Target {
-    fn parse(url: &str) -> Result<Target, FetchError> {
+    pub(crate) fn parse(url: &str) -> Result<Target, FetchError> {
         let bad = || FetchError::BadUrl(url.to_string());
         let uri: Uri = url.parse().map_err(|_| bad())?;
         let https = match uri.scheme_str() {
@@ -415,8 +415,13 @@ impl Target {
     }
 }
 
-/// Loopback, private, link-local and unspecified addresses: where a list server must not be
-/// able to send a request from inside the network.
+/// 100.64.0.0/10, which covers Tailscale: a peer's admin page is as private as a LAN host.
+fn is_shared_address_space(address: Ipv4Addr) -> bool {
+    address.octets()[0] == 100 && address.octets()[1] & 0xC0 == 0x40
+}
+
+/// Loopback, private, link-local, unspecified and shared (100.64.0.0/10) addresses: where a
+/// list server must not be able to send a request from inside the network.
 fn is_local_address(address: IpAddr) -> bool {
     match address.to_canonical() {
         IpAddr::V4(address) => {
@@ -424,6 +429,7 @@ fn is_local_address(address: IpAddr) -> bool {
                 || address.is_private()
                 || address.is_link_local()
                 || address.is_unspecified()
+                || is_shared_address_space(address)
         }
 
         IpAddr::V6(address) => {
@@ -762,6 +768,7 @@ fn build_request(
         .header(HOST, target.host_header())
         .header(USER_AGENT, concat!("picoguard/", env!("CARGO_PKG_VERSION")))
         .header(ACCEPT, "*/*")
+        .header(ACCEPT_ENCODING, "identity")
         .header(CONNECTION, "close");
 
     let validators = [
@@ -1468,6 +1475,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_download_asks_for_the_body_uncompressed() {
+        let server = Server::start(|_, _, mut stream| async move {
+            respond(&mut stream, "200 OK", &[], b"||ads.example^\n").await;
+        })
+        .await;
+
+        fetch_body(&local(), &server.url("/"), &Limits::default()).await;
+
+        let request = server.requests.lock().unwrap()[0].clone();
+        assert_eq!(request.headers["accept-encoding"], "identity");
+    }
+
+    #[tokio::test]
     async fn other_statuses_are_errors() {
         let server = Server::start(|_, request, mut stream| async move {
             let status = if request.path == "/missing" {
@@ -1799,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn local_addresses_are_loopback_private_link_local_and_unspecified() {
+    fn local_addresses_are_loopback_private_link_local_shared_and_unspecified() {
         for local in [
             "127.0.0.1",
             "127.1.2.3",
@@ -1816,6 +1836,10 @@ mod tests {
             "fc00::1",
             "::ffff:127.0.0.1",
             "::ffff:192.168.1.1",
+            "100.64.0.1",
+            "100.100.100.100",
+            "100.127.255.255",
+            "::ffff:100.64.0.1",
         ] {
             assert!(is_local_address(local.parse().unwrap()), "{local}");
         }
@@ -1825,7 +1849,8 @@ mod tests {
             "172.15.0.1",
             "172.32.0.1",
             "192.169.0.1",
-            "100.64.0.1",
+            "100.63.255.255",
+            "100.128.0.0",
             "2606:4700::1111",
             "fec0::1",
             "::ffff:8.8.8.8",
@@ -1880,6 +1905,21 @@ mod tests {
             );
             assert_eq!(server.request_count(), 1, "{target}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_a_tailscale_address_is_refused() {
+        let server = redirecting_server("http://100.100.100.100:9/end").await;
+        let mut downloader = downloader(never_resolve());
+        // The test server on 127.0.0.1 has to count as the public first hop.
+        downloader.is_local = |address| {
+            address.to_canonical() != IpAddr::from([127, 0, 0, 1]) && is_local_address(address)
+        };
+
+        let error = fetch_error(&downloader, &server.url("/start"), &quick()).await;
+
+        assert!(matches!(error, FetchError::LocalRedirect(_)), "{error:?}");
+        assert_eq!(server.request_count(), 1);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! Snapshot files: the compiled form of a list on disk (plan D14).
 //!
-//! A snapshot holds the sorted hash arrays of one list, so a restart skips the download and
+//! A snapshot holds the hash sets of one list, so a restart skips the download and
 //! the compile. The file is written only when the list's fingerprint changed, through a
 //! temporary file, `fsync`, rename and a sync of the directory, by a thread of its own.
 //!
@@ -11,12 +11,14 @@
 //! body: fingerprint u128, content_hash u128, compiler_version u32, configured_format u8,
 //!       effective_format u8, max_rules u32, allow_redirects u8, source, etag?, last_modified?,
 //!       counters (u64 each), first_invalid?, regex_failed u64, compile_charge u64,
-//!       6 plain-rule arrays (u64 length, u64 hashes),
-//!       host groups (u32 count; IP text, u64 length, u64 hashes),
+//!       6 plain-rule sets, host groups (u32 count; IP text), host set,
 //!       slow rules (u32 count; flags u8, content types u32, pattern, record types,
 //!       deny-allow names, client and tag keys)
 //! checksum u128   -- xxh3-128 of the body
 //! ```
+//!
+//! A hash set is a u64 length and, when that is not zero, a u8 bucket bit count, the u32 start
+//! of each bucket and of the end (2^bits + 1 of them), and the 6-byte residuals.
 //!
 //! Strings are a u32 length and UTF-8 text. Every length is checked against the limits of
 //! plan D12 before anything is allocated.
@@ -37,12 +39,13 @@ use super::compile::{
     COMPILE_PEAK_BYTES_PER_RULE, COMPILER_VERSION, CompileOptions, Compiled, NAME_OVERHEAD_BYTES,
     SlowRuleBudget, TEXT_BYTE_COST, blocks_a_canary,
 };
-use super::engine::{CompiledList, FAST_KINDS, HostRules, MAX_HOST_GROUPS, SlowRule};
-use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, NetworkRule};
+use super::engine::{CompiledList, FAST_KINDS, HostRules, MAX_HOST_GROUPS, PlainRules, SlowRule};
+use super::hash_set::{HashSet48, MAX_BUCKET_BITS, RESIDUAL_BYTES};
+use super::parse::{ClientSet, Counters, ListFormat, MAX_LINE_BYTES, Modifiers, NetworkRule};
 use super::pattern::too_complex_build_bytes;
 use crate::lists::Validators;
 
-pub const FILE_VERSION: u32 = 5;
+pub const FILE_VERSION: u32 = 6;
 
 const MAGIC: [u8; 8] = *b"PICOSNAP";
 const PREAMBLE_BYTES: u64 = 12;
@@ -406,16 +409,34 @@ impl<W: Write> Encoder<W> {
         Ok(())
     }
 
-    fn u64s(&mut self, values: &[u64]) -> io::Result<()> {
-        self.u64(values.len() as u64)?;
+    fn hash_set<const TAG_BITS: u32>(&mut self, set: &HashSet48<TAG_BITS>) -> io::Result<()> {
+        self.u64(set.len() as u64)?;
+        if set.is_empty() {
+            return Ok(());
+        }
 
-        let mut buffer = [0u8; 8192];
-        for chunk in values.chunks(buffer.len() / 8) {
-            for (slot, value) in buffer.as_chunks_mut::<8>().0.iter_mut().zip(chunk) {
-                slot.copy_from_slice(&value.to_le_bytes());
+        self.u8(set.bucket_bits() as u8)?;
+
+        let mut buffer = [0u8; IO_CHUNK_BYTES];
+        for chunk in set.starts().chunks(buffer.len() / 4) {
+            for (slot, start) in buffer.as_chunks_mut::<4>().0.iter_mut().zip(chunk) {
+                slot.copy_from_slice(&start.to_le_bytes());
             }
 
-            self.raw(&buffer[..chunk.len() * 8])?;
+            self.raw(&buffer[..chunk.len() * 4])?;
+        }
+
+        for chunk in set.residuals().chunks(buffer.len() / RESIDUAL_BYTES) {
+            for (slot, residual) in buffer
+                .as_chunks_mut::<RESIDUAL_BYTES>()
+                .0
+                .iter_mut()
+                .zip(chunk)
+            {
+                *slot = *residual;
+            }
+
+            self.raw(&buffer[..chunk.len() * RESIDUAL_BYTES])?;
         }
 
         Ok(())
@@ -436,12 +457,13 @@ impl<W: Write> Encoder<W> {
         self.u8(flags)?;
         self.u32(rule.restricted_types)?;
         self.text(&rule.pattern)?;
-        self.u16s(&rule.dns_permitted)?;
-        self.u16s(&rule.dns_restricted)?;
-        self.texts(&rule.denyallow)?;
-        self.texts(&rule.restricted_clients.entries())?;
+        let modifiers = rule.modifiers();
+        self.u16s(&modifiers.dns_permitted)?;
+        self.u16s(&modifiers.dns_restricted)?;
+        self.texts(&modifiers.denyallow)?;
+        self.texts(&modifiers.restricted_clients.entries())?;
 
-        self.texts(&rule.restricted_ctags)
+        self.texts(&modifiers.restricted_ctags)
     }
 }
 
@@ -475,8 +497,8 @@ fn encode<W: Write>(snapshot: &Snapshot, mut out: W) -> io::Result<()> {
     let list = &snapshot.list;
     encoder.u64(list.regex_failed)?;
     encoder.u64(list.compile_charge as u64)?;
-    for array in &list.fast {
-        encoder.u64s(array)?;
+    for set in &list.fast {
+        encoder.hash_set(set)?;
     }
 
     encoder.u32(list.hosts.ips.len() as u32)?;
@@ -484,7 +506,7 @@ fn encode<W: Write>(snapshot: &Snapshot, mut out: W) -> io::Result<()> {
         encoder.text(&ip.to_string())?;
     }
 
-    encoder.u64s(&list.hosts.entries)?;
+    encoder.hash_set(&list.hosts.entries)?;
 
     encoder.u32(list.slow.len() as u32)?;
     for slow in &list.slow {
@@ -502,6 +524,9 @@ fn encode<W: Write>(snapshot: &Snapshot, mut out: W) -> io::Result<()> {
 
 /// The least bytes one host group and one slow rule take in the file: a length field that
 /// promises more of them than the file holds is refused before anything is reserved.
+/// A multiple of 4 and of 6, the sizes of the entries that are moved in chunks.
+const IO_CHUNK_BYTES: usize = 8184;
+
 const MIN_HOST_GROUP_BYTES: u64 = 4 + 2;
 const MIN_SLOW_RULE_BYTES: u64 = 1 + 4 + 6 * 4;
 
@@ -667,52 +692,86 @@ impl<R: Read> Decoder<R> {
         }
     }
 
-    fn u64s(&mut self, what: &'static str) -> Result<Vec<u64>, SnapshotError> {
+    fn hash_set<const TAG_BITS: u32>(
+        &mut self,
+        what: &'static str,
+    ) -> Result<HashSet48<TAG_BITS>, SnapshotError> {
         let length = self.u64()?;
         self.charge(length, what)?;
-        match length.checked_mul(8) {
-            Some(bytes) if bytes <= self.remaining => {}
-            _ => return Err(SnapshotError::Truncated),
+        if length == 0 {
+            return Ok(HashSet48::default());
         }
 
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(length as usize)
+        let bucket_bits = u32::from(self.u8()?);
+        if !(1..=MAX_BUCKET_BITS).contains(&bucket_bits) {
+            return Err(SnapshotError::Corrupt("hash set buckets"));
+        }
+
+        let start_count = (1usize << bucket_bits) + 1;
+        let stored_bytes = (start_count as u64) * 4 + length.saturating_mul(RESIDUAL_BYTES as u64);
+        if stored_bytes > self.remaining {
+            return Err(SnapshotError::Truncated);
+        }
+
+        let mut starts = Vec::new();
+        starts
+            .try_reserve_exact(start_count)
             .map_err(|_| SnapshotError::Io(io::ErrorKind::OutOfMemory.into()))?;
-        let mut buffer = [0u8; 8192];
-        let mut left = length as usize;
+        let mut buffer = [0u8; IO_CHUNK_BYTES];
+        let mut left = start_count;
         while left > 0 {
-            let count = left.min(buffer.len() / 8);
-            self.raw(&mut buffer[..count * 8])?;
-            values.extend(
-                buffer[..count * 8]
-                    .as_chunks::<8>()
+            let count = left.min(buffer.len() / 4);
+            self.raw(&mut buffer[..count * 4])?;
+            starts.extend(
+                buffer[..count * 4]
+                    .as_chunks::<4>()
                     .0
                     .iter()
-                    .map(|bytes| u64::from_le_bytes(*bytes)),
+                    .map(|bytes| u32::from_le_bytes(*bytes)),
             );
             left -= count;
         }
 
-        Ok(values)
+        let mut residuals = Vec::new();
+        residuals
+            .try_reserve_exact(length as usize)
+            .map_err(|_| SnapshotError::Io(io::ErrorKind::OutOfMemory.into()))?;
+        let mut left = length as usize;
+        while left > 0 {
+            let count = left.min(buffer.len() / RESIDUAL_BYTES);
+            self.raw(&mut buffer[..count * RESIDUAL_BYTES])?;
+            residuals.extend_from_slice(
+                buffer[..count * RESIDUAL_BYTES]
+                    .as_chunks::<RESIDUAL_BYTES>()
+                    .0,
+            );
+            left -= count;
+        }
+
+        HashSet48::from_parts(bucket_bits, starts, residuals)
+            .ok_or(SnapshotError::Corrupt("hash set directory"))
     }
 
     fn rule(&mut self) -> Result<SlowRule, SnapshotError> {
         self.name_allowance = self.slow_budget.remaining();
         let flags = self.u8()?;
         let restricted_types = self.u32()?;
-        let rule = NetworkRule {
-            whitelist: flags & WHITELIST != 0,
-            important: flags & IMPORTANT != 0,
-            badfilter: flags & BADFILTER != 0,
-            restricted_types,
-            pattern: self.text(MAX_LINE_BYTES, "rule pattern")?,
+        let pattern = self.text(MAX_LINE_BYTES, "rule pattern")?;
+        let modifiers = Modifiers {
             dns_permitted: self.u16s("record types")?,
             dns_restricted: self.u16s("record types")?,
             denyallow: self.names("deny-allow names")?,
             restricted_clients: ClientSet::new(&self.names("client entries")?),
             restricted_ctags: self.names("tag entries")?,
         };
+        let rule = NetworkRule::new(
+            flags & WHITELIST != 0,
+            flags & IMPORTANT != 0,
+            flags & BADFILTER != 0,
+            pattern,
+            restricted_types,
+            modifiers,
+        );
 
         self.charge(1, "slow rules")?;
         let slow = SlowRule::compile(rule)
@@ -792,6 +851,10 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
     let stored_fingerprint = decoder.u128()?;
     let content_hash = decoder.u128()?;
     let compiler_version = decoder.u32()?;
+    if compiler_version != COMPILER_VERSION {
+        return Err(SnapshotError::OldCompiler(compiler_version));
+    }
+
     let configured_format = format_from_code(decoder.u8()?)?;
     let effective_format = format_from_code(decoder.u8()?)?;
     let meta_max_rules = decoder.u32()?;
@@ -813,9 +876,9 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
     let regex_failed = decoder.u64()?;
     let compile_charge = decoder.u64()?;
 
-    let mut fast: [Vec<u64>; FAST_KINDS] = Default::default();
-    for array in fast.iter_mut() {
-        *array = decoder.u64s("plain rule array")?;
+    let mut fast: [PlainRules; FAST_KINDS] = Default::default();
+    for set in fast.iter_mut() {
+        *set = decoder.hash_set("plain rule array")?;
     }
 
     // Host groups are not rules: the names mapped to them are charged, the groups are bounded
@@ -837,7 +900,7 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
 
     let hosts = HostRules {
         ips: host_ips,
-        entries: decoder.u64s("host name array")?,
+        entries: decoder.hash_set("host name array")?,
     };
     if !hosts.groups_exist() {
         return Err(SnapshotError::Corrupt("host name without a group"));
@@ -853,10 +916,6 @@ pub fn load(path: &Path, options: &CompileOptions) -> Result<Snapshot, SnapshotE
 
     if decoder.remaining != 0 {
         return Err(SnapshotError::Corrupt("data after the last rule"));
-    }
-
-    if compiler_version != COMPILER_VERSION {
-        return Err(SnapshotError::OldCompiler(compiler_version));
     }
 
     let expected = fingerprint(
@@ -1252,8 +1311,8 @@ mod tests {
 
     use super::*;
     use crate::filter::compile::{CompileWorker, HOST_GROUP_BYTES, slow_rule_cost};
-    use crate::filter::engine::MAX_HOST_GROUPS;
     use crate::filter::engine::{Decision, Engine, TYPE_A, TYPE_AAAA};
+    use crate::filter::engine::{MAX_HOST_GROUPS, MAX_HOST_IPS};
     use crate::lists::Piece;
     use crate::test_dir::TestDir;
 
@@ -1430,6 +1489,36 @@ ads.*.tracker
     }
 
     #[tokio::test]
+    async fn a_name_with_a_thousand_answer_ips_survives_a_save_and_a_load() {
+        let worker = CompileWorker::spawn().unwrap();
+        let state = TestDir::new("snap");
+        let store = SnapshotStore::open(state.path()).unwrap();
+        let text: String = (0..1024)
+            .map(|index| format!("10.1.{}.{} pool.example\n", index / 256, index % 256))
+            .collect();
+        let snapshot = snapshot_of(&worker, &text, ListFormat::Hosts).await;
+        assert_eq!(snapshot.list.hosts.ips.len(), 1024);
+
+        store.save(clone_of(&snapshot)).await.unwrap();
+        store.flush().await;
+        let loaded = load(&store.path_for(SOURCE).unwrap(), &caps()).unwrap();
+
+        let tags = |list: &CompiledList| {
+            list.hosts
+                .entries
+                .tags_of(xxh3_64(b"pool.example"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tags(&loaded.list), (0..1024).collect::<Vec<_>>());
+        assert_same_list(&loaded.list, &snapshot.list);
+        let reloaded = Engine::new(vec![loaded.list], Vec::new());
+        let Decision::Block { ips } = reloaded.check("pool.example", TYPE_A, false) else {
+            panic!("the name should be blocked with its addresses");
+        };
+        assert_eq!(ips.len(), MAX_HOST_IPS + 1);
+    }
+
+    #[tokio::test]
     async fn unchanged_content_writes_nothing() {
         let worker = CompileWorker::spawn().unwrap();
         let state = TestDir::new("snap");
@@ -1577,6 +1666,20 @@ ads.*.tracker
     }
 
     #[tokio::test]
+    async fn an_older_compiler_is_named_even_when_the_rest_of_the_body_cannot_be_decoded() {
+        let state = TestDir::new("snap");
+        let (path, mut bytes) = saved_bytes(&state, MIXED).await;
+        let at = PREAMBLE_BYTES as usize + 32;
+        bytes[at..at + 4].copy_from_slice(&(COMPILER_VERSION + 1).to_le_bytes());
+        let body_end = bytes.len() - CHECKSUM_BYTES as usize;
+        bytes[at + 4..body_end].fill(0xff);
+        fix_checksum(&mut bytes);
+        fs::write(&path, &bytes).unwrap();
+
+        assert!(matches!(rejected(&path), SnapshotError::OldCompiler(_)));
+    }
+
+    #[tokio::test]
     async fn a_snapshot_that_blocks_a_canary_is_refused_only_when_canaries_are_checked() {
         let state = TestDir::new("snap");
         let (path, _) = saved_bytes(&state, "||*^\n").await;
@@ -1592,15 +1695,19 @@ ads.*.tracker
         assert!(matches!(refused, Err(SnapshotError::BlocksCanary)));
     }
 
-    /// The offset of the length field of the first plain-rule array of a one-rule list.
+    /// The offset of the length field of the first plain-rule set of a list of `a.example`: the
+    /// residual of its only hash, after the length, the bucket bit count and three bucket
+    /// starts.
     fn first_array_length_offset(bytes: &[u8]) -> usize {
-        let mut pattern = 1u64.to_le_bytes().to_vec();
-        pattern.extend_from_slice(&xxh3_64(b"a.example").to_le_bytes());
+        let set = PlainRules::from_sorted(&[xxh3_64(b"a.example")]);
+        let residual = set.residuals()[0];
 
-        bytes
-            .windows(pattern.len())
-            .position(|window| window == pattern)
-            .expect("the array is in the file")
+        let residual_at = bytes
+            .windows(residual.len())
+            .position(|window| window == residual)
+            .expect("the residual is in the file");
+
+        residual_at - 3 * 4 - 1 - 8
     }
 
     #[tokio::test]
@@ -1636,6 +1743,45 @@ ads.*.tracker
         assert!(matches!(
             load(&path, &capped(0)).err(),
             Some(SnapshotError::TooLarge(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_hash_set_directory_that_cannot_be_one_is_refused_even_with_a_valid_checksum() {
+        let state = TestDir::new("snap");
+        let (path, good) = saved_bytes(&state, "||a.example^\n").await;
+        let length_at = first_array_length_offset(&good);
+        let bucket_bits_at = length_at + 8;
+        let starts_at = bucket_bits_at + 1;
+        let patch = |at: usize, bytes: &[u8]| {
+            let mut bad = good.clone();
+            bad[at..at + bytes.len()].copy_from_slice(bytes);
+            fix_checksum(&mut bad);
+            fs::write(&path, &bad).unwrap();
+
+            rejected(&path)
+        };
+
+        // The buckets a set may have are 2 to 2^16.
+        for bits in [0u8, 17, 255] {
+            assert!(matches!(
+                patch(bucket_bits_at, &[bits]),
+                SnapshotError::Corrupt("hash set buckets")
+            ));
+        }
+
+        // Starts that decrease, or that end past the last residual.
+        assert!(matches!(
+            patch(starts_at + 4, &9u32.to_le_bytes()),
+            SnapshotError::Corrupt("hash set directory")
+        ));
+        assert!(matches!(
+            patch(starts_at + 8, &2u32.to_le_bytes()),
+            SnapshotError::Corrupt("hash set directory")
+        ));
+        assert!(matches!(
+            patch(starts_at, &1u32.to_le_bytes()),
+            SnapshotError::Corrupt("hash set directory")
         ));
     }
 
@@ -1861,7 +2007,7 @@ ads.*.tracker
                 fast: Default::default(),
                 hosts: HostRules {
                     ips: (0..count).map(group_ip).collect(),
-                    entries: Vec::new(),
+                    entries: Default::default(),
                 },
                 slow: Vec::new(),
                 regex_failed: 0,

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::harness::{a_record, config_for, fake_upstream, name, reply_to};
+use common::harness::{a_record, config_for, fake_upstream, name, reply_to, until};
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::RecordType;
 use picoguard::dns::build::Protocol;
@@ -92,19 +92,21 @@ async fn failing_refreshes_log_no_line_per_query() {
     answer_all(&pipeline, &names).await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     answer_all(&pipeline, &names).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    assert!(
-        received.load(Ordering::SeqCst) > NAMES,
-        "the stale answers started refreshes"
-    );
+    until("a refresh reached the upstream", || {
+        received.load(Ordering::SeqCst) > NAMES
+    })
+    .await;
+    until("every refresh ended", || pipeline.lookups_in_flight() == 0).await;
 
     let lines = LINES.lock().unwrap();
     let warnings = lines
         .iter()
         .filter(|(level, line)| *level == log::Level::Warn && line.contains("failed"))
         .count();
-    assert!(warnings <= 1, "{lines:?}");
+    assert_eq!(
+        warnings, 1,
+        "the first failure is logged, the rest are not: {lines:?}"
+    );
 
     let bare_names: Vec<&str> = names
         .iter()

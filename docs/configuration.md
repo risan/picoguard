@@ -8,7 +8,9 @@ is the default, and most are commented out. Check a file without starting the se
 picoguard --check -c /etc/picoguard/picoguard.toml
 ```
 
-It prints `OK` or the first error. Unknown keys are errors, so a typo cannot hide.
+It prints `OK` or the first error. Unknown keys are errors, so a typo cannot hide. The check refuses
+what the start would refuse: a `blocked_hosts` or `local.domains` name with an empty, non-ASCII or
+too long label, and a list or catalog URL the downloader cannot use.
 
 Top-level keys (`blocked_ttl`, `rules`, ...) must come before the first `[section]` header. This
 is a TOML rule.
@@ -414,7 +416,7 @@ and once among the `[[allowlists]]`.
 | Key | Default | Meaning |
 |---|---|---|
 | `name` | none | Label on the status page. |
-| `url` | none | `http://` or `https://` address, without a user name or password (the download refuses `user:pass@`, so the list would fail at every refresh; the page refuses to add one). Set `url` or `path`, not both. |
+| `url` | none | `http://` or `https://` address, without a user name or password (the download refuses `user:pass@`, so the list would fail at every refresh; the check and the page refuse one). Set `url` or `path`, not both. |
 | `path` | none | Local file. Read at start and again every `refresh_hours`. |
 | `format` | `"auto"` | `auto`, `adblock`, `hosts`, `domains`, `wildcard`, `dnsmasq` or `rpz`. |
 | `refresh_hours` | `24` | How often to download again. |
@@ -424,8 +426,9 @@ and once among the `[[allowlists]]`.
 | `enabled` | `true` | A list that is off is not downloaded and holds no memory. The page can turn lists on and off. |
 | `slow_rule_budget` | `8388608` (8 MiB) | Estimated bytes for rules that are not plain domains (regex, wildcards, modifiers). A regex is charged the memory it really holds (about 8 KB for `/track[0-9]+/`, close to 1 MB for `/(\pL\|\pN){1,50}x/`), a wildcard rule 64 bytes for each of its parts, and every distinct rule at least 32 bytes more, even a regex that does not compile. A list over it is not used. |
 
-Downloads use `If-None-Match` and `If-Modified-Since`. A failed download keeps the last good list.
-A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private,
+Downloads use `If-None-Match` and `If-Modified-Since`, and send `Accept-Encoding: identity`:
+picoguard does not decompress, so a reply that is compressed anyway fails. A failed download keeps the last good list.
+A download that takes longer than 10 minutes in all fails. A redirect to a loopback, private, shared (`100.64.0.0/10`, Tailscale),
 link-local or unspecified address fails too, unless the list URL itself points into those ranges.
 A list in `[[lists]]` that blocks any of three made-up check names (for example because of a rule
 like `||*^` or `/./`) is refused the same way: the last good copy stays and the status page shows the
@@ -468,7 +471,7 @@ The detected format shows on the status page. If auto picks wrong, set `format` 
 | `domains` | One domain per line. Each blocks that exact name only. |
 | `wildcard` | `domain` or `*.domain` per line. Each blocks the domain and all its subdomains. HaGeZi "wildcard" lists. |
 | `dnsmasq` | `address=/domain/...`, `local=/domain/`, `server=/domain/`. Each blocks the domain and its subdomains. |
-| `rpz` | RPZ zone files: `domain CNAME .` blocks the name; `*.domain CNAME .` blocks the subdomains; `CNAME rpz-passthru.` allows. Other record types are skipped and counted. |
+| `rpz` | RPZ zone files: `domain CNAME .` blocks the name; `*.domain CNAME .` blocks the subdomains; `CNAME rpz-passthru.` allows. A passthru entry wins over any block entry it covers, even a more specific one: with `*.example.com CNAME rpz-passthru.` and `ads.example.com CNAME .`, `ads.example.com` is allowed (most RPZ servers would block it). Other record types are skipped and counted. |
 
 Rules that need features picoguard does not have (`$client`, `$ctag`, `$dnsrewrite`) are parsed and
 counted, not fatal. Unknown lines are counted and logged once per list. See the README for the
@@ -525,6 +528,10 @@ block = ["tiktok", "youtube"]
   that fails, whose lists would pass the [memory budget](#the-memory-budget), or with a service
   whose rules cannot be used (they would block nearly every name) keeps all the lists in force,
   shows why in `GET /api/services` `error`, and tries again later, with the same waits as a list.
+- A service that stays switched on but is missing from a refreshed catalog, or has no usable rules
+  there (over a cap, or every rule left out), keeps the list it had; `error` names it, and the
+  page lists it as on under "Unavailable" until it is switched off. A service with no list yet
+  stays unblocked, and `error` names it too.
 - Each service switched on is a list of its own, named "Blocked service: <name>": **Check a
   name** names it, a pause turns it off like every list, and an allowlist or an Allow rule wins
   over it as over any list.
@@ -704,8 +711,9 @@ pays the hash, and the same credentials after it are checked in microseconds.
 
 Wrong passwords are limited per client address. After 5 failed password checks within 15 minutes,
 sign-ins and basic auth from that address answer 429 ("too many attempts, try again later") until
-15 minutes after its last failure. A right password clears the address. picoguard tracks 64
-addresses; when the table is full, the one with the oldest last failure is dropped.
+15 minutes after its last failure. A right password clears the address. All addresses in one
+IPv6 /64 count as one client. picoguard tracks 64 clients; when the table is full, the one with
+the oldest last failure is dropped.
 
 Make a hash with `picoguard --hash-password`. It reads the password from standard input (it asks
 without echo on a terminal) and prints a line to paste into `[web]`:
@@ -805,7 +813,7 @@ logged) and picoguard starts with empty statistics.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `query_log_entries` | `1000` | Recent queries kept (up to 100000). Allocated in full. |
+| `query_log_entries` | `1000` | Recent queries kept (up to 100000). Allocated in full. One `/api/querylog` answer holds at most 1000. |
 | `top_k` | `50` | Entries in each top list (up to 1000). Allocated in full. |
 | `persist` | `true` | Save the statistics to `stats.json` and read them back at start. `false`: the file is never read or written, and the statistics start empty at every start. |
 | `retention_days` | `30` | How long the hourly history is kept: `1`, `7`, `30` or `90` days. The Settings tab can set it instead ([above](#statistics-retention-from-the-page)); a value from the page wins. The ring for 90 days (51,840 bytes) is always allocated; a save builds the file in memory for a moment: a few tens of KB with the defaults and a busy 30 days, up to about 1.4 MB at `top_k = 1000` with the longest names and 90 days. |

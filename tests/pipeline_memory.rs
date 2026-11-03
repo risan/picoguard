@@ -1,10 +1,8 @@
 //! Memory held while queries wait for a stalled upstream. This file has its own
 //! test binary so that the counting allocator sees only this one test.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hickory_proto::op::{Edns, Message, Query};
@@ -20,28 +18,13 @@ const MAX_MESSAGE: usize = 65_535;
 const OPTION_PADDING: u16 = 12;
 const SETTLE: Duration = Duration::from_millis(500);
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
+use counting::live;
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// A query for `name` with an EDNS padding option that fills the message to
 /// the 65,535-byte maximum of a TCP frame.
@@ -76,7 +59,7 @@ async fn padded_tcp_queries_waiting_for_a_stalled_upstream_hold_little_memory() 
     let tcp = listeners.tcp_addresses()[0];
     server::spawn(listeners, pipeline, &config);
     tokio::task::yield_now().await;
-    let before = LIVE_BYTES.load(Ordering::Relaxed);
+    let before = live();
 
     let mut clients = Vec::new();
     for connection in 0..CONNECTIONS {
@@ -95,7 +78,7 @@ async fn padded_tcp_queries_waiting_for_a_stalled_upstream_hold_little_memory() 
 
     tokio::time::sleep(SETTLE).await;
 
-    let held = LIVE_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+    let held = live().saturating_sub(before);
     assert!(
         held < 1024 * 1024,
         "{held} bytes held for {} waiting queries",

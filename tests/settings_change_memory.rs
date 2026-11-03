@@ -3,10 +3,8 @@
 //! replaced upstream pool is freed when it is no longer used, so changes leave nothing behind.
 //! This file has its own test binary so that the counting allocator sees only this one test.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use picoguard::config::{CacheConfig, Config};
 use picoguard::dns::build::Protocol;
@@ -20,38 +18,19 @@ const SWAPS: usize = 20;
 const HEADER_LEN: usize = 12;
 const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// The stats of the names asked (query log, top lists), which stay after the cache is replaced.
-/// Measured: 6,950 bytes held after the replacement, for 500 names; the full cache held 102,672.
+/// Measured: 7,014 bytes held after the replacement, for 500 names; the full cache held 94,544.
 const STATS_ALLOWANCE: usize = 16 * 1024;
 /// One query through a new pool: its cache entry and its stats. Measured: 6,032 bytes for 20
 /// replacements, 302 per replacement; a pool left behind would hold its TLS root store.
 const PER_SWAP_ALLOWANCE: usize = 1024;
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
+use counting::live;
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-fn live() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// Where the question of `message` ends: after its name, type and class.
 fn question_end(message: &[u8]) -> usize {

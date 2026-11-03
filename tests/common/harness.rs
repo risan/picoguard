@@ -2,6 +2,7 @@
 //! end-to-end tests of filtering. Nothing leaves the machine.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +26,8 @@ pub type Handler = dyn Fn(&Message) -> Vec<(Duration, Message)> + Send + Sync;
 pub struct FakeUpstream {
     pub address: SocketAddr,
     received: Arc<Mutex<Vec<Message>>>,
+    in_flight: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl FakeUpstream {
@@ -36,6 +39,21 @@ impl FakeUpstream {
     /// The queries that reached the upstream, in order.
     pub fn received(&self) -> Vec<Message> {
         self.received.lock().unwrap().clone()
+    }
+
+    /// The query that reached the upstream last.
+    pub fn last_query(&self) -> Message {
+        self.received.lock().unwrap().last().unwrap().clone()
+    }
+
+    /// How many queries are waiting for their reply to be sent right now.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// The most queries that waited for their reply at the same moment.
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
     }
 }
 
@@ -70,7 +88,13 @@ async fn serve(
     let address = socket.local_addr().unwrap();
     let received = Arc::new(Mutex::new(Vec::new()));
     let handler: Arc<Handler> = Arc::new(handler);
-    let seen = Arc::clone(&received);
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (seen, waiting, highest) = (
+        Arc::clone(&received),
+        Arc::clone(&in_flight),
+        Arc::clone(&peak),
+    );
 
     tokio::spawn(async move {
         let mut buffer = [0u8; 4096];
@@ -81,7 +105,8 @@ async fn serve(
 
             seen.lock().unwrap().push(query.clone());
             let replies = handler(&query);
-            let socket = Arc::clone(&socket);
+            highest.fetch_max(waiting.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            let (socket, waiting) = (Arc::clone(&socket), Arc::clone(&waiting));
             let mut gate = hold
                 .as_ref()
                 .filter(|(holds, _)| holds(&query))
@@ -95,11 +120,18 @@ async fn serve(
                     tokio::time::sleep(delay).await;
                     let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
                 }
+
+                waiting.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
 
-    FakeUpstream { address, received }
+    FakeUpstream {
+        address,
+        received,
+        in_flight,
+        peak,
+    }
 }
 
 /// A response to `query` with the given answers and no flags beyond RD and RA.
@@ -111,6 +143,19 @@ pub fn reply_to(query: &Message, answers: Vec<Record>) -> Message {
     reply.add_answers(answers);
 
     reply
+}
+
+/// Polls `condition` every 5 ms for up to 5 s and panics naming `what` when it never holds.
+pub async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    for _ in 0..1000 {
+        if condition() {
+            return;
+        }
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    panic!("{what} did not happen within 5 s");
 }
 
 pub fn name(text: &str) -> Name {
@@ -131,6 +176,11 @@ pub async fn answering_upstream(address: [u8; 4], delay: Duration) -> FakeUpstre
     .await
 }
 
+/// An upstream that receives every query and never replies.
+pub async fn silent_upstream() -> FakeUpstream {
+    fake_upstream(|_| Vec::new()).await
+}
+
 pub fn engine_of(main: &[&str], allow: &[&str]) -> Arc<Engine> {
     let compile = |text: &&str| Arc::new(CompiledList::from_text(ListFormat::Adblock, text).0);
 
@@ -143,6 +193,7 @@ pub fn engine_of(main: &[&str], allow: &[&str]) -> Arc<Engine> {
 #[derive(Clone)]
 pub struct Running {
     pub udp: SocketAddr,
+    pub tcp: SocketAddr,
     pub policy: Arc<Policy>,
     pub pipeline: Arc<Pipeline>,
 }
@@ -165,10 +216,12 @@ pub async fn start_with_policy(config: &Config, policy: Arc<Policy>) -> Running 
     let pipeline = Pipeline::new(config, Arc::clone(&policy)).unwrap();
     let listeners = Listeners::bind(&config.server).unwrap();
     let udp = listeners.udp_addresses()[0];
+    let tcp = listeners.tcp_addresses()[0];
     server::spawn(listeners, Arc::clone(&pipeline), config);
 
     Running {
         udp,
+        tcp,
         policy,
         pipeline,
     }

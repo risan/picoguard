@@ -2,47 +2,19 @@
 //! for them. This test binary has a counting global allocator and a single test, so nothing
 //! else allocates while it measures.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use picoguard::filter::compile::{CompileOptions, CompileWorker};
 use picoguard::filter::parse::ListFormat;
 use picoguard::filter::snapshot::{Snapshot, SnapshotError, SnapshotStore, load};
 use picoguard::lists::{Piece, Validators};
 use xxhash_rust::xxh3::xxh3_128;
 
-struct Counting;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-fn grow(bytes: usize) {
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    PEAK.fetch_max(live, Ordering::Relaxed);
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        grow(layout.size());
-
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        grow(new_size);
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+use counting::{peak_bytes, reset_peak};
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 const PREAMBLE_BYTES: usize = 12;
 const CHECKSUM_BYTES: usize = 16;
@@ -67,12 +39,11 @@ fn forged(good: &[u8], groups: u32, slow: u32, fix_checksum: bool) -> Vec<u8> {
 }
 
 fn peak_of_loading(path: &std::path::Path, options: &CompileOptions) -> (usize, SnapshotError) {
-    let before = LIVE.load(Ordering::Relaxed);
-    PEAK.store(before, Ordering::Relaxed);
+    let before = reset_peak();
     let error = load(path, options)
         .err()
         .expect("the file should be refused");
-    let peak = PEAK.load(Ordering::Relaxed);
+    let peak = peak_bytes();
 
     (peak - before, error)
 }

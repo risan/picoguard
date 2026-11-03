@@ -6,10 +6,8 @@
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::http::ListServer;
@@ -39,46 +37,13 @@ const WARM_UP_ALLOWANCE: usize = 32 * 1024;
 /// 4,970 bytes.
 const ROUNDS_ALLOWANCE: usize = 16 * 1024;
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-fn grow(size: usize) {
-    let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
-    PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
-}
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            grow(layout.size());
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-
-    /// Counted as a move: the old and the new block both live until the copy is done.
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        grow(new_size);
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-
-        unsafe { System.realloc(pointer, layout, new_size) }
-    }
-}
+use counting::{live, peak_bytes, reset_peak};
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-fn live() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// Made-up services of AdGuard's sizes: ids and names of 6 to 20 characters, a dozen groups,
 /// 2,406 rules spread over them, and an icon each.
@@ -192,10 +157,9 @@ async fn the_index_and_the_lists_of_the_services_switched_on_stay_within_their_b
     assert_eq!(ids.len(), SERVICES);
     assert!(index <= INDEX_BUDGET, "the index holds {index} bytes");
 
-    let off = live();
-    PEAK_BYTES.store(off, Ordering::Relaxed);
+    let off = reset_peak();
     switch(&control, &pipeline, &ids).await;
-    let peak = PEAK_BYTES.load(Ordering::Relaxed) - off;
+    let peak = peak_bytes() - off;
     let all_on = live() - off;
     eprintln!("all {SERVICES} switched on: {all_on} bytes held, {peak} at the peak");
     assert!(all_on <= ALL_ON_BUDGET, "{all_on} bytes held");

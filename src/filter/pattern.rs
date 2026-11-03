@@ -14,6 +14,7 @@ use std::fmt;
 use regex_automata::meta::{self, Regex};
 use regex_automata::nfa::thompson::WhichCaptures;
 use regex_syntax::ast::{self, Ast, ClassPerlKind, ClassSetItem};
+use regex_syntax::hir::Hir;
 use regex_syntax::hir::translate::TranslatorBuilder;
 
 /// Compiled regexes may not grow beyond this many bytes. The slow-rule budget charges what
@@ -235,11 +236,13 @@ fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize, usize), Pat
         return Err(PatternError::TooBig);
     }
 
-    let hir = TranslatorBuilder::new()
-        .case_insensitive(true)
-        .build()
-        .translate(&translated, &ast)
-        .map_err(|error| PatternError::Regex(error.to_string(), REGEX_BUILD_BYTES + parse_bytes))?;
+    let hir = if may_name_a_non_ascii_character(&translated) {
+        translate_hir(&translated, &ast, Alphabet::Unicode)
+    } else {
+        translate_hir(&translated, &ast, Alphabet::Ascii)
+            .or_else(|_| translate_hir(&translated, &ast, Alphabet::Unicode))
+    }
+    .map_err(|error| PatternError::Regex(error.to_string(), REGEX_BUILD_BYTES + parse_bytes))?;
     drop(ast);
     let size_limit = if room == usize::MAX {
         REGEX_SIZE_LIMIT
@@ -273,6 +276,42 @@ fn compile_regex(source: &str, room: usize) -> Result<(Regex, usize, usize), Pat
     let cost = regex.memory_usage() + regex.create_cache().memory_usage();
 
     Ok((regex, cost, parse_bytes))
+}
+
+/// True when `pattern`, as translated (octal escapes are spelled out by then), may spell a
+/// character beyond ASCII, by itself or through an escape.
+/// Case folding in the ASCII alphabet loses what such a character folds to: U+212A (the Kelvin
+/// sign) is a `k`, U+017F a `s`. A false positive only costs a larger automaton.
+fn may_name_a_non_ascii_character(pattern: &str) -> bool {
+    !pattern.is_ascii()
+        || ["\\x{", "\\u", "\\p", "\\P"]
+            .iter()
+            .any(|escape| pattern.contains(escape))
+}
+
+/// What a regex is matched against.
+#[derive(Clone, Copy)]
+enum Alphabet {
+    /// Every input of the DNS path is ASCII (`Name` escapes the rest), so classes, `.` and case
+    /// folding can be byte-sized, which builds a much smaller automaton.
+    Ascii,
+    /// Needed by a pattern that is not ASCII-only (`\pL`, a non-ASCII literal).
+    Unicode,
+}
+
+fn translate_hir(
+    translated: &str,
+    ast: &Ast,
+    alphabet: Alphabet,
+) -> Result<Hir, regex_syntax::hir::Error> {
+    let unicode = matches!(alphabet, Alphabet::Unicode);
+
+    TranslatorBuilder::new()
+        .case_insensitive(true)
+        .unicode(unicode)
+        .utf8(unicode)
+        .build()
+        .translate(translated, ast)
 }
 
 /// What parsing a regex of `length` bytes with this syntax tree holds at most: the tree, and
@@ -666,12 +705,13 @@ pub fn regex_shortcut(pattern: &str) -> String {
 /// Go: `([^\\])\<open>.*[^\\]\<close>` replaced by `$1...`, leftmost and greedy.
 fn replace_brackets(chars: &[char], open: char, close: char) -> Vec<char> {
     let mut out = Vec::with_capacity(chars.len());
+    let last_close = (1..chars.len())
+        .rev()
+        .find(|&j| chars[j] == close && chars[j - 1] != '\\');
     let mut at = 0;
     while at < chars.len() {
         if chars[at] != '\\' && chars.get(at + 1) == Some(&open) {
-            let end = (at + 3..chars.len())
-                .rev()
-                .find(|&j| chars[j] == close && chars[j - 1] != '\\');
+            let end = last_close.filter(|&j| j >= at + 3);
             if let Some(end) = end {
                 out.push(chars[at]);
                 out.extend("...".chars());
@@ -871,7 +911,12 @@ fn translate_octal(chars: &[char], at: usize, out: &mut String) -> Result<usize,
     }
 
     let value = digits.iter().fold(0, |value, digit| value * 8 + digit);
-    out.push_str(&format!("\\x{{{value:X}}}"));
+    // Kept as `\xHH` while it is ASCII, so such a pattern is still built for ASCII.
+    if value < 0x80 {
+        out.push_str(&format!("\\x{value:02X}"));
+    } else {
+        out.push_str(&format!("\\x{{{value:X}}}"));
+    }
 
     Ok(at + 1 + digits.len())
 }
@@ -934,52 +979,63 @@ fn translate_group(chars: &[char], at: usize, out: &mut String) -> Result<usize,
         return Ok(at + 1);
     }
 
-    let rest: String = chars[at + 2..].iter().collect();
-    let name_start = rest.strip_prefix("P<").or_else(|| rest.strip_prefix('<'));
-    if let Some(name_start) = name_start {
+    let rest = &chars[at + 2..];
+    let name_prefix = if rest.starts_with(&['P', '<']) {
+        2
+    } else if rest.starts_with(&['<']) {
+        1
+    } else {
+        0
+    };
+    if name_prefix > 0 {
+        let name_start = &rest[name_prefix..];
         let name_end = name_start
-            .find('>')
+            .iter()
+            .position(|&c| c == '>')
             .ok_or_else(|| syntax_error("unclosed group name"))?;
         let name = &name_start[..name_end];
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        if name.is_empty() || !name.iter().all(|&c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(syntax_error("invalid named capture"));
         }
 
         // Go accepts numeric and repeated names, which the regex crate rejects; nothing
         // can refer to a capture here, so a plain group is equivalent.
         out.push_str("(?:");
-        let header = &rest[..rest.len() - name_start.len() + name_end + 1];
 
-        return Ok(at + 2 + header.chars().count());
+        return Ok(at + 2 + name_prefix + name_end + 1);
     }
 
     let flags_end = rest
-        .find([')', ':'])
+        .iter()
+        .position(|&c| c == ')' || c == ':')
         .ok_or_else(|| syntax_error("unclosed group flags"))?;
     let flags = &rest[..flags_end];
-    if !flags.chars().all(|c| "imsU-".contains(c)) {
+    if !flags.iter().all(|&c| "imsU-".contains(c)) {
         return Err(syntax_error("unsupported group syntax"));
     }
 
     out.push_str("(?");
-    out.push_str(flags);
+    out.extend(flags);
 
-    Ok(at + 2 + flags.chars().count())
+    Ok(at + 2 + flags_end)
 }
 
 /// A `{` starts a repetition only as `{n}`, `{n,}` or `{n,m}`; otherwise it is literal.
 fn translate_brace(chars: &[char], at: usize, out: &mut String) -> Result<usize, PatternError> {
-    let rest: String = chars[at + 1..].iter().collect();
-    let Some(close) = rest.find('}') else {
+    let body_end = chars[at + 1..]
+        .iter()
+        .position(|&c| !(c.is_ascii_digit() || c == ','))
+        .map_or(chars.len(), |offset| at + 1 + offset);
+    if chars.get(body_end) != Some(&'}') {
         out.push_str("\\{");
 
         return Ok(at + 1);
-    };
+    }
 
-    let body = &rest[..close];
+    let body: String = chars[at + 1..body_end].iter().collect();
     let (low, high) = match body.split_once(',') {
         Some((low, high)) => (low, Some(high)),
-        None => (body, None),
+        None => (body.as_str(), None),
     };
     // Go's parseInt: digits without a leading zero.
     let digits = |text: &str| {
@@ -1005,10 +1061,10 @@ fn translate_brace(chars: &[char], at: usize, out: &mut String) -> Result<usize,
     }
 
     out.push('{');
-    out.push_str(body);
+    out.push_str(&body);
     out.push('}');
 
-    Ok(at + 2 + body.chars().count())
+    Ok(body_end + 1)
 }
 
 // ---- Fast-path candidates ----
@@ -1055,6 +1111,8 @@ fn for_each_end(input: &str, start: usize, f: &mut dyn FnMut(&str)) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
 
     fn matches(pattern: &str, host: &str) -> bool {
@@ -1210,6 +1268,26 @@ mod tests {
         assert_eq!(glob_shortcut("*"), "");
         assert_eq!(glob_shortcut("abc*de"), "abc");
         assert_eq!(glob_shortcut("ab*cd*efg"), "efg");
+    }
+
+    #[test]
+    fn a_4_kib_line_of_unclosed_openers_is_processed_in_linear_time() {
+        let started = std::time::Instant::now();
+        for unit in ["a{", "a(", "a[", "(?:", "(?P<", "a{1,"] {
+            let body = unit.repeat(4000 / unit.len());
+            for _ in 0..10 {
+                let _ = regex_shortcut(&format!("/{body}/"));
+                let _ = translate_go_regex(&body);
+            }
+        }
+
+        // Quadratic code needs over two seconds for this in a debug build, linear code 40
+        // milliseconds; the bound leaves room for a loaded machine.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -1528,6 +1606,140 @@ mod tests {
                         matches(&exact_rule, input),
                         exact.iter().any(|c| c == part),
                         "{exact_rule} vs {input}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_regex_is_built_for_ascii_input() {
+        let cost = Matcher::compile(r"/(https?:\/\/)1\.2\.3\..{100,}/")
+            .unwrap()
+            .cost_bytes();
+
+        assert!(cost < 16 * 1024, "{cost} bytes");
+    }
+
+    #[test]
+    fn a_regex_that_needs_unicode_falls_back_to_it() {
+        let (class, _, _) = compile_regex(r"^\pL+x$", usize::MAX).unwrap();
+        let (literal, _, _) = compile_regex("^caf\u{e9}$", usize::MAX).unwrap();
+
+        assert!(class.is_match("abx"));
+        assert!(!class.is_match("a1x"));
+        assert!(literal.is_match("caf\u{e9}"));
+    }
+
+    #[test]
+    fn a_character_that_folds_to_ascii_keeps_its_folding() {
+        let cases = [
+            (r"^(?:\x{212a})ey\.example$", "key.example"),
+            (r"^\x{212A}ey\.example$", "KEY.example"),
+            (r"^(?:\577)ite\.example$", "site.example"),
+            (r"^[\577]ite\.example$", "SITE.example"),
+            (r"^\x{017f}ite\.example$", "site.example"),
+            ("^\u{212a}ey\\.example$", "key.example"),
+            ("^\u{17f}ite\\.example$", "SITE.example"),
+            (r"^[\x{212a}]ey\.example$", "key.example"),
+        ];
+        for (source, host) in cases {
+            let (regex, _, _) = compile_regex(source, usize::MAX).unwrap();
+
+            assert!(regex.is_match(host), "{source} on {host}");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_regex_is_built_for_ascii() {
+        let for_unicode =
+            |source: &str| may_name_a_non_ascii_character(&translate_go_regex(source).unwrap());
+
+        for source in [
+            r"^ads[0-9]+\.example$",
+            r"^(?:a|b)\w*\.(com|net)$",
+            r"\0\.x",
+            r"\101\57[\07]",
+        ] {
+            assert!(!for_unicode(source), "{source}");
+        }
+
+        for source in [
+            r"\x{212a}",
+            r"\pL",
+            r"\P{Greek}",
+            "caf\u{e9}",
+            "\u{212a}",
+            r"\577",
+            r"[\577]",
+        ] {
+            assert!(for_unicode(source), "{source}");
+        }
+    }
+
+    fn fixture_regexes() -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lists/adguard-dns.txt.gz");
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+
+        text.lines()
+            .filter(|line| line.len() > 2 && line.starts_with('/') && line.ends_with('/'))
+            .map(|line| line[1..line.len() - 1].to_string())
+            .collect()
+    }
+
+    fn build_in(source: &str, alphabet: Alphabet) -> Regex {
+        let translated = translate_go_regex(source).unwrap();
+        let ast = ast::parse::Parser::new().parse(&translated).unwrap();
+        let hir = translate_hir(&translated, &ast, alphabet).unwrap();
+
+        meta::Builder::new()
+            .configure(meta::Config::new().which_captures(WhichCaptures::None))
+            .build_from_hir(&hir)
+            .unwrap()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn the_ascii_and_the_unicode_build_agree_on_ascii_hosts(
+            random in "[ -~]{0,60}",
+            address in "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}(:[0-9]{1,3})?",
+            prefix in proptest::sample::select(vec!["", "http://", "https://"]),
+            label in "(mon|tue|wed|a|c|anon1)[0-9a-f]{0,60}(\\.com)?",
+        ) {
+            static BUILDS: std::sync::OnceLock<Vec<(String, Regex, Regex)>> =
+                std::sync::OnceLock::new();
+            let builds = BUILDS.get_or_init(|| {
+                let regexes = fixture_regexes();
+                assert!(regexes.len() >= 20);
+
+                regexes
+                    .into_iter()
+                    .map(|source| {
+                        let ascii = build_in(&source, Alphabet::Ascii);
+                        let unicode = build_in(&source, Alphabet::Unicode);
+
+                        (source, ascii, unicode)
+                    })
+                    .collect()
+            });
+
+            let hosts = [
+                random,
+                format!("{prefix}{address}"),
+                format!("{prefix}139.45.197.2{}", address.len()),
+                format!("{prefix}{label}"),
+                format!("{prefix}{label}.png#/ads/"),
+            ];
+            for (source, ascii, unicode) in builds {
+                for host in &hosts {
+                    proptest::prop_assert_eq!(
+                        ascii.is_match(host),
+                        unicode.is_match(host),
+                        "{} on {:?}", source, host
                     );
                 }
             }

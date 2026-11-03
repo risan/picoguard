@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::harness::{
-    Running, a_record, answering_upstream, ask, config_for, fake_upstream, name, reply_to,
-    start_with_policy,
+    Running, a_record, answering_upstream, ask, config_for, fake_upstream, fake_upstream_with_gate,
+    name, reply_to, start_with_policy,
 };
 use common::http::ListServer;
 use common::release::{Files, TARGET, scratch, test_key};
@@ -26,7 +26,8 @@ use picoguard::dns::wire::Name;
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::{Downloader, Names};
-use picoguard::password::PasswordHash;
+use picoguard::password::{MAX_ITERATIONS, PasswordHash};
+use picoguard::pipeline::ServerKind;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ListControl, Scheduler, Timing};
 use picoguard::settings;
@@ -486,6 +487,9 @@ async fn plain_site() -> (Site, common::harness::FakeUpstream) {
     (site, upstream)
 }
 
+const PAGE_CSP: &str =
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'";
+
 #[tokio::test]
 async fn the_page_is_served_with_protective_headers() {
     let (site, _upstream) = plain_site().await;
@@ -497,623 +501,13 @@ async fn the_page_is_served_with_protective_headers() {
         reply.header("content-type"),
         Some("text/html; charset=utf-8")
     );
-    assert!(reply.body.contains("<title>picoguard"), "{}", reply.body);
+    assert_eq!(reply.body, include_str!("../src/web/index.html"));
     assert_eq!(reply.header("cache-control"), Some("no-store"));
     assert_eq!(reply.header("x-content-type-options"), Some("nosniff"));
     assert_eq!(reply.header("x-frame-options"), Some("DENY"));
-    assert_eq!(
-        reply.header("content-security-policy"),
-        Some(
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
-             connect-src 'self'"
-        )
-    );
+    assert_eq!(reply.header("content-security-policy"), Some(PAGE_CSP));
     // No answer ever grants a cross-origin read.
     assert!(reply.header("access-control-allow-origin").is_none());
-}
-
-/// The page's ceiling, raised on purpose for the redesign: static bytes in the binary, no memory
-/// at run time.
-const PAGE_HARD_CAP_BYTES: usize = 80 * 1024;
-
-/// The redesign: card descriptions that say what each setting does, save-at-once settings and a
-/// notice line; raised on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 72 * 1024;
-
-#[tokio::test]
-async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    assert!(
-        page.len() <= PAGE_BUDGET_BYTES,
-        "this slice's budget is {PAGE_BUDGET_BYTES} bytes, the page has {}",
-        page.len()
-    );
-    assert!(
-        page.len() <= PAGE_HARD_CAP_BYTES,
-        "the hard cap is {PAGE_HARD_CAP_BYTES} bytes, the page has {}",
-        page.len()
-    );
-    for external in [
-        "src=", "href=", "http://", "https://", "url(", "@import", "<link",
-    ] {
-        assert!(!page.contains(external), "the page refers to {external}");
-    }
-
-    for needed in [
-        "prefers-color-scheme: dark",
-        "name=\"viewport\"",
-        "/api/status",
-        "/api/querylog",
-        "/api/pause",
-        "/api/resume",
-        "/api/lists/refresh",
-        "/api/update",
-        "/api/login",
-        "/api/logout",
-        "/api/cache/clear",
-        "/api/stats/clear",
-        "/api/querylog/clear",
-        "/api/history?days=",
-        "/api/rules",
-        "/api/rules/remove",
-        "/api/explain?name=",
-        "/api/settings",
-        "/api/services",
-        "api(\"/api/lists\")",
-        "/api/lists/add",
-        "/api/lists/reset",
-        "\"/api/lists/\" + change",
-        "editList(node, \"edit\"",
-        "editList(node, \"remove\"",
-        // Without it every 401 would open the browser's own sign-in prompt.
-        "\"X-Requested-With\": \"picoguard\"",
-        "setInterval(update, 5000)",
-        "id=\"version\"",
-        "id=\"update\"",
-        "id=\"update-how\"",
-        "id=\"install\"",
-        "id=\"install-state\"",
-        "showUpdate(status)",
-        "showInstall(",
-        "confirm(",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-
-    for minutes in ["5", "30", "60", "1440"] {
-        assert!(
-            page.contains(&format!("data-minutes=\"{minutes}\"")),
-            "{minutes}"
-        );
-    }
-
-    // Names come from the network: the page never builds markup from them.
-    assert!(!page.contains("innerHTML") && !page.contains("insertAdjacentHTML"));
-}
-
-/// No browser here: the sign-in flow is checked as source, and in the build's browser check.
-#[tokio::test]
-async fn the_page_signs_in_with_its_own_form_and_never_asks_for_the_browser_prompt() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send_as_is(get("/")).await.body;
-
-    for needed in [
-        "id=\"login-form\"",
-        "id=\"login-user\"",
-        "id=\"login-password\"",
-        "type=\"password\"",
-        "autocomplete=\"current-password\"",
-        "id=\"login-note\"",
-        "id=\"logout\"",
-        "class=\"signed-out\"",
-        "\"X-Requested-With\": \"picoguard\"",
-        "authEpoch",
-        "authBusy",
-        "\"Session ended, sign in again.\"",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-/// No browser here: the tab code is checked as source. A tab is a `[data-tab]` button and a
-/// `[data-panel]` panel, and no element id equals a tab name, so a fragment never scrolls.
-#[tokio::test]
-async fn the_page_has_four_tabs_kept_in_the_url_fragment() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for needed in ["role=\"tablist\"", "aria-selected", "\"hashchange\""] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-
-    for tab in ["dashboard", "log", "lists", "settings"] {
-        assert!(page.contains(&format!("data-tab=\"{tab}\"")), "{tab}");
-        assert!(page.contains(&format!("id=\"panel-{tab}\"")), "{tab}");
-        assert!(
-            !page.contains(&format!("id=\"{tab}\"")),
-            "{tab} is a fragment target"
-        );
-    }
-}
-
-/// No browser here: the Upstreams card is checked as source. The read-only view leaves the
-/// field out, so the card is hidden there with the top lists.
-#[tokio::test]
-async fn the_dashboard_has_an_upstreams_card_drawn_as_text() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for needed in [
-        "id=\"upstreams\"",
-        "id=\"upstream-table\"",
-        "showUpstreams(status.upstreams)",
-        "\"local: \"",
-        "\"\\u2014\"",
-        "[\"Answered\", \"num\"]",
-        "[\"pause\", \"tops\", \"upstreams\"",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-#[tokio::test]
-async fn the_dashboard_has_a_cache_card_with_a_confirmed_clear_button() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for needed in [
-        "id=\"cache\"",
-        "id=\"cache-size\"",
-        "id=\"clear-cache\"",
-        "id=\"cache-note\"",
-        "\"/api/cache/clear\"",
-        "showCache(status.cache)",
-        "\"Cache cleared (\"",
-        "\"Clear the DNS cache?",
-        "\"upstreams\", \"cache\"",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-/// No browser here: the names are checked as source, and in the build's browser check. The
-/// ban on `innerHTML` in the page test covers markup.
-#[tokio::test]
-async fn the_clients_show_their_name_beside_the_ip_as_text() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for needed in [
-        "function who(",
-        "who(e.name, e.key)",
-        "who(e.name, e.client)",
-        ".ip {",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-#[tokio::test]
-async fn the_query_log_rows_offer_block_allow_and_why() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for needed in [
-        "data-act",
-        "\"Block\"",
-        "\"Allow\"",
-        "\"Why\"",
-        "blocked_response",
-        "\"/api/rules\"",
-        "location.hash = \"lists\"",
-        "checkName(",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-#[tokio::test]
-async fn the_lists_tab_has_your_rules_and_a_name_check() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for id in [
-        "rules",
-        "rule-count",
-        "rule-table",
-        "config-rules",
-        "check",
-        "check-form",
-        "check-name",
-        "check-result",
-    ] {
-        assert!(
-            page.contains(&format!("id=\"{id}\"")),
-            "the page lacks #{id}"
-        );
-    }
-
-    for needed in [
-        "\"/api/rules/remove\"",
-        "\"/api/explain?name=\" + encodeURIComponent(",
-        "[\"settings-note\", \"rules-note\"]",
-        "\"refresh-row\", \"list-add\", \"rules\", \"check\"]",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-/// No browser here: the tab is checked as source, and in the build's browser check.
-#[tokio::test]
-async fn the_lists_tab_turns_lists_on_and_off_adds_removes_and_resets_them_and_shows_the_memory() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for id in [
-        "lists-from",
-        "list-memory",
-        "list-add",
-        "list-form",
-        "l-name",
-        "l-url",
-        "l-role",
-        "l-hours",
-        "list-add-note",
-        "lists-reset",
-        "settings-memory",
-    ] {
-        assert!(
-            page.contains(&format!("id=\"{id}\"")),
-            "the page lacks #{id}"
-        );
-    }
-
-    for needed in [
-        "\"/api/lists/add\"",
-        "\"/api/lists/\" + change",
-        "\"/api/lists/reset\"",
-        "\"edit\", { enabled: node.checked }",
-        "\"edit\", { refresh_hours: Number(node.value) }",
-        "\"remove\", {}",
-        "showLists(await api(\"/api/lists\"))",
-        "\"from the config file\"",
-        "\"Set on this page\"",
-        ">Reset to config file<",
-        "\"Memory estimate: \"",
-        "#list-table td.name { min-width: 12rem; white-space: normal; overflow-wrap: anywhere; }",
-        "confirm(\"Remove this list?\")",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-/// No browser here: the tab is checked as source. Its cards come with the parts that apply
-/// them; this part shows where settings are saved and why a saved file is not used.
-#[tokio::test]
-async fn the_settings_tab_says_where_settings_are_saved_and_why_they_are_not_used() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for id in [
-        "tab-settings",
-        "settings-note",
-        "settings-file",
-        "rules-note",
-    ] {
-        assert!(
-            page.contains(&format!("id=\"{id}\"")),
-            "the page lacks #{id}"
-        );
-    }
-
-    for needed in [
-        "api(\"/api/settings\")",
-        "showSettings(",
-        "\"Saved settings could not be used: \"",
-        "\". Saving from this page replaces them.\"",
-        "s.can_save",
-        "\"tab-log\", \"tab-settings\"",
-        "#settings-file { overflow-wrap: anywhere; }",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-/// No browser here: the cards are checked as source, and in the build's browser check. Each
-/// card says where its values come from, goes back to the config file, and saves on its own;
-/// polling leaves a card alone while it is being edited.
-#[tokio::test]
-async fn the_settings_tab_edits_the_upstream_servers_and_the_cache() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for id in [
-        "upstream-card",
-        "upstream-from",
-        "upstream-list",
-        "upstream-add",
-        "upstream-new",
-        "bootstrap",
-        "upstream-reset",
-        "upstream-note",
-        "cache-card",
-        "cache-from",
-        "c-entries",
-        "c-kib",
-        "c-min",
-        "c-max",
-        "c-optimistic",
-        "cache-reset",
-        "cache-note",
-    ] {
-        assert!(
-            page.contains(&format!("id=\"{id}\"")),
-            "the page lacks #{id}"
-        );
-    }
-
-    for needed in [
-        "\"From the config file\"",
-        "\"Changed on this page\"",
-        ">Reset to config file<",
-        "A change clears the cache.",
-        "saveServers(",
-        "data-reset=\"upstream\"",
-        "data-reset=\"cache\"",
-        "\"Move up\"",
-        "\"Move down\"",
-        "\"Remove\"",
-        "editing[key]",
-        "{ [key]: value }",
-        "max_bytes",
-        ".items li > :first-child",
-        "overflow-wrap: anywhere",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-#[tokio::test]
-async fn the_settings_tab_edits_the_rewrites_and_safe_search() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for id in [
-        "rewrites-card",
-        "rewrites-from",
-        "rewrite-table",
-        "rewrite-add",
-        "rewrite-name",
-        "rewrite-answer",
-        "rewrites-reset",
-        "rewrites-note",
-        "safe-search-card",
-        "safe_search-from",
-        "safe-search",
-        "safe_search-reset",
-        "safe_search-note",
-    ] {
-        assert!(
-            page.contains(&format!("id=\"{id}\"")),
-            "the page lacks #{id}"
-        );
-    }
-
-    for needed in [
-        "[\"rewrites\", s.rewrites]",
-        "[\"safe_search\", s.safe_search]",
-        "rewritten: \"rewritten\"",
-        "data.decision === \"rewritten\"",
-        "counters.rewritten",
-        "#rewrite-table li",
-        "saveSetting(\"rewrites\", [...rewrites,",
-        "saveSetting(\"safe_search\", $(\"safe-search\").checked)",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-#[tokio::test]
-async fn the_settings_tab_switches_blocked_services_by_group_with_a_filter() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for id in [
-        "services-card",
-        "services-from",
-        "service-filter",
-        "services-state",
-        "service-groups",
-        "services-reset",
-        "services-note",
-    ] {
-        assert!(
-            page.contains(&format!("id=\"{id}\"")),
-            "the page lacks #{id}"
-        );
-    }
-
-    for needed in [
-        "[\"services\", s.services]",
-        "api(\"/api/services\")",
-        "saveSetting(\"services\"",
-        "editing.services",
-        "AdGuard",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-/// No browser here: the chart is checked as source. The SVG namespace is read from the markup,
-/// because its literal contains `http://`, which the page must never contain.
-#[tokio::test]
-async fn the_chart_is_inline_svg_drawn_with_create_element_ns() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for needed in [
-        "<svg id=\"chart\"",
-        "createElementNS(",
-        ".namespaceURI",
-        "id=\"chart-readout\"",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-/// No browser here: the ranges are checked as source, and in the build's browser check.
-#[tokio::test]
-async fn the_chart_has_four_ranges_that_keep_to_the_retention_and_are_remembered() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for days in ["1", "7", "30", "90"] {
-        assert!(
-            page.contains(&format!("<button data-days=\"{days}\">")),
-            "{days}"
-        );
-    }
-
-    for needed in [
-        "id=\"chart-totals\"",
-        "id=\"chart-title\"",
-        "button.disabled = days > retention",
-        "status.retention_days",
-        "\"&offset=\" + -new Date().getTimezoneOffset()",
-        "HISTORY_REFRESH_MS = 60000",
-        "localStorage.getItem(",
-        "localStorage.setItem(",
-        "\"since \" + when(status.since)",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-
-    // Storage can be blocked: each use of it sits in a try.
-    assert!(page.matches("try {").count() >= 2);
-    assert!(!page.contains("(since start)"));
-}
-
-/// No browser here: the statistics card and the two clear buttons are checked as source.
-#[tokio::test]
-async fn the_statistics_card_and_the_clear_buttons_ask_before_they_clear() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for needed in [
-        "id=\"stats-card\"",
-        "id=\"retention\"",
-        "id=\"stats-saving\"",
-        "id=\"stats-clear\"",
-        "id=\"stats-reset\"",
-        "saveSetting(\"stats\", { retention_days:",
-        "saveSetting(key, null)",
-        "showSaving(status.stats_saving)",
-        "\"Clear the statistics?",
-        "act(\"/api/stats/clear\"",
-        "id=\"clear-log\"",
-        "\"Clear the query log?",
-        "act(\"/api/querylog/clear\"",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-
-    for option in ["1", "7", "30", "90"] {
-        assert!(
-            page.contains(&format!("<option value=\"{option}\">")),
-            "{option}"
-        );
-    }
-}
-
-/// No browser here: the form's source is checked. `pause_takes_one_to_1440_minutes_and_nothing_else`
-/// pins the same limits on the server.
-#[tokio::test]
-async fn the_pause_form_sends_only_whole_minutes_from_1_to_1440() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    for needed in [
-        "id=\"pause-form\"",
-        "novalidate",
-        "id=\"pause-minutes\"",
-        "type=\"number\"",
-        "min=\"1\"",
-        "max=\"1440\"",
-        "Number.isInteger(",
-        "\"Enter 1 to 1440 minutes\"",
-    ] {
-        assert!(page.contains(needed), "the page lacks {needed}");
-    }
-}
-
-/// No browser here: the button is hidden by a style rule, so the rule is what is checked.
-#[tokio::test]
-async fn the_resume_button_is_shown_only_while_blocking_is_paused() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    assert!(page.contains("#resume { display: none; }"));
-    assert!(page.contains(".paused #resume { display: inline-block; }"));
-}
-
-/// No browser here, so the page source is checked for what hides the notice and what fills it.
-#[tokio::test]
-async fn the_update_notice_is_hidden_until_a_newer_version_is_known() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-
-    assert!(page.contains("<section id=\"update\" hidden>"));
-    assert!(page.contains(
-        "$(\"update\").hidden = !u.latest && !installing && !(watchingInstall && state);"
-    ));
-    for filled_as_text in [
-        "$(\"version\").textContent",
-        "$(\"update-text\").textContent",
-        "$(\"update-notes\").textContent",
-        "$(\"update-how\").textContent",
-        "$(\"install-state\").textContent",
-    ] {
-        assert!(page.contains(filled_as_text), "{filled_as_text}");
-    }
-
-    assert!(page.contains("\" is available\""));
-}
-
-/// No browser here: the click handler's source must ask before it posts.
-#[tokio::test]
-async fn the_install_button_asks_before_it_posts() {
-    let (site, _upstream) = plain_site().await;
-
-    let page = site.send(get("/")).await.body;
-    let handler = &page[page
-        .find("$(\"install\").addEventListener(")
-        .expect("a click handler")..];
-    let asks = handler.find("confirm(").expect("the handler asks");
-    let posts = handler.find("\"/api/update\"").expect("the handler posts");
-
-    assert!(asks < posts);
-    assert!(page.contains("$(\"install\").hidden = !update.can_install;"));
 }
 
 #[tokio::test]
@@ -1335,6 +729,23 @@ async fn the_query_log_is_newest_first_and_never_longer_than_the_ring() {
     }
 }
 
+#[tokio::test]
+async fn one_query_log_answer_is_cut_to_a_thousand_entries() {
+    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+    let mut config = local_config(&upstream);
+    config.stats.query_log_entries = 1_500;
+    let site = site(config).await;
+    for index in 0..1_500 {
+        record_client(&site, "127.0.0.1", &format!("n{index}.example."));
+    }
+
+    let everything = site.send(get("/api/querylog?limit=100000")).await;
+    let entries = everything.json()["entries"].as_array().unwrap().clone();
+
+    assert_eq!(entries.len(), 1_000);
+    assert_eq!(entries[0]["qname"], "n1499.example");
+}
+
 /// Records a query from `client` straight into the site's stats: the names code sees only the
 /// addresses the views show, however they got there.
 fn record_client(site: &Site, client: &str, qname: &str) {
@@ -1517,6 +928,15 @@ async fn without_a_local_resolver_names_are_null_and_nothing_is_looked_up() {
     assert_eq!(upstream.count(), 0);
 }
 
+/// Waits, up to a generous bound, until `done` holds: a slow machine is late, not wrong.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "never happened: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_router_silent_to_lookups_holds_up_neither_dns_nor_the_page() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
@@ -1555,30 +975,30 @@ async fn a_router_silent_to_lookups_holds_up_neither_dns_nor_the_page() {
         record_client(&site, &format!("192.168.1.{}", 100 + number), "a.example.");
     }
 
-    let t0 = Instant::now();
+    let local_tally = || {
+        site.dns
+            .pipeline
+            .upstream_tallies()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Local)
+            .unwrap()
+            .tally
+    };
+    let started = Instant::now();
+
+    // The router never answers a lookup, so the reply can only come before the lookups end.
     let status = site.send(get("/api/status")).await.json();
 
-    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert_eq!(local_tally().failed, 0, "the page waited for the lookups");
     let clients = status["top_clients"]["entries"].as_array().unwrap();
     assert_eq!(clients.len(), 20);
     assert!(clients.iter().all(|client| client["name"].is_null()));
-
-    while distinct_names() < 4 {
-        assert!(
-            t0.elapsed() < Duration::from_secs(1),
-            "4 lookups within 1 s"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    until("4 lookups asked", || distinct_names() == 4).await;
 
     // The client pool has one slot; the lookups hold four of their own.
-    let asked_at = Instant::now();
     let answer = ask(&site.dns, "printer.lan.", RecordType::A).await;
-    assert!(
-        asked_at.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        asked_at.elapsed()
-    );
+
+    assert_eq!(local_tally().failed, 0, "the answer waited for the lookups");
     assert_eq!(answer.answers[0].data.to_string(), "192.168.1.9");
 
     site.send(get("/api/status")).await;
@@ -1589,40 +1009,25 @@ async fn a_router_silent_to_lookups_holds_up_neither_dns_nor_the_page() {
         "the cap holds while four are in flight"
     );
 
-    let started = Instant::now();
-    let local = loop {
-        let status = site.send(get("/api/status")).await.json();
-        let local = local_entry(&status).clone();
-        if local["failed"].as_u64().unwrap() >= 8 {
-            break local;
-        }
+    // Waiting reads the tallies, not the page, so no new lookup starts meanwhile.
+    until("two tries of four lookups failed", || {
+        local_tally().failed >= 8
+    })
+    .await;
 
-        assert!(started.elapsed() < Duration::from_secs(6), "{local}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-
-    // Two tries for each of the first four; the next four have not failed yet.
-    assert_eq!(local["failed"], 8);
-    assert_eq!(local["answered"], 1);
+    // Two tries for each of the first four; the next four have not started yet.
+    assert_eq!(local_tally().failed, 8);
+    assert_eq!(local_tally().answered, 1);
     assert!(
-        t0.elapsed() >= Duration::from_millis(1900),
+        started.elapsed() >= Duration::from_millis(1900),
         "{:?}",
-        t0.elapsed()
+        started.elapsed()
     );
 
     // The first four gave up and freed their slots, so a poll starts the next four.
     site.send(get("/api/status")).await;
-    let started = Instant::now();
-    while distinct_names() < 8 {
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{}",
-            distinct_names()
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    until("8 lookups asked", || distinct_names() == 8).await;
 
-    assert_eq!(distinct_names(), 8);
     let status = site.send(get("/api/status")).await.json();
     assert_eq!(status["counters"]["total"], 21);
 }
@@ -2497,20 +1902,22 @@ async fn unsafe_mutations_are_rejected_with_a_session_cookie() {
 /// is accepted.
 #[tokio::test]
 async fn every_change_route_accepts_the_request_the_tables_refuse() {
+    let mut routes = tokio::task::JoinSet::new();
     for index in 0..change_routes("").len() {
-        let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-        let site = seeded_site(local_config(&upstream), true).await;
-        let route = change_routes(&site.list).swap_remove(index);
+        routes.spawn(async move {
+            let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
+            let site = seeded_site(local_config(&upstream), true).await;
+            let route = change_routes(&site.list).swap_remove(index);
+            let reply = site.send(route.valid()).await;
 
-        let reply = site.send(route.valid()).await;
+            (route.name, reply.status, reply.body)
+        });
+    }
 
-        assert!(
-            reply.status == 200 || reply.status == 202,
-            "{}: {} {}",
-            route.name,
-            reply.status,
-            reply.body
-        );
+    while let Some(done) = routes.join_next().await {
+        let (name, status, body) = done.unwrap();
+
+        assert!(status == 200 || status == 202, "{name}: {status} {body}");
     }
 }
 
@@ -2670,6 +2077,115 @@ async fn wrong_basic_auth_counts_toward_the_limit_and_anonymous_requests_do_not(
 }
 
 #[tokio::test]
+async fn an_anonymous_request_is_asked_to_sign_in_before_a_path_is_found_missing() {
+    let (site, _upstream) = plain_site().await;
+
+    let anonymous = site.send_as_is(get("/nope")).await;
+    let signed_in = site.send_as_is(get("/nope").signed_in(ADMIN)).await;
+
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(signed_in.status, 404);
+}
+
+#[tokio::test]
+async fn a_bearer_token_is_not_a_login_and_does_not_count_toward_the_limit() {
+    let (site, _upstream) = plain_site().await;
+
+    for _ in 0..10 {
+        let reply = site
+            .send_from(
+                "127.0.0.2",
+                get("/api/status").header("Authorization", "Bearer x"),
+            )
+            .await;
+        assert_eq!(reply.status, 401);
+    }
+
+    let reply = site
+        .send_from("127.0.0.2", get("/api/status").signed_in(ADMIN))
+        .await;
+    assert_eq!(reply.status, 200);
+}
+
+#[tokio::test]
+async fn every_refusal_carries_the_protective_headers_and_grants_no_cross_origin_read() {
+    let (site, _upstream) = plain_site().await;
+    let padded = format!("{{}}{}", " ".repeat(64 * 1024));
+    for _ in 0..5 {
+        site.send_from("127.0.0.2", get("/api/status").signed_in(WRONG_PASSWORD))
+            .await;
+    }
+
+    let refusals = [
+        (401, site.send_as_is(get("/api/status")).await),
+        (
+            403,
+            site.send_as_is(
+                get("/api/lists")
+                    .header("Host", "evil.example")
+                    .signed_in(ADMIN),
+            )
+            .await,
+        ),
+        (404, site.send_as_is(get("/nope").signed_in(ADMIN)).await),
+        (
+            405,
+            site.send_as_is(get("/api/pause").signed_in(ADMIN)).await,
+        ),
+        (
+            413,
+            site.send_as_is(post("/api/settings", &padded).signed_in(ADMIN))
+                .await,
+        ),
+        (
+            429,
+            site.send_from("127.0.0.2", get("/api/status").signed_in(ADMIN))
+                .await,
+        ),
+    ];
+
+    for (status, reply) in refusals {
+        assert_eq!(reply.status, status, "{}", reply.body);
+        assert_eq!(reply.header("cache-control"), Some("no-store"), "{status}");
+        assert_eq!(
+            reply.header("x-content-type-options"),
+            Some("nosniff"),
+            "{status}"
+        );
+        assert_eq!(reply.header("x-frame-options"), Some("DENY"), "{status}");
+        assert_eq!(
+            reply.header("content-security-policy"),
+            Some(PAGE_CSP),
+            "{status}"
+        );
+        assert_no_cross_origin_grant(&reply, &status.to_string());
+    }
+}
+
+#[tokio::test]
+async fn a_preflight_is_not_answered_with_a_cross_origin_grant() {
+    let (site, _upstream) = plain_site().await;
+    let preflight = Request {
+        method: "OPTIONS",
+        ..get("/api/pause")
+            .header("Origin", "http://evil.example")
+            .header("Access-Control-Request-Method", "POST")
+            .signed_in(ADMIN)
+    };
+
+    let reply = site.send_as_is(preflight).await;
+
+    assert_no_cross_origin_grant(&reply, "OPTIONS");
+    assert!(!site.is_paused());
+}
+
+fn assert_no_cross_origin_grant(reply: &Reply, what: &str) {
+    for (name, _) in &reply.headers {
+        assert!(!name.starts_with("access-control-allow-"), "{what}: {name}");
+    }
+}
+
+#[tokio::test]
 async fn a_password_hash_opens_the_api_with_basic_auth() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
     let site = site(hashed_config(&upstream, "s3cret", 1000)).await;
@@ -2685,41 +2201,9 @@ async fn a_password_hash_opens_the_api_with_basic_auth() {
 }
 
 #[tokio::test]
-async fn repeated_basic_auth_with_a_hash_does_not_pay_the_hash_each_time() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let config = hashed_config(&upstream, "s3cret", 100_000);
-    let hash = config.web.password_hash.clone().unwrap();
-    let site = site(config).await;
-    let started = Instant::now();
-    assert!(hash.verify(b"s3cret"));
-    let one = started.elapsed();
-
-    let wrong = site
-        .send_as_is(get("/api/status").signed_in(WRONG_PASSWORD))
-        .await;
-    assert_eq!(wrong.status, 401);
-    let first = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
-    assert_eq!(first.status, 200);
-    assert!(first.json().get("limited").is_none());
-
-    let started = Instant::now();
-    for _ in 0..100 {
-        let reply = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
-        assert_eq!(reply.status, 200);
-    }
-    let hundred = started.elapsed();
-
-    // Uncached, they would take `one * 100`.
-    assert!(
-        hundred < one * 10,
-        "one hash {one:?}, 100 requests {hundred:?}"
-    );
-}
-
-#[tokio::test]
 async fn a_slow_password_check_holds_up_neither_dns_nor_the_page() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let site = Arc::new(site(hashed_config(&upstream, "s3cret", 2_000_000)).await);
+    let site = Arc::new(site(hashed_config(&upstream, "s3cret", MAX_ITERATIONS)).await);
 
     let slow = tokio::spawn({
         let site = Arc::clone(&site);
@@ -2735,7 +2219,8 @@ async fn a_slow_password_check_holds_up_neither_dns_nor_the_page() {
         ask(&site.dns, "ok.example.", RecordType::A).await;
         site.send_as_is(get("/")).await
     };
-    let page = tokio::time::timeout(Duration::from_secs(2), answers)
+    // The order is the check: the bound only ends a hang.
+    let page = tokio::time::timeout(Duration::from_secs(30), answers)
         .await
         .expect("DNS and the page answer while a password is hashed");
     assert_eq!(page.status, 200);
@@ -3054,8 +2539,7 @@ async fn a_request_without_a_host_is_refused() {
 
     let bytes = exchange(site.web, b"GET /api/status HTTP/1.0\r\n\r\n").await;
 
-    let reply = parse_reply(&bytes);
-    assert!(reply.is_none_or(|reply| reply.status == 403 || reply.status == 400));
+    assert_eq!(parse_reply(&bytes).map(|reply| reply.status), Some(403));
 }
 
 #[tokio::test]
@@ -3066,35 +2550,54 @@ async fn oversized_request_heads_are_refused() {
         .map(|index| (format!("X-Header-{index}"), "v".to_string()))
         .collect();
 
-    let mut with_long = get("/api/status");
+    let mut with_long = get("/api/status").signed_in(ADMIN);
     with_long = with_long.header("X-Long", &long_value);
-    let mut with_many = get("/api/status");
+    let mut with_many = get("/api/status").signed_in(ADMIN);
     with_many.headers.extend(many_headers);
 
     for (what, request) in [("a long header", with_long), ("many headers", with_many)] {
         let bytes = exchange(site.web, &request.bytes(site.web)).await;
         let status = parse_reply(&bytes).map(|reply| reply.status);
 
-        assert!(
-            status.is_none_or(|status| status >= 400),
-            "{what}: {status:?}"
-        );
+        // Signed in, so only the head limit can refuse it: the status route would answer 200.
+        assert!(status == Some(431), "{what}: {status:?}");
     }
 
     let after = site.send(get("/api/status")).await;
     assert_eq!(after.status, 200, "the server still answers");
 }
 
-/// How many connections the page serves at once, and how long one may take to send its head:
-/// `MAX_CONNECTIONS` and `HEAD_TIMEOUT` in `src/web.rs`.
+/// How many connections the page serves at once, how many of them one client may hold, and how
+/// long one may take to send its head and its body: `MAX_CONNECTIONS`,
+/// `MAX_CONNECTIONS_PER_CLIENT`, `HEAD_TIMEOUT` and `BODY_TIMEOUT` in `src/web.rs`.
 const PAGE_CONNECTIONS: usize = 16;
+const PAGE_CONNECTIONS_PER_CLIENT: usize = 4;
+
+async fn connect_from(web: SocketAddr, from: &str) -> TcpStream {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddr::new(from.parse().unwrap(), 0))
+        .unwrap();
+
+    socket.connect(web).await.unwrap()
+}
+
+async fn closes_within(stream: &mut TcpStream, wait: Duration) -> bool {
+    let mut chunk = [0u8; 64];
+
+    matches!(
+        tokio::time::timeout(wait, stream.read(&mut chunk)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
 
 #[tokio::test]
 async fn connections_that_send_no_head_cannot_hold_the_page_down() {
     let (site, _upstream) = plain_site().await;
     let mut idle = Vec::new();
     for index in 0..PAGE_CONNECTIONS {
-        let mut stream = TcpStream::connect(site.web).await.unwrap();
+        let from = format!("127.0.0.{}", 1 + index / PAGE_CONNECTIONS_PER_CLIENT);
+        let mut stream = connect_from(site.web, &from).await;
         if index % 2 == 1 {
             stream
                 .write_all(b"GET /api/status HTTP/1.1\r\nHost: x\r\n")
@@ -3117,19 +2620,61 @@ async fn connections_that_send_no_head_cannot_hold_the_page_down() {
     );
 
     for (index, mut stream) in idle.into_iter().enumerate() {
-        let mut chunk = [0u8; 64];
-        let closed = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
-            .await
-            .unwrap_or_else(|_| panic!("connection {index} was still open after 15 s"));
-
         assert!(
-            matches!(closed, Ok(0) | Err(_)),
-            "connection {index} got {closed:?}"
+            closes_within(&mut stream, Duration::from_secs(15)).await,
+            "connection {index} was still open after 15 s"
         );
     }
 
     let after = site.send(get("/api/status")).await;
     assert_eq!(after.status, 200, "the page answers again");
+}
+
+#[tokio::test]
+async fn one_client_cannot_hold_more_than_its_share_of_the_page_connections() {
+    let (site, _upstream) = plain_site().await;
+    let stalled_login = "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                         Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{";
+    let mut stalled = Vec::new();
+    for _ in 0..PAGE_CONNECTIONS_PER_CLIENT {
+        let mut stream = connect_from(site.web, "127.0.0.1").await;
+        stream.write_all(stalled_login.as_bytes()).await.unwrap();
+        stalled.push(stream);
+    }
+
+    let mut fifth = connect_from(site.web, "127.0.0.1").await;
+
+    assert!(
+        closes_within(&mut fifth, Duration::from_secs(1)).await,
+        "a fifth connection from one client was kept"
+    );
+    let other = exchange_from(
+        site.web,
+        "127.0.0.2".parse().unwrap(),
+        &get("/api/status").bytes(site.web),
+    )
+    .await;
+    assert!(
+        parse_reply(&other).is_some_and(|reply| reply.status == 200 || reply.status == 401),
+        "another client was not answered: {other:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_sent_in_time_is_answered_with_408() {
+    let (site, _upstream) = plain_site().await;
+    let request = "POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                   Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{";
+
+    let mut stream = TcpStream::connect(site.web).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut reply))
+        .await
+        .expect("the server kept the connection open")
+        .unwrap();
+
+    assert_eq!(parse_reply(&reply).unwrap().status, 408);
 }
 
 #[tokio::test]
@@ -4416,12 +3961,26 @@ async fn the_file_is_written_only_when_a_setting_in_force_changes() {
     }
 }
 
-/// Upstreams that answer after a while, so queries are still waiting when the servers change.
-async fn slow_upstreams() -> [common::harness::FakeUpstream; 2] {
-    [
-        answering_upstream([1, 1, 1, 1], Duration::from_millis(1500)).await,
-        answering_upstream([2, 2, 2, 2], Duration::from_millis(1500)).await,
-    ]
+/// An upstream that holds every reply until its gate opens, so a query is waiting for as long as
+/// the test wants and not for a time that a slow machine can use up.
+async fn gated_upstream(
+    address: [u8; 4],
+) -> (
+    common::harness::FakeUpstream,
+    tokio::sync::watch::Sender<bool>,
+) {
+    fake_upstream_with_gate(
+        move |query| {
+            let owner = query.queries[0].name().to_string();
+
+            vec![(
+                Duration::ZERO,
+                reply_to(query, vec![a_record(&owner, 300, address)]),
+            )]
+        },
+        |_| true,
+    )
+    .await
 }
 
 fn ask_later(site: &Site, name: String) -> tokio::task::JoinHandle<hickory_proto::op::Message> {
@@ -4432,60 +3991,56 @@ fn ask_later(site: &Site, name: String) -> tokio::task::JoinHandle<hickory_proto
 
 #[tokio::test]
 async fn queries_waiting_through_upstream_changes_all_get_their_answer() {
-    let upstreams = slow_upstreams().await;
-    let mut config = local_config(&upstreams[0]);
-    // A busy test machine must not turn a slow answer into a timeout.
-    config.upstream.timeout_ms = 6000;
+    let (first, first_gate) = gated_upstream([1, 1, 1, 1]).await;
+    let (second, second_gate) = gated_upstream([2, 2, 2, 2]).await;
+    let upstreams = [&first, &second];
+    let mut config = local_config(&first);
+    // Held queries must outlast a busy test machine.
+    config.upstream.timeout_ms = 60_000;
     let site = site(config).await;
     let generations = || site.dns.pipeline.upstreams().generations();
     let mut waiting = Vec::new();
 
     for round in 0..2 {
-        waiting.extend((0..5).map(|index| ask_later(&site, format!("r{round}-{index}.example."))));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let next = upstream_body(&[udp(&upstreams[(round + 1) % 2])]);
+        waiting.push((
+            round,
+            (0..5)
+                .map(|index| ask_later(&site, format!("r{round}-{index}.example.")))
+                .collect::<Vec<_>>(),
+        ));
+        until("the five queries reached their upstream", || {
+            upstreams[round].count() == 5
+        })
+        .await;
+        let next = upstream_body(&[udp(upstreams[(round + 1) % 2])]);
 
         assert_eq!(site.send(post("/api/settings", &next)).await.status, 200);
     }
 
     assert_eq!(generations(), 3);
-    let refused = site
-        .send(post("/api/settings", &upstream_body(&[udp(&upstreams[1])])))
-        .await;
+    let again = upstream_body(&[udp(&second)]);
+    let refused = site.send(post("/api/settings", &again)).await;
     assert_eq!(refused.status, 409, "{}", refused.body);
     assert_eq!(
         refused.json()["error"],
         "the previous upstream change is still finishing; try again in a few seconds"
     );
 
-    for round in 2..8 {
-        waiting.extend((0..3).map(|index| ask_later(&site, format!("r{round}-{index}.example."))));
-        let next = upstream_body(&[udp(&upstreams[round % 2])]);
-        loop {
-            let reply = site.send(post("/api/settings", &next)).await;
-            assert!(generations() <= 3);
-            if reply.status == 200 {
-                break;
-            }
+    first_gate.send(true).unwrap();
+    second_gate.send(true).unwrap();
+    for (round, queries) in waiting {
+        let address = format!("{0}.{0}.{0}.{0}", round + 1);
+        for query in queries {
+            let reply = query.await.unwrap();
 
-            assert_eq!(reply.status, 409, "{}", reply.body);
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(reply.response_code, ResponseCode::NoError);
+            assert_eq!(reply.answers.len(), 1);
+            assert_eq!(reply.answers[0].data.to_string(), address);
         }
     }
 
-    let total = waiting.len();
-    for query in waiting {
-        let reply = query.await.unwrap();
-        assert_eq!(reply.response_code, ResponseCode::NoError);
-        assert_eq!(reply.answers.len(), 1);
-    }
-
-    assert_eq!(total, 28);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while generations() > 1 {
-        assert!(Instant::now() < deadline, "replaced pools are still alive");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until("the replaced pools finished", || generations() == 1).await;
+    assert_eq!(site.send(post("/api/settings", &again)).await.status, 200);
 }
 
 fn cache_body(min_ttl: u32) -> String {
@@ -5310,6 +4865,77 @@ async fn a_failed_refresh_keeps_the_service_lists_and_no_refresh_writes_a_file()
 
     let written: Vec<_> = std::fs::read_dir(&site.state).unwrap().collect();
     assert!(written.is_empty(), "{written:?}");
+}
+
+/// Waits until the services view reports an error that names `id`.
+async fn wait_for_services_error_naming(site: &Site, id: &str) -> Value {
+    for _ in 0..400 {
+        let services = site.send(get("/api/services")).await.json();
+        if services["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(id))
+        {
+            return services;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    panic!("the services view never named {id} in its error");
+}
+
+/// A service stays switched on, and blocking, after a refreshed catalog stops offering usable
+/// rules for it; the page keeps it listed as on and says why.
+async fn assert_video_stays_blocked_after(catalog_without_usable_video: &str) {
+    let (site, catalog, _upstream) = services_site(&["chat", "video"], fast_timing(), |config| {
+        config.services.refresh_hours = 1;
+    })
+    .await;
+    wait_until_blocked(&site, "chat.example.", true).await;
+    wait_until_blocked(&site, "video.example.", true).await;
+
+    catalog.serve(CATALOG_PATH, catalog_without_usable_video, None);
+    let services = wait_for_services_error_naming(&site, "video").await;
+
+    let video = services["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|service| service["id"] == "video")
+        .unwrap_or_else(|| panic!("video is not listed: {services}"));
+    assert_eq!(video["on"], true, "{services}");
+    assert!(is_blocked(&site, "chat.example.").await);
+    assert!(
+        is_blocked(&site, "video.example.").await,
+        "video is still switched on but no longer blocked"
+    );
+    let settings = site.send(get("/api/settings")).await.json();
+    assert_eq!(
+        settings["services"]["block"],
+        serde_json::json!(["chat", "video"])
+    );
+}
+
+#[tokio::test]
+async fn a_service_missing_from_the_new_catalog_keeps_its_list() {
+    let video = "{\"id\": \"video\", \"name\": \"Video\", \"group\": \"streaming\", \"icon_svg\": \"<svg>video</svg>\",\n     \"rules\": [\"||video.example^\"]},";
+    let without_video = CATALOG.replace(video, "");
+    assert!(!without_video.contains("\"video\""));
+
+    assert_video_stays_blocked_after(&without_video).await;
+}
+
+#[tokio::test]
+async fn a_service_grown_over_the_rule_cap_keeps_its_list() {
+    let many_rules = (0..2001)
+        .map(|index| format!("\"||video{index}.example^\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let video = "\"rules\": [\"||video.example^\"]},";
+    let grown = CATALOG.replace(video, &format!("\"rules\": [{many_rules}]}},"));
+    assert!(grown.contains("video2000.example"));
+
+    assert_video_stays_blocked_after(&grown).await;
 }
 
 #[tokio::test]

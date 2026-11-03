@@ -18,7 +18,7 @@
 use std::borrow::Cow;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -31,10 +31,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
-use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE};
+use self::auth::{Attempt, Auth, Check, SIGNED_OUT_COOKIE, client_key};
 use crate::config::{Cidr, Config, ListFormat, Rewrite, WebConfig, is_allowed};
 use crate::dns::wire::Name;
 use crate::memory::{self, Memory};
@@ -57,16 +56,21 @@ use crate::update::{Tag, UpdateView, Updates, parse_tag};
 
 mod auth;
 
+pub use auth::LIMITER_ADDRESSES;
+
 const PAGE: &str = include_str!("web/index.html");
 
 const MAX_BODY_BYTES: usize = 1024;
 /// A settings change carries whole lists (upstreams, rewrites, services).
 const MAX_SETTINGS_BODY_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 16;
+/// One client cannot hold more than this many of the slots, so it cannot lock the others out.
+const MAX_CONNECTIONS_PER_CLIENT: usize = 4;
 /// The smallest buffer hyper accepts; it bounds the request line and headers together.
 const MAX_HEAD_BYTES: usize = 8 * 1024;
 const MAX_HEADERS: usize = 32;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 /// A request and its response, slow clients included; one request per connection.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
@@ -74,6 +78,8 @@ const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 const MIN_PAUSE_MINUTES: u32 = 1;
 const MAX_PAUSE_MINUTES: u32 = 24 * 60;
 const DEFAULT_QUERY_LOG_LIMIT: usize = 100;
+/// One answer is built under the lock every DNS answer takes, whatever the ring holds.
+const MAX_QUERY_LOG_ANSWER: usize = 1_000;
 const HISTORY_DAYS: [u32; 3] = [7, 30, 90];
 /// The furthest time zone from UTC is 14 hours east.
 const MAX_OFFSET_MINUTES: i32 = 14 * 60;
@@ -179,14 +185,72 @@ impl WebListeners {
 
 /// Starts serving on the current runtime and returns at once.
 pub fn spawn(listeners: WebListeners, web: Arc<Web>) {
-    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let connections = Arc::new(Connections::new());
 
     for listener in listeners.0 {
         tokio::spawn(serve(listener, Arc::clone(&web), Arc::clone(&connections)));
     }
 }
 
-async fn serve(listener: TcpListener, web: Arc<Web>, connections: Arc<Semaphore>) {
+/// The page connections that are open, per client, in a table that is allocated once.
+struct Connections {
+    /// One entry per client with at least one open connection, so never more than
+    /// `MAX_CONNECTIONS` entries.
+    open: Mutex<Vec<(IpAddr, usize)>>,
+}
+
+/// A held connection slot; dropping it gives the slot back.
+struct Slot {
+    connections: Arc<Connections>,
+    client: IpAddr,
+}
+
+impl Connections {
+    fn new() -> Connections {
+        Connections {
+            open: Mutex::new(Vec::with_capacity(MAX_CONNECTIONS)),
+        }
+    }
+
+    /// A slot for `peer`, or `None` when all slots are taken or the client holds its share.
+    fn admit(self: &Arc<Self>, peer: IpAddr) -> Option<Slot> {
+        let client = client_key(peer);
+        let mut open = self.open.lock().unwrap();
+
+        if open.iter().map(|&(_, count)| count).sum::<usize>() >= MAX_CONNECTIONS {
+            return None;
+        }
+
+        match open.iter_mut().find(|(key, _)| *key == client) {
+            Some((_, count)) if *count >= MAX_CONNECTIONS_PER_CLIENT => return None,
+
+            Some((_, count)) => *count += 1,
+
+            None => open.push((client, 1)),
+        }
+
+        Some(Slot {
+            connections: Arc::clone(self),
+            client,
+        })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut open = self.connections.open.lock().unwrap();
+
+        if let Some(position) = open.iter().position(|(key, _)| *key == self.client) {
+            open[position].1 -= 1;
+
+            if open[position].1 == 0 {
+                open.swap_remove(position);
+            }
+        }
+    }
+}
+
+async fn serve(listener: TcpListener, web: Arc<Web>, connections: Arc<Connections>) {
     loop {
         let Ok((stream, peer)) = listener.accept().await else {
             tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
@@ -199,7 +263,7 @@ async fn serve(listener: TcpListener, web: Arc<Web>, connections: Arc<Semaphore>
             continue;
         }
 
-        let Ok(slot) = Arc::clone(&connections).try_acquire_owned() else {
+        let Some(slot) = connections.admit(peer.ip()) else {
             continue;
         };
 
@@ -207,12 +271,7 @@ async fn serve(listener: TcpListener, web: Arc<Web>, connections: Arc<Semaphore>
     }
 }
 
-async fn serve_connection(
-    stream: TcpStream,
-    peer: IpAddr,
-    web: Arc<Web>,
-    _slot: OwnedSemaphorePermit,
-) {
+async fn serve_connection(stream: TcpStream, peer: IpAddr, web: Arc<Web>, _slot: Slot) {
     let service = service_fn(move |request| {
         let web = Arc::clone(&web);
 
@@ -981,7 +1040,7 @@ impl Web {
             }
         }
 
-        Ok(limit.min(self.query_log_entries))
+        Ok(limit.min(self.query_log_entries).min(MAX_QUERY_LOG_ANSWER))
     }
 
     fn pause_view(&self) -> PauseView {
@@ -1163,7 +1222,14 @@ async fn read_body(
         return Err(too_large());
     }
 
-    match Limited::new(body, max_bytes).collect().await {
+    let Ok(collected) = timeout(BODY_TIMEOUT, Limited::new(body, max_bytes).collect()).await else {
+        return Err(Rejection::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "the body was not sent in time",
+        ));
+    };
+
+    match collected {
         Ok(collected) => Ok(collected.to_bytes()),
 
         Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => Err(too_large()),
@@ -2114,5 +2180,58 @@ mod tests {
         assert_eq!(share(1, 0, 3), 33.3);
         assert_eq!(share(1, 1, 3), 66.7);
         assert_eq!(share(5, 5, 10), 100.0);
+    }
+
+    #[test]
+    fn a_client_holds_at_most_its_share_of_the_slots() {
+        let connections = Arc::new(Connections::new());
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+
+        let held: Vec<Slot> = (0..MAX_CONNECTIONS_PER_CLIENT)
+            .map(|_| connections.admit(ip("192.0.2.1")).unwrap())
+            .collect();
+
+        assert!(connections.admit(ip("192.0.2.1")).is_none());
+        assert!(connections.admit(ip("192.0.2.2")).is_some());
+
+        drop(held);
+
+        assert!(connections.admit(ip("192.0.2.1")).is_some());
+    }
+
+    #[test]
+    fn all_addresses_of_one_ipv6_64_share_one_client_share() {
+        let connections = Arc::new(Connections::new());
+        let held: Vec<Slot> = (1..=MAX_CONNECTIONS_PER_CLIENT as u16)
+            .map(|index| {
+                connections
+                    .admit(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, index)))
+                    .unwrap()
+            })
+            .collect();
+
+        assert!(connections.admit("fe80::99".parse().unwrap()).is_none());
+        assert!(
+            connections
+                .admit("fe80:0:0:1::1".parse().unwrap())
+                .is_some()
+        );
+
+        drop(held);
+    }
+
+    #[test]
+    fn no_more_than_all_slots_are_handed_out_and_the_table_does_not_grow() {
+        let connections = Arc::new(Connections::new());
+        let held: Vec<Slot> = (0..MAX_CONNECTIONS as u8)
+            .map(|index| connections.admit(IpAddr::from([10, 0, 0, index])).unwrap())
+            .collect();
+
+        assert!(connections.admit("10.0.1.1".parse().unwrap()).is_none());
+        assert_eq!(connections.open.lock().unwrap().capacity(), MAX_CONNECTIONS);
+
+        drop(held);
+
+        assert!(connections.open.lock().unwrap().is_empty());
     }
 }

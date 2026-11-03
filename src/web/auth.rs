@@ -2,7 +2,7 @@
 //! signed session cookie, the per-address failure table, and the one slot in which a password
 //! hash runs.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -22,7 +22,8 @@ pub(super) const SIGNED_OUT_COOKIE: &str =
 const LIMITED_AFTER_FAILURES: usize = 5;
 /// Five failures within this span lock an address until this long after the last one.
 const LIMIT_WINDOW_SECONDS: u32 = 15 * 60;
-const LIMITER_ADDRESSES: usize = 64;
+/// How many client addresses the table of failed sign-ins holds; the oldest is replaced after that.
+pub const LIMITER_ADDRESSES: usize = 64;
 
 pub(super) enum Attempt<'a> {
     /// The credentials of an `Authorization: Basic` header, still encoded.
@@ -324,7 +325,20 @@ fn lowercase_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     Some(bytes)
 }
 
-/// The newest failed password checks per address, in a table that is allocated once.
+/// An IPv6 host can take any address of its /64, so the /64 counts as one client.
+pub(super) fn client_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let [a, b, c, d, ..] = v6.segments();
+
+            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
+
+        v4 => v4,
+    }
+}
+
+/// The newest failed password checks per client, in a table that is allocated once.
 struct Limiter {
     start: Instant,
     entries: Vec<Strikes>,
@@ -359,7 +373,7 @@ impl Limiter {
 
     fn is_limited(&self, ip: IpAddr, now: Instant) -> bool {
         let now = self.seconds(now);
-        let ip = ip.to_canonical();
+        let ip = client_key(ip);
 
         self.entries
             .iter()
@@ -373,7 +387,7 @@ impl Limiter {
 
     fn record_failure(&mut self, ip: IpAddr, now: Instant) {
         let now = self.seconds(now);
-        let ip = ip.to_canonical();
+        let ip = client_key(ip);
 
         if let Some(strikes) = self.entries.iter_mut().find(|strikes| strikes.ip == ip) {
             if usize::from(strikes.count) == LIMITED_AFTER_FAILURES {
@@ -411,7 +425,7 @@ impl Limiter {
     }
 
     fn clear(&mut self, ip: IpAddr) {
-        let ip = ip.to_canonical();
+        let ip = client_key(ip);
 
         self.entries.retain(|strikes| strikes.ip != ip);
     }
@@ -420,7 +434,7 @@ impl Limiter {
     fn failures(&self, ip: IpAddr) -> usize {
         self.entries
             .iter()
-            .find(|strikes| strikes.ip == ip.to_canonical())
+            .find(|strikes| strikes.ip == client_key(ip))
             .map_or(0, |strikes| usize::from(strikes.count))
     }
 
@@ -519,10 +533,13 @@ pub(super) fn base64(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::time::Duration;
 
     use hyper::header::HeaderValue;
     use tokio::task::JoinSet;
+
+    use crate::password::MAX_ITERATIONS;
 
     use super::*;
 
@@ -817,6 +834,43 @@ mod tests {
     }
 
     #[test]
+    fn every_address_of_one_ipv6_64_counts_as_one_client() {
+        let start = Instant::now();
+        let mut limiter = Limiter::new(start);
+        let address = |index: u16| IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, index));
+
+        for index in 1..=1000 {
+            if index <= 5 {
+                assert!(!limiter.is_limited(address(index), start));
+            }
+            limiter.record_failure(address(index), start);
+        }
+
+        assert!(limiter.is_limited(address(1), start));
+        assert!(limiter.is_limited(address(1000), start));
+        assert!(limiter.is_limited(ip("fe80:0:0:0:1:2:3:4"), start));
+        assert!(!limiter.is_limited(ip("fe80:0:0:1::1"), start));
+        assert_eq!(limiter.capacity(), 64);
+    }
+
+    #[test]
+    fn a_success_clears_only_the_key_of_that_client() {
+        let start = Instant::now();
+        let mut limiter = Limiter::new(start);
+
+        for _ in 0..4 {
+            limiter.record_failure(ip("fe80::1"), start);
+            limiter.record_failure(ip("fd00::1"), start);
+            limiter.record_failure(ip("192.0.2.1"), start);
+        }
+        limiter.clear(ip("fe80::99"));
+
+        assert_eq!(limiter.failures(ip("fe80::1")), 0);
+        assert_eq!(limiter.failures(ip("fd00::1")), 4);
+        assert_eq!(limiter.failures(ip("192.0.2.1")), 4);
+    }
+
+    #[test]
     fn an_ipv4_mapped_address_counts_as_its_ipv4_address() {
         let start = Instant::now();
         let mut limiter = Limiter::new(start);
@@ -880,16 +934,22 @@ mod tests {
         auth.check(ip(peer), Attempt::Form { user, password }).await
     }
 
-    fn timed_verify(hash: &PasswordHash) -> Duration {
-        (0..3)
-            .map(|_| {
-                let started = Instant::now();
-                hash.verify(b"not it");
+    /// Whether `check` is still waiting while another task holds the only hashing permit,
+    /// which only a check that needs the hash does. Gives the permit back and lets a waiting
+    /// check finish before it returns.
+    async fn needs_the_hash(auth: &Auth, check: impl Future<Output = Check>) -> bool {
+        let permit = Arc::clone(&auth.hashing).acquire_owned().await.unwrap();
+        let mut check = std::pin::pin!(check);
 
-                started.elapsed()
-            })
-            .min()
-            .unwrap()
+        let waited = tokio::time::timeout(Duration::from_millis(100), &mut check)
+            .await
+            .is_err();
+        drop(permit);
+        if waited {
+            check.await;
+        }
+
+        waited
     }
 
     #[tokio::test]
@@ -954,76 +1014,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_the_first_success_the_same_credentials_are_checked_in_microseconds() {
-        let hash = PasswordHash::new(b"s3cret", 100_000).unwrap();
+    async fn after_the_first_success_the_same_credentials_are_accepted_without_the_hash() {
+        let hash = PasswordHash::new(b"s3cret", 1000).unwrap();
         let auth = auth(&hashed_config("admin", &hash));
-
-        let started = Instant::now();
-        assert_eq!(
-            check_basic(&auth, "192.0.2.1", "admin", "s3cret").await,
-            Check::Accepted
-        );
-        let first = started.elapsed();
-
-        let started = Instant::now();
-        for _ in 0..50 {
-            assert_eq!(
-                check_basic(&auth, "192.0.2.1", "admin", "s3cret").await,
-                Check::Accepted
-            );
-            assert_eq!(
-                check_form(&auth, "192.0.2.1", "admin", "s3cret").await,
-                Check::Accepted
-            );
-        }
-        let hundred = started.elapsed();
-
         assert!(
-            hundred < first / 10,
-            "first {first:?}, next 100 {hundred:?}"
+            needs_the_hash(&auth, check_basic(&auth, "192.0.2.1", "admin", "s3cret")).await,
+            "the first success has to be hashed"
         );
+
+        assert!(!needs_the_hash(&auth, check_basic(&auth, "192.0.2.1", "admin", "s3cret")).await);
+        assert!(!needs_the_hash(&auth, check_form(&auth, "192.0.2.1", "admin", "s3cret")).await);
     }
 
     #[tokio::test]
-    async fn every_wrong_attempt_pays_the_full_hash_even_after_a_success() {
-        let hash = PasswordHash::new(b"s3cret", 100_000).unwrap();
+    async fn every_wrong_attempt_needs_the_hash_even_after_a_success() {
+        let hash = PasswordHash::new(b"s3cret", 1000).unwrap();
         let auth = auth(&hashed_config("admin", &hash));
         assert_eq!(
             check_form(&auth, "192.0.2.1", "admin", "s3cret").await,
             Check::Accepted
         );
-        let one = timed_verify(&hash);
 
-        let started = Instant::now();
-        assert_eq!(
-            check_form(&auth, "192.0.2.1", "admin", "wrong").await,
-            Check::Refused
-        );
-        let wrong = started.elapsed();
-
-        assert!(
-            wrong >= one / 2,
-            "one hash {one:?}, wrong attempt {wrong:?}"
-        );
+        assert!(needs_the_hash(&auth, check_form(&auth, "192.0.2.1", "admin", "wrong")).await);
     }
 
     #[tokio::test]
-    async fn a_wrong_user_and_a_wrong_password_cost_the_same_hash() {
-        let hash = PasswordHash::new(b"s3cret", 100_000).unwrap();
+    async fn a_wrong_user_and_a_wrong_password_both_need_the_hash() {
+        let hash = PasswordHash::new(b"s3cret", 1000).unwrap();
         let auth = auth(&hashed_config("admin", &hash));
-        let one = timed_verify(&hash);
 
         for (user, password) in [("other", "s3cret"), ("admin", "wrong")] {
-            let started = Instant::now();
-            assert_eq!(
-                check_basic(&auth, "192.0.2.1", user, password).await,
-                Check::Refused
-            );
-            let took = started.elapsed();
-
             assert!(
-                took >= one / 2,
-                "{user}: one hash {one:?}, attempt {took:?}"
+                needs_the_hash(&auth, check_basic(&auth, "192.0.2.1", user, password)).await,
+                "{user}"
             );
         }
     }
@@ -1090,7 +1113,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_is_counted_even_when_the_request_is_dropped_mid_hash() {
-        let hash = PasswordHash::new(b"s3cret", 2_000_000).unwrap();
+        let hash = PasswordHash::new(b"s3cret", MAX_ITERATIONS).unwrap();
         let auth = Arc::new(auth(&hashed_config("admin", &hash)));
 
         let attempt = tokio::spawn({

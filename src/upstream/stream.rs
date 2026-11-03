@@ -53,9 +53,14 @@ impl StreamUpstream {
         budget: &Arc<Budget>,
         deadline: Instant,
     ) -> Result<Charged, UpstreamError> {
-        self.ensure_connected(deadline).await?;
+        let fresh = self.ensure_connected(deadline).await?;
+        let mut result = self.client.query_charged(request, budget, deadline).await;
+        if !fresh && matches!(result, Err(UpstreamError::Closed)) {
+            self.ensure_connected(deadline).await?;
+            result = self.client.query_charged(request, budget, deadline).await;
+        }
 
-        let (reply, charge) = self.client.query_charged(request, budget, deadline).await?;
+        let (reply, charge) = result?;
         if !is_answer_to(request, &reply) {
             return Err(UpstreamError::BadReply);
         }
@@ -74,9 +79,10 @@ impl StreamUpstream {
         Ok(self.query_charged(request, &unlimited, deadline).await?.0)
     }
 
-    async fn ensure_connected(&self, deadline: Instant) -> Result<(), UpstreamError> {
+    /// True when this call opened the connection.
+    async fn ensure_connected(&self, deadline: Instant) -> Result<bool, UpstreamError> {
         if self.client.is_connected() {
-            return Ok(());
+            return Ok(false);
         }
 
         let Ok(_serialize_connects) = timeout_at(deadline, self.connect_lock.lock()).await else {
@@ -84,7 +90,7 @@ impl StreamUpstream {
         };
 
         if self.client.is_connected() {
-            return Ok(());
+            return Ok(false);
         }
 
         match &self.dial {
@@ -104,7 +110,7 @@ impl StreamUpstream {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -114,6 +120,8 @@ struct State {
     /// Which connection the writer and pending queries belong to.
     epoch: u64,
     next_token: u64,
+    /// When the connection of `epoch` last delivered the start of a reply.
+    heard_at: Option<Instant>,
 }
 
 struct Registration {
@@ -146,6 +154,7 @@ impl StreamClient {
                 pending: HashMap::new(),
                 epoch: 0,
                 next_token: 0,
+                heard_at: None,
             })),
             max_reply,
             io_timeout,
@@ -172,6 +181,7 @@ impl StreamClient {
             state.epoch += 1;
             state.writer = Some(writer);
             state.pending.clear();
+            state.heard_at = None;
 
             state.epoch
         };
@@ -234,7 +244,16 @@ impl StreamClient {
             }
         }
 
+        let sent_at = Instant::now();
         let Ok(received) = timeout_at(deadline, reply).await else {
+            // Nothing at all came back on this connection since the query went out: it is
+            // presumed dead, so the next query opens a new one.
+            let mut state = self.state.lock().unwrap();
+            let silent = state.heard_at.is_none_or(|heard_at| heard_at < sent_at);
+            if state.epoch == registration.epoch && silent {
+                state.writer = None;
+            }
+
             return Err(UpstreamError::Timeout);
         };
 
@@ -353,7 +372,17 @@ impl Session {
         }
 
         let id = u16::from_be_bytes([start[2], start[3]]);
-        let waiting = self.state.lock().unwrap().pending.remove(&id);
+        let waiting = {
+            let mut state = self.state.lock().unwrap();
+            if state.epoch == self.epoch {
+                state.heard_at = Some(Instant::now());
+
+                state.pending.remove(&id)
+            } else {
+                // A retired session may hear a late reply whose ID the new connection reuses.
+                None
+            }
+        };
         let rest = (length - 2) as u64;
         let Some(waiting) = waiting else {
             return self.skip(reader, rest).await;
@@ -869,6 +898,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_retired_connection_does_not_consume_a_query_of_the_new_one() {
+        let client = client();
+        let (first, mut first_server) = duplex(4096);
+        client.attach(first);
+        // A query blocked on a full queue keeps the retired connection's writer, and so its
+        // session, alive after the replacement.
+        let retired_writer = client.state.lock().unwrap().writer.clone();
+        let (second, mut second_server) = duplex(4096);
+        client.attach(second);
+
+        let server_task = tokio::spawn(async move {
+            let received = read_frame(&mut second_server).await;
+            let id = [received[0], received[1]];
+            // The retired connection answers first, with the ID the new query drew.
+            write_reply(&mut first_server, id, b"old").await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            write_reply(&mut second_server, id, b"new").await;
+            (first_server, second_server)
+        });
+        let reply = client
+            .query(&mut request("b.example."), deadline())
+            .await
+            .unwrap();
+
+        assert_eq!(&reply[12..], b"new");
+        drop(retired_writer);
+        drop(server_task.await.unwrap());
+    }
+
+    #[tokio::test]
     async fn an_id_reused_after_delivery_is_not_unregistered_by_the_old_query() {
         let client = client();
         let (ours, _server) = duplex(4096);
@@ -1097,18 +1156,9 @@ mod tests {
             let upstream = upstream(&pki, &server);
 
             for _ in 0..6 {
-                let mut attempts = 0;
-                loop {
-                    attempts += 1;
-                    let result = upstream.query(&mut query_for("a.example."), later()).await;
-                    if result.is_ok() || attempts == 2 {
-                        assert!(result.is_ok(), "{result:?}");
-                        break;
-                    }
+                let result = upstream.query(&mut query_for("a.example."), later()).await;
 
-                    // A query sent into a connection that is just closing fails once.
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
+                assert!(result.is_ok(), "{result:?}");
             }
 
             assert!(server.handshakes.load(Ordering::SeqCst) >= 3);

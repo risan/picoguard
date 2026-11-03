@@ -1,7 +1,6 @@
 //! Memory held by stale cache entries and the refreshes they start, and what a clear frees.
 //! This file has its own test binary so that the counting allocator sees only this one test.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,31 +27,16 @@ const REFRESH_ALLOWANCE: usize = 16 * 1024;
 /// state. Measured: 957,057 bytes held after the clear, about 71 KiB beyond the refreshes.
 const OTHER_ALLOWANCE: usize = 192 * 1024;
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
+use counting::live;
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 fn live_since(baseline: usize) -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed).saturating_sub(baseline)
+    live().saturating_sub(baseline)
 }
 
 /// Where the question of `message` ends: after its name, type and class.
@@ -156,7 +140,7 @@ async fn stale_entries_and_their_refreshes_stay_inside_the_cache_limits_and_a_cl
     server::spawn(listeners, Arc::clone(&pipeline), &config);
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     tokio::task::yield_now().await;
-    let baseline = LIVE_BYTES.load(Ordering::Relaxed);
+    let baseline = live();
 
     ask_all(&client, server, |index, ttl| {
         assert_eq!(ttl, 1, "name {index}");

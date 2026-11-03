@@ -3,48 +3,20 @@
 //! memory budget counts (plan D6). This test binary has a counting allocator that also keeps
 //! the highest total, and one test, so nothing else allocates while it measures.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use picoguard::filter::compile::{CompileOptions, CompileWorker, Compiled};
 use picoguard::filter::parse::ListFormat;
 use picoguard::lists::{MAX_PIECE_BYTES, Piece};
 
-struct Counting;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-fn grow(size: usize) {
-    let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
-    PEAK.fetch_max(live, Ordering::Relaxed);
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        grow(layout.size());
-
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    /// Counted as a move: the old and the new block both live until the copy is done.
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        grow(new_size);
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+use counting::{live, peak_bytes, reset_peak};
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// The pieces in the queue, the one being parsed and the parser's line buffer: the same for
 /// every list, whatever its size.
@@ -63,8 +35,7 @@ async fn compile(
     let mut reader = flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap());
     let options = CompileOptions::new(format, 3_000_000);
     let mut piece = vec![0; MAX_PIECE_BYTES];
-    let before = LIVE.load(Ordering::Relaxed);
-    PEAK.store(before, Ordering::Relaxed);
+    let before = reset_peak();
 
     let compilation = worker.start(options);
     loop {
@@ -82,8 +53,8 @@ async fn compile(
 
     compilation.pieces.send(Piece::End).await.unwrap();
     let compiled = compilation.result().await.unwrap();
-    let held = LIVE.load(Ordering::Relaxed) - before;
-    let peak = PEAK.load(Ordering::Relaxed) - before;
+    let held = live() - before;
+    let peak = peak_bytes() - before;
 
     (compiled, held, peak)
 }
@@ -115,6 +86,13 @@ async fn heap_bytes_is_what_a_list_holds_and_the_compile_charge_covers_its_peak(
             held <= heap + 4096,
             "{name}: holds {held}, heap_bytes {heap}"
         );
+        // Plain rules take a little over 6 bytes each (a 48-bit residual and a share of the
+        // bucket directory); a big list of nothing else shows it.
+        if list.slow_rule_count() == 0 && list.rule_count() > 100_000 {
+            let per_rule = held as f64 / list.rule_count() as f64;
+            assert!(per_rule <= 6.5, "{name}: {per_rule:.2} bytes a rule");
+        }
+
         // The slow rules are charged more than they hold, never less.
         assert!(
             heap <= held * 2 + 4096,

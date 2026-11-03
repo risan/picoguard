@@ -364,7 +364,8 @@ async fn every_kind_of_failure_keeps_the_last_good_list() {
     capture_warnings();
     let dir = StateDir::new();
     let server = ListServer::start().await;
-    let closed = ListServer::start().await.stop().await;
+    let vanishing = ListServer::start().await;
+    vanishing.serve("/l.txt", V1, Some("\"v\""));
     server.serve("/status.txt", V1, Some("\"s\""));
     server.serve("/cap.txt", V1, Some("\"c\""));
     server.serve("/budget.txt", V1, Some("\"b\""));
@@ -380,19 +381,21 @@ async fn every_kind_of_failure_keeps_the_last_good_list() {
         url_list("failing-status", server.url("/status.txt")),
         capped,
         budgeted,
-        url_list("failing-network", format!("http://{closed}/l.txt")),
+        url_list("failing-network", vanishing.url("/l.txt")),
     ];
     let (mut scheduler, _) = boot(&config_of(&dir, lists)).await;
     let policy = scheduler.policy();
-    for index in 0..3 {
+    for index in 0..4 {
         scheduler.refresh(index, &downloader()).await;
     }
 
-    let in_force: Vec<_> = (0..3)
+    let in_force: Vec<_> = (0..4)
         .map(|index| Arc::clone(scheduler.list(index).unwrap()))
         .collect();
     let generation_before = generation(&policy);
 
+    // The network list had a good copy; now its server is gone.
+    vanishing.stop().await;
     server.fail("/status.txt", 503);
     let long_line = format!("||{}.example^\n", "a".repeat(100));
     server.serve("/cap.txt", &long_line, Some("\"c2\""));
@@ -412,7 +415,6 @@ async fn every_kind_of_failure_keeps_the_last_good_list() {
         );
     }
 
-    assert!(scheduler.list(3).is_none());
     assert!(blocked(&policy, "ads.example."));
     assert_eq!(generation(&policy), generation_before);
     for label in [
@@ -841,6 +843,58 @@ async fn the_loop_checks_lists_again_with_their_validators_and_retries_after_a_f
 }
 
 #[tokio::test]
+async fn a_list_that_keeps_failing_is_retried_after_longer_and_longer_waits() {
+    const RETRIES: [u64; 4] = [30, 120, 480, 480];
+    let dir = StateDir::new();
+    let server = ListServer::start().await;
+    server.fail("/bad.txt", 503);
+    let config = config_of(&dir, vec![url_list("retrying", server.url("/bad.txt"))]);
+    let timing = Timing {
+        retries: RETRIES.map(Duration::from_millis),
+        ..slow_timing()
+    };
+    let scheduler = Scheduler::boot(
+        &config,
+        saved_of(&config),
+        CompileWorker::spawn().unwrap(),
+        Arc::new(SnapshotStore::disabled()),
+        timing,
+    )
+    .await
+    .unwrap();
+    let running = tokio::spawn(scheduler.run(downloader(), std::future::pending()));
+
+    let mut arrivals = Vec::new();
+    let patience = Instant::now() + Duration::from_secs(10);
+    while arrivals.len() < RETRIES.len() + 1 {
+        assert!(Instant::now() < patience, "{} requests", arrivals.len());
+        while arrivals.len() < server.requests() {
+            arrivals.push(Instant::now());
+        }
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    running.abort();
+    let gaps: Vec<Duration> = arrivals.windows(2).map(|pair| pair[1] - pair[0]).collect();
+
+    // The looks at the server are only as exact as the machine is idle, so a wait counts if it
+    // lasted half its time: the steps are four times apart, and a wrong step is far below.
+    for (gap, retry) in gaps.iter().zip(RETRIES) {
+        assert!(*gap >= Duration::from_millis(retry / 2), "{gaps:?}");
+    }
+
+    assert!(
+        gaps[0] < gaps[1] && gaps[1] < gaps[2],
+        "growing waits: {gaps:?}"
+    );
+    assert!(
+        gaps[3] < 2 * Duration::from_millis(RETRIES[3]),
+        "the last wait repeats: {gaps:?}"
+    );
+}
+
+#[tokio::test]
 async fn local_files_rules_and_allowlists_make_one_engine() {
     let dir = StateDir::new();
     fs::write(
@@ -924,6 +978,31 @@ async fn a_changed_local_file_is_swapped_in_and_an_unchanged_one_is_kept() {
 
     assert!(!Arc::ptr_eq(&loaded, scheduler.list(0).unwrap()));
     assert!(blocked(&policy, "tracker.example."));
+}
+
+#[tokio::test]
+async fn a_local_file_deleted_after_a_good_copy_keeps_the_copy_and_shows_the_error() {
+    let dir = StateDir::new();
+    fs::write(dir.file("l.txt"), V1).unwrap();
+    let config = config_of(&dir, vec![path_list(dir.file("l.txt"))]);
+    let (mut scheduler, _) = boot(&config).await;
+    let policy = scheduler.policy();
+    let control = scheduler.control();
+    let loaded = Arc::clone(scheduler.list(0).unwrap());
+    assert!(control.statuses()[0].last_error.is_none());
+
+    fs::remove_file(dir.file("l.txt")).unwrap();
+    scheduler.refresh(0, &downloader()).await;
+
+    assert!(Arc::ptr_eq(&loaded, scheduler.list(0).unwrap()));
+    assert!(blocked(&policy, "ads.example."));
+    assert!(control.statuses()[0].last_error.is_some());
+
+    fs::write(dir.file("l.txt"), V2).unwrap();
+    scheduler.refresh(0, &downloader()).await;
+
+    assert!(blocked(&policy, "tracker.example."));
+    assert!(control.statuses()[0].last_error.is_none());
 }
 
 #[tokio::test]

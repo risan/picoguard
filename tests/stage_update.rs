@@ -6,6 +6,7 @@ mod common;
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,13 +14,16 @@ use std::time::{Duration, Instant};
 use common::http::ListServer;
 use common::release::{Files, TARGET, scratch, sign_with, sums_line, test_key};
 use picoguard::lists::Names;
-use picoguard::release::Request;
+use picoguard::release::{MAX_SUMS_BYTES, Request};
 use picoguard::stage::{InstallView, Refused, StageSetup, StageTiming, Stager};
 use picoguard::update::{Build, Latest, Updates};
 use picoguard::upstream::tls::Tls;
 
 const VERSION: &str = "9.9.9";
 const CAP: u64 = 64 * 1024;
+// The daemon's own caps on the signature and on the installer's result file.
+const SIGNATURE_CAP: u64 = 1024;
+const RESULT_CAP: u64 = 1024;
 const FOUR_FILES: [&str; 4] = ["SHA256SUMS", "SHA256SUMS.sig", "picoguard", "request"];
 
 fn path(file: &str) -> String {
@@ -328,6 +332,69 @@ async fn a_binary_that_does_not_match_is_removed() {
 }
 
 #[tokio::test]
+async fn a_missing_signature_stops_before_the_binary() {
+    let rig = make_rig("signature-404", &release_files()).await;
+    rig.server.fail(&path("SHA256SUMS.sig"), 404);
+
+    let view = start_and_end(&rig).await;
+
+    assert_failed(&view, "SHA256SUMS.sig: HTTP status 404");
+    assert_eq!(rig.server.requested(&binary_path()), 0);
+    assert!(names(&rig.staged()).is_empty());
+}
+
+#[tokio::test]
+async fn a_small_file_over_its_cap_is_refused_before_the_binary() {
+    let mut huge_sums = release_files();
+    huge_sums.resign(&"x".repeat(MAX_SUMS_BYTES as usize + 1));
+    let mut huge_signature = release_files();
+    huge_signature.signature = vec![0; SIGNATURE_CAP as usize + 1];
+
+    for (name, files, file, body) in [
+        ("sums", &huge_sums, "SHA256SUMS", &huge_sums.sums),
+        (
+            "signature",
+            &huge_signature,
+            "SHA256SUMS.sig",
+            &huge_signature.signature,
+        ),
+    ] {
+        for sized in [true, false] {
+            let rig = make_rig(&format!("small-over-cap-{name}-{sized}"), files).await;
+            if !sized {
+                rig.server.serve_unsized(&path(file), body.clone());
+            }
+
+            let view = start_and_end(&rig).await;
+
+            assert_failed(&view, &format!("{file}: invalid answer"));
+            assert_eq!(rig.server.requested(&binary_path()), 0, "{name} {sized}");
+            assert!(names(&rig.staged()).is_empty(), "{name} {sized}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_small_file_exactly_at_its_cap_is_read() {
+    let mut at_the_sums_cap = release_files();
+    at_the_sums_cap.resign(&"x".repeat(MAX_SUMS_BYTES as usize));
+    let mut at_the_signature_cap = release_files();
+    at_the_signature_cap.signature = vec![0; SIGNATURE_CAP as usize];
+
+    for (name, files, reason) in [
+        ("sums", at_the_sums_cap, "the release has no binary for"),
+        ("signature", at_the_signature_cap, "signature"),
+    ] {
+        let rig = make_rig(&format!("small-at-cap-{name}"), &files).await;
+
+        let view = start_and_end(&rig).await;
+
+        assert_failed(&view, reason);
+        assert_eq!(rig.server.requested(&binary_path()), 0, "{name}");
+    }
+}
+
+#[tokio::test]
 async fn a_binary_over_the_cap_is_refused() {
     let big = vec![b'x'; 100 * 1024];
     let mut files = release_files();
@@ -533,6 +600,58 @@ async fn the_installer_result_ends_the_wait() {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(view.reason.as_deref(), reason);
         assert!(names(&rig.staged()).is_empty(), "{state}");
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Hostile {
+    Symlink,
+    Fifo,
+    OverOneKib,
+}
+
+/// Puts at `installer/result` a file that would end the wait as "updated" if it were
+/// followed or read in full.
+fn plant_hostile_result(rig_root: &Path, id: &str, kind: Hostile) {
+    let result = rig_root.join("installer/result");
+    let valid = format!("id={id}\noutcome=updated\n");
+
+    match kind {
+        Hostile::Symlink => {
+            let elsewhere = rig_root.join("answer-elsewhere");
+            fs::write(&elsewhere, &valid).unwrap();
+            symlink(&elsewhere, &result).unwrap();
+        }
+
+        Hostile::Fifo => {
+            let name = std::ffi::CString::new(result.to_str().unwrap()).unwrap();
+
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        }
+
+        Hostile::OverOneKib => {
+            let padding = "x".repeat(RESULT_CAP as usize);
+
+            fs::write(&result, format!("{valid}future={padding}\n")).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_hostile_result_file_is_ignored_until_a_real_one_replaces_it() {
+    for kind in [Hostile::Symlink, Hostile::Fifo, Hostile::OverOneKib] {
+        let rig = make_rig(&format!("hostile-result-{kind:?}"), &release_files()).await;
+        let id = staged_and_waiting(&rig).await;
+
+        plant_hostile_result(&rig.root, &id, kind);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(rig.stager.view().unwrap().state, "waiting", "{kind:?}");
+        assert_eq!(names(&rig.staged()), FOUR_FILES, "{kind:?}");
+
+        write_result(&rig.root, &format!("id={id}\noutcome=updated\n"));
+
+        view_is(&rig.stager, "updated").await;
     }
 }
 

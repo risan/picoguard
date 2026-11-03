@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dns::wire::Name;
 use crate::filter::compile::DEFAULT_SLOW_RULE_BUDGET;
+use crate::lists::Target;
 use crate::password::PasswordHash;
 use crate::scheduler::normalized_name;
 use crate::stats::{DEFAULT_RETENTION_DAYS, RETENTION_CHOICES};
@@ -271,6 +273,7 @@ impl Config {
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         self.server.validate()?;
         self.upstream.validate()?;
+        validate_names("blocked_hosts", &self.blocked_hosts)?;
         self.local.validate()?;
         validate_lists("lists", &self.lists)?;
         validate_lists("allowlists", &self.allowlists)?;
@@ -393,7 +396,7 @@ impl LocalConfig {
             }
         }
 
-        Ok(())
+        validate_names("local.domains", &self.domains)
     }
 }
 
@@ -485,33 +488,30 @@ impl ListConfig {
 }
 
 fn validate_url(field: &str, url: &str) -> Result<(), ConfigError> {
-    let Some(rest) = LIST_URL_SCHEMES
+    if !LIST_URL_SCHEMES
         .iter()
-        .find_map(|scheme| url.strip_prefix(scheme))
-    else {
+        .any(|scheme| url.starts_with(scheme))
+    {
         return invalid(format!("{field} must start with http:// or https://"));
-    };
+    }
 
-    if !has_host(rest) {
-        return invalid(format!("{field} has no host"));
+    // The same parser the downloader uses, so the check refuses what a refresh would.
+    if Target::parse(url).is_err() {
+        return invalid(format!("{field} is not a valid URL"));
     }
 
     Ok(())
 }
 
-fn has_host(url_after_scheme: &str) -> bool {
-    let authority = url_after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
-    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or_default()
-    } else {
-        host_and_port.split(':').next().unwrap_or_default()
-    };
+/// The same parser the pipeline uses at start, so the check refuses what start refuses.
+fn validate_names(field: &str, names: &[String]) -> Result<(), ConfigError> {
+    for (index, name) in names.iter().enumerate() {
+        if Name::from_text(name).is_none() {
+            return invalid(format!("{field}[{index}] is not a valid domain name"));
+        }
+    }
 
-    !host.is_empty() && !host.contains(char::is_whitespace)
+    Ok(())
 }
 
 /// A source is a list's identity on the status page, so one role holds it once.
@@ -1488,14 +1488,17 @@ mod tests {
             ),
             ("[state]\ndir = \"\"", "state.dir must not be empty"),
             ("[[lists]]\npath = \"\"", "lists[0].path must not be empty"),
-            ("[[lists]]\nurl = \"https://\"", "lists[0].url has no host"),
+            (
+                "[[lists]]\nurl = \"https://\"",
+                "lists[0].url is not a valid URL",
+            ),
             (
                 "[[lists]]\nurl = \"http:///list.txt\"",
-                "lists[0].url has no host",
+                "lists[0].url is not a valid URL",
             ),
             (
                 "[[lists]]\nurl = \"https://user@:8080/x\"",
-                "lists[0].url has no host",
+                "lists[0].url is not a valid URL",
             ),
             (
                 "[[allowlists]]\npath = \"\"",
@@ -1503,7 +1506,7 @@ mod tests {
             ),
             (
                 "[[allowlists]]\nurl = \"https://\"",
-                "allowlists[0].url has no host",
+                "allowlists[0].url is not a valid URL",
             ),
         ];
 
@@ -1522,7 +1525,6 @@ mod tests {
         for url in [
             "https://example.com/list.txt",
             "http://192.168.1.2:8080/l",
-            "https://user:pw@example.com/l",
             "https://[2001:db8::1]:443/l",
             "https://example.com",
         ] {
@@ -1565,6 +1567,40 @@ mod tests {
 
         assert_eq!(cidr.to_string(), "10.0.0.0/8");
         assert!(cidr.contains("10.200.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_name_or_url_the_server_cannot_use_fails_the_check() {
+        let long_label = "a".repeat(64);
+        let cases = [
+            ("blocked_hosts = [\"a..b\"]".to_string(), "blocked_hosts[0]"),
+            (
+                "[local]\ndomains = [\"büro\"]".to_string(),
+                "local.domains[0]",
+            ),
+            (
+                format!("blocked_hosts = [\"ok.example\", \"{long_label}.example\"]"),
+                "blocked_hosts[1]",
+            ),
+            (
+                "[[lists]]\nurl = \"https://example.com/a b.txt\"".to_string(),
+                "lists[0].url",
+            ),
+            (
+                "[[allowlists]]\nurl = \"https://büro.example/list.txt\"".to_string(),
+                "allowlists[0].url",
+            ),
+            (
+                "[services]\ncatalog_url = \"https://user@example.com/s.json\"".to_string(),
+                "services.catalog_url",
+            ),
+        ];
+
+        for (text, field) in cases {
+            let message = error_of(&text);
+
+            assert!(message.contains(field), "config {text:?}: {message:?}");
+        }
     }
 
     #[test]
@@ -1806,7 +1842,7 @@ mod tests {
             ),
             (
                 "[services]\ncatalog_url = \"https://\"".to_string(),
-                "services.catalog_url has no host",
+                "services.catalog_url is not a valid URL",
             ),
             (
                 "[services]\nrefresh_hours = 0".to_string(),

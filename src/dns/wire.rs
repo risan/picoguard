@@ -425,6 +425,7 @@ fn read_question(msg: &[u8], start: usize) -> Result<(Question, usize), WireErro
 pub struct Edns {
     pub udp_size: u16,
     pub dnssec_ok: bool,
+    pub version: u8,
 }
 
 /// Why a datagram or frame is not a query that can be processed.
@@ -519,6 +520,7 @@ fn read_query_edns(msg: &[u8], start: usize, count: u16) -> Result<Option<Edns>,
             edns = Some(Edns {
                 udp_size: class,
                 dnssec_ok: ttl & EDNS_DO != 0,
+                version: (ttl >> 16) as u8,
             });
         }
 
@@ -777,6 +779,24 @@ struct AuthoritySoa {
 }
 
 impl ResponseInfo {
+    /// Parses `msg` after taking the upstream's OPT record out of it, which every delivery
+    /// replaces with our own. `extended_rcode` keeps what the OPT said. Fails like
+    /// `remove_opt`.
+    pub fn parse_dropping_opt(msg: &mut Vec<u8>) -> Result<ResponseInfo, WireError> {
+        let info = ResponseInfo::parse(msg)?;
+        let Some(opt_start) = info.opt_start else {
+            return Ok(info);
+        };
+
+        remove_opt(msg, usize::from(opt_start))?;
+
+        // The records after the OPT moved up, and with them their TTL fields.
+        Ok(ResponseInfo {
+            extended_rcode: info.extended_rcode,
+            ..ResponseInfo::parse(msg)?
+        })
+    }
+
     pub fn parse(msg: &[u8]) -> Result<ResponseInfo, WireError> {
         if msg.len() > MAX_MESSAGE_LEN {
             return Err(WireError::Malformed);
@@ -1128,9 +1148,23 @@ mod tests {
             query.edns,
             Some(Edns {
                 udp_size: 1400,
-                dnssec_ok: true
+                dnssec_ok: true,
+                version: 0
             })
         );
+    }
+
+    #[test]
+    fn the_edns_version_of_a_query_is_read() {
+        let mut bytes = QuerySpec::new("www.example.com.", RecordType::A);
+        bytes.edns = Some((1232, false));
+        let mut bytes = bytes.bytes();
+        assert_eq!(Query::parse(&bytes).unwrap().edns.unwrap().version, 0);
+
+        let version_at = bytes.len() - 11 + 6;
+        bytes[version_at] = 3;
+
+        assert_eq!(Query::parse(&bytes).unwrap().edns.unwrap().version, 3);
     }
 
     #[test]

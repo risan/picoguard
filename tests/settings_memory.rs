@@ -4,46 +4,19 @@
 //! test binary has a counting global allocator and a single test, so nothing else allocates
 //! while it measures.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use picoguard::config::Config;
 use picoguard::scheduler::{Action, ButtonRule, MAX_BUTTON_RULES};
 use picoguard::settings::{self, CacheSettings, Settings, UpstreamSettings};
 
-struct Counting;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-fn grow(bytes: usize) {
-    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    PEAK.fetch_max(live, Ordering::Relaxed);
-}
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        grow(layout.size());
-
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        grow(new_size);
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+use counting::{live, peak_since, reset_peak};
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 /// The config file kept beside the settings, the path and the lock, for the default config.
 /// Measured: 1,506 bytes.
@@ -58,21 +31,6 @@ const OTHER_SETTINGS_BYTES: usize = 1024;
 /// Reading the file: its bytes, then the parsed settings beside them, and a merged config.
 /// Measured: 1.9 times the file on top of what the load keeps.
 const READ_PEAK_FILES: usize = 3;
-
-fn live() -> usize {
-    LIVE.load(Ordering::Relaxed)
-}
-
-fn reset_peak() -> usize {
-    let live = live();
-    PEAK.store(live, Ordering::Relaxed);
-
-    live
-}
-
-fn peak_since(before: usize) -> usize {
-    PEAK.load(Ordering::Relaxed).saturating_sub(before)
-}
 
 fn write_config(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("picoguard.toml");

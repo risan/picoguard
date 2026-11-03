@@ -1,10 +1,8 @@
 //! Memory held by TCP clients that announce a large frame and then stall. This file has its
 //! own test binary so that the counting allocator sees only this one test.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use picoguard::config::Config;
@@ -16,28 +14,13 @@ use tokio::net::{TcpStream, UdpSocket};
 
 const SETTLE: Duration = Duration::from_millis(500);
 
-struct CountingAllocator;
+#[path = "common/counting.rs"]
+mod counting;
 
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(pointer, layout) };
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-}
+use counting::live;
 
 #[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
+static ALLOCATOR: counting::Counting = counting::Counting;
 
 #[tokio::test]
 async fn tcp_clients_announcing_a_big_frame_and_stalling_hold_only_the_read_buffer() {
@@ -52,7 +35,7 @@ async fn tcp_clients_announcing_a_big_frame_and_stalling_hold_only_the_read_buff
     let tcp = listeners.tcp_addresses()[0];
     server::spawn(listeners, pipeline, &config);
     tokio::task::yield_now().await;
-    let before = LIVE_BYTES.load(Ordering::Relaxed);
+    let before = live();
 
     let mut clients = Vec::new();
     for _ in 0..connections {
@@ -64,7 +47,7 @@ async fn tcp_clients_announcing_a_big_frame_and_stalling_hold_only_the_read_buff
 
     tokio::time::sleep(SETTLE).await;
 
-    let held = LIVE_BYTES.load(Ordering::Relaxed).saturating_sub(before);
+    let held = live().saturating_sub(before);
     let announced = connections * usize::from(u16::MAX);
     // A buffer sized by the announced length would hold all of `announced`; the read buffer
     // and the connection's own state come to about a fifth of that.
