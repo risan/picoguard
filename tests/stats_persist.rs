@@ -354,6 +354,7 @@ async fn without_a_page_value_the_config_files_retention_drops_older_hours() {
 
     assert_eq!(history["retention_days"], 30);
     assert!(history_total(&history) < 40, "{history}");
+    assert!(daemon.total().await >= 1000, "the saved file was read");
     daemon.stop().await;
 }
 

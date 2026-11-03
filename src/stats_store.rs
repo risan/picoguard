@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_with_more_than_this_version_knows_is_still_read() {
+    async fn a_file_with_fields_this_build_does_not_know_is_still_read() {
         let dir = TestDir::new("stats-extra");
         let (saver, pipeline) = loaded(&dir);
         record(&pipeline, "example.com", QueryResult::Pass);
