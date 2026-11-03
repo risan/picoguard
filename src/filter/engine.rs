@@ -1493,6 +1493,18 @@ mod tests {
     }
 
     #[test]
+    fn an_rpz_passthru_wins_over_every_block_it_covers_even_a_more_specific_one() {
+        let zone = "*.example.com CNAME rpz-passthru.\nads.example.com CNAME .\n*.ads.example.com CNAME .\n*.example.org CNAME .\nok.example.org CNAME rpz-passthru.\n";
+        let (list, _) = CompiledList::from_text(ListFormat::Rpz, zone);
+        let engine = Engine::new(vec![Arc::new(list)], Vec::new());
+
+        assert!(!blocked(&engine, "ads.example.com", TYPE_A));
+        assert!(!blocked(&engine, "x.ads.example.com", TYPE_A));
+        assert!(blocked(&engine, "x.example.org", TYPE_A));
+        assert!(!blocked(&engine, "ok.example.org", TYPE_A));
+    }
+
+    #[test]
     fn explicit_formats_through_the_engine() {
         let engine = engine(
             &[
