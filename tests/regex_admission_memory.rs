@@ -68,7 +68,9 @@ async fn compile(
         .send(Piece::Data(text.as_bytes().to_vec()))
         .await
         .unwrap();
-    compilation.pieces.send(Piece::End).await.unwrap();
+    // A worker that refuses the list on its data stops reading, so the end may find no reader;
+    // the result says why.
+    let _ = compilation.pieces.send(Piece::End).await;
     let result = compilation.result().await.map(|compiled| compiled.list);
     let peak = PEAK.load(Ordering::Relaxed) - before;
 
