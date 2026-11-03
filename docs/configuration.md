@@ -61,9 +61,11 @@ and the budget it is checked against.
 
 ### Upstream servers and cache from the page
 
-The Settings tab has a card for each. The card says "From the config file" or "Set on this page";
-**Save** saves the card and puts it in force at once, without a restart, and **Use the config
-file** goes back to this file's values.
+The Settings tab has a card for each. Every change is saved and put in force at once, without a
+restart and without a Save button: adding, removing or moving a server, leaving a field you
+changed, ticking a box. A short notice says "saved", and a refused change shows why in its card.
+A card changed on the page says "Changed on this page" and has **Reset to config file**, which goes
+back to this file's values after asking; otherwise it says "From the config file".
 
 - **Upstream servers**: `[upstream] servers` (1 to 8, in order; add, remove, move up and down)
   and `bootstrap` (0 to 4 addresses). A server this file would refuse is refused with the same
@@ -106,13 +108,13 @@ A change that leaves the saved values as they are writes nothing.
 The Settings tab's Statistics card sets how long the history is kept: 1, 7, 30 or 90 days, the
 same values as [`[stats] retention_days`](#stats) (any other value answers 400 "stats.retention_days
 must be 1, 7, 30 or 90"). Saved from the page it is written to `settings.json` as
-`"stats": {"retention_days": 90}` and wins over this file; **Use the config file** removes it.
+`"stats": {"retention_days": 90}` and wins over this file; **Reset to config file** removes it.
 The key is left out of the file until it is set, so a `settings.json` without it still reads
 in an older picoguard after a rollback; one with it is refused whole by a version that does not
 know it (it then starts on the config file alone).
 
-- It applies at once. Shortening it drops the older hours for good: lengthening it again does not
-  bring them back.
+- It applies at once. Shortening it asks first, and drops the older hours for good: lengthening it
+  again does not bring them back.
 - It is read before `stats.json` is, so a value of 90 from the page keeps 60-day-old hours that
   a file value of 30 would have dropped at start.
 - The card also shows whether saving is on, when `stats.json` was last written and why the last
@@ -121,9 +123,9 @@ know it (it then starts on the config file alone).
 
 ### Rewrites and SafeSearch from the page
 
-The Settings tab has a **Rewrites** card (a table of name and answer, Add, Remove) and a
-**SafeSearch** card (one switch), each with "From the config file" or "Set on this page", its
-own **Save**, and **Use the config file**. They follow [`[[rewrites]]` and
+The Settings tab has a **Rewrites** card (a list of name and answer, Add rewrite, and a remove
+button on each) and a **SafeSearch** card (one switch). Like the cards above, each change is saved
+at once, and **Reset to config file** goes back to this file. They follow [`[[rewrites]]` and
 `safe_search`](#rewrites-and-safesearch) below, and apply at once: the next query is answered from
 them.
 
@@ -134,20 +136,20 @@ them.
   "rewrites[0] points nas.lan at itself", and nothing is saved.
 - The new table is built off the DNS thread, saved, then put in force whole; the old one is freed
   off the DNS thread.
-- **Check a name** on the Lists tab says "rewritten to X (your rewrite)" or "rewritten to X
+- **Check a domain** on the Lists tab says "rewritten to X (your rewrite)" or "rewritten to X
   (SafeSearch)" for a rewritten name, before any list. `GET /api/explain` then answers
   `{"decision": "rewritten", "list": "your rewrites" or "SafeSearch", "rule": "rewritten to X (...)"}`.
 
 ### Blocked services from the page
 
 The Settings tab has a **Blocked services** card: a switch for each service of the catalog,
-grouped as the catalog groups them, a filter box, "From the config file" or "Set on this page",
-**Save**, and **Use the config file**. It follows [`[services]`](#services) below.
+grouped as the catalog groups them, a find box, the number blocked, and **Reset to config file**. It follows [`[services]`](#services) below.
 
 - The catalog is downloaded the first time the Settings tab is opened, and the card says
   "Loading the list of services" until it is read. If it cannot be downloaded the card says why,
   and the page asks again a minute later.
-- **Save** puts the services switched on in force at once. Switching one on downloads the catalog
+- Ticking or clearing a box puts the change in force at once (boxes ticked within about half a
+  second are saved together). Switching one on downloads the catalog
   (once for the change) and builds that service's list, within the [memory
   budget](#the-memory-budget); switching one off drops its list and downloads nothing.
 - Refused, with nothing saved or changed: an id the catalog does not have (400 "there is no
@@ -181,7 +183,7 @@ cannot change them (409).
   list, and this file's `url` lists are no longer used; its `path` lists still are, first. A page
   list with the same role and URL as a list of this file keeps that list's `format`,
   `max_rules`, `max_body_bytes`, `slow_rule_budget` and `allow_redirects`; a list only the page
-  has gets the defaults (`format = "auto"`, no redirects). **Use the config file** removes the
+  has gets the defaults (`format = "auto"`, no redirects). **Reset to config file** removes the
   page's lists and goes back to this file's.
 - **Each row** has an on switch, the refresh hours (1 to 168) and Remove. A list that is off is
   not downloaded and holds no memory. A rename or new hours changes nothing else: the list in
@@ -728,7 +730,7 @@ web service on the same address sees the session cookie. A browser that still ho
 credentials from an older picoguard keeps sending them; it shows the dashboard without the form,
 and **Sign out** cannot end that until the browser forgets them.
 
-### Block, Allow and Check a name
+### Block, Allow and Check a domain
 
 Each row of the query log has **Block** (or **Allow** when the query was blocked) and **Why**.
 Block and Allow add a rule for that name and its subdomains; the Lists tab shows them in the card
@@ -750,7 +752,7 @@ Block and Allow add a rule for that name and its subdomains; the Lists tab shows
 - Cached answers follow the new rules at their next query.
 - While blocking is paused, a change is kept and applies when blocking is on again.
 
-Which rule decides a name, in the order of "Which rule wins" above, comes from **Check a name** on
+Which rule decides a name, in the order of "Which rule wins" above, comes from **Check a domain** on
 the Lists tab; **Why** on a log row fills it in and runs it.
 
 - The name is judged as an `A` query, with blocking on even while it is paused.
@@ -818,14 +820,14 @@ logged) and picoguard starts with empty statistics.
 ## `[update]`
 
 The status page shows the running version. About once a day, picoguard also asks GitHub whether
-a newer release exists, and the page says "update available" with a short summary of the release
+a newer release exists, and the page says "picoguard vX.Y.Z is available" with a short summary of the release
 notes and the command that updates your kind of build. A release binary installed with
 `install.sh`, shown to a signed-in user (`web.user` and `web.password` or `web.password_hash`),
 also gets an **Update** button that installs it ([how it works](install.md#from-the-status-page)).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `check` | `true` | Look for a newer release, and offer the button. `false`: picoguard never contacts GitHub, so there is no "update available" and no button. |
+| `check` | `true` | Look for a newer release, and offer the button. `false`: picoguard never contacts GitHub, so there is no update notice and no button. |
 
 What the check does:
 
