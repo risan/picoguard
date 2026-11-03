@@ -357,6 +357,7 @@ async fn a_statistics_save_that_fails_at_stop_still_exits_with_code_zero() {
     let status = exit_within(&mut server.0.child, Duration::from_secs(15)).await;
     assert_eq!(status.and_then(|status| status.code()), Some(0));
     assert!(state.0.join("stats.json").is_dir());
+    assert!(!state.0.join("stats.json.part").exists());
     let rest = log.rest().await;
     assert!(
         rest.iter()

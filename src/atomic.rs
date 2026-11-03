@@ -42,7 +42,11 @@ pub fn write_file(
         hook();
     }
 
-    fs::rename(&part, dir.join(name))?;
+    if let Err(error) = fs::rename(&part, dir.join(name)) {
+        let _ = fs::remove_file(&part);
+
+        return Err(error);
+    }
 
     if let Err(error) = File::open(dir).and_then(|dir| dir.sync_all()) {
         log::warn!("saved {name}, but cannot sync {}: {error}", dir.display());
@@ -147,14 +151,14 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_rename_is_an_error_and_the_next_write_replaces_the_part() {
+    fn a_failed_rename_is_an_error_and_leaves_no_part() {
         let dir = TestDir::new("atomic-rename-fails");
         fs::create_dir(dir.path().join("data")).unwrap();
 
         assert!(write_file(dir.path(), "data", b"new", None).is_err());
 
         assert!(dir.path().join("data").is_dir());
-        assert_eq!(fs::read(dir.path().join("data.part")).unwrap(), b"new");
+        assert_eq!(names(&dir), ["data"]);
 
         fs::remove_dir(dir.path().join("data")).unwrap();
         write_file(dir.path(), "data", b"next", None).unwrap();
