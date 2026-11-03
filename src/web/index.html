@@ -1481,7 +1481,8 @@ async function update() {
       // Only the open tab's data is fetched; opening a tab runs an update.
       const log = $("panel-log").hidden ? null : await api("/api/querylog?limit=50");
       const rules = $("panel-lists").hidden ? null : await api("/api/rules");
-      const saved = $("panel-settings").hidden ? null : await api("/api/settings");
+      // The Lists tab shows the memory estimate and the saved-settings warning too.
+      const saved = $("panel-settings").hidden && $("panel-lists").hidden ? null : await api("/api/settings");
 
       if (epoch !== authEpoch) {
         return;
@@ -1501,7 +1502,10 @@ async function update() {
 
       if (saved) {
         showSettings(saved);
-        await loadServices();
+
+        if (!$("panel-settings").hidden) {
+          await loadServices();
+        }
       }
     }
 

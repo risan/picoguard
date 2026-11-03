@@ -152,6 +152,8 @@ fn the_page_polls_one_update_at_a_time_and_fetches_only_the_open_tabs_data() {
         ("panel-log", "/api/querylog?limit=50"),
         ("panel-lists", "/api/rules"),
         ("panel-settings", "/api/settings"),
+        // The memory estimate and the saved-settings warning also show on the Lists tab.
+        ("panel-lists", "/api/settings"),
     ] {
         assert!(
             a_line_has(panel, route),
