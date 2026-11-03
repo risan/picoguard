@@ -16,7 +16,7 @@ use crate::filter::engine::Decision;
 
 /// Slot, hash-table entry and allocator overhead of one entry, counted against `max_bytes` on
 /// top of the payload.
-const ENTRY_OVERHEAD: usize = 160;
+const ENTRY_OVERHEAD: usize = 144;
 const FLAG_RD: u8 = 1;
 const FLAG_DO: u8 = 2;
 const FLAG_CD: u8 = 4;

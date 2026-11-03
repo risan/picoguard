@@ -24,9 +24,9 @@ pub const QUERY_LOG_ENTRY_BYTES: usize = 352;
 pub const TOP_ENTRY_BYTES: usize = 336;
 
 /// What a full cache holds on the heap per byte it counts against `max_bytes`, in percent:
-/// its slots and hash table grow past the counted cost. Measured 104 % for caches of 256 KiB
-/// and 4 MiB full of replies of 50 to 300 bytes (110 % with 104-byte slots); the margin is for
-/// a slab that has just doubled its capacity.
+/// its slots and hash table grow past the counted cost. Measured 107 % for caches of 256 KiB
+/// and 4 MiB full of replies of 50 to 300 bytes; the margin is for a slab that has just
+/// doubled its capacity.
 pub const CACHE_HEAP_PERCENT: usize = 125;
 
 /// What the estimate shows on the page: what the process may hold, and the budget.
