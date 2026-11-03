@@ -501,6 +501,7 @@ impl Web {
                         version: env!("CARGO_PKG_VERSION"),
                         update: self.update_view(),
                         since: snapshot.since,
+                        retention_days: self.pipeline.stats().retention_days(),
                         counters: &snapshot.counters,
                         blocked_percent: blocked_percent(&snapshot.counters),
                         hourly: &snapshot.hourly,
@@ -1851,6 +1852,8 @@ struct StatusView<'a> {
     update: UpdateView,
     /// Unix seconds: the start, or the last clear, that the counters and lists count from.
     since: u64,
+    /// How many days the history keeps, so the page knows which ranges it can offer.
+    retention_days: u32,
     counters: &'a Counters,
     /// Of answered queries, blocked by a request or a response rule; one decimal.
     blocked_percent: f64,

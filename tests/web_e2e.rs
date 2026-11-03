@@ -516,8 +516,9 @@ async fn the_page_is_served_with_protective_headers() {
 /// binary, no memory at run time.
 const PAGE_HARD_CAP_BYTES: usize = 64 * 1024;
 
-/// The last part, the blocked services; raised on purpose, never past the cap.
-const PAGE_BUDGET_BYTES: usize = 54 * 1024;
+/// Release 3, the history ranges, the statistics card and the clear buttons; raised on purpose,
+/// never past the cap.
+const PAGE_BUDGET_BYTES: usize = 59 * 1024;
 
 #[tokio::test]
 async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
@@ -553,6 +554,9 @@ async fn the_page_is_small_self_contained_and_fits_phone_and_dark_mode() {
         "/api/login",
         "/api/logout",
         "/api/cache/clear",
+        "/api/stats/clear",
+        "/api/querylog/clear",
+        "/api/history?days=",
         "/api/rules",
         "/api/rules/remove",
         "/api/explain?name=",
@@ -970,6 +974,73 @@ async fn the_chart_is_inline_svg_drawn_with_create_element_ns() {
         "id=\"chart-readout\"",
     ] {
         assert!(page.contains(needed), "the page lacks {needed}");
+    }
+}
+
+/// No browser here: the ranges are checked as source, and in the build's browser check.
+#[tokio::test]
+async fn the_chart_has_four_ranges_that_keep_to_the_retention_and_are_remembered() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for days in ["1", "7", "30", "90"] {
+        assert!(
+            page.contains(&format!("<button data-days=\"{days}\">")),
+            "{days}"
+        );
+    }
+
+    for needed in [
+        "id=\"chart-totals\"",
+        "id=\"chart-title\"",
+        "button.disabled = days > retention",
+        "status.retention_days",
+        "\"&offset=\" + -new Date().getTimezoneOffset()",
+        "HISTORY_REFRESH_MS = 60000",
+        "localStorage.getItem(",
+        "localStorage.setItem(",
+        "\"since \" + new Date(status.since * 1000)",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+
+    // Storage can be blocked: each use of it sits in a try.
+    assert!(page.matches("try {").count() >= 2);
+    assert!(!page.contains("(since start)"));
+}
+
+/// No browser here: the statistics card and the two clear buttons are checked as source.
+#[tokio::test]
+async fn the_statistics_card_and_the_clear_buttons_ask_before_they_clear() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "id=\"stats-card\"",
+        "id=\"retention\"",
+        "id=\"stats-saving\"",
+        "id=\"stats-clear\"",
+        "id=\"stats-save\"",
+        "id=\"stats-reset\"",
+        "saveSetting(\"stats\", { retention_days:",
+        "saveSetting(\"stats\", null",
+        "showSaving(status.stats_saving)",
+        "\"Clear the statistics?",
+        "act(\"/api/stats/clear\"",
+        "id=\"clear-log\"",
+        "\"Clear the query log?",
+        "act(\"/api/querylog/clear\"",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+
+    for option in ["1", "7", "30", "90"] {
+        assert!(
+            page.contains(&format!("<option value=\"{option}\">")),
+            "{option}"
+        );
     }
 }
 
@@ -5665,6 +5736,7 @@ async fn the_status_has_the_start_for_everyone_and_the_saving_state_for_a_signed
 
     let read = open.send(get("/api/status")).await.json();
     assert!(read["since"].as_u64().unwrap() > 1_700_000_000);
+    assert_eq!(read["retention_days"], 30);
     assert!(read.get("stats_saving").is_none(), "{read}");
 
     let signed_in = closed.send(get("/api/status")).await.json();

@@ -99,6 +99,10 @@ td.name, td.who { overflow-wrap: anywhere; }
 #chart .blocked { fill: var(--blocked); }
 #chart .hit { fill: transparent; pointer-events: all; }
 #chart .hit.on { fill: var(--tint); }
+#ranges { margin-bottom: var(--s3); }
+#ranges button[aria-pressed="true"] { border-color: var(--accent); background: var(--tint); }
+button:disabled { opacity: .5; cursor: default; }
+#chart-totals { margin: 0 0 var(--s1); }
 .actions { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; }
 .actions p { margin: 0 auto 0 0; flex: 1 1 12rem; font-size: 15px; }
 .paused #pause { border-color: var(--warn); }
@@ -226,12 +230,19 @@ input[type="checkbox"] { width: auto; margin: 0; }
     </section>
 
     <section class="wide">
-      <h2>Totals</h2>
+      <h2>Totals <small id="totals-since"></small></h2>
       <div class="cards" id="cards"></div>
     </section>
 
     <section class="wide">
-      <h2>Last 24 hours <small>(queries, blocked in red)</small></h2>
+      <h2><span id="chart-title">Last 24 hours</span> <small>(queries, blocked in red)</small></h2>
+      <div id="ranges" class="actions">
+        <button data-days="1">24 hours</button>
+        <button data-days="7">7 days</button>
+        <button data-days="30">30 days</button>
+        <button data-days="90">90 days</button>
+      </div>
+      <p id="chart-totals"></p>
       <p id="chart-readout"></p>
       <svg id="chart" width="100%" height="150"></svg>
     </section>
@@ -243,7 +254,7 @@ input[type="checkbox"] { width: auto; margin: 0; }
     </div>
 
     <section id="upstreams" class="wide bars">
-      <h2>Upstreams <small>(since start)</small></h2>
+      <h2>Upstreams <small id="upstreams-since"></small></h2>
       <div class="scroll" id="upstream-table"></div>
     </section>
 
@@ -260,6 +271,10 @@ input[type="checkbox"] { width: auto; margin: 0; }
   <div class="grid" role="tabpanel" id="panel-log" data-panel="log" aria-labelledby="tab-log" hidden>
     <section class="wide">
       <h2>Recent queries</h2>
+      <div class="actions">
+        <button id="clear-log">Clear query log</button>
+        <span id="log-note" class="empty"></span>
+      </div>
       <div class="scroll" id="queries"></div>
     </section>
   </div>
@@ -378,6 +393,21 @@ input[type="checkbox"] { width: auto; margin: 0; }
       </div>
     </section>
 
+    <section id="stats-card" class="wide">
+      <h2>Statistics <small id="stats-from"></small></h2>
+      <div class="fields">
+        <label>Keep the history for <select id="retention"><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option></select></label>
+      </div>
+      <p class="empty">Shortening it drops the older days for good.</p>
+      <p id="stats-saving" class="empty"></p>
+      <div class="actions">
+        <button id="stats-save" class="go">Save</button>
+        <button id="stats-reset">Use the config file</button>
+        <button id="stats-clear">Clear statistics</button>
+        <span id="stats-note"></span>
+      </div>
+    </section>
+
     <section id="services-card" class="wide">
       <h2>Blocked services <small id="services-from"></small></h2>
       <p class="empty">Blocks every name of a service, off while filtering is paused. The list of services is AdGuard's, downloaded when it is needed.</p>
@@ -415,8 +445,17 @@ const CHART_TOP = 18;
 const CHART_BASE = 132;
 let pausedUntil = null;
 let latestVersion = null;
+const RANGE_KEY = "picoguard.range";
+const HISTORY_REFRESH_MS = 60000;
+// Where the date labels of a day chart go: every this many bars.
+const LABEL_STEP = { 1: 4, 7: 1, 30: 6, 90: 15 };
 let chartData = [];
-let chartHour = null;
+let chartStart = null;
+let hourly = [];
+let retention = 30;
+let range = storedRange();
+let histories = {};
+let historyLoading = 0;
 // Moves on every change of sign-in state, so an answer from before it never acts.
 let authEpoch = 0;
 // One sign-in or sign-out at a time: a late second sign-in would store a cookie again.
@@ -587,22 +626,51 @@ function svg(tag, attributes, text) {
   return node;
 }
 
+function storedRange() {
+  try {
+    const days = Number(localStorage.getItem(RANGE_KEY));
+
+    return LABEL_STEP[days] ? days : 1;
+  } catch (error) {
+    return 1;
+  }
+}
+
+function rememberRange() {
+  try {
+    localStorage.setItem(RANGE_KEY, String(range));
+  } catch (error) {
+    // Private mode or blocked storage: the range is kept until the page closes.
+  }
+}
+
+// The range asked for, or the longest one the retention keeps.
+function activeRange() {
+  return Math.min(range, retention);
+}
+
 function hourOf(bucket) {
-  return new Date(bucket.hour_start * 1000).getHours();
+  return new Date(bucket.start * 1000).getHours();
 }
 
-function chooseHour(i) {
-  chartHour = chartData[i].hour_start;
-  markHour();
+function dayOf(bucket, options) {
+  return new Date(bucket.start * 1000).toLocaleDateString(undefined, options);
 }
 
-// The chosen hour is kept by its start time, because the buckets shift left every hour. Once it
-// has left the 24 hours, the newest hour shows again.
-function markHour() {
-  const found = chartData.findIndex((h) => h.hour_start === chartHour);
+function chooseBucket(i) {
+  chartStart = chartData[i].start;
+  markBucket();
+}
+
+// The chosen bucket is kept by its start time, because the buckets shift left as time passes.
+// Once it has left the range, the newest bucket shows again.
+function markBucket() {
+  const found = chartData.findIndex((b) => b.start === chartStart);
   const i = found < 0 ? chartData.length - 1 : found;
   const bucket = chartData[i];
-  $("chart-readout").textContent = hourOf(bucket) + ":00 \u00b7 " + bucket.total.toLocaleString()
+  const name = activeRange() === 1 ? hourOf(bucket) + ":00"
+    : dayOf(bucket, { weekday: "short", month: "short", day: "numeric" });
+  $("chart-readout").textContent = name + " \u00b7 " + bucket.total.toLocaleString()
     + " queries \u00b7 " + bucket.blocked.toLocaleString() + " blocked";
   $("chart").querySelectorAll("[data-i]").forEach((hit) =>
     hit.classList.toggle("on", Number(hit.dataset.i) === i));
@@ -610,37 +678,101 @@ function markHour() {
 
 // x and width are percentages and y and height are pixels, so the bars stretch to any width
 // while the axis text keeps its size.
-function showChart(hourly) {
-  chartData = hourly;
-  const peak = Math.max(0, ...hourly.map((h) => h.total));
+function showChart(buckets) {
+  chartData = buckets;
+  const days = activeRange();
+  const total = buckets.reduce((sum, b) => sum + b.total, 0);
+  const blocked = buckets.reduce((sum, b) => sum + b.blocked, 0);
+  $("chart-totals").textContent = buckets.length ? total.toLocaleString() + " queries \u00b7 "
+    + blocked.toLocaleString() + " blocked (" + (total ? blocked / total * 100 : 0).toFixed(1) + " %)" : "";
+
+  if (!buckets.length) {
+    $("chart").replaceChildren();
+    $("chart-readout").textContent = "Loading\u2026";
+
+    return;
+  }
+
+  const peak = Math.max(0, ...buckets.map((b) => b.total));
   const room = CHART_BASE - CHART_TOP;
-  const slot = 100 / hourly.length;
+  const slot = 100 / buckets.length;
   const parts = [
     svg("line", { x1: 0, x2: "100%", y1: CHART_TOP, y2: CHART_TOP }),
     svg("line", { class: "base", x1: 0, x2: "100%", y1: CHART_BASE, y2: CHART_BASE }),
     svg("text", { x: 0, y: CHART_TOP - 5 }, peak.toLocaleString()),
   ];
-  hourly.forEach((h, i) => {
-    const height = h.total / Math.max(1, peak) * room;
+  buckets.forEach((b, i) => {
+    const height = b.total / Math.max(1, peak) * room;
     const bar = { x: (i + .15) * slot + "%", width: slot * .7 + "%", rx: 2 };
-    const blockedHeight = h.total ? h.blocked / h.total * height : 0;
+    const blockedHeight = b.total ? b.blocked / b.total * height : 0;
     parts.push(
       svg("rect", { ...bar, class: "total", y: CHART_BASE - height, height }),
       svg("rect", { ...bar, class: "blocked", y: CHART_BASE - blockedHeight, height: blockedHeight }));
 
-    if (i % 4 === 0) {
-      parts.push(svg("text", { x: (i + .5) * slot + "%", y: CHART_HEIGHT - 2, "text-anchor": "middle" }, hourOf(h)));
+    if (i % LABEL_STEP[days] === 0) {
+      parts.push(days === 1
+        ? svg("text", { x: (i + .5) * slot + "%", y: CHART_HEIGHT - 2, "text-anchor": "middle" }, hourOf(b))
+        : svg("text", { x: i * slot + "%", y: CHART_HEIGHT - 2 }, dayOf(b, { month: "short", day: "numeric" })));
     }
   });
-  hourly.forEach((h, i) => {
+  buckets.forEach((b, i) => {
     const hit = svg("rect", { class: "hit", "data-i": i, x: i * slot + "%", y: 0,
       width: slot + "%", height: CHART_HEIGHT });
-    hit.addEventListener("pointerover", () => chooseHour(i));
-    hit.addEventListener("click", () => chooseHour(i));
+    hit.addEventListener("pointerover", () => chooseBucket(i));
+    hit.addEventListener("click", () => chooseBucket(i));
     parts.push(hit);
   });
   $("chart").replaceChildren(...parts);
-  markHour();
+  markBucket();
+}
+
+function showRanges() {
+  document.querySelectorAll("button[data-days]").forEach((button) => {
+    const days = Number(button.dataset.days);
+    button.disabled = days > retention;
+    button.setAttribute("aria-pressed", String(days === activeRange()));
+  });
+}
+
+function drawChart() {
+  const days = activeRange();
+  $("chart-title").textContent = "Last " + document.querySelector("button[data-days=\"" + days + "\"]").textContent;
+  showChart(days === 1
+    ? hourly.map((h) => ({ start: h.hour_start, total: h.total, blocked: h.blocked }))
+    : histories[days] ? histories[days].buckets : []);
+}
+
+// The days of a longer range come from the server in the viewer's time zone, and are asked
+// for again at most once a minute. `getTimezoneOffset` is minutes west of UTC.
+async function loadHistory(force) {
+  const days = activeRange();
+  const kept = histories[days];
+
+  if (days === 1 || historyLoading === days || (!force && kept && Date.now() - kept.at < HISTORY_REFRESH_MS)) {
+    return;
+  }
+
+  historyLoading = days;
+  const epoch = authEpoch;
+
+  try {
+    const data = await api("/api/history?days=" + days + "&offset=" + -new Date().getTimezoneOffset());
+
+    if (epoch === authEpoch) {
+      histories[days] = { at: Date.now(), buckets: data.days.map((d) => ({ start: d.day_start, total: d.total, blocked: d.blocked })) };
+      drawChart();
+    }
+  } catch (error) {
+    if (epoch === authEpoch) {
+      if (error.status === 401) {
+        sessionEnded();
+      } else {
+        $("chart-readout").textContent = "History: " + error.message;
+      }
+    }
+  } finally {
+    historyLoading = 0;
+  }
 }
 
 // A name that took over another one's slot inherited that count. If it was seen only once
@@ -753,7 +885,7 @@ function showMemory(m) {
 }
 
 // A card being edited is left alone by the refresh until it is saved or reset.
-const editing = { upstream: false, cache: false, rewrites: false, safe_search: false, services: false };
+const editing = { upstream: false, cache: false, rewrites: false, safe_search: false, services: false, stats: false };
 const CACHE_FIELDS = [["c-entries", "max_entries", 1], ["c-kib", "max_bytes", 1024],
   ["c-min", "min_ttl", 1], ["c-max", "max_ttl", 1]];
 let servers = [];
@@ -762,7 +894,7 @@ let chosen = new Set();
 let catalog = [];
 
 function showSettingCards(s) {
-  [["upstream", s.upstream], ["cache", s.cache], ["rewrites", s.rewrites], ["safe_search", s.safe_search], ["services", s.services]].forEach(([key, value]) => {
+  [["upstream", s.upstream], ["cache", s.cache], ["rewrites", s.rewrites], ["safe_search", s.safe_search], ["services", s.services], ["stats", s.stats]].forEach(([key, value]) => {
     $(key + "-from").textContent = value.from === "page" ? "Set on this page" : "From the config file";
     $(key + "-reset").hidden = value.from !== "page";
   });
@@ -791,6 +923,18 @@ function showSettingCards(s) {
     chosen = new Set(s.services.block);
     showServiceSwitches();
   }
+
+  if (!editing.stats) {
+    $("retention").value = s.stats.retention_days;
+  }
+}
+
+function showSaving(saving) {
+  const text = !saving.enabled ? "Saving is off ([stats] persist): statistics are lost when picoguard stops."
+    : "Saved hourly when changed, and when picoguard stops. "
+      + (saving.last_saved ? "Last saved " + new Date(saving.last_saved * 1000).toLocaleString() + "." : "Not saved since start.");
+  $("stats-saving").textContent = saving.error ? "Cannot save: " + saving.error + ". " + text : text;
+  $("stats-saving").className = saving.error ? "err" : "empty";
 }
 
 // The catalog is read on the first visit of the Settings tab, not before.
@@ -1097,12 +1241,19 @@ async function update() {
     showLimited(status.limited);
     showPause(status.pause);
     showCards(status.counters, status.blocked_percent);
-    showChart(status.hourly);
+    retention = status.retention_days;
+    hourly = status.hourly;
+    showRanges();
+    drawChart();
+    loadHistory(false);
+    $("totals-since").textContent = "since " + new Date(status.since * 1000).toLocaleString();
     showLists(await api("/api/lists"));
 
     if (!status.limited) {
       showUpstreams(status.upstreams);
+      $("upstreams-since").textContent = $("totals-since").textContent;
       showCache(status.cache);
+      showSaving(status.stats_saving);
       const log = await api("/api/querylog?limit=50");
       const rules = await api("/api/rules");
       const saved = await api("/api/settings");
@@ -1254,6 +1405,30 @@ $("clear-cache").addEventListener("click", () => {
     });
   }
 });
+$("clear-log").addEventListener("click", () => {
+  if (confirm("Clear the query log? It is kept in memory only.")) {
+    act("/api/querylog/clear", {}, () => {
+      $("log-note").textContent = "Query log cleared";
+    });
+  }
+});
+$("stats-clear").addEventListener("click", () => {
+  if (confirm("Clear the statistics? Counters, history, top lists and upstream tallies start again from zero.")) {
+    act("/api/stats/clear", {}, (data) => {
+      histories = {};
+      $("stats-note").textContent = data.save_error ? "Cleared, not saved: " + data.save_error : "Statistics cleared";
+      $("stats-note").className = data.save_error ? "err" : "empty";
+    });
+  }
+});
+document.querySelectorAll("button[data-days]").forEach((button) =>
+  button.addEventListener("click", () => {
+    range = Number(button.dataset.days);
+    rememberRange();
+    showRanges();
+    drawChart();
+    loadHistory(true);
+  }));
 $("queries").addEventListener("click", (event) => {
   const button = event.target.closest("[data-act]");
 
@@ -1343,6 +1518,15 @@ $("rewrites-reset").addEventListener("click", () => saveSetting("rewrites", null
 $("safe-search").addEventListener("change", () => { editing.safe_search = true; });
 $("safe_search-save").addEventListener("click", () => saveSetting("safe_search", $("safe-search").checked, "safe_search-note"));
 $("safe_search-reset").addEventListener("click", () => saveSetting("safe_search", null, "safe_search-note"));
+$("retention").addEventListener("change", () => { editing.stats = true; });
+$("stats-save").addEventListener("click", () => {
+  histories = {};
+  saveSetting("stats", { retention_days: Number($("retention").value) }, "stats-note");
+});
+$("stats-reset").addEventListener("click", () => {
+  histories = {};
+  saveSetting("stats", null, "stats-note");
+});
 $("service-filter").addEventListener("input", showServiceSwitches);
 $("service-groups").addEventListener("change", (event) => {
   editing.services = true;
