@@ -737,15 +737,27 @@ const KEY_BYTES: usize = 4;
 /// Finds the slow rules whose shortcut can occur in a URL, like urlfilter's shortcut table:
 /// a rule is filed under the first [`KEY_BYTES`] bytes of its shortcut, and a check looks up
 /// every window of that length in the URL. Rules with a shorter shortcut are always tried.
+/// A bitmap of the keys answers most windows before the search of `keyed` is paid for.
 #[derive(Default)]
 struct SlowIndex {
     /// `(key, list, rule)` sorted by key.
     keyed: Vec<(u32, u32, u32)>,
     always: Vec<(u32, u32)>,
+    key_bits: Box<[u64]>,
+    key_bits_shift: u32,
 }
+
+/// Bits of the key bitmap per keyed rule: about one window in sixteen that matches no key
+/// still goes on to the search.
+const KEY_BITS_PER_RULE: usize = 16;
 
 fn key_of(bytes: &[u8]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+/// Where a key is in the bitmap: the top bits of a multiplicative hash.
+fn key_slot(key: u32, shift: u32) -> usize {
+    (key.wrapping_mul(0x9E37_79B1) >> shift) as usize
 }
 
 impl SlowIndex {
@@ -766,6 +778,18 @@ impl SlowIndex {
         index.keyed.sort_unstable();
         index.keyed.shrink_to_fit();
         index.always.shrink_to_fit();
+
+        let slots = (index.keyed.len() * KEY_BITS_PER_RULE)
+            .next_power_of_two()
+            .clamp(64, 1 << 16);
+        index.key_bits_shift = 32 - slots.trailing_zeros();
+        let mut key_bits = vec![0u64; slots / 64];
+        for &(key, _, _) in &index.keyed {
+            let slot = key_slot(key, index.key_bits_shift);
+            key_bits[slot / 64] |= 1 << (slot % 64);
+        }
+
+        index.key_bits = key_bits.into_boxed_slice();
 
         index
     }
@@ -789,6 +813,11 @@ impl SlowIndex {
 
         for window in url.as_bytes().windows(KEY_BYTES) {
             let key = key_of(window);
+            let slot = key_slot(key, self.key_bits_shift);
+            if self.key_bits[slot / 64] & (1 << (slot % 64)) == 0 {
+                continue;
+            }
+
             let first = self.keyed.partition_point(|entry| entry.0 < key);
             for &(found, list, rule) in &self.keyed[first..] {
                 if found != key {
@@ -1688,6 +1717,48 @@ mod tests {
         );
 
         count
+    }
+
+    #[test]
+    fn the_key_bitmap_never_hides_a_rule_whose_key_is_in_the_url() {
+        // 4,000 keys in a bitmap of 65,536 bits, and urls made from the same few letters,
+        // so windows both collide with keys and hit them.
+        let letters = b"abcdefghij";
+        let key = |n: usize| -> String {
+            (0..4)
+                .map(|i| letters[n / 10usize.pow(i) % 10] as char)
+                .collect()
+        };
+        let text: String = (0..4000).map(|n| format!("*{}*\n", key(n))).collect();
+        let engine = adblock(&text);
+        let rules = &engine.lists.main.lists;
+        assert_eq!(rules[0].slow_rule_count(), 4000);
+
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..300 {
+            let mut url = String::from("http://");
+            for _ in 0..30 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                url.push(letters[(state >> 33) as usize % 10] as char);
+            }
+
+            let mut found = HashSet::new();
+            engine
+                .lists
+                .main
+                .slow_index
+                .for_each_candidate(rules, &url, &mut |_, slow| {
+                    found.insert(slow.rule.pattern.clone());
+                });
+
+            let expected: HashSet<String> = (0..4000)
+                .filter(|&n| url.contains(&key(n)))
+                .map(|n| format!("*{}*", key(n)))
+                .collect();
+            assert_eq!(found, expected, "{url}");
+        }
     }
 
     fn explained(allowed: bool, side: Side, list: usize, rule: &str) -> Option<Explanation> {
