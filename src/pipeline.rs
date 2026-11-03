@@ -223,7 +223,7 @@ impl Delivery {
         ReplyParts {
             bytes: &self.bytes,
             ttl_offsets: &self.info.ttl_offsets,
-            opt_start: self.info.opt_start,
+            extended_rcode: self.info.extended_rcode,
         }
     }
 }
@@ -1500,7 +1500,8 @@ impl Pipeline {
                     _ => Failure::Upstream,
                 }
             })?;
-        let mut info = ResponseInfo::parse(&bytes).map_err(|_| Failure::Upstream)?;
+        let mut info =
+            ResponseInfo::parse_dropping_opt(&mut bytes).map_err(|_| Failure::Upstream)?;
         info.cap_soa_ttls(&mut bytes);
 
         let query = Query::parse(&request).map_err(|_| Failure::Upstream)?;
@@ -1545,7 +1546,7 @@ fn write_flattened(
         return;
     };
 
-    if header.truncated() || parts.extended_rcode() != 0 {
+    if header.truncated() || parts.extended_rcode != 0 {
         reply.error(rcode::SERVFAIL, out);
 
         return;
@@ -1672,15 +1673,19 @@ fn reverse_address(name: &Name) -> Option<IpAddr> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use hickory_proto::op::ResponseCode;
     use hickory_proto::rr::RecordType;
 
     use super::*;
-    use crate::dns::test_util::{QuerySpec, ResponseSpec, a, parse, soa};
+    use crate::dns::test_util::{
+        OPT_BEFORE_ADDITIONALS_FIRST_START, OPT_BEFORE_ADDITIONALS_OPT_START, QuerySpec,
+        ResponseSpec, a, parse, response_with_opt_before_other_additionals, soa,
+    };
     use crate::dns::wire::{HEADER_LEN, skip_name};
     use crate::filter::engine::{CompiledList, Engine};
     use crate::filter::parse::ListFormat;
     use crate::names::reverse_name;
-    use crate::upstream::test_dns::{self, fake_dns, fake_router};
+    use crate::upstream::test_dns::{self, fake_dns, fake_router, scripted_dns};
 
     const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
 
@@ -2969,5 +2974,157 @@ mod tests {
             "{:?}",
             pipeline.upstream_tallies()
         );
+    }
+
+    const OPT_RECORD_LEN: usize = 11;
+
+    fn edns_query(name: &str) -> QuerySpec {
+        let mut spec = QuerySpec::new(name, RecordType::A);
+        spec.edns = Some((1232, false));
+
+        spec
+    }
+
+    /// `reply` with the ID of the query that is being answered.
+    fn answering(request: &[u8], mut reply: Vec<u8>) -> Vec<u8> {
+        reply[0..2].copy_from_slice(&request[0..2]);
+
+        reply
+    }
+
+    fn cached_bytes(pipeline: &Pipeline, spec: &QuerySpec) -> Option<Vec<u8>> {
+        let request = spec.bytes();
+        let query = Query::parse(&request).unwrap();
+        let mut cache = pipeline.cache.lock().unwrap();
+
+        cache
+            .get(&CacheKey::new(&query), Instant::now())
+            .map(|hit| hit.parts.bytes.to_vec())
+    }
+
+    async fn answer_over_udp(pipeline: &Arc<Pipeline>, spec: &QuerySpec) -> Vec<u8> {
+        let mut out = Vec::new();
+        pipeline
+            .answer(spec.bytes(), Protocol::Udp, CLIENT, &mut out)
+            .await;
+
+        out
+    }
+
+    #[tokio::test]
+    async fn the_cache_keeps_no_upstream_opt_and_the_client_gets_only_ours() {
+        let (address, _) = scripted_dns(|request| {
+            let spec = QuerySpec::new("www.example.com.", RecordType::A);
+            let reply = ResponseSpec {
+                answers: vec![a("www.example.com.", 300, Ipv4Addr::new(192, 0, 2, 1))],
+                edns: Some(4096),
+                ..ResponseSpec::default()
+            };
+
+            answering(request, reply.bytes(&spec))
+        })
+        .await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(address), Arc::new(Policy::new())).unwrap();
+        let spec = edns_query("www.example.com.");
+
+        let first = answer_over_udp(&pipeline, &spec).await;
+
+        let cached = cached_bytes(&pipeline, &spec).unwrap();
+        let cached_info = ResponseInfo::parse(&cached).unwrap();
+        assert_eq!(cached_info.opt_start, None);
+        assert_eq!(cached_info.header.additional_count, 0);
+
+        let mut hit = Vec::new();
+        assert_eq!(ask_quickly(&pipeline, &spec, &mut hit), Quick::Replied);
+        for reply in [first, hit] {
+            let message = parse(&reply);
+            assert_eq!(message.answers.len(), 1);
+            assert_eq!(message.edns.unwrap().max_payload(), pipeline.udp_size);
+            assert_eq!(
+                ResponseInfo::parse(&reply).unwrap().header.additional_count,
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_opt_before_other_additional_records_is_dropped_before_caching() {
+        let (address, _) = scripted_dns(|request| {
+            answering(request, response_with_opt_before_other_additionals())
+        })
+        .await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(address), Arc::new(Policy::new())).unwrap();
+        let spec = edns_query("www.example.com.");
+
+        let reply = answer_over_udp(&pipeline, &spec).await;
+
+        let cached = cached_bytes(&pipeline, &spec).unwrap();
+        let cached_info = ResponseInfo::parse(&cached).unwrap();
+        assert_eq!(cached_info.opt_start, None);
+        assert_eq!(cached_info.header.additional_count, 3);
+        assert_eq!(cached_info.ttl_offsets.len(), 4);
+
+        let message = parse(&reply);
+        assert_eq!(message.additionals.len(), 3);
+        assert_eq!(message.edns.unwrap().max_payload(), pipeline.udp_size);
+        assert_eq!(
+            ResponseInfo::parse(&reply).unwrap().header.additional_count,
+            4
+        );
+    }
+
+    fn reply_with_extended_rcode(request: &[u8]) -> Vec<u8> {
+        let spec = QuerySpec::new("ext.example.com.", RecordType::A);
+        let mut reply = ResponseSpec {
+            answers: vec![a("ext.example.com.", 300, Ipv4Addr::new(192, 0, 2, 1))],
+            edns: Some(4096),
+            ..ResponseSpec::default()
+        }
+        .bytes(&spec);
+        let extended_rcode_at = reply.len() - OPT_RECORD_LEN + 5;
+        reply[extended_rcode_at] = 1;
+
+        answering(request, reply)
+    }
+
+    #[tokio::test]
+    async fn an_extended_rcode_reaches_an_edns_client_and_a_client_without_edns_gets_servfail() {
+        let (address, _) = scripted_dns(reply_with_extended_rcode).await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(address), Arc::new(Policy::new())).unwrap();
+        let with_edns = edns_query("ext.example.com.");
+
+        let reply = answer_over_udp(&pipeline, &with_edns).await;
+
+        assert_eq!(reply[reply.len() - OPT_RECORD_LEN + 5], 1);
+        assert_eq!(cached_bytes(&pipeline, &with_edns), None);
+
+        let without_edns = QuerySpec::new("ext.example.com.", RecordType::A);
+        let reply = answer_over_udp(&pipeline, &without_edns).await;
+
+        assert_eq!(parse(&reply).metadata.response_code, ResponseCode::ServFail);
+    }
+
+    #[tokio::test]
+    async fn a_record_pointing_into_the_upstream_opt_is_a_servfail_and_is_not_cached() {
+        let (address, _) = scripted_dns(|request| {
+            let mut reply = response_with_opt_before_other_additionals();
+            let second_start = OPT_BEFORE_ADDITIONALS_FIRST_START + 19;
+            reply[second_start] = 0xC0;
+            reply[second_start + 1] = OPT_BEFORE_ADDITIONALS_OPT_START as u8;
+
+            answering(request, reply)
+        })
+        .await;
+        let pipeline =
+            Pipeline::new(&config_for_upstream(address), Arc::new(Policy::new())).unwrap();
+        let spec = edns_query("www.example.com.");
+
+        let reply = answer_over_udp(&pipeline, &spec).await;
+
+        assert_eq!(parse(&reply).metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(cached_bytes(&pipeline, &spec), None);
     }
 }

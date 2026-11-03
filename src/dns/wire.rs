@@ -777,6 +777,24 @@ struct AuthoritySoa {
 }
 
 impl ResponseInfo {
+    /// Parses `msg` after taking the upstream's OPT record out of it, which every delivery
+    /// replaces with our own. `extended_rcode` keeps what the OPT said. Fails like
+    /// `remove_opt`.
+    pub fn parse_dropping_opt(msg: &mut Vec<u8>) -> Result<ResponseInfo, WireError> {
+        let info = ResponseInfo::parse(msg)?;
+        let Some(opt_start) = info.opt_start else {
+            return Ok(info);
+        };
+
+        remove_opt(msg, usize::from(opt_start))?;
+
+        // The records after the OPT moved up, and with them their TTL fields.
+        Ok(ResponseInfo {
+            extended_rcode: info.extended_rcode,
+            ..ResponseInfo::parse(msg)?
+        })
+    }
+
     pub fn parse(msg: &[u8]) -> Result<ResponseInfo, WireError> {
         if msg.len() > MAX_MESSAGE_LEN {
             return Err(WireError::Malformed);

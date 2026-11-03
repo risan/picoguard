@@ -101,6 +101,26 @@ pub async fn fake_dns(v4: Vec<Ipv4Addr>, v6: Vec<Ipv6Addr>) -> FakeDns {
     }
 }
 
+/// A server that answers every query with what `script` makes of its bytes, and counts them.
+pub async fn scripted_dns(
+    script: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&queries);
+
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 512];
+        while let Ok((length, peer)) = socket.recv_from(&mut buffer).await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.send_to(&script(&buffer[..length]), peer).await;
+        }
+    });
+
+    (address, queries)
+}
+
 /// A router as the `[local]` resolver: it answers every A question at once with 192.168.1.9,
 /// and records every PTR question's name, lowercased without its trailing dot.
 pub struct FakeRouter {

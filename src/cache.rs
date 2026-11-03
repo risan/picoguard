@@ -116,7 +116,6 @@ struct Entry {
     hash: u64,
     data: Box<[u16]>,
     reply_len: u32,
-    opt_start: Option<u16>,
     request_flags: u8,
     inserted: Instant,
     lifetime_secs: u32,
@@ -128,7 +127,6 @@ struct NewEntry<'a> {
     key: &'a CacheKey<'a>,
     reply: &'a [u8],
     ttl_offsets: &'a [u16],
-    opt_start: Option<u16>,
     inserted: Instant,
     lifetime_secs: u32,
 }
@@ -141,7 +139,6 @@ impl Entry {
             key,
             reply,
             ttl_offsets,
-            opt_start,
             inserted,
             lifetime_secs,
         } = new;
@@ -160,7 +157,6 @@ impl Entry {
             hash: key.hash,
             data,
             reply_len: u32::try_from(reply.len()).expect("a reply is at most 64 KiB"),
-            opt_start,
             request_flags: key.request_flags,
             inserted,
             lifetime_secs,
@@ -392,7 +388,7 @@ impl Cache {
             parts: ReplyParts {
                 bytes: entry.bytes(),
                 ttl_offsets: entry.ttl_offsets(),
-                opt_start: entry.opt_start,
+                extended_rcode: 0,
             },
             age_secs,
             memo: entry.memo.clone(),
@@ -453,7 +449,6 @@ impl Cache {
             key,
             reply,
             ttl_offsets: &info.ttl_offsets,
-            opt_start: info.opt_start,
             inserted: now,
             lifetime_secs,
         });
@@ -1039,7 +1034,7 @@ mod tests {
 
             assert_eq!(hit.parts.bytes, &reply[..]);
             assert_eq!(hit.parts.ttl_offsets, &info.ttl_offsets[..]);
-            assert_eq!(hit.parts.opt_start, info.opt_start);
+            assert_eq!(hit.parts.extended_rcode, 0);
             assert_eq!(info.ttl_offsets.len(), records);
         }
     }

@@ -356,7 +356,7 @@ mod tests {
         view.check_response(ReplyParts {
             bytes: reply,
             ttl_offsets: &[],
-            opt_start: None,
+            extended_rcode: 0,
         })
     }
 
