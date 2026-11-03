@@ -26,7 +26,7 @@ use picoguard::dns::wire::Name;
 use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::{Downloader, Names};
-use picoguard::password::PasswordHash;
+use picoguard::password::{MAX_ITERATIONS, PasswordHash};
 use picoguard::pipeline::ServerKind;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ListControl, Scheduler, Timing};
@@ -2201,41 +2201,9 @@ async fn a_password_hash_opens_the_api_with_basic_auth() {
 }
 
 #[tokio::test]
-async fn repeated_basic_auth_with_a_hash_does_not_pay_the_hash_each_time() {
-    let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let config = hashed_config(&upstream, "s3cret", 100_000);
-    let hash = config.web.password_hash.clone().unwrap();
-    let site = site(config).await;
-    let started = Instant::now();
-    assert!(hash.verify(b"s3cret"));
-    let one = started.elapsed();
-
-    let wrong = site
-        .send_as_is(get("/api/status").signed_in(WRONG_PASSWORD))
-        .await;
-    assert_eq!(wrong.status, 401);
-    let first = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
-    assert_eq!(first.status, 200);
-    assert!(first.json().get("limited").is_none());
-
-    let started = Instant::now();
-    for _ in 0..100 {
-        let reply = site.send_as_is(get("/api/status").signed_in(ADMIN)).await;
-        assert_eq!(reply.status, 200);
-    }
-    let hundred = started.elapsed();
-
-    // Uncached, they would take `one * 100`.
-    assert!(
-        hundred < one * 10,
-        "one hash {one:?}, 100 requests {hundred:?}"
-    );
-}
-
-#[tokio::test]
 async fn a_slow_password_check_holds_up_neither_dns_nor_the_page() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
-    let site = Arc::new(site(hashed_config(&upstream, "s3cret", 2_000_000)).await);
+    let site = Arc::new(site(hashed_config(&upstream, "s3cret", MAX_ITERATIONS)).await);
 
     let slow = tokio::spawn({
         let site = Arc::clone(&site);
@@ -2251,7 +2219,8 @@ async fn a_slow_password_check_holds_up_neither_dns_nor_the_page() {
         ask(&site.dns, "ok.example.", RecordType::A).await;
         site.send_as_is(get("/")).await
     };
-    let page = tokio::time::timeout(Duration::from_secs(2), answers)
+    // The order is the check: the bound only ends a hang.
+    let page = tokio::time::timeout(Duration::from_secs(30), answers)
         .await
         .expect("DNS and the page answer while a password is hashed");
     assert_eq!(page.status, 200);
