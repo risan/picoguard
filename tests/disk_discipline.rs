@@ -1,7 +1,10 @@
 //! The daemon writes to the state folder only when something worth keeping changes. The
 //! SBC it runs on has a flash card that wears with every write, so DNS traffic, polling the
 //! page, signing in and a list refresh that finds nothing new must leave every file and
-//! folder of the state folder as they were, with or without a saved settings file.
+//! folder of the state folder as they were, with or without a saved settings file. The
+//! statistics are saved once an hour while something changed and once on a clean stop, so a
+//! workload of a few seconds leaves them for the stop; with `[stats] persist = false` there
+//! is no statistics file at all.
 
 mod common;
 
@@ -9,11 +12,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use common::harness::{answering_upstream, name};
 use common::http::ListServer;
-use common::process::{Running, start_with_web_port};
+use common::process::{Running, exit_within, send_signal, start_with_web_port};
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::RecordType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -93,7 +97,7 @@ struct World {
     lists: ListServer,
     _upstream: common::harness::FakeUpstream,
     // Held so the child is killed when the test ends.
-    _daemon: Stopped,
+    daemon: Stopped,
 }
 
 struct Stopped(Running);
@@ -105,7 +109,7 @@ impl Drop for Stopped {
     }
 }
 
-async fn world(name: &str, saved_settings: Option<&str>) -> World {
+async fn world(name: &str, saved_settings: Option<&str>, persist_stats: bool) -> World {
     let state = common::release::scratch(name);
     if let Some(saved) = saved_settings {
         fs::write(state.join("settings.json"), saved).unwrap();
@@ -123,6 +127,7 @@ async fn world(name: &str, saved_settings: Option<&str>) -> World {
              [upstream]\nservers = [\"udp://{}\"]\n\
              [update]\ncheck = false\n\
              [web]\nuser = \"admin\"\npassword = \"s3cret\"\nbind = [\"127.0.0.1\"]\nport = {web_port}\n\
+             [stats]\npersist = {persist_stats}\n\
              [state]\ndir = {state:?}\n",
             lists.url("/with-etag.txt"),
             lists.url("/without-etag.txt"),
@@ -138,7 +143,18 @@ async fn world(name: &str, saved_settings: Option<&str>) -> World {
         dns_port,
         lists,
         _upstream: upstream,
-        _daemon: Stopped(daemon),
+        daemon: Stopped(daemon),
+    }
+}
+
+impl World {
+    /// SIGTERM, then the exit status once the process is gone.
+    async fn stop(&mut self) -> ExitStatus {
+        send_signal(&self.daemon.0.child, "TERM");
+
+        exit_within(&mut self.daemon.0.child, Duration::from_secs(15))
+            .await
+            .expect("the daemon should stop within its allowance")
     }
 }
 
@@ -255,14 +271,8 @@ async fn until_the_lists_are_saved(world: &World) {
     panic!("the lists were never loaded and saved");
 }
 
-async fn unchanged_workload_leaves_the_state_folder_as_it_was(name: &str, saved: Option<&str>) {
-    let world = world(name, saved).await;
-    until_the_lists_are_saved(&world).await;
-    tick().await;
-    let before = observe(&world.state);
-    let settings_existed = world.state.join("settings.json").exists();
-    assert_eq!(settings_existed, saved.is_some());
-
+/// The traffic, polling and sign-in of a short run.
+async fn work_the_daemon(world: &World) {
     for round in 0..5 {
         for text in ["ads.example.", "tracker.example.", "ok.example."] {
             ask(world.dns_port, text).await;
@@ -282,6 +292,17 @@ async fn unchanged_workload_leaves_the_state_folder_as_it_was(name: &str, saved:
     )
     .await;
     assert!(login.starts_with("HTTP/1.1 200"), "{login}");
+}
+
+async fn unchanged_workload_leaves_the_state_folder_as_it_was(name: &str, saved: Option<&str>) {
+    let world = world(name, saved, true).await;
+    until_the_lists_are_saved(&world).await;
+    tick().await;
+    let before = observe(&world.state);
+    let settings_existed = world.state.join("settings.json").exists();
+    assert_eq!(settings_existed, saved.is_some());
+
+    work_the_daemon(&world).await;
 
     until_both_lists(&world, "the lists never aged a second", |age| age >= 1).await;
     let requests = world.lists.requests();
@@ -294,6 +315,10 @@ async fn unchanged_workload_leaves_the_state_folder_as_it_was(name: &str, saved:
     assert_eq!(world.lists.not_modified(), 1, "one answer was a 304");
     assert_eq!(observe(&world.state), before);
     assert_eq!(world.state.join("settings.json").exists(), settings_existed);
+    assert!(
+        !world.state.join("stats.json").exists(),
+        "the statistics wait for the hour or the stop"
+    );
 }
 
 #[tokio::test]
@@ -308,4 +333,52 @@ async fn dns_polling_signing_in_and_an_unchanged_refresh_write_nothing_beside_sa
         Some("{\"version\": 1}"),
     )
     .await;
+}
+
+#[tokio::test]
+async fn a_clean_stop_writes_the_statistics_once_and_nothing_else_changes() {
+    let mut world = world("disk-stop-saves", None, true).await;
+    until_the_lists_are_saved(&world).await;
+    tick().await;
+    let before = observe(&world.state);
+    work_the_daemon(&world).await;
+    assert_eq!(observe(&world.state), before);
+
+    let status = world.stop().await;
+
+    assert_eq!(status.code(), Some(0));
+    let file = world.state.join("stats.json");
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert!(
+        saved["counters"]["total"].as_u64().unwrap() >= 15,
+        "{saved}"
+    );
+    assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+    assert!(!world.state.join("stats.json.part").exists());
+    let after = observe(&world.state);
+    let changed: Vec<&PathBuf> = after
+        .keys()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert_eq!(
+        changed,
+        [&world.state, &file],
+        "only the new file and the folder it is in"
+    );
+}
+
+#[tokio::test]
+async fn with_saving_off_the_daemon_never_writes_a_statistics_file() {
+    let mut world = world("disk-stats-off", None, false).await;
+    until_the_lists_are_saved(&world).await;
+    tick().await;
+    let before = observe(&world.state);
+    work_the_daemon(&world).await;
+
+    let status = world.stop().await;
+
+    assert_eq!(status.code(), Some(0));
+    assert!(!world.state.join("stats.json").exists());
+    assert!(!world.state.join("stats.json.part").exists());
+    assert_eq!(observe(&world.state), before);
 }
