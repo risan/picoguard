@@ -27,6 +27,7 @@ use picoguard::filter::compile::CompileWorker;
 use picoguard::filter::snapshot::SnapshotStore;
 use picoguard::lists::{Downloader, Names};
 use picoguard::password::PasswordHash;
+use picoguard::pipeline::ServerKind;
 use picoguard::policy::Policy;
 use picoguard::scheduler::{Action, ListControl, Scheduler, Timing};
 use picoguard::settings;
@@ -927,6 +928,15 @@ async fn without_a_local_resolver_names_are_null_and_nothing_is_looked_up() {
     assert_eq!(upstream.count(), 0);
 }
 
+/// Waits, up to a generous bound, until `done` holds: a slow machine is late, not wrong.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "never happened: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_router_silent_to_lookups_holds_up_neither_dns_nor_the_page() {
     let upstream = answering_upstream([9, 9, 9, 9], Duration::ZERO).await;
@@ -965,30 +975,30 @@ async fn a_router_silent_to_lookups_holds_up_neither_dns_nor_the_page() {
         record_client(&site, &format!("192.168.1.{}", 100 + number), "a.example.");
     }
 
-    let t0 = Instant::now();
+    let local_tally = || {
+        site.dns
+            .pipeline
+            .upstream_tallies()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Local)
+            .unwrap()
+            .tally
+    };
+    let started = Instant::now();
+
+    // The router never answers a lookup, so the reply can only come before the lookups end.
     let status = site.send(get("/api/status")).await.json();
 
-    assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
+    assert_eq!(local_tally().failed, 0, "the page waited for the lookups");
     let clients = status["top_clients"]["entries"].as_array().unwrap();
     assert_eq!(clients.len(), 20);
     assert!(clients.iter().all(|client| client["name"].is_null()));
-
-    while distinct_names() < 4 {
-        assert!(
-            t0.elapsed() < Duration::from_secs(1),
-            "4 lookups within 1 s"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    until("4 lookups asked", || distinct_names() == 4).await;
 
     // The client pool has one slot; the lookups hold four of their own.
-    let asked_at = Instant::now();
     let answer = ask(&site.dns, "printer.lan.", RecordType::A).await;
-    assert!(
-        asked_at.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        asked_at.elapsed()
-    );
+
+    assert_eq!(local_tally().failed, 0, "the answer waited for the lookups");
     assert_eq!(answer.answers[0].data.to_string(), "192.168.1.9");
 
     site.send(get("/api/status")).await;
@@ -999,40 +1009,25 @@ async fn a_router_silent_to_lookups_holds_up_neither_dns_nor_the_page() {
         "the cap holds while four are in flight"
     );
 
-    let started = Instant::now();
-    let local = loop {
-        let status = site.send(get("/api/status")).await.json();
-        let local = local_entry(&status).clone();
-        if local["failed"].as_u64().unwrap() >= 8 {
-            break local;
-        }
+    // Waiting reads the tallies, not the page, so no new lookup starts meanwhile.
+    until("two tries of four lookups failed", || {
+        local_tally().failed >= 8
+    })
+    .await;
 
-        assert!(started.elapsed() < Duration::from_secs(6), "{local}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-
-    // Two tries for each of the first four; the next four have not failed yet.
-    assert_eq!(local["failed"], 8);
-    assert_eq!(local["answered"], 1);
+    // Two tries for each of the first four; the next four have not started yet.
+    assert_eq!(local_tally().failed, 8);
+    assert_eq!(local_tally().answered, 1);
     assert!(
-        t0.elapsed() >= Duration::from_millis(1900),
+        started.elapsed() >= Duration::from_millis(1900),
         "{:?}",
-        t0.elapsed()
+        started.elapsed()
     );
 
     // The first four gave up and freed their slots, so a poll starts the next four.
     site.send(get("/api/status")).await;
-    let started = Instant::now();
-    while distinct_names() < 8 {
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{}",
-            distinct_names()
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    until("8 lookups asked", || distinct_names() == 8).await;
 
-    assert_eq!(distinct_names(), 8);
     let status = site.send(get("/api/status")).await.json();
     assert_eq!(status["counters"]["total"], 21);
 }
