@@ -536,7 +536,7 @@ fn copy_and_check(
         return Err("the binary does not match SHA256SUMS".to_string());
     }
 
-    run_version(&into.join("picoguard"), &request.version)
+    run_version(&into.join("picoguard"), &request.version, VERSION_RUN_LIMIT)
 }
 
 /// Copies the binary in pieces and returns the hash of the bytes it wrote.
@@ -582,10 +582,10 @@ fn copy_capped(source: impl Read, target: &mut impl Write, cap: u64) -> io::Resu
 /// The copy must print its own version: a genuine release of another version, signed and
 /// served under a newer tag, fails here. One deadline covers the run and the reading of its
 /// output, so a child that left a process holding its output open cannot stall the check.
-fn run_version(binary: &Path, version: &str) -> Result<(), String> {
-    let too_slow = || "picoguard --version did not finish within 10 seconds".to_string();
+fn run_version(binary: &Path, version: &str, limit: Duration) -> Result<(), String> {
+    let too_slow = || format!("picoguard --version did not finish within {limit:?}");
     let mut child = spawn_version(binary)?;
-    let deadline = Instant::now() + VERSION_RUN_LIMIT;
+    let deadline = Instant::now() + limit;
     let output = match read_output(child.stdout.take()) {
         Ok(output) => output,
 
@@ -681,9 +681,12 @@ fn spawn_version(binary: &Path) -> Result<std::process::Child, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
     use super::*;
+    use crate::test_dir::TestDir;
 
     fn test_pair(seed: u8) -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap()
@@ -771,12 +774,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_built_in_key_is_the_key_file() {
-        let key_file = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/dist/release-key.der"));
+    /// The fingerprint printed in README.md and docs/releasing.md. A key rotation has to edit
+    /// this literal on purpose.
+    const RELEASE_KEY_FINGERPRINT: &str =
+        "5724aad59c1a5c73be060aaffe293b0b56e5092b71ebb0073e19b1c4238656cf";
 
-        assert_eq!(RELEASE_KEY, key_file[12..]);
-        assert_ne!(RELEASE_KEY, public_key(&test_pair(7)));
+    #[test]
+    fn the_built_in_key_is_the_published_release_key() {
+        let der = [&KEY_PREFIX[..], &RELEASE_KEY[..]].concat();
+        let fingerprint: String = digest::digest(&digest::SHA256, &der)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        assert_eq!(fingerprint, RELEASE_KEY_FINGERPRINT);
     }
 
     #[test]
@@ -1022,5 +1034,71 @@ mod tests {
             ),
             answer(ID, Outcome::Failed("a?b??c".to_string()))
         );
+    }
+
+    const GENEROUS_LIMIT: Duration = Duration::from_secs(30);
+    const SHORT_LIMIT: Duration = Duration::from_millis(300);
+
+    fn executable(dir: &TestDir, body: &str) -> PathBuf {
+        let path = dir.path().join("picoguard");
+        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        path
+    }
+
+    #[test]
+    fn a_binary_that_prints_its_own_version_passes() {
+        let dir = TestDir::new("version-good");
+        let binary = executable(&dir, "echo \"picoguard 9.9.9\"\n");
+
+        assert_eq!(run_version(&binary, "9.9.9", GENEROUS_LIMIT), Ok(()));
+        assert!(run_version(&binary, "9.9.8", GENEROUS_LIMIT).is_err());
+    }
+
+    #[test]
+    fn a_descendant_that_keeps_the_output_open_cannot_outlast_the_limit() {
+        let dir = TestDir::new("version-descendant");
+        let binary = executable(&dir, "echo \"picoguard 9.9.9\"\nsleep 5 &\nexit 0\n");
+
+        let started = Instant::now();
+        let error = run_version(&binary, "9.9.9", SHORT_LIMIT).unwrap_err();
+
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_binary_that_never_exits_is_stopped_at_the_limit() {
+        let dir = TestDir::new("version-hangs");
+        let binary = executable(&dir, "exec sleep 5\n");
+
+        let started = Instant::now();
+        let error = run_version(&binary, "9.9.9", SHORT_LIMIT).unwrap_err();
+
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn the_version_run_gets_an_empty_environment() {
+        let dir = TestDir::new("version-environment");
+        let binary = executable(
+            &dir,
+            "if [ -n \"$HOME\" ] || [ -n \"$USER\" ]; then echo leaked; else echo \"picoguard 9.9.9\"; fi\n",
+        );
+
+        assert_eq!(run_version(&binary, "9.9.9", GENEROUS_LIMIT), Ok(()));
+    }
+
+    #[test]
+    fn output_past_the_cap_is_refused_even_if_it_starts_right() {
+        let dir = TestDir::new("version-long-output");
+        let binary = executable(
+            &dir,
+            "echo \"picoguard 9.9.9\"\nhead -c 300 /dev/zero | tr '\\0' x\n",
+        );
+
+        assert!(run_version(&binary, "9.9.9", GENEROUS_LIMIT).is_err());
     }
 }
