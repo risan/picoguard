@@ -447,6 +447,12 @@ impl Pipeline {
         self.inflight.lock().unwrap().waiting
     }
 
+    /// How many upstream lookups run right now, those started by a client and the refreshes
+    /// of stale answers.
+    pub fn lookups_in_flight(&self) -> usize {
+        self.inflight.lock().unwrap().queries.len()
+    }
+
     /// What the pipeline records about the queries it answers.
     pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
