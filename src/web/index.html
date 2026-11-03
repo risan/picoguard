@@ -1431,12 +1431,23 @@ function showLimited(note) {
   showTab();
 }
 
+// One update at a time: a slow answer must not pile requests up on a board that serves 16.
+let polling = false;
+let pollAgain = false;
+
 async function update() {
-  if (!$("login").hidden) {
+  if (polling) {
+    pollAgain = true;
+
+    return;
+  }
+
+  if (document.hidden || !$("login").hidden) {
     return;
   }
 
   const epoch = authEpoch;
+  polling = true;
 
   try {
     const status = await api("/api/status");
@@ -1465,9 +1476,10 @@ async function update() {
       showUpstreams(status.upstreams);
       showCache(status.cache);
       showSaving(status.stats_saving);
-      const log = await api("/api/querylog?limit=50");
-      const rules = await api("/api/rules");
-      const saved = await api("/api/settings");
+      // Only the open tab's data is fetched; opening a tab runs an update.
+      const log = $("panel-log").hidden ? null : await api("/api/querylog?limit=50");
+      const rules = $("panel-lists").hidden ? null : await api("/api/rules");
+      const saved = $("panel-settings").hidden ? null : await api("/api/settings");
 
       if (epoch !== authEpoch) {
         return;
@@ -1476,11 +1488,17 @@ async function update() {
       showTop("top-queried", status.top_queried, "Domain");
       showTop("top-blocked", status.top_blocked, "Domain");
       showTop("top-clients", status.top_clients, "Client");
-      showQueries(log.entries);
-      showRules(rules);
-      showSettings(saved);
 
-      if (!$("panel-settings").hidden) {
+      if (log) {
+        showQueries(log.entries);
+      }
+
+      if (rules) {
+        showRules(rules);
+      }
+
+      if (saved) {
+        showSettings(saved);
         await loadServices();
       }
     }
@@ -1498,6 +1516,13 @@ async function update() {
     }
 
     $("state").textContent = "Cannot reach picoguard (" + error.message + "). Trying again\u2026";
+  } finally {
+    polling = false;
+
+    if (pollAgain) {
+      pollAgain = false;
+      update();
+    }
   }
 }
 
@@ -1539,11 +1564,9 @@ document.querySelectorAll("[data-tab]").forEach((tab) =>
   tab.addEventListener("click", () => { location.hash = tab.dataset.tab; }));
 window.addEventListener("hashchange", () => {
   showTab();
-
-  if (signedIn && !$("panel-settings").hidden) {
-    loadServices().catch(() => {});
-  }
+  update();
 });
+document.addEventListener("visibilitychange", update);
 document.querySelectorAll("button[data-minutes]").forEach((button) =>
   button.addEventListener("click", () =>
     act("/api/pause", { minutes: Number(button.dataset.minutes) })));

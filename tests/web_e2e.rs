@@ -641,6 +641,36 @@ async fn the_page_has_four_tabs_kept_in_the_url_fragment() {
     }
 }
 
+/// No browser here: the polling is checked as source. One update runs at a time, a hidden page
+/// does not poll, and a tab's own data is fetched only while that tab is open.
+#[tokio::test]
+async fn the_page_polls_one_update_at_a_time_and_fetches_only_the_open_tabs_data() {
+    let (site, _upstream) = plain_site().await;
+
+    let page = site.send(get("/")).await.body;
+
+    for needed in [
+        "if (polling) {",
+        "pollAgain = true;",
+        "document.hidden",
+        "addEventListener(\"visibilitychange\", update)",
+        "$(\"panel-log\").hidden ? null : await api(\"/api/querylog?limit=50\")",
+        "$(\"panel-lists\").hidden ? null : await api(\"/api/rules\")",
+        "$(\"panel-settings\").hidden ? null : await api(\"/api/settings\")",
+    ] {
+        assert!(page.contains(needed), "the page lacks {needed}");
+    }
+
+    let on_hashchange = page.split("\"hashchange\"").nth(1).unwrap();
+    assert!(
+        on_hashchange
+            .split("});")
+            .next()
+            .unwrap()
+            .contains("update();")
+    );
+}
+
 /// No browser here: the Upstreams card is checked as source. The read-only view leaves the
 /// field out, so the card is hidden there with the top lists.
 #[tokio::test]
